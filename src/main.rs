@@ -11,6 +11,8 @@ mod bundle;
 mod composition;
 mod device;
 mod explain;
+#[cfg(feature = "gpu")]
+mod gpu_mm;
 mod gemma;
 mod model;
 mod retrieval;
