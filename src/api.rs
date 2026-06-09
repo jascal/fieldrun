@@ -765,12 +765,17 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                 match lm.explain(&pids) {
                     Some(ex) => {
                         let dec = |id: i64| {
+                            // show both the token's meaning and its id: `" lunch" [54809]`, `<|im_start|> [151644]`.
                             let s = tg.decode(&[id]);
-                            if !s.is_empty() {
-                                format!("{s:?}")
+                            let meaning = if !s.is_empty() {
+                                format!("{s:?}") // visible text (special tokens decode to "")
                             } else {
-                                // special tokens decode to "" — show their name (e.g. <|im_start|>) instead of a bare id
-                                tg.id_to_token(id).unwrap_or_else(|| format!("[{id}]"))
+                                tg.id_to_token(id).unwrap_or_default() // special-token name, e.g. <|im_start|>
+                            };
+                            if meaning.is_empty() {
+                                format!("[{id}]")
+                            } else {
+                                format!("{meaning} [{id}]")
                             }
                         };
                         eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec));

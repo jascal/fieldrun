@@ -548,7 +548,7 @@ fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
             let inv: HashMap<i64, String> = map.into_iter().map(|(k, v)| (v, k)).collect();
             return Box::new(move |id| {
                 inv.get(&id)
-                    .map(|s| format!("{:?}", s.replace('\u{0120}', " ").replace('\u{010A}', "\n")))
+                    .map(|s| format!("{:?} [{id}]", s.replace('\u{0120}', " ").replace('\u{010A}', "\n")))
                     .unwrap_or_else(|| format!("[{id}]"))
             });
         }
