@@ -432,7 +432,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
             }
             eprint!("\r\x1b[2K"); // clear the spinner line
             let _ = std::io::stderr().flush();
-        });
+        }));
         let mut started = false;
         let (text, _, _, _) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
             if !started {
