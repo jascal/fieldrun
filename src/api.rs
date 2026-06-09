@@ -673,8 +673,10 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
     if !tg.knows_chatml() {
         eprintln!("[fieldrun] heads-up: this tokenizer has no ChatML template (<|im_start|>) — it looks like a BASE \
                    model (e.g. GPT-2), not an instruct model, so chat will just CONTINUE your text and won't stop \
-                   cleanly. For a base model, prefer `--ids <stream> --explain` or `--generate` over `--chat`.");
+                   so chat runs as a text-COMPLETION REPL — type text and it continues it, stopping at the model's EOS \
+                   (it won't follow instructions like an instruct model).");
     }
+    let chatml = tg.knows_chatml(); // instruct model → ChatML template + history; base model → raw completion
     let mut history: Vec<(String, String)> = Vec::new();
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
     // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
@@ -764,7 +766,13 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             }
             continue;
         }
-        let prompt = tg.chat_prompt(None, &history, user);
+        // instruct model → ChatML template + conversation history; base model → raw text completion (add the
+        // tokenizer's special tokens, e.g. a BOS) so it just continues the text and stops at the model's EOS.
+        let (prompt, add_special) = if chatml {
+            (tg.chat_prompt(None, &history, user), false)
+        } else {
+            (user.to_string(), true)
+        };
         // "thinking" spinner until the first token (the gap = prompt prefill, which is slow on big models), then the
         // reply streams token-by-token. The spinner runs on its own thread + writes stderr; on the first token we stop
         // and join it (so it's done writing) before printing the reply, so the two never race on the line.
@@ -790,7 +798,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
         // looking like an editable input prompt while it's still generating. `in_code` carries an open ``` fence.
         let mut linebuf = String::new();
         let mut in_code = false;
-        let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
+        let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, add_special, &mut |chunk| {
             if !fmt {
                 if !started {
                     started = true;
@@ -878,8 +886,11 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                 }
             }
         }
-        history.push(("user".into(), user.to_string()));
-        history.push(("assistant".into(), text.trim().to_string()));
+        if chatml {
+            // only instruct models carry conversation history (base completion is stateless per turn)
+            history.push(("user".into(), user.to_string()));
+            history.push(("assistant".into(), text.trim().to_string()));
+        }
     }
 }
 
