@@ -25,11 +25,14 @@ diverges without explaining why.
 - `src/retrieval.rs` — Tier A: `Store` ports `lm.py` (induction + n-gram backoff + grammar).
 - `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + VNNI int8 W8A8 with
   outlier-aware activation quant), `mm_routed_down` (Tier C), and the row-wise embed helpers.
-- `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` — Tier B forward passes (GPT-2 / Llama-Qwen /
-  Gemma-2 / Gemma-3), each with a KV-cache `generate` (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base
-  RoPE (local θ for sliding layers / global θ for full), the 5:1 sliding:full pattern, and no soft-capping.
+- `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
+  (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
+  (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1 pattern, no soft-capping. `gemma4.rs`
+  adds (dense text path) value-norm, scaling=1, per-layer-type head_dim, partial-rotary global RoPE, and the PLE
+  gated-residual block; norms use the weight directly (no (1+w)). gemma4 `generate` falls back to naive recompute and
+  `explain` is TBD (forward correctness is the gate).
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
-  archs (`--arch gpt2|rope|gemma|gemma3`), `--dtype int8|f16|f32` (f32 = bit-exact, for the faithfulness gate).
+  archs (`--arch gpt2|rope|gemma|gemma3|gemma4`), `--dtype int8|f16|f32` (f32 = bit-exact, for the faithfulness gate).
 - `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`).
@@ -38,11 +41,12 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**5 archs**: GPT-2, RoPE, Gemma-2, Gemma-3), KV-cache + **int8 KV cache**
-(`--kv-int8`, all archs, ~4x smaller, lossy: near-lossless short-run, occasional greedy flips long-run), fp16/int8
-bundles (int8 for all archs — embeddings stay fp16, linear weights int8 via VNNI W8A8 + outlier-aware quant), Tier C
-(`--route-frac`), `explain` for all archs, the HTTP API, and a **pure-Rust `convert`** (no torch). Gemma-3 is validated
-f32 60/60 / f16 60/60 / int8 59/60 vs a tiny `Gemma3ForCausalLM` (`scripts/gemma3_ref.py`).
+Done across the board: Tier A/B (**6 archs**: GPT-2, RoPE, Gemma-2, Gemma-3, Gemma-4 dense text), KV-cache + **int8 KV
+cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional greedy flips
+long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 via VNNI W8A8 +
+outlier-aware quant), Tier C (`--route-frac`), `explain` (GPT-2/RoPE/Gemma-2/Gemma-3), the HTTP API, and a **pure-Rust
+`convert`** (no torch). Gemma-3 and Gemma-4 are each validated f32 60/60 / f16 60/60 / int8 59/60 vs a tiny
+`Gemma3ForCausalLM`/`Gemma4ForCausalLM` (`scripts/gemma3_ref.py build {gemma3,gemma4}`).
 
 Still open, with the honest catch on each (none are quick wins — they need hardware or a deep kernel, not more glue):
 - **ARM NEON SDOT** (Peter's M2): can't be *validated* on this x86 box, and shipping unvalidated SIMD would break the
@@ -55,13 +59,16 @@ Still open, with the honest catch on each (none are quick wins — they need har
   uncertain (the gather read can cost as much as the dense pass).
 - **KV-cache quant** (TurboQuant-style): a *memory* win (4× smaller cache) that only manifests at long context, which
   these short-context demos don't exercise — validatable by token-identity but not demonstrable as a real saving here.
-- **Newer archs.** Gemma-3's backbone (just landed) is also the **Gemma-4 text** backbone; Gemma-4 adds three pieces on
-  top, each its own validated increment: Per-Layer Embeddings (a parallel 256-dim conditioning stream added per layer),
-  a partial-rotary (0.25) RoPE + larger `head_dim` on the *global* layers, and an MoE FFN (the 26B-A4B). The MoE FFN +
-  the MLA attention class are the two unimplemented kernels that also gate the wider frontier-MoE roadmap (Qwen3.x,
-  Kimi-2.x, DeepSeek-V4, MiniMax-M3) — most of those don't fit a ≤24 GB budget at f16, so they're "kernel exists,
-  hardware permitting", not near-term. `transformers` 5.10 already exposes `Gemma4ForCausalLM`/`Gemma3ForCausalLM`, so
-  each is validatable on a tiny random-init instance with no gated download (the gemma3 gate is the template).
+- **Gemma-4 remaining pieces** (the dense text path landed, 60/60). Each its own validated increment: the **MoE FFN
+  block** (26B-A4B: router + grouped experts, top-k); **attention_k_eq_v** (global layers reuse k as v, with
+  `num_global_key_value_heads`); **KV-sharing** (`num_kv_shared_layers` — later layers reuse an earlier layer's K/V);
+  and a **KV-cache `generate` + `explain`** for gemma4 (currently naive recompute / TBD).
+- **Frontier-MoE roadmap** (Qwen3.x, Kimi-2.x, DeepSeek-V4, MiniMax-M3). Two unimplemented kernel *classes* gate all of
+  them: the **MoE FFN** (sparse expert routing — shared with Gemma-4 MoE) and **MLA** (multi-head latent attention, the
+  DeepSeek/Kimi compressed-KV scheme). Beyond the kernels, the binding constraint is **memory**: these are 100B–1T-param
+  models that don't fit a ≤24 GB budget at f16/int8 — running them is "kernel exists + expert-offload/paging + a much
+  bigger box", not glue. `transformers` 5.10 exposes the classes, so each kernel is validatable on a tiny random-init
+  instance with no gated download (the gemma3/gemma4 gate is the template); the *full* weights are the hardware ask.
 
 ## Conventions
 
