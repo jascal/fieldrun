@@ -29,7 +29,16 @@ fn default_dtype() -> String {
 enum Arr {
     F32(Vec<f32>),
     F16(Vec<half::f16>),
-    I8(Vec<i8>), // per-output-column symmetric int8; its f16 scale lives in the sibling "<name>__scale" array
+    I8(I8w), // per-output-column symmetric int8 (scale in sibling "<name>__scale"), repacked for the VNNI path
+}
+
+/// An int8 weight prepared for the VNNI matmul: stored transposed to (out, in) so each output column's contiguous
+/// `k` values feed `vpdpbusd` directly, plus the per-column weight sum (the zero-point correction term).
+struct I8w {
+    wt: Vec<i8>,    // (n, k) row-major: wt[j*k + kk] = W[kk, j]
+    colsum: Vec<i32>, // colsum[j] = sum_k W[kk, j]
+    k: usize,
+    n: usize,
 }
 
 #[derive(Deserialize)]
@@ -71,7 +80,20 @@ impl Bundle {
             let arr = match a.dtype.as_str() {
                 "f32" => Arr::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
                 "f16" => Arr::F16(raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect()),
-                "i8" => Arr::I8(raw.iter().map(|&b| b as i8).collect()),
+                "i8" => {
+                    let (k, n) = (a.shape[0], a.shape[1]);
+                    let mut wt = vec![0i8; k * n];
+                    let mut colsum = vec![0i32; n];
+                    for kk in 0..k {
+                        let base = kk * n;
+                        for j in 0..n {
+                            let w = raw[base + j] as i8;
+                            wt[j * k + kk] = w; // transpose to (out, in) for contiguous-k VNNI dots
+                            colsum[j] += w as i32;
+                        }
+                    }
+                    Arr::I8(I8w { wt, colsum, k, n })
+                }
                 d => panic!("unsupported array dtype {d:?} in bundle"),
             };
             arrays.insert(a.name, (a.shape, arr));
@@ -116,33 +138,30 @@ impl Bundle {
     pub fn mm(&self, a: &Array2<f32>, name: &str) -> Array2<f32> {
         let (shape, arr) = self.get(name);
         let (k, n) = (shape[0], shape[1]);
-        // int8: dequant W[k,j] = w_i8 * scale[j] (per output column) into the block buffer, then the same SIMD dot.
-        let scale = if matches!(arr, Arr::I8(_)) { Some(self.arr1o(&format!("{name}__scale"))) } else { None };
         match arr {
             Arr::F32(v) => a.dot(&ArrayView2::from_shape((k, n), v).unwrap()),
-            Arr::I8(v) => {
-                let scale = scale.unwrap();
-                let block = 512.min(n);
-                let nblocks = n.div_ceil(block);
-                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
-                    .into_par_iter()
-                    .map(|bi| {
-                        let c0 = bi * block;
-                        let bw = block.min(n - c0);
-                        let mut buf = vec![0f32; k * bw];
-                        for kk in 0..k {
-                            let wrow = &v[kk * n + c0..kk * n + c0 + bw];
-                            for (jj, (b, w)) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow).enumerate() {
-                                *b = *w as f32 * scale[c0 + jj];
-                            }
-                        }
-                        (c0, a.dot(&ArrayView2::from_shape((k, bw), &buf).unwrap()))
-                    })
-                    .collect();
-                let mut out = Array2::<f32>::zeros((a.nrows(), n));
-                for (c0, ob) in blocks.drain(..) {
-                    let bw = ob.ncols();
-                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+            // int8 W8A8: dynamically quantise each activation row to u8 (offset +128), int8·int8 dot via VNNI, then
+            // dequant: out = scale_a * scale_w[j] * (Σ au·w  −  128·colsum[j]). The +128 makes `a` unsigned for
+            // vpdpbusd (u8×s8); the colsum term cancels that offset. Activations go to int8 too, so this is lossier
+            // than the f16-activation dequant path — it trades a little accuracy for the on-core int8 dot.
+            Arr::I8(w8) => {
+                let scale = self.arr1o(&format!("{name}__scale"));
+                let (kk, nn) = (w8.k, w8.n);
+                let mut out = Array2::<f32>::zeros((a.nrows(), nn));
+                for i in 0..a.nrows() {
+                    let arow = a.row(i);
+                    let arow = arow.as_slice().unwrap();
+                    let amax = arow.iter().fold(0f32, |mx, &v| mx.max(v.abs()));
+                    let sa = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                    let au: Vec<u8> = arow.iter().map(|&v| ((v / sa).round() as i32).clamp(-127, 127) as u8 ^ 0x80).collect();
+                    let orow: Vec<f32> = (0..nn)
+                        .into_par_iter()
+                        .map(|j| {
+                            let acc = vnni_udot(&au, &w8.wt[j * kk..(j + 1) * kk]);
+                            sa * scale[j] * (acc - 128 * w8.colsum[j]) as f32
+                        })
+                        .collect();
+                    out.row_mut(i).assign(&ArrayView1::from(orow.as_slice()));
                 }
                 out
             }
@@ -227,4 +246,35 @@ impl Bundle {
             })
             .collect()
     }
+}
+
+/// Dot product of unsigned-int8 activations with signed-int8 weights, accumulating in i32. Uses the on-core AVX-512
+/// VNNI int8 instruction (`vpdpbusd`) when the CPU has it, else a scalar fallback. This is the kernel int8 weights buy.
+fn vnni_udot(au: &[u8], w: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vnni_udot_avx512(au, w) };
+        }
+    }
+    au.iter().zip(w).map(|(&a, &b)| a as i32 * b as i32).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vnni")]
+unsafe fn vnni_udot_avx512(au: &[u8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let len = au.len();
+    let chunks = len / 64;
+    let mut acc = _mm512_setzero_si512();
+    for c in 0..chunks {
+        let a = _mm512_loadu_si512(au.as_ptr().add(c * 64) as *const __m512i);
+        let b = _mm512_loadu_si512(w.as_ptr().add(c * 64) as *const __m512i);
+        acc = _mm512_dpbusd_epi32(acc, a, b); // 16 i32 lanes, each += Σ of 4 u8·s8 products
+    }
+    let mut sum = _mm512_reduce_add_epi32(acc);
+    for k in (chunks * 64)..len {
+        sum += au[k] as i32 * w[k] as i32; // tail (k not a multiple of 64)
+    }
+    sum
 }
