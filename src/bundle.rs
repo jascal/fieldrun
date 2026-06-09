@@ -432,3 +432,78 @@ unsafe fn vnni_udot_avx512(au: &[u8], w: &[i8]) -> i32 {
     }
     sum
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a minimal bundle (manifest + blob) to `stem` for tests. Arrays: (name, dtype f32|f16, shape, data).
+    fn write_bundle(stem: &str, arch: &str, config: &[i64], arrays: &[(&str, &str, Vec<usize>, Vec<f32>)]) {
+        let mut bin: Vec<u8> = Vec::new();
+        let mut specs: Vec<serde_json::Value> = Vec::new();
+        for (name, dtype, shape, data) in arrays {
+            let offset = bin.len();
+            match *dtype {
+                "f32" => for &v in data { bin.extend_from_slice(&v.to_le_bytes()); },
+                "f16" => for &v in data { bin.extend_from_slice(&half::f16::from_f32(v).to_le_bytes()); },
+                d => panic!("test dtype {d}"),
+            }
+            specs.push(serde_json::json!({ "name": name, "dtype": dtype, "shape": shape, "offset": offset,
+                "bytes": bin.len() - offset }));
+        }
+        let manifest = serde_json::json!({ "format": FORMAT, "version": VERSION, "arch": arch, "config": config,
+            "config_f": [], "arrays": specs });
+        std::fs::write(format!("{stem}.fieldrun.bin"), &bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+    }
+
+    fn tmp_stem(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("fr_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("b").to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn mm_f32_exact() {
+        let stem = tmp_stem("mm32");
+        // W (k=2, n=3) row-major [[1,2,3],[4,5,6]]
+        write_bundle(&stem, "test", &[], &[("w", "f32", vec![2, 3], vec![1., 2., 3., 4., 5., 6.])]);
+        let b = Bundle::load(&stem).unwrap();
+        let a = Array2::from_shape_vec((1, 2), vec![1.0, 1.0]).unwrap();
+        let out = b.mm(&a, "w"); // [1+4, 2+5, 3+6]
+        assert_eq!(out.as_slice().unwrap(), &[5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn mm_f16_close_to_f32() {
+        let stem = tmp_stem("mm16");
+        write_bundle(&stem, "test", &[], &[("w", "f16", vec![2, 2], vec![0.5, -1.5, 2.0, 0.25])]);
+        let b = Bundle::load(&stem).unwrap();
+        let a = Array2::from_shape_vec((1, 2), vec![2.0, 4.0]).unwrap();
+        let out = b.mm(&a, "w"); // [2*0.5+4*2.0, 2*-1.5+4*0.25] = [9.0, -2.0]
+        assert!((out[[0, 0]] - 9.0).abs() < 1e-2 && (out[[0, 1]] + 2.0).abs() < 1e-2, "{out:?}");
+    }
+
+    #[test]
+    fn rows_and_rowdot() {
+        let stem = tmp_stem("emb");
+        // embed (vocab=3, d=2)
+        write_bundle(&stem, "test", &[], &[("embed", "f32", vec![3, 2], vec![0., 1., 2., 3., 4., 5.])]);
+        let b = Bundle::load(&stem).unwrap();
+        let rows = b.rows_f32("embed", &[2, 0]);
+        assert_eq!(rows.row(0).to_vec(), vec![4.0, 5.0]);
+        assert_eq!(rows.row(1).to_vec(), vec![0.0, 1.0]);
+        // rowdot: dot(embed[r], x) for x=[1,1] -> [0+1, 2+3, 4+5] = [1,5,9]
+        assert_eq!(b.rowdot_f32("embed", &[1.0, 1.0]), vec![1.0, 5.0, 9.0]);
+        // weight_row
+        assert_eq!(b.weight_row("embed", 1), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn vnni_udot_scalar_matches_manual() {
+        let au: Vec<u8> = vec![128, 200, 60, 255];
+        let w: Vec<i8> = vec![1, -2, 3, 4];
+        let want: i32 = au.iter().zip(&w).map(|(&a, &b)| a as i32 * b as i32).sum();
+        assert_eq!(vnni_udot(&au, &w), want);
+    }
+}

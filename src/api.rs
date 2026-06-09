@@ -431,3 +431,33 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
 fn err(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
 }
+
+#[cfg(all(test, feature = "api"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wants_stream_parses() {
+        assert!(wants_stream(r#"{"stream":true}"#));
+        assert!(!wants_stream(r#"{"stream":false}"#));
+        assert!(!wants_stream(r#"{"messages":[]}"#));
+        assert!(!wants_stream("not json"));
+    }
+
+    #[test]
+    fn sse_openai_format() {
+        let d = String::from_utf8(sse_delta("/v1/chat/completions", "rope", 1, "Paris")).unwrap();
+        assert!(d.starts_with("data: "), "{d}");
+        assert!(d.contains("\"content\":\"Paris\"") && d.contains("chat.completion.chunk") && d.ends_with("\n\n"));
+        let done = String::from_utf8(sse_close("/v1/chat/completions", "rope", 1)).unwrap();
+        assert!(done.contains("[DONE]") && done.contains("\"finish_reason\":\"stop\""), "{done}");
+    }
+
+    #[test]
+    fn sse_anthropic_format() {
+        let open = String::from_utf8(sse_open("/v1/messages", "rope", 1)).unwrap();
+        assert!(open.contains("message_start") && open.contains("content_block_start"));
+        let d = String::from_utf8(sse_delta("/v1/messages", "rope", 1, "Hi")).unwrap();
+        assert!(d.contains("content_block_delta") && d.contains("\"text\":\"Hi\""), "{d}");
+    }
+}

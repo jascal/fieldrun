@@ -708,3 +708,47 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn eos_ids_int_array_none() {
+        assert_eq!(eos_ids(&json!({"eos_token_id": 5})), vec![5]);
+        assert_eq!(eos_ids(&json!({"eos_token_id": [1, 2, 3]})), vec![1, 2, 3]);
+        assert_eq!(eos_ids(&json!({})), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn geti_getf_basic() {
+        let c = json!({"a": 7, "b": 1.5});
+        assert_eq!(geti(&c, "a"), Some(7));
+        assert_eq!(geti(&c, "missing"), None);
+        assert_eq!(getf(&c, "b"), Some(1.5));
+    }
+
+    #[test]
+    fn gemma3_thetas_flat_nested_default() {
+        assert_eq!(gemma3_thetas(&json!({"rope_local_base_freq": 10000.0, "rope_theta": 1000000.0})), (10000.0, 1000000.0));
+        let nested = json!({"rope_parameters": {"sliding_attention": {"rope_theta": 1234.0}, "full_attention": {"rope_theta": 9999.0}}});
+        assert_eq!(gemma3_thetas(&nested), (1234.0, 9999.0));
+        assert_eq!(gemma3_thetas(&json!({})), (10000.0, 1000000.0));
+    }
+
+    #[test]
+    fn int8_quant_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("fr_i8_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut w = BundleWriter::new(&stem).unwrap();
+        // (in=2, out=2) matrix [[1,2],[3,4]] stored as-is (transpose=false)
+        w.put_i8("m", &[1.0, 2.0, 3.0, 4.0], 2, 2, false).unwrap();
+        w.finish(&stem, json!({"format": "fieldrun-bundle", "version": 1, "arch": "test", "config": []})).unwrap();
+        let b = crate::bundle::Bundle::load(&stem).unwrap();
+        let (r0, r1) = (b.weight_row("m", 0), b.weight_row("m", 1));
+        assert!((r0[0] - 1.0).abs() < 0.05 && (r0[1] - 2.0).abs() < 0.05, "{r0:?}");
+        assert!((r1[0] - 3.0).abs() < 0.05 && (r1[1] - 4.0).abs() < 0.05, "{r1:?}");
+    }
+}

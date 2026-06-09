@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build across the MSRV (1.82) + current stable, for every feature combination. This is the gate that catches
+  # dependency drift past Rust 1.82 (the class of bug found by testing on an Intel Mac on 1.82) — the moment a dep
+  # bumps its MSRV/edition, CI goes red here instead of a user discovering it.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.82.0", "stable"]
+        features: ["", "--features api", "--features gpu"]
+    name: build (${{ matrix.rust }}, ${{ matrix.features || 'default' }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      # respect the committed Cargo.lock (the pins that keep us on 1.82) — never re-resolve in CI
+      - run: cargo build --release --locked ${{ matrix.features }}
+
+  # Unit tests (the #[cfg(test)] modules) on stable, with the api feature so the api/tokenizer tests run too.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked --features api
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # Correctness: the faithfulness sweep — convert each arch from a tiny random-init torch model and check top-1 vs the
+  # torch reference. Heavier (installs CPU torch + transformers), so it's its own job; f32 is the gate.
+  faithfulness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install torch (cpu) + transformers
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers>=5.10" safetensors
+      - name: faithfulness sweep (f32 is the gate)
+        run: PY=python bash scripts/validate_all.sh

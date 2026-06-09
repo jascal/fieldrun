@@ -376,3 +376,37 @@ fn report(tier: &str, detail: &str, correct: usize, total: usize, threads: usize
     println!("[fieldrun] {tier} · {detail}");
     println!("[fieldrun] next-token top-1: {:.1}%  ({total} positions, {threads} threads)", acc * 100.0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_parsing() {
+        let a: Vec<String> = ["fr", "--arch", "rope", "--chat"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(flag(&a, "--arch"), Some("rope"));
+        assert_eq!(flag(&a, "--missing"), None);
+        assert!(has_flag(&a, "--chat"));
+        assert!(!has_flag(&a, "--nope"));
+    }
+
+    #[test]
+    fn resolve_bundle_explicit_cache_and_repo_id() {
+        let dir = std::env::temp_dir().join(format!("fr_rb_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // explicit stem: <stem>.fieldrun.json exists -> returned as-is
+        let st = dir.join("x").to_string_lossy().into_owned();
+        std::fs::write(format!("{st}.fieldrun.json"), "{}").unwrap();
+        assert_eq!(resolve_bundle(&st), st);
+        // cache: bare name + full repo id both resolve to <cache>/<name>/<name>
+        std::env::set_var("FIELDRUN_BUNDLES", &dir);
+        let mdir = dir.join("Qwen2.5-0.5B-Instruct");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let bstem = mdir.join("Qwen2.5-0.5B-Instruct").to_string_lossy().into_owned();
+        std::fs::write(format!("{bstem}.fieldrun.json"), "{}").unwrap();
+        assert_eq!(resolve_bundle("Qwen2.5-0.5B-Instruct"), bstem);
+        assert_eq!(resolve_bundle("Qwen/Qwen2.5-0.5B-Instruct"), bstem);
+        assert_eq!(resolve_bundle("does-not-exist"), "does-not-exist"); // passthrough
+        std::env::remove_var("FIELDRUN_BUNDLES");
+    }
+}
