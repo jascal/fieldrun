@@ -7,6 +7,9 @@ description = "Run a decompiled LLM as a single native binary — the three pylm
 license = "Apache-2.0"
 
 [features]
+# `hub` is ON by default (ease of use: `convert --model org/repo` pulls from HF out of the box). For a lean, fully
+# offline / network-free binary, build with `--no-default-features`.
+default = ["hub"]
 # opt-in GPU backend (wgpu: Metal on Mac, DX12 on Windows incl. ARM, Vulkan on Linux). The default build is pure-CPU,
 # no GPU dependency — the CPU path stays the faithful reference; GPU is an accelerator for usable generation speed.
 gpu = ["dep:wgpu", "dep:pollster"]
@@ -14,6 +17,10 @@ gpu = ["dep:wgpu", "dep:pollster"]
 # unstable on stable). Default build omits it and uses a portable scalar int8 dot, so it compiles on stable everywhere
 # (incl. Apple Silicon / Intel macOS). Enable on an x86 server with nightly: `cargo +nightly build --release --features vnni`.
 vnni = []
+# HF hub pull (default): `convert --model org/repo` fetches config + safetensors from Hugging Face over a small ureq
+# client (no torch, no async); auth via `huggingface-cli login` / $HF_TOKEN for gated models. `--no-default-features`
+# drops it for a fully offline / network-free binary.
+hub = ["dep:ureq"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +33,10 @@ safetensors = "0.4"  # read HF weights directly (pure Rust, no torch) for the `c
 memmap2 = "0.9"      # mmap the safetensors so convert streams one tensor at a time (RAM ≈ one tensor)
 wgpu = { version = "22", optional = true }       # cross-platform GPU backend (opt-in, --features gpu)
 pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter/device requests
+# HF hub pull (default feature `hub`): blocking ureq client, no async/tokio. ureq's default TLS is rustls (pure-Rust,
+# no system OpenSSL/SecureTransport needed, same on Mac + Linux). We download by repo id ourselves — ureq follows HF's
+# relative 307 redirects (which hf-hub 0.3 did not) — and read the standard HF token; no login of our own.
+ureq = { version = "=2.9.7", optional = true }
 
 [[bin]]
 name = "fieldrun"

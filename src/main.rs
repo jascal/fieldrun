@@ -25,6 +25,8 @@ mod gpu_rope;
 mod gemma;
 mod gemma3;
 mod gemma4;
+#[cfg(feature = "hub")]
+mod hub;
 mod minimax;
 mod mla;
 mod model;
@@ -64,13 +66,28 @@ fn has_flag(args: &[String], name: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // `fieldrun convert --model <hf-dir> --arch rope --dtype int8 -o <stem>` — HF safetensors -> bundle, no torch.
+    // `fieldrun convert --model <dir-or-hf-repo-id> --arch rope --dtype int8 -o <stem>` — HF safetensors -> bundle, no torch.
+    // `--model` is a local checkpoint dir, OR (with the default `hub` feature) a Hugging Face repo id like `org/name`,
+    // which is downloaded to the HF cache first. Token (gated models): `--hf-token` > $HF_TOKEN > `huggingface-cli login`.
     if args.get(1).map(String::as_str) == Some("convert") {
-        let model = flag(&args, "--model").expect("--model <hf-model-dir>");
+        let model = flag(&args, "--model").expect("--model <local-dir | hf-repo-id>");
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
         let out = flag(&args, "-o").or_else(|| flag(&args, "--out")).expect("-o <bundle-stem>");
-        convert::convert(model, arch, dtype, out).expect("convert");
+        let model_dir: String = if std::path::Path::new(model).join("config.json").exists() {
+            model.to_string() // a local checkpoint directory
+        } else {
+            #[cfg(feature = "hub")]
+            {
+                hub::fetch(model, hub::token(flag(&args, "--hf-token")))
+            }
+            #[cfg(not(feature = "hub"))]
+            {
+                panic!("--model {model:?}: not a local dir with config.json. To pull it from the Hugging Face hub by \
+                        repo id, use a build with the `hub` feature (it's on by default; you've disabled it).");
+            }
+        };
+        convert::convert(&model_dir, arch, dtype, out).expect("convert");
         return;
     }
 

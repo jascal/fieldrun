@@ -137,10 +137,11 @@ active set *before* gate/up (the informed-router / MoE direction) plus SIMD spar
 
 ## Build & run
 
-**Requirements:** stable **Rust ≥ 1.82** (`rustup update` if older) — both the default build and `--features gpu` are
-pinned to build on 1.82. The runtime needs no ML framework. `convert` needs a Hugging Face checkpoint dir
-(safetensors + `config.json`). The validation/quality harness (`scripts/`) uses Python + `transformers`, but the
-binary itself does not.
+**Requirements:** stable **Rust ≥ 1.82** (`rustup update` if older) — the default build, `--features gpu`, and the
+default `hub` (HF pull) feature are all pinned to build on 1.82. The runtime needs no ML framework. `convert` reads a
+local checkpoint dir **or** pulls one from the Hugging Face hub by repo id (the default `hub` feature; build
+`--no-default-features` for a fully offline, network-free binary). The validation/quality harness (`scripts/`) uses
+Python + `transformers`, but the binary itself does not.
 
 ```bash
 cargo build --release
@@ -148,10 +149,13 @@ B=../lm-sae/pylm                       # bundles + stores live here (built by py
 
 # Tier A — retrieval over the flat store
 ./target/release/fieldrun --store $B/store_gpt2.json --ids $B/holdout_gpt2.json
-# Convert a Hugging Face checkpoint -> bundle, pure Rust, no torch (single-file or sharded safetensors)
-#   --arch gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
-#   --dtype int8 (default) | f16 | f32 (f32 = bit-exact bundle, used by the faithfulness gate)
-./target/release/fieldrun convert --model ~/.cache/huggingface/hub/.../gemma-3-1b-it --arch gemma3 --dtype int8 -o $B/gemma3_1b
+# Convert a checkpoint -> bundle, pure Rust, no torch (single-file or sharded safetensors).
+#   --model  a LOCAL dir, OR an HF repo id like `Qwen/Qwen3-30B-A3B` — pulled straight from the hub (default `hub`
+#            feature). Gated models (Gemma/Llama): `huggingface-cli login` once, or `--hf-token <tok>` / $HF_TOKEN.
+#   --arch   gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
+#   --dtype  int8 (default) | f16 | f32 (f32 = bit-exact bundle, used by the faithfulness gate)
+./target/release/fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8 -o $B/qwen7b   # pulls from HF
+./target/release/fieldrun convert --model ./local-gemma-3-1b-it      --arch gemma3 --dtype int8 -o $B/gemma3_1b  # local dir
 # Tier B — score the real forward pass over a bundle (gpt2 / qwen05b / gemma2_2b[_int8] / gemma3_*)
 ./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --n-eval 200   # --dump preds.txt for the diff
 # Generate (KV-cache) — compares cached vs naive, prints tok/s
