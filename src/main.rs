@@ -66,6 +66,12 @@ fn has_flag(args: &[String], name: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // help: explicit --help/-h, or a bare invocation (the dev-only default store/ids paths would just panic otherwise).
+    if args.len() == 1 || has_flag(&args, "--help") || has_flag(&args, "-h") {
+        print_help();
+        return;
+    }
+
     // `fieldrun convert --model <dir-or-hf-repo-id> --arch rope --dtype int8 -o <stem>` — HF safetensors -> bundle, no torch.
     // `--model` is a local checkpoint dir, OR (with the default `hub` feature) a Hugging Face repo id like `org/name`,
     // which is downloaded to the HF cache first. Token (gated models): `--hf-token` > $HF_TOKEN > `huggingface-cli login`.
@@ -226,6 +232,40 @@ fn main() {
     by.sort_by(|a, b| b.1.cmp(&a.1));
     let parts: Vec<String> = by.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("[fieldrun] idioms: {}", parts.join(", "));
+}
+
+fn print_help() {
+    let gpu = if cfg!(feature = "gpu") { "on" } else { "off (build --features gpu)" };
+    let hub = if cfg!(feature = "hub") { "on" } else { "off (default; you built --no-default-features)" };
+    print!(
+        "fieldrun {ver} — run a decompiled LLM as a single native binary (pure-Rust, no framework at runtime).\n\
+\n\
+USAGE\n\
+  fieldrun convert --model <dir|hf-repo-id> --arch <arch> [--dtype int8|f16|f32] -o <stem>\n\
+  fieldrun --bundle <stem> --ids <ids.json> [--ctx N] [--n-eval N]        score next-token top-1 (Tier B)\n\
+  fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
+  fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
+  fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: /predict /generate /explain\n\
+  fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
+\n\
+  --ids expects {{\"holdout_ids\": [<token ids>]}} from the model's tokenizer.\n\
+\n\
+CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
+  --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
+  --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
+  --dtype <D>     int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
+  -o, --out <S>   output bundle stem (writes <S>.fieldrun.json + .bin)\n\
+  --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
+\n\
+RUN\n\
+  --bundle <S>    the .fieldrun bundle stem to load          --ctx N         context window / prediction (default 64)\n\
+  --n-eval N      positions to score (default 500)           --generate M    greedy-generate M tokens (KV-cache where wired)\n\
+  --kv-int8       int8 KV cache during generate              --route-frac F  Tier C: compute only fraction F of MLP neurons\n\
+  --explain       explain the last --ctx token               --vocab <f>     gpt2 vocab.json for readable explain labels\n\
+  --serve <PORT>  start the HTTP API                         --dump <f>      write predictions, one id per line\n\
+  --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
+        ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
+    );
 }
 
 fn dump_if(args: &[String], preds: &[i64]) {
