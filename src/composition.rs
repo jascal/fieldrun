@@ -138,56 +138,12 @@ impl Gpt2 {
             x = &x + &(self.b.mm(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
         let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
-        let model_predicts = {
-            let lg = self.b.rowdot_f32("wte", &xf.row(seq - 1).to_vec());
-            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
-        };
-
-        let mut head_circuits = Vec::new();
-        let mut sink_heads = 0;
-        for (l, la) in att_last.iter().enumerate() {
-            for (h, row) in la.iter().enumerate() {
-                let (role, j, mass) = classify_head(row, ids);
-                if role == "sink" && mass >= 0.5 {
-                    sink_heads += 1;
-                } else if matches!(role, "induction" | "duplicate-token" | "previous-token") && mass >= 0.15 {
-                    head_circuits.push(HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass });
-                }
-            }
-        }
-        let order = |r: &str| match r { "induction" => 0, "duplicate-token" => 1, _ => 2 };
-        head_circuits.sort_by(|a, b| order(&a.role).cmp(&order(&b.role)).then(b.mass.partial_cmp(&a.mass).unwrap()));
-        head_circuits.truncate(6);
-
-        let mut mlp_features: Vec<MlpFeature> = mlp_h
-            .iter()
-            .enumerate()
-            .map(|(l, h)| {
-                let (n, act) = h.iter().enumerate().fold((0, 0f32), |(bn, ba), (i, &v)| if v.abs() > ba.abs() { (i, v) } else { (bn, ba) });
-                MlpFeature { layer: l, neuron: n, act, promotes: self.neuron_promotes(l, n, act) }
-            })
-            .collect();
-        mlp_features.sort_by(|a, b| b.act.abs().partial_cmp(&a.act.abs()).unwrap());
-        mlp_features.truncate(6);
-
-        Explanation {
-            context_tail: ids[seq.saturating_sub(8)..].to_vec(),
-            model_predicts,
-            head_circuits,
-            sink_heads,
-            mlp_features,
-        }
-    }
-
-    fn neuron_promotes(&self, l: usize, n: usize, act: f32) -> Vec<i64> {
-        let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // (d,) neuron n's write direction (any dtype)
-        let logits = self.b.rowdot_f32("wte", &w_out); // (vocab,) direct-logit contribution
-        let sign = if act < 0.0 { -1.0 } else { 1.0 };
-        let mut idx: Vec<usize> = (0..logits.len()).collect();
-        idx.select_nth_unstable_by(5, |&a, &b| (sign * logits[b]).partial_cmp(&(sign * logits[a])).unwrap());
-        let mut top: Vec<usize> = idx[0..5].to_vec();
-        top.sort_by(|&a, &b| (sign * logits[b]).partial_cmp(&(sign * logits[a])).unwrap());
-        top.iter().map(|&i| i as i64).collect()
+        let lg = self.b.rowdot_f32("wte", &xf.row(seq - 1).to_vec());
+        let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+        assemble(ids, &att_last, &mlp_h, model_predicts, |l, n, act| {
+            let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // neuron n's write direction (any dtype)
+            top_promoted(&self.b.rowdot_f32("wte", &w_out), act, 5)
+        })
     }
 
     /// Run `m` new positions (rows of `emb`, already token+position embeddings for absolute positions `cur..cur+m`)

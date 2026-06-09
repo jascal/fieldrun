@@ -141,6 +141,61 @@ impl Rope {
         if self.b.config[7] != 0 { "embed" } else { "lm_head" } // tied embed, else a separate (fp16) head
     }
 
+    fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
+        use crate::explain::*;
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut mlp_h: Vec<Vec<f32>> = Vec::new();
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            let mut layer_att = Vec::with_capacity(h);
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                layer_att.push(scores.row(seq - 1).to_vec());
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            att_last.push(layer_att);
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            mlp_h.push(hidden.row(seq - 1).to_vec());
+            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        let xf = rmsnorm(&x, self.b.arr1("norm"), self.eps);
+        let lg = self.b.rowdot_f32(self.unembed_name(), &xf.row(seq - 1).to_vec());
+        let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+        let un = self.unembed_name();
+        assemble(ids, &att_last, &mlp_h, model_predicts, |l, n, act| {
+            let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
+            top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
+        })
+    }
+
     /// Run `m` new positions through the layers, caching K/V (post-RoPE, GQA width nkv*hd) and attending over the whole
     /// cache. cur = absolute position of the first new row. Prefill (m = prompt, cur = 0) or decode (m = 1).
     fn forward_block(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> Array2<f32> {
@@ -198,6 +253,10 @@ impl Model for Rope {
         let xf = self.hidden(ids); // unembed only the predicting position
         let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {
+        Some(self.explanation(ids))
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
