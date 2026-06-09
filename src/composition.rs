@@ -13,7 +13,8 @@ pub struct Gpt2 {
     n_layer: usize,
     n_head: usize,
     d: usize,
-    route: f32, // Tier C: fraction of MLP neurons to compute per token (0 = off / full)
+    route: f32,    // Tier C: fraction of MLP neurons to compute per token (0 = off / full)
+    kv_int8: bool, // store the KV cache as int8 (per-head scale) — 4x smaller cache for long context
 }
 
 fn layernorm(x: &Array2<f32>, g: Array1<f32>, b: Array1<f32>) -> Array2<f32> {
@@ -49,10 +50,10 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gpt2 {
-    pub fn new(b: Bundle, route: f32) -> Gpt2 {
+    pub fn new(b: Bundle, route: f32, kv_int8: bool) -> Gpt2 {
         let c = &b.config; // [n_layer, n_head, n_embd, n_positions, vocab]
         let (n_layer, n_head, d) = (c[0] as usize, c[1] as usize, c[2] as usize);
-        Gpt2 { b, n_layer, n_head, d, route }
+        Gpt2 { b, n_layer, n_head, d, route, kv_int8 }
     }
 
     fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
@@ -185,6 +186,91 @@ impl Gpt2 {
         x
     }
 
+    /// Same as `forward_block` but with an int8 KV cache (per-position-per-head scale): quantise new K/V on write,
+    /// dequantise on read. 4x smaller cache for long context; the small per-head quant error keeps tokens ~identical.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_q(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>],
+                       vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]) -> Array2<f32> {
+        let (d, h_n) = (self.d, self.n_head);
+        let hd = d / h_n;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let q8 = |v: f32, sc: f32| (v / sc).round().clamp(-127.0, 127.0) as i8;
+        for l in 0..self.n_layer {
+            let p = format!("h{l}.");
+            let a = layernorm(&x, self.b.arr1(&format!("{p}ln_1.weight")), self.b.arr1(&format!("{p}ln_1.bias")));
+            let qkv = self.b.mm(&a, &format!("{p}attn.c_attn.weight")) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
+            for i in 0..m {
+                let pos = cur + i;
+                for head in 0..h_n {
+                    let (kb, vb) = (d + head * hd, 2 * d + head * hd);
+                    let sck = (0..hd).fold(0f32, |mx, c| mx.max(qkv[[i, kb + c]].abs())) / 127.0;
+                    let scv = (0..hd).fold(0f32, |mx, c| mx.max(qkv[[i, vb + c]].abs())) / 127.0;
+                    let (sck, scv) = (if sck > 0.0 { sck } else { 1.0 }, if scv > 0.0 { scv } else { 1.0 });
+                    ks[l][pos * h_n + head] = sck;
+                    vs[l][pos * h_n + head] = scv;
+                    for c in 0..hd {
+                        kc[l][pos * d + head * hd + c] = q8(qkv[[i, kb + c]], sck);
+                        vc[l][pos * d + head * hd + c] = q8(qkv[[i, vb + c]], scv);
+                    }
+                }
+            }
+            let q = qkv.slice(s![.., 0..d]);
+            let mut attn_out = Array2::<f32>::zeros((m, d));
+            for head in 0..h_n {
+                let mut kh = Array2::<f32>::zeros((klen, hd)); // dequantise the cached head
+                let mut vh = Array2::<f32>::zeros((klen, hd));
+                for pos in 0..klen {
+                    let (sck, scv) = (ks[l][pos * h_n + head], vs[l][pos * h_n + head]);
+                    for c in 0..hd {
+                        kh[[pos, c]] = kc[l][pos * d + head * hd + c] as f32 * sck;
+                        vh[[pos, c]] = vc[l][pos * d + head * hd + c] as f32 * scv;
+                    }
+                }
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..m {
+                    for j in (cur + i + 1)..klen {
+                        scores[[i, j]] = -1e10;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight")) + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
+            let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
+            let mut hm = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
+            gelu(&mut hm);
+            x = &x + &(self.down(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+        }
+        x
+    }
+
+    fn generate_kv_int8(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        let (d, total) = (self.d, prompt.len() + n_new);
+        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * d]).collect();
+        let mut vc = kc.clone();
+        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.n_head]).collect();
+        let mut vs = ks.clone();
+        let ppos: Vec<i64> = (0..prompt.len() as i64).collect();
+        let emb = &self.b.rows_f32("wte", prompt) + &self.b.rows_f32("wpe", &ppos);
+        let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            let e = &self.b.rows_f32("wte", &[next]) + &self.b.rows_f32("wpe", &[pos as i64]);
+            let xb = self.forward_block_q(&e, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+    }
+
     fn head_argmax(&self, xb: &Array2<f32>) -> i64 {
         let xfn = layernorm(xb, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
         let logits = self.b.rowdot_f32("wte", &xfn.row(xb.nrows() - 1).to_vec());
@@ -207,6 +293,9 @@ impl Model for Gpt2 {
     /// the cached K/V — O(1) layer work per token instead of re-running the whole context. Identical greedy tokens to
     /// the naive path (the cache is exact), just without the recompute.
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        if self.kv_int8 {
+            return self.generate_kv_int8(prompt, n_new);
+        }
         let d = self.d;
         let total = prompt.len() + n_new;
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, d))).collect();
