@@ -13,6 +13,7 @@ pub struct Gpt2 {
     n_layer: usize,
     n_head: usize,
     d: usize,
+    route: f32, // Tier C: fraction of MLP neurons to compute per token (0 = off / full)
 }
 
 fn layernorm(x: &Array2<f32>, g: ArrayView1<f32>, b: ArrayView1<f32>) -> Array2<f32> {
@@ -48,10 +49,18 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gpt2 {
-    pub fn new(b: Bundle) -> Gpt2 {
+    pub fn new(b: Bundle, route: f32) -> Gpt2 {
         let c = &b.config; // [n_layer, n_head, n_embd, n_positions, vocab]
         let (n_layer, n_head, d) = (c[0] as usize, c[1] as usize, c[2] as usize);
-        Gpt2 { b, n_layer, n_head, d }
+        Gpt2 { b, n_layer, n_head, d, route }
+    }
+
+    fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
+        if self.route > 0.0 && self.route < 1.0 {
+            self.b.mm_routed_down(h, name, self.route)
+        } else {
+            self.b.mm(h, name)
+        }
     }
 
     /// Final hidden states (seq, d) after the last LayerNorm — the forward pass minus the unembed. Mirrors
@@ -90,7 +99,7 @@ impl Gpt2 {
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
             let mut h_mlp = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
             gelu(&mut h_mlp);
-            x = &x + &(self.b.mm(&h_mlp, &format!("{p}mlp.c_proj.weight"))
+            x = &x + &(self.down(&h_mlp, &format!("{p}mlp.c_proj.weight"))
                 + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
 
@@ -136,7 +145,7 @@ impl Gpt2 {
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
             let mut hm = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
             gelu(&mut hm);
-            x = &x + &(self.b.mm(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+            x = &x + &(self.down(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
         x
     }

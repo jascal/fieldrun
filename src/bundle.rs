@@ -106,6 +106,38 @@ impl Bundle {
         self.arrays.get(name).unwrap_or_else(|| panic!("missing array {name}"))
     }
 
+    /// Tier C — routed MLP down-projection. For each row keep only the top `frac` neurons by |activation| and sum just
+    /// their down-rows (a sparse axpy), skipping the rest entirely: real conditional compute, ~`frac` of the work.
+    /// Numerically identical to zeroing the bottom (1-frac) neurons then a dense down-proj (the pylm `--route-frac`).
+    pub fn mm_routed_down(&self, h: &Array2<f32>, name: &str, frac: f32) -> Array2<f32> {
+        let (shape, arr) = self.get(name); // down: (ffn, d)
+        if matches!(arr, Arr::I8(_)) {
+            return self.mm(h, name); // int8 down is stored transposed for VNNI — routing falls back to dense for now
+        }
+        let (ffn, d) = (shape[0], shape[1]);
+        let keep = ((frac * ffn as f32).ceil() as usize).clamp(1, ffn);
+        let mut out = Array2::<f32>::zeros((h.nrows(), d));
+        for i in 0..h.nrows() {
+            let hrow = h.row(i);
+            let hrow = hrow.as_slice().unwrap();
+            let mut idx: Vec<usize> = (0..ffn).collect();
+            idx.select_nth_unstable_by(keep.min(ffn - 1), |&x, &y| {
+                hrow[y].abs().partial_cmp(&hrow[x].abs()).unwrap()
+            });
+            let mut acc = vec![0f32; d];
+            for &k in &idx[0..keep] {
+                let hk = hrow[k];
+                match arr {
+                    Arr::F32(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, &w)| *a += hk * w),
+                    Arr::F16(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, w)| *a += hk * w.to_f32()),
+                    Arr::I8(_) => unreachable!(),
+                }
+            }
+            out.row_mut(i).assign(&ArrayView1::from(acc.as_slice()));
+        }
+        out
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.arrays.contains_key(name)
     }

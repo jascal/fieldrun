@@ -15,6 +15,7 @@ pub struct Rope {
     hd: usize,
     eps: f32,
     inv: Vec<f32>, // rotary frequencies, length hd/2
+    route: f32,    // Tier C: fraction of MLP neurons to compute per token (0 = off)
 }
 
 fn rmsnorm(x: &Array2<f32>, w: ArrayView1<f32>, eps: f32) -> Array2<f32> {
@@ -47,13 +48,21 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Rope {
-    pub fn new(b: Bundle) -> Rope {
+    pub fn new(b: Bundle, route: f32) -> Rope {
         let c = &b.config; // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
         let (n_layer, h, nkv, hd) = (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize);
         let theta = b.config_f[0] as f32;
         let eps = b.config_f[1] as f32;
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
-        Rope { b, n_layer, h, nkv, hd, eps, inv }
+        Rope { b, n_layer, h, nkv, hd, eps, inv, route }
+    }
+
+    fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
+        if self.route > 0.0 && self.route < 1.0 {
+            self.b.mm_routed_down(h, name, self.route)
+        } else {
+            self.b.mm(h, name)
+        }
     }
 
     /// Apply rotary embedding in place to a (seq, n_heads*hd) block, treating each head's hd-vector independently.
@@ -126,7 +135,7 @@ impl Rope {
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = silu(*hv) * uv;
             }
-            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
         }
 
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
@@ -177,7 +186,7 @@ impl Rope {
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = silu(*hv) * uv;
             }
-            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
         }
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }

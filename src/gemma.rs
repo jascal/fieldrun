@@ -24,6 +24,7 @@ pub struct Gemma {
     escale: f32,
     inv: Vec<f32>,
     window: usize,
+    route: f32, // Tier C: fraction of MLP neurons per token (0 = off; int8 down falls back to dense)
 }
 
 fn gelu_tanh(x: f32) -> f32 {
@@ -44,14 +45,22 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gemma {
-    pub fn new(b: Bundle) -> Gemma {
+    pub fn new(b: Bundle, route: f32) -> Gemma {
         // config: [n_layer, H, nkv, hd, d, ffn, vocab, tied]; config_f: [theta, eps, attn_cap, final_cap, qscalar, escale]
         let (n_layer, h, nkv, hd, d) = (b.config[0] as usize, b.config[1] as usize, b.config[2] as usize,
                                         b.config[3] as usize, b.config[4] as usize);
         let (theta, eps, attn_cap, final_cap, qscalar, escale) = (b.config_f[0] as f32, b.config_f[1] as f32,
             b.config_f[2] as f32, b.config_f[3] as f32, b.config_f[4] as f32, b.config_f[5] as f32);
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
-        Gemma { b, n_layer, h, nkv, hd, d, eps, attn_cap, final_cap, scale: qscalar.powf(-0.5), escale, inv, window: 4096 }
+        Gemma { b, n_layer, h, nkv, hd, d, eps, attn_cap, final_cap, scale: qscalar.powf(-0.5), escale, inv, window: 4096, route }
+    }
+
+    fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
+        if self.route > 0.0 && self.route < 1.0 {
+            self.b.mm_routed_down(h, name, self.route)
+        } else {
+            self.b.mm(h, name)
+        }
     }
 
     fn norm(&self, x: &Array2<f32>, name: &str) -> Array2<f32> {
@@ -134,7 +143,7 @@ impl Gemma {
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = gelu_tanh(*hv) * uv;
             }
-            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let mlp = self.down(&hidden, &format!("{p}mlp.down_proj"));
             x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
         }
         self.norm(&x, "norm")
@@ -189,7 +198,7 @@ impl Gemma {
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = gelu_tanh(*hv) * uv;
             }
-            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let mlp = self.down(&hidden, &format!("{p}mlp.down_proj"));
             x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
         }
         self.norm(&x, "norm")

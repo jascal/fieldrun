@@ -51,10 +51,11 @@ fn main() {
     if let Some(stem) = flag(&args, "--bundle") {
         let bundle = Bundle::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
         let arch = bundle.arch.clone();
+        let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let lm: Box<dyn Model> = match arch.as_str() {
-            "gpt2" => Box::new(Gpt2::new(bundle)),
-            "rope" => Box::new(Rope::new(bundle)),
-            "gemma" => Box::new(Gemma::new(bundle)),
+            "gpt2" => Box::new(Gpt2::new(bundle, route)),
+            "rope" => Box::new(Rope::new(bundle, route)),
+            "gemma" => Box::new(Gemma::new(bundle, route)),
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
 
