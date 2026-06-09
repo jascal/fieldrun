@@ -142,6 +142,21 @@ impl Bundle {
         self.arrays.contains_key(name)
     }
 
+    /// Logical row r of a (rows, cols) weight as f32, dtype-agnostic (i8 is dequantised from its transposed store via
+    /// the per-column scale). Used for explain's neuron labels so they work on int8 bundles too.
+    pub fn weight_row(&self, name: &str, r: usize) -> Vec<f32> {
+        let (shape, arr) = self.get(name);
+        let cols = shape[1];
+        match arr {
+            Arr::F32(v) => v[r * cols..(r + 1) * cols].to_vec(),
+            Arr::F16(v) => v[r * cols..(r + 1) * cols].iter().map(|h| h.to_f32()).collect(),
+            Arr::I8(w8) => {
+                let scale = self.arr1o(&format!("{name}__scale"));
+                (0..w8.n).map(|j| w8.wt[j * w8.k + r] as f32 * scale[j]).collect()
+            }
+        }
+    }
+
     // Zero-copy f32 views — for f32 bundles (GPT-2 / RoPE). Panics on an f16 array (use arr2o/arr1o).
     pub fn arr2(&self, name: &str) -> ArrayView2<f32> {
         let (shape, arr) = self.get(name);
@@ -151,12 +166,10 @@ impl Bundle {
         }
     }
 
-    pub fn arr1(&self, name: &str) -> ArrayView1<f32> {
-        let (_, arr) = self.get(name);
-        match arr {
-            Arr::F32(v) => ArrayView1::from(v.as_slice()),
-            _ => panic!("arr1: {name} is not f32; use arr1o (owned, upcast)"),
-        }
+    /// 1D weight as an owned f32 vector — upcasts f16 (norms/biases are tiny under fp16/int8 bundles, so copying is
+    /// free) so the kernels are dtype-agnostic. (The big 2D weights go through `mm`/`weight_row`, not here.)
+    pub fn arr1(&self, name: &str) -> Array1<f32> {
+        self.arr1o(name)
     }
 
     // Owned f32 — upcasts f16 (or copies f32) per call. The in-RAM-precision path (Gemma keeps weights f16 in RAM).

@@ -3,7 +3,7 @@
 //! GELU MLP, a final LayerNorm, and the tied unembed. This is the half flat retrieval cannot do (genuine dense
 //! computation, the forge tax) — it runs here as plain `ndarray` matmuls, no framework. fp32 in, exact vs numpy.
 
-use ndarray::{s, Array2, ArrayView1, Axis};
+use ndarray::{s, Array1, Array2};
 
 use crate::bundle::Bundle;
 use crate::model::Model;
@@ -16,7 +16,7 @@ pub struct Gpt2 {
     route: f32, // Tier C: fraction of MLP neurons to compute per token (0 = off / full)
 }
 
-fn layernorm(x: &Array2<f32>, g: ArrayView1<f32>, b: ArrayView1<f32>) -> Array2<f32> {
+fn layernorm(x: &Array2<f32>, g: Array1<f32>, b: Array1<f32>) -> Array2<f32> {
     let eps = 1e-5f32;
     let mut out = x.clone();
     for mut row in out.rows_mut() {
@@ -68,12 +68,7 @@ impl Gpt2 {
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
         let seq = ids.len();
         let hd = self.d / self.n_head;
-        let wte = self.b.arr2("wte");
-        let wpe = self.b.arr2("wpe");
-        let mut x = Array2::<f32>::zeros((seq, self.d));
-        for (t, &id) in ids.iter().enumerate() {
-            x.row_mut(t).assign(&(&wte.row(id as usize) + &wpe.row(t)));
-        }
+        let mut x = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &(0..seq as i64).collect::<Vec<_>>());
 
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
@@ -106,22 +101,12 @@ impl Gpt2 {
         layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"))
     }
 
-    /// Full logits (seq, vocab) — for explain / scoring every position. `predict` uses the cheaper last-row path.
-    pub fn logits(&self, ids: &[i64]) -> Array2<f32> {
-        self.hidden(ids).dot(&self.b.arr2("wte").t())
-    }
-
     /// Explain the prediction: the live attention-head circuits + top MLP features at the predicting position.
     fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
         use crate::explain::*;
         let seq = ids.len();
         let hd = self.d / self.n_head;
-        let wte = self.b.arr2("wte");
-        let wpe = self.b.arr2("wpe");
-        let mut x = Array2::<f32>::zeros((seq, self.d));
-        for (t, &id) in ids.iter().enumerate() {
-            x.row_mut(t).assign(&(&wte.row(id as usize) + &wpe.row(t)));
-        }
+        let mut x = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &(0..seq as i64).collect::<Vec<_>>());
         let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new(); // per layer, per head, last-position attention row
         let mut mlp_h: Vec<Vec<f32>> = Vec::new();
         for l in 0..self.n_layer {
@@ -154,7 +139,7 @@ impl Gpt2 {
         }
         let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
         let model_predicts = {
-            let lg = xf.row(seq - 1).dot(&wte.t());
+            let lg = self.b.rowdot_f32("wte", &xf.row(seq - 1).to_vec());
             lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
         };
 
@@ -195,9 +180,8 @@ impl Gpt2 {
     }
 
     fn neuron_promotes(&self, l: usize, n: usize, act: f32) -> Vec<i64> {
-        let cproj = self.b.arr2(&format!("h{l}.mlp.c_proj.weight")); // (ffn, d) — neuron n's write direction is row n
-        let wte = self.b.arr2("wte"); // (vocab, d)
-        let logits = wte.dot(&cproj.row(n)); // (vocab,) direct-logit contribution
+        let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // (d,) neuron n's write direction (any dtype)
+        let logits = self.b.rowdot_f32("wte", &w_out); // (vocab,) direct-logit contribution
         let sign = if act < 0.0 { -1.0 } else { 1.0 };
         let mut idx: Vec<usize> = (0..logits.len()).collect();
         idx.select_nth_unstable_by(5, |&a, &b| (sign * logits[b]).partial_cmp(&(sign * logits[a])).unwrap());
@@ -247,17 +231,15 @@ impl Gpt2 {
 
     fn head_argmax(&self, xb: &Array2<f32>) -> i64 {
         let xfn = layernorm(xb, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
-        let last = xfn.index_axis(Axis(0), xb.nrows() - 1);
-        let logits = last.dot(&self.b.arr2("wte").t());
+        let logits = self.b.rowdot_f32("wte", &xfn.row(xb.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
 }
 
 impl Model for Gpt2 {
     fn predict(&self, ids: &[i64]) -> i64 {
-        let xf = self.hidden(ids);
-        let last = xf.index_axis(Axis(0), ids.len() - 1);   // unembed only the predicting position
-        let logits = last.dot(&self.b.arr2("wte").t());
+        let xf = self.hidden(ids); // unembed only the predicting position
+        let logits = self.b.rowdot_f32("wte", &xf.row(ids.len() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
 
@@ -271,14 +253,10 @@ impl Model for Gpt2 {
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         let d = self.d;
         let total = prompt.len() + n_new;
-        let wte = self.b.arr2("wte");
-        let wpe = self.b.arr2("wpe");
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, d))).collect();
         let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, d))).collect();
-        let mut emb = Array2::<f32>::zeros((prompt.len(), d)); // prefill
-        for (t, &id) in prompt.iter().enumerate() {
-            emb.row_mut(t).assign(&(&wte.row(id as usize) + &wpe.row(t)));
-        }
+        let ppos: Vec<i64> = (0..prompt.len() as i64).collect();
+        let emb = &self.b.rows_f32("wte", prompt) + &self.b.rows_f32("wpe", &ppos); // prefill
         let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
         let mut next = self.head_argmax(&xb);
         let mut out = Vec::with_capacity(n_new);
@@ -288,8 +266,7 @@ impl Model for Gpt2 {
             if out.len() == n_new {
                 return out;
             }
-            let mut e = Array2::<f32>::zeros((1, d)); // decode one token
-            e.row_mut(0).assign(&(&wte.row(next as usize) + &wpe.row(pos)));
+            let e = &self.b.rows_f32("wte", &[next]) + &self.b.rows_f32("wpe", &[pos as i64]); // decode one token
             let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
             next = self.head_argmax(&xb);
             pos += 1;

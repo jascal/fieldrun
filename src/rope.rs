@@ -2,7 +2,7 @@
 //! rotary position embedding + grouped-query attention + SwiGLU MLP, over a fieldrun bundle (`arch: "rope"`). Mirrors
 //! the numpy kernel array-for-array, so it reproduces it (and torch) exactly. fp32 in.
 
-use ndarray::{s, Array2, ArrayView1, Axis};
+use ndarray::{s, Array1, Array2};
 
 use crate::bundle::Bundle;
 use crate::model::Model;
@@ -18,7 +18,7 @@ pub struct Rope {
     route: f32,    // Tier C: fraction of MLP neurons to compute per token (0 = off)
 }
 
-fn rmsnorm(x: &Array2<f32>, w: ArrayView1<f32>, eps: f32) -> Array2<f32> {
+fn rmsnorm(x: &Array2<f32>, w: Array1<f32>, eps: f32) -> Array2<f32> {
     let mut out = x.clone();
     for mut row in out.rows_mut() {
         let n = row.len() as f32;
@@ -97,11 +97,7 @@ impl Rope {
         let seq = ids.len();
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
         let rep = h / nkv;
-        let embed = self.b.arr2("embed");
-        let mut x = Array2::<f32>::zeros((seq, embed.ncols()));
-        for (t, &id) in ids.iter().enumerate() {
-            x.row_mut(t).assign(&embed.row(id as usize));
-        }
+        let mut x = self.b.rows_f32("embed", ids); // dtype-agnostic lookup (embed stays f16 under int8)
 
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
@@ -141,8 +137,8 @@ impl Rope {
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }
 
-    fn unembed(&self) -> ndarray::ArrayView2<f32> {
-        if self.b.config[7] != 0 { self.b.arr2("embed") } else { self.b.arr2("lm_head") }
+    fn unembed_name(&self) -> &'static str {
+        if self.b.config[7] != 0 { "embed" } else { "lm_head" } // tied embed, else a separate (fp16) head
     }
 
     /// Run `m` new positions through the layers, caching K/V (post-RoPE, GQA width nkv*hd) and attending over the whole
@@ -192,31 +188,24 @@ impl Rope {
     }
 
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
-        let last = xfn.index_axis(Axis(0), xfn.nrows() - 1);
-        let logits = last.dot(&self.unembed().t());
+        let logits = self.b.rowdot_f32(self.unembed_name(), &xfn.row(xfn.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
 }
 
 impl Model for Rope {
     fn predict(&self, ids: &[i64]) -> i64 {
-        let xf = self.hidden(ids);
-        let last = xf.index_axis(Axis(0), ids.len() - 1);   // unembed only the predicting position
-        let logits = last.dot(&self.unembed().t());
+        let xf = self.hidden(ids); // unembed only the predicting position
+        let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         let total = prompt.len() + n_new;
         let kvdim = self.nkv * self.hd;
-        let embed = self.b.arr2("embed");
-        let d = embed.ncols();
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
         let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
-        let mut emb = Array2::<f32>::zeros((prompt.len(), d));
-        for (t, &id) in prompt.iter().enumerate() {
-            emb.row_mut(t).assign(&embed.row(id as usize));
-        }
+        let emb = self.b.rows_f32("embed", prompt);
         let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
         let mut next = self.head_argmax(&xb);
         let mut out = Vec::with_capacity(n_new);
@@ -226,8 +215,7 @@ impl Model for Rope {
             if out.len() == n_new {
                 return out;
             }
-            let mut e = Array2::<f32>::zeros((1, d));
-            e.row_mut(0).assign(&embed.row(next as usize));
+            let e = self.b.rows_f32("embed", &[next]);
             let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
             next = self.head_argmax(&xb);
             pos += 1;
