@@ -22,9 +22,18 @@ diverges without explaining why.
 
 ## Layout
 
-- `src/retrieval.rs` — Tier A: `Store` loads `store.json` and ports `lm.py` (induction + n-gram backoff + grammar).
-- `src/main.rs` — CLI: score a held-out token-id stream; `--dump` writes per-position predictions for the diff.
-- Tier B/C, `explain`, and the API are not built yet — see the roadmap in `README.md`.
+- `src/retrieval.rs` — Tier A: `Store` ports `lm.py` (induction + n-gram backoff + grammar).
+- `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + VNNI int8 W8A8 with
+  outlier-aware activation quant), `mm_routed_down` (Tier C), and the row-wise embed helpers.
+- `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` — Tier B forward passes (GPT-2 / Llama-Qwen / Gemma-2), each
+  with a KV-cache `generate`. `composition.rs` also has GPT-2 `explain`.
+- `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
+- `src/explain.rs` — head-circuit classification + feature naming + render.
+- `src/api.rs` — the `tiny_http` server (`--serve PORT`).
+- `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
+
+What's intentionally still open: int8 for GPT-2/RoPE (only Gemma int8 so far), ARM NEON SDOT (VNNI is x86), a true
+informed-router for a Tier-C wall-clock speedup, RoPE/Gemma `explain`, and a real KV-cache speedup at long context.
 
 ## Conventions
 

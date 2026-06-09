@@ -35,6 +35,10 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let store_path = flag(&args, "--store").unwrap_or("../lm-sae/pylm/store_gpt2.json");
@@ -68,7 +72,7 @@ fn main() {
         }
 
         // --explain: explain the prediction at the end of the first --ctx tokens (composition circuits + features).
-        if flag(&args, "--explain").is_some() {
+        if has_flag(&args, "--explain") {
             let ctx = &ids[..ctx_window.min(ids.len())];
             match lm.explain(ctx) {
                 Some(ex) => {
