@@ -57,6 +57,23 @@ fn main() {
             "gemma" => Box::new(Gemma::new(bundle)),
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
+
+        // --generate N: greedy autoregressive generation from the first --ctx tokens; compares KV-cache vs naive.
+        if let Some(n) = flag(&args, "--generate").and_then(|s| s.parse::<usize>().ok()) {
+            let prompt = &ids[..ctx_window.min(ids.len())];
+            let t0 = std::time::Instant::now();
+            let kv = lm.generate(prompt, n);
+            let kv_s = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            let mut ctx2 = prompt.to_vec();
+            let naive: Vec<i64> = (0..n).map(|_| { let t = lm.predict(&ctx2); ctx2.push(t); t }).collect();
+            let naive_s = t1.elapsed().as_secs_f64();
+            println!("[fieldrun] generate {n} tokens from a {}-token prompt · {arch}", prompt.len());
+            println!("[fieldrun]   KV-cache: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
+            println!("[fieldrun]   naive   : {naive_s:.2}s  ({:.1} tok/s)", n as f64 / naive_s);
+            println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
+            return;
+        }
         let t0 = std::time::Instant::now();
         let preds: Vec<i64> = (ctx_window..end).into_par_iter().map(|i| lm.predict(ctx(i))).collect();
         let secs = t0.elapsed().as_secs_f64();
