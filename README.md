@@ -13,7 +13,7 @@ distribution form of that result: the same tiers, ported to Rust, built into one
 | Tier | What it adds | Status |
 |------|--------------|--------|
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
-| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen (RoPE), Gemma-2**, each exact vs the Python/torch reference |
+| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen (RoPE), Gemma-2, Gemma-3**, each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
 | API | `/predict` · `/generate` · `/explain` HTTP server | **done** — `--serve PORT` |
@@ -40,6 +40,10 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
 - **Tier A** — 0 per-position mismatches vs `lm.py` over 500 positions (with and without grammar).
 - **Tier B** — exact vs the numpy kernels (= torch): GPT-2 0/200, Qwen 0/32, Gemma-2-2b 0/18 (fp16/fp32); int8+VNNI
   matches on the sample once activations are outlier-aware-quantised.
+- **Gemma-3** — `convert --dtype f32` gives a bit-exact bundle, scored top-1 against a tiny random-init
+  `Gemma3ForCausalLM` (eager attention; sized to exercise both sliding+full layers, GQA, QK-norm, dual-base RoPE and
+  window masking): **f32 60/60, f16 60/60, int8 59/60** (`scripts/gemma3_ref.py`). No gated download — the architecture
+  math is what's validated, and a tiny instance exercises it identically to the full model.
 - **KV-cache** generation produces tokens byte-identical to naive full-recompute on every arch.
 
 ## Performance (16-core box)
@@ -63,7 +67,11 @@ B=../lm-sae/pylm                       # bundles + stores live here (built by py
 
 # Tier A — retrieval over the flat store
 ./target/release/fieldrun --store $B/store_gpt2.json --ids $B/holdout_gpt2.json
-# Tier B — score the real forward pass over a bundle (gpt2 / qwen05b / gemma2_2b[_int8])
+# Convert a Hugging Face checkpoint -> bundle, pure Rust, no torch (single-file or sharded safetensors)
+#   --arch gpt2 | rope (Llama/Qwen/Mistral/Phi) | gemma (Gemma-2) | gemma3 (Gemma-3, also the Gemma-4 text backbone)
+#   --dtype int8 (default) | f16 | f32 (f32 = bit-exact bundle, used by the faithfulness gate)
+./target/release/fieldrun convert --model ~/.cache/huggingface/hub/.../gemma-3-1b-it --arch gemma3 --dtype int8 -o $B/gemma3_1b
+# Tier B — score the real forward pass over a bundle (gpt2 / qwen05b / gemma2_2b[_int8] / gemma3_*)
 ./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --n-eval 200   # --dump preds.txt for the diff
 # Generate (KV-cache) — compares cached vs naive, prints tok/s
 ./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --ctx 64 --generate 128
