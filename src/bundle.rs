@@ -396,10 +396,13 @@ impl Bundle {
     }
 }
 
-/// Dot product of unsigned-int8 activations with signed-int8 weights, accumulating in i32. Uses the on-core AVX-512
-/// VNNI int8 instruction (`vpdpbusd`) when the CPU has it, else a scalar fallback. This is the kernel int8 weights buy.
+/// Dot product of unsigned-int8 activations with signed-int8 weights, accumulating in i32. With the opt-in `vnni`
+/// feature (x86-64 + nightly Rust), it uses the on-core AVX-512 VNNI instruction (`vpdpbusd`) when the CPU has it; the
+/// default build is a portable scalar dot (it autovectorises well, and is the path on ARM / Apple Silicon). The
+/// AVX-512 intrinsics + `#[target_feature(avx512*)]` are still unstable on stable Rust, so they're feature-gated to
+/// keep the default build compiling everywhere (stable x86 macOS/Linux, ARM macOS).
 fn vnni_udot(au: &[u8], w: &[i8]) -> i32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "vnni"))]
     {
         if is_x86_feature_detected!("avx512vnni") {
             return unsafe { vnni_udot_avx512(au, w) };
@@ -408,7 +411,7 @@ fn vnni_udot(au: &[u8], w: &[i8]) -> i32 {
     au.iter().zip(w).map(|(&a, &b)| a as i32 * b as i32).sum()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "vnni"))]
 #[target_feature(enable = "avx512f,avx512vnni")]
 unsafe fn vnni_udot_avx512(au: &[u8], w: &[i8]) -> i32 {
     use std::arch::x86_64::*;
@@ -416,8 +419,8 @@ unsafe fn vnni_udot_avx512(au: &[u8], w: &[i8]) -> i32 {
     let chunks = len / 64;
     let mut acc = _mm512_setzero_si512();
     for c in 0..chunks {
-        let a = _mm512_loadu_si512(au.as_ptr().add(c * 64) as *const __m512i);
-        let b = _mm512_loadu_si512(w.as_ptr().add(c * 64) as *const __m512i);
+        let a = _mm512_loadu_si512(au.as_ptr().add(c * 64) as *const i32);
+        let b = _mm512_loadu_si512(w.as_ptr().add(c * 64) as *const i32);
         acc = _mm512_dpbusd_epi32(acc, a, b); // 16 i32 lanes, each += Σ of 4 u8·s8 products
     }
     let mut sum = _mm512_reduce_add_epi32(acc);

@@ -520,7 +520,7 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
         let (s, dt) = m.read("lm_head.weight"); w.put_small("lm_head", &dt, &s, dtype)?;
     }
     // experts ship either packed (experts.gate_up_proj/down_proj 3D) or per-expert Linears — write per-expert gate/up/down either way.
-    let mut write_experts = |w: &mut BundleWriter, p: &str, l: usize| -> std::io::Result<()> {
+    let write_experts = |w: &mut BundleWriter, p: &str, l: usize| -> std::io::Result<()> {
         let packed = format!("{p}mlp.experts.gate_up_proj");
         if m.has(&packed) {
             let (gus, gud) = m.read(&packed);        // (E, 2*mi, d)
