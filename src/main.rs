@@ -1,13 +1,20 @@
 //! fieldrun — run a decompiled LLM as a native binary.
 //!
-//! This first cut is Tier A (retrieval): the pure-Rust port of pylm's `lm.py`, scored over a held-out token-id stream
-//! exactly as the Python `validate.py` does. Tiers B (numpy composition kernel -> Rust matmuls) and C (router) and the
-//! `explain` surface land on top of this. The whole point: one static binary, flat-file knowledge, no framework.
+//! Tier A (retrieval, pure-Rust port of pylm's `lm.py`) and Tier B (composition, the real GPT-2 forward pass over a
+//! fieldrun bundle), each scored over a held-out token-id stream exactly as Python `validate.py` / `numpy_lm.py` do.
+//! The scoring loops fan out across cores with rayon (each next-token prediction is an independent, read-only forward).
+//! Tier C (router), `explain`, and the API land on top. The whole point: one static binary, flat-file knowledge,
+//! no framework.
 
+mod bundle;
+mod composition;
 mod retrieval;
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
+use composition::Gpt2;
 use retrieval::Store;
 
 #[derive(serde::Deserialize)]
@@ -26,40 +33,51 @@ fn main() {
     let ctx_window: usize = flag(&args, "--ctx").and_then(|s| s.parse().ok()).unwrap_or(64);
     let n_eval: usize = flag(&args, "--n-eval").and_then(|s| s.parse().ok()).unwrap_or(500);
 
-    let store = Store::load(store_path).unwrap_or_else(|e| panic!("load store {store_path}: {e}"));
     let hold: Holdout = serde_json::from_str(&std::fs::read_to_string(ids_path).expect("read ids"))
         .expect("parse ids");
     let ids = hold.holdout_ids;
-
     let end = (ctx_window + n_eval).min(ids.len());
-    let mut correct = 0usize;
-    let mut total = 0usize;
-    let mut idioms: HashMap<String, usize> = HashMap::new();
-    for i in ctx_window..end {
-        let ctx = &ids[i.saturating_sub(ctx_window)..i];
-        let (pred, idiom) = store.predict(ctx);
-        *idioms.entry(idiom).or_default() += 1;
-        correct += usize::from(pred == ids[i]);
-        total += 1;
+    let ctx = |i: usize| &ids[i.saturating_sub(ctx_window)..i];
+    let threads = rayon::current_num_threads();
+
+    // Tier B (composition) — the real forward pass from a fieldrun bundle; positions scored in parallel.
+    if let Some(stem) = flag(&args, "--bundle") {
+        let lm = Gpt2::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+        let preds: Vec<i64> = (ctx_window..end).into_par_iter().map(|i| lm.predict(ctx(i))).collect();
+        let correct = preds.iter().zip(ctx_window..end).filter(|(p, i)| **p == ids[*i]).count();
+        dump_if(&args, &preds);
+        report("Tier B (composition)", &format!("bundle {stem}.fieldrun · pure-Rust GPT-2"), correct, preds.len(), threads);
+        return;
     }
 
-    if let Some(path) = flag(&args, "--dump") {
-        // per-position predictions for the faithfulness gate (diff against Python lm.py)
-        let mut out = String::new();
-        for i in ctx_window..end {
-            let ctx = &ids[i.saturating_sub(ctx_window)..i];
-            let (pred, _) = store.predict(ctx);
-            out.push_str(&format!("{pred}\n"));
-        }
-        std::fs::write(path, out).expect("write dump");
-        eprintln!("[fieldrun] wrote {} predictions to {path}", end - ctx_window);
-    }
+    // Tier A (retrieval) — induction + n-gram + grammar over the flat store; positions scored in parallel.
+    let store = Store::load(store_path).unwrap_or_else(|e| panic!("load store {store_path}: {e}"));
+    let out: Vec<(i64, String)> = (ctx_window..end).into_par_iter().map(|i| store.predict(ctx(i))).collect();
+    let correct = out.iter().zip(ctx_window..end).filter(|((p, _), i)| *p == ids[*i]).count();
+    let preds: Vec<i64> = out.iter().map(|(p, _)| *p).collect();
+    dump_if(&args, &preds);
+    report("Tier A (retrieval)", &format!("store {store_path}"), correct, out.len(), threads);
 
-    let acc = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
-    println!("[fieldrun] Tier A (retrieval) · store {store_path}");
-    println!("[fieldrun] next-token top-1: {:.1}%  ({total} positions)", acc * 100.0);
+    let mut idioms: HashMap<&str, usize> = HashMap::new();
+    for (_, tag) in &out {
+        *idioms.entry(tag.as_str()).or_default() += 1;
+    }
     let mut by: Vec<_> = idioms.into_iter().collect();
     by.sort_by(|a, b| b.1.cmp(&a.1));
     let parts: Vec<String> = by.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("[fieldrun] idioms: {}", parts.join(", "));
+}
+
+fn dump_if(args: &[String], preds: &[i64]) {
+    if let Some(path) = flag(args, "--dump") {
+        let out: String = preds.iter().map(|p| format!("{p}\n")).collect();
+        std::fs::write(path, out).expect("write dump");
+        eprintln!("[fieldrun] wrote {} predictions to {path}", preds.len());
+    }
+}
+
+fn report(tier: &str, detail: &str, correct: usize, total: usize, threads: usize) {
+    let acc = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
+    println!("[fieldrun] {tier} · {detail}");
+    println!("[fieldrun] next-token top-1: {:.1}%  ({total} positions, {threads} threads)", acc * 100.0);
 }

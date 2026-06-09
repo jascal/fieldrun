@@ -8,6 +8,8 @@ license = "Apache-2.0"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ndarray = "0.16"
+rayon = "1"   # data-parallel scoring: independent forward passes fan out across cores
 
 [[bin]]
 name = "fieldrun"
