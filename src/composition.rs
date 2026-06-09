@@ -111,6 +111,101 @@ impl Gpt2 {
         self.hidden(ids).dot(&self.b.arr2("wte").t())
     }
 
+    /// Explain the prediction: the live attention-head circuits + top MLP features at the predicting position.
+    fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
+        use crate::explain::*;
+        let seq = ids.len();
+        let hd = self.d / self.n_head;
+        let wte = self.b.arr2("wte");
+        let wpe = self.b.arr2("wpe");
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for (t, &id) in ids.iter().enumerate() {
+            x.row_mut(t).assign(&(&wte.row(id as usize) + &wpe.row(t)));
+        }
+        let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new(); // per layer, per head, last-position attention row
+        let mut mlp_h: Vec<Vec<f32>> = Vec::new();
+        for l in 0..self.n_layer {
+            let p = format!("h{l}.");
+            let a = layernorm(&x, self.b.arr1(&format!("{p}ln_1.weight")), self.b.arr1(&format!("{p}ln_1.bias")));
+            let qkv = self.b.mm(&a, &format!("{p}attn.c_attn.weight")) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
+            let mut attn_out = Array2::<f32>::zeros((seq, self.d));
+            let mut layer_att = Vec::with_capacity(self.n_head);
+            for h in 0..self.n_head {
+                let q = qkv.slice(s![.., h * hd..(h + 1) * hd]);
+                let k = qkv.slice(s![.., self.d + h * hd..self.d + (h + 1) * hd]);
+                let v = qkv.slice(s![.., 2 * self.d + h * hd..2 * self.d + (h + 1) * hd]);
+                let mut scores = q.dot(&k.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e10;
+                    }
+                }
+                softmax_rows(&mut scores);
+                layer_att.push(scores.row(seq - 1).to_vec());
+                attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&v));
+            }
+            att_last.push(layer_att);
+            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight")) + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
+            let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
+            let mut hm = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
+            gelu(&mut hm);
+            mlp_h.push(hm.row(seq - 1).to_vec());
+            x = &x + &(self.b.mm(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+        }
+        let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
+        let model_predicts = {
+            let lg = xf.row(seq - 1).dot(&wte.t());
+            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+        };
+
+        let mut head_circuits = Vec::new();
+        let mut sink_heads = 0;
+        for (l, la) in att_last.iter().enumerate() {
+            for (h, row) in la.iter().enumerate() {
+                let (role, j, mass) = classify_head(row, ids);
+                if role == "sink" && mass >= 0.5 {
+                    sink_heads += 1;
+                } else if matches!(role, "induction" | "duplicate-token" | "previous-token") && mass >= 0.15 {
+                    head_circuits.push(HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass });
+                }
+            }
+        }
+        let order = |r: &str| match r { "induction" => 0, "duplicate-token" => 1, _ => 2 };
+        head_circuits.sort_by(|a, b| order(&a.role).cmp(&order(&b.role)).then(b.mass.partial_cmp(&a.mass).unwrap()));
+        head_circuits.truncate(6);
+
+        let mut mlp_features: Vec<MlpFeature> = mlp_h
+            .iter()
+            .enumerate()
+            .map(|(l, h)| {
+                let (n, act) = h.iter().enumerate().fold((0, 0f32), |(bn, ba), (i, &v)| if v.abs() > ba.abs() { (i, v) } else { (bn, ba) });
+                MlpFeature { layer: l, neuron: n, act, promotes: self.neuron_promotes(l, n, act) }
+            })
+            .collect();
+        mlp_features.sort_by(|a, b| b.act.abs().partial_cmp(&a.act.abs()).unwrap());
+        mlp_features.truncate(6);
+
+        Explanation {
+            context_tail: ids[seq.saturating_sub(8)..].to_vec(),
+            model_predicts,
+            head_circuits,
+            sink_heads,
+            mlp_features,
+        }
+    }
+
+    fn neuron_promotes(&self, l: usize, n: usize, act: f32) -> Vec<i64> {
+        let cproj = self.b.arr2(&format!("h{l}.mlp.c_proj.weight")); // (ffn, d) — neuron n's write direction is row n
+        let wte = self.b.arr2("wte"); // (vocab, d)
+        let logits = wte.dot(&cproj.row(n)); // (vocab,) direct-logit contribution
+        let sign = if act < 0.0 { -1.0 } else { 1.0 };
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.select_nth_unstable_by(5, |&a, &b| (sign * logits[b]).partial_cmp(&(sign * logits[a])).unwrap());
+        let mut top: Vec<usize> = idx[0..5].to_vec();
+        top.sort_by(|&a, &b| (sign * logits[b]).partial_cmp(&(sign * logits[a])).unwrap());
+        top.iter().map(|&i| i as i64).collect()
+    }
+
     /// Run `m` new positions (rows of `emb`, already token+position embeddings for absolute positions `cur..cur+m`)
     /// through all layers, appending their K/V to the cache and attending against the whole cache. Returns the
     /// pre-final-LN hidden states (m, d). Used for both prefill (m = prompt len, cur = 0) and decode (m = 1).
@@ -164,6 +259,10 @@ impl Model for Gpt2 {
         let last = xf.index_axis(Axis(0), ids.len() - 1);   // unembed only the predicting position
         let logits = last.dot(&self.b.arr2("wte").t());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {
+        Some(self.explanation(ids))
     }
 
     /// KV-cache generation: prefill the prompt once, then each new token only forwards its own row and attends against

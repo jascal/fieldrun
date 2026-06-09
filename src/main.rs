@@ -8,6 +8,7 @@
 
 mod bundle;
 mod composition;
+mod explain;
 mod gemma;
 mod model;
 mod retrieval;
@@ -58,6 +59,22 @@ fn main() {
             "gemma" => Box::new(Gemma::new(bundle, route)),
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
+
+        // --explain: explain the prediction at the end of the first --ctx tokens (composition circuits + features).
+        if flag(&args, "--explain").is_some() {
+            let ctx = &ids[..ctx_window.min(ids.len())];
+            match lm.explain(ctx) {
+                Some(ex) => {
+                    let dec = load_decoder(flag(&args, "--vocab"));
+                    println!("{}", explain::render(&ex, &dec));
+                    if let Some(p) = flag(&args, "--out-json") {
+                        std::fs::write(p, serde_json::to_string_pretty(&ex).unwrap()).expect("write json");
+                    }
+                }
+                None => println!("[fieldrun] explain not implemented for arch {arch}"),
+            }
+            return;
+        }
 
         // --generate N: greedy autoregressive generation from the first --ctx tokens; compares KV-cache vs naive.
         if let Some(n) = flag(&args, "--generate").and_then(|s| s.parse::<usize>().ok()) {
@@ -110,6 +127,23 @@ fn dump_if(args: &[String], preds: &[i64]) {
         std::fs::write(path, out).expect("write dump");
         eprintln!("[fieldrun] wrote {} predictions to {path}", preds.len());
     }
+}
+
+/// Build an id→string decoder. With a GPT-2 `vocab.json` (token→id), invert it and show the raw BPE token (Ġ→space,
+/// Ċ→newline for readability); without one, fall back to `[id]`.
+fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
+    if let Some(path) = vocab {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            let map: HashMap<String, i64> = serde_json::from_str(&txt).unwrap_or_default();
+            let inv: HashMap<i64, String> = map.into_iter().map(|(k, v)| (v, k)).collect();
+            return Box::new(move |id| {
+                inv.get(&id)
+                    .map(|s| format!("{:?}", s.replace('\u{0120}', " ").replace('\u{010A}', "\n")))
+                    .unwrap_or_else(|| format!("[{id}]"))
+            });
+        }
+    }
+    Box::new(|id| format!("[{id}]"))
 }
 
 fn report(tier: &str, detail: &str, correct: usize, total: usize, threads: usize) {
