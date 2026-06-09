@@ -78,12 +78,34 @@ impl TextGen {
         s
     }
 
-    /// Generate from a text prompt; returns (text, prompt_tokens, completion_tokens, hit_eos). Output is cut at EOS.
-    pub fn gen(&self, lm: &dyn Model, prompt: &str, max_tokens: usize, add_special: bool) -> (String, usize, usize, bool) {
+    /// Generate from a text prompt with **early-stop at EOS** (no compute past the natural end). `on_text` receives
+    /// each newly-decoded text chunk *as it is produced* — used for live chat + SSE streaming. Returns
+    /// (full_text, prompt_tokens, completion_tokens, hit_eos).
+    pub fn gen(
+        &self,
+        lm: &dyn Model,
+        prompt: &str,
+        max_tokens: usize,
+        add_special: bool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> (String, usize, usize, bool) {
         let ids = self.encode(prompt, add_special);
-        let out = lm.generate(&ids, max_tokens);
-        let cut = out.iter().position(|t| self.eos.contains(t)).unwrap_or(out.len());
-        (self.decode(&out[..cut]), ids.len(), cut, cut < out.len())
+        let mut acc: Vec<i64> = Vec::new();
+        let mut prev = String::new();
+        // decode the full accumulator each step and emit the byte-prefix delta — robust to BPE multi-byte/merge tokens.
+        let out = lm.generate_stream(&ids, max_tokens, &self.eos, &mut |t| {
+            acc.push(t);
+            let text = self.decode(&acc);
+            if text.starts_with(&prev) {
+                let delta = &text[prev.len()..];
+                if !delta.is_empty() {
+                    on_text(delta);
+                }
+            }
+            prev = text;
+            true
+        });
+        (prev, ids.len(), out.len(), out.len() < max_tokens)
     }
 }
 
@@ -177,7 +199,7 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
 
     if route == "/v1/completions" {
         // OpenAI text completion — raw prompt, with the tokenizer's special tokens
-        let (text, pt, ct, eos) = tg.gen(lm, &r.prompt, max_tokens, true);
+        let (text, pt, ct, eos) = tg.gen(lm, &r.prompt, max_tokens, true, &mut |_| {});
         return serde_json::json!({
             "id": format!("cmpl-{}", now()), "object": "text_completion", "created": now(), "model": arch,
             "choices": [{ "text": text, "index": 0, "finish_reason": if eos {"stop"} else {"length"} }],
@@ -199,7 +221,7 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         }
     }
     let prompt = tg.chat_prompt(system.as_deref(), &history, &last_user);
-    let (text, pt, ct, eos) = tg.gen(lm, &prompt, max_tokens, false);
+    let (text, pt, ct, eos) = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
 
     if route == "/v1/messages" {
         // Anthropic Messages API
@@ -240,11 +262,16 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
             continue;
         }
         let prompt = tg.chat_prompt(None, &history, user);
-        let (text, _, _, _) = tg.gen(lm.as_ref(), &prompt, max_tokens, false);
-        let reply = text.trim().to_string();
-        println!("bot> {reply}");
+        print!("bot> ");
+        let _ = std::io::stdout().flush();
+        // stream the reply token-by-token to the terminal as it's generated
+        let (text, _, _, _) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+        });
+        println!();
         history.push(("user".into(), user.to_string()));
-        history.push(("assistant".into(), reply));
+        history.push(("assistant".into(), text.trim().to_string()));
     }
 }
 

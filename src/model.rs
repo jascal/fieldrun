@@ -11,16 +11,30 @@ pub trait Model: Sync {
         None
     }
 
-    /// Greedy autoregressive generation of `n_new` tokens after `prompt`. The default recomputes the whole forward per
-    /// token (O(context) work each step); kernels override with a KV-cache so each step processes only the new token.
-    fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+    /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
+    /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
+    /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole
+    /// context every token (O(n)/token); kernels with a KV-cache override this for O(1)/token decode.
+    fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let mut ctx = prompt.to_vec();
-        let mut out = Vec::with_capacity(n_new);
-        for _ in 0..n_new {
+        let mut out = Vec::with_capacity(max_tokens);
+        for _ in 0..max_tokens {
             let t = self.predict(&ctx);
-            ctx.push(t);
+            if eos.contains(&t) {
+                break;
+            }
             out.push(t);
+            if !emit(t) {
+                break;
+            }
+            ctx.push(t);
         }
         out
+    }
+
+    /// Fixed-length greedy generation (exactly `n_new` tokens, no early stop) — used by the CLI `--generate`
+    /// KV-cache-vs-naive benchmark. KV-cache kernels override for speed; otherwise delegates to `generate_stream`.
+    fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        self.generate_stream(prompt, n_new, &[], &mut |_| true)
     }
 }
