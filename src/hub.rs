@@ -58,24 +58,37 @@ fn download(url: &str, dest: &Path, token: &Option<String>, name: &str) -> Resul
     let mut reader = resp.into_reader();
     let tmp = dest.with_extension("part");
     let mut f = std::fs::File::create(&tmp).map_err(|e| format!("{name}: create {}: {e}", tmp.display()))?;
-    let mut buf = vec![0u8; 1 << 20];
-    let (mut done, mut last) = (0u64, 0u64);
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("{name}: read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        f.write_all(&buf[..n]).map_err(|e| format!("{name}: write: {e}"))?;
-        done += n as u64;
-        if done - last > (64 << 20) {
-            if total > 0 {
-                eprint!("\r[hub] {name}: {} / {} MB", done >> 20, total >> 20);
-            } else {
-                eprint!("\r[hub] {name}: {} MB", done >> 20);
+    // stream to the .part file; on ANY failure (e.g. ENOSPC) delete it so a half-download doesn't keep eating disk.
+    // immediately-invoked closure so its &mut borrows of `reader`/`f` release before we drop/rename below.
+    let result: Result<u64, String> = (|| {
+        let mut buf = vec![0u8; 1 << 20];
+        let (mut got, mut last) = (0u64, 0u64);
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("{name}: read: {e}"))?;
+            if n == 0 {
+                break;
             }
-            last = done;
+            f.write_all(&buf[..n]).map_err(|e| format!("{name}: write: {e}"))?;
+            got += n as u64;
+            if got - last > (64 << 20) {
+                if total > 0 {
+                    eprint!("\r[hub] {name}: {} / {} MB", got >> 20, total >> 20);
+                } else {
+                    eprint!("\r[hub] {name}: {} MB", got >> 20);
+                }
+                last = got;
+            }
         }
-    }
+        Ok(got)
+    })();
+    let done = match result {
+        Ok(n) => n,
+        Err(e) => {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp); // don't leave a partial download consuming space
+            return Err(e);
+        }
+    };
     drop(f);
     std::fs::rename(&tmp, dest).map_err(|e| format!("{name}: finalize: {e}"))?;
     eprintln!("\r[hub] {name}: {} MB ✓                ", done >> 20);
