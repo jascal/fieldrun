@@ -15,6 +15,8 @@ mod explain;
 mod gpu_gpt2;
 #[cfg(feature = "gpu")]
 mod gpu_mm;
+#[cfg(feature = "gpu")]
+mod gpu_rope;
 mod gemma;
 mod model;
 mod retrieval;
@@ -70,21 +72,33 @@ fn main() {
         #[cfg(feature = "gpu")]
         if has_flag(&args, "--gpu-check") {
             let b1 = Bundle::load(stem).expect("load bundle");
-            if b1.arch != "gpt2" {
-                println!("[fieldrun] --gpu-check is gpt2-only for now (arch {})", b1.arch);
-                return;
-            }
-            let g = gpu_gpt2::GpuGpt2::new(&b1).expect("no GPU adapter");
-            let cpu = Gpt2::new(Bundle::load(stem).expect("load bundle"), 0.0, false);
             let n = n_eval.min(50);
             let last = (ctx_window + n).min(ids.len());
-            let t0 = std::time::Instant::now();
-            let gp: Vec<i64> = (ctx_window..last).map(|i| g.predict(&ids[i.saturating_sub(ctx_window)..i], &b1)).collect();
+            let ctxs: Vec<&[i64]> = (ctx_window..last).map(|i| &ids[i.saturating_sub(ctx_window)..i]).collect();
+            // CPU reference predictions + the matching GPU kernel + name
+            let (cp, name, t0, gp) = match b1.arch.as_str() {
+                "gpt2" => {
+                    let g = gpu_gpt2::GpuGpt2::new(&b1).expect("no GPU adapter");
+                    let cpu = Gpt2::new(Bundle::load(stem).expect("load"), 0.0, false);
+                    let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
+                    let t0 = std::time::Instant::now();
+                    let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
+                    (cp, g.name.clone(), t0, gp)
+                }
+                "rope" => {
+                    let g = gpu_rope::GpuRope::new(&b1).expect("no GPU adapter");
+                    let cpu = Rope::new(Bundle::load(stem).expect("load"), 0.0, false);
+                    let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
+                    let t0 = std::time::Instant::now();
+                    let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
+                    (cp, g.name.clone(), t0, gp)
+                }
+                other => { println!("[fieldrun] --gpu-check: arch {other} not supported (gpt2, rope)"); return; }
+            };
             let gsec = t0.elapsed().as_secs_f64();
-            let cp: Vec<i64> = (ctx_window..last).map(|i| cpu.predict(&ids[i.saturating_sub(ctx_window)..i])).collect();
             let agree = gp.iter().zip(&cp).filter(|(a, b)| a == b).count();
             println!("[fieldrun] GPU [{}] vs CPU forward: {}/{} top-1 agree · {:.1} GPU fwd/s",
-                     g.name, agree, gp.len(), gp.len() as f64 / gsec);
+                     name, agree, gp.len(), gp.len() as f64 / gsec);
             return;
         }
 
