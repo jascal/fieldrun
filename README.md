@@ -174,12 +174,13 @@ fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     #
 #   --arch  gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
 #   --dtype int8 (default) | f16 | f32       --hf-token <t> (gated)      -o <stem> (override the default location)
 
-# 2. CHAT — interactive REPL (text in/out). Bare `--bundle <name>` defaults to chat. Replies are rendered from Markdown
-#    to ANSI in a terminal (bold/headers/lists/code, and LaTeX math transliterated to Unicode: \theta→θ, x^2→x²);
-#    `--raw` or `/format off` keeps it plain (and piped output is always raw). `/help` lists slash commands
-#    (/exit, /reset, /explain [on|off], /format [on|off]). `--explain` starts with per-reply explanations on.
-fieldrun --bundle Qwen2.5-7B-Instruct --chat               # bare name resolves under bundles/
-fieldrun --bundle Qwen2.5-7B-Instruct --chat --explain     # + show why each reply was produced
+# 2. CHAT — interactive REPL (text in/out). This is the DEFAULT: a bare `--bundle <name>` with no other mode opens chat
+#    (Tab-completes slash commands, ↑/↓ history). Replies render from Markdown to ANSI in a terminal (bold/headers/
+#    lists/code, LaTeX math transliterated to Unicode: \theta→θ, x^2→x²); `--raw` or `/format off` keeps it plain (piped
+#    output is always raw). `/help` lists slash commands (/exit, /reset, /explain [on|off], /format [on|off]).
+#    Instruct models use a ChatML template; base models (e.g. GPT-2) run as a plain text-completion REPL.
+fieldrun --bundle Qwen2.5-7B-Instruct                      # bare name resolves under bundles/; defaults to chat
+fieldrun --bundle Qwen2.5-7B-Instruct --explain            # chat + per-reply circuits/features (--chat is the explicit form)
 
 # 3. SERVE — OpenAI- & Anthropic-compatible HTTP API
 fieldrun --bundle Qwen2.5-7B-Instruct --serve 8731
