@@ -142,6 +142,12 @@ impl Bundle {
         self.arrays.contains_key(name)
     }
 
+    /// Whole array as (shape, f32 data) — upcasts f16/copies f32 (i8 panics; the GPU path uses f32/f16 bundles).
+    pub fn f32_array(&self, name: &str) -> (Vec<usize>, Vec<f32>) {
+        let (shape, arr) = self.get(name);
+        (shape.clone(), self.upcast(arr))
+    }
+
     /// Logical row r of a (rows, cols) weight as f32, dtype-agnostic (i8 is dequantised from its transposed store via
     /// the per-column scale). Used for explain's neuron labels so they work on int8 bundles too.
     pub fn weight_row(&self, name: &str, r: usize) -> Vec<f32> {

@@ -12,6 +12,8 @@ mod composition;
 mod device;
 mod explain;
 #[cfg(feature = "gpu")]
+mod gpu_gpt2;
+#[cfg(feature = "gpu")]
 mod gpu_mm;
 mod gemma;
 mod model;
@@ -64,9 +66,28 @@ fn main() {
         let budget_gb: u64 = flag(&args, "--max-vram").and_then(|s| s.parse().ok()).unwrap_or(24);
         let dev = device::select(flag(&args, "--device").unwrap_or("auto"), model_bytes, budget_gb * 1_000_000_000);
         eprintln!("[fieldrun] device: {}", dev.detail);
-        if dev.use_gpu {
-            eprintln!("[fieldrun] (GPU matmul dispatch not wired yet — running on CPU this build)");
+        // --gpu-check: validate the GPU-resident GPT-2 forward against the CPU forward (top-1 agreement + GPU tok/s).
+        #[cfg(feature = "gpu")]
+        if has_flag(&args, "--gpu-check") {
+            let b1 = Bundle::load(stem).expect("load bundle");
+            if b1.arch != "gpt2" {
+                println!("[fieldrun] --gpu-check is gpt2-only for now (arch {})", b1.arch);
+                return;
+            }
+            let g = gpu_gpt2::GpuGpt2::new(&b1).expect("no GPU adapter");
+            let cpu = Gpt2::new(Bundle::load(stem).expect("load bundle"), 0.0, false);
+            let n = n_eval.min(50);
+            let last = (ctx_window + n).min(ids.len());
+            let t0 = std::time::Instant::now();
+            let gp: Vec<i64> = (ctx_window..last).map(|i| g.predict(&ids[i.saturating_sub(ctx_window)..i], &b1)).collect();
+            let gsec = t0.elapsed().as_secs_f64();
+            let cp: Vec<i64> = (ctx_window..last).map(|i| cpu.predict(&ids[i.saturating_sub(ctx_window)..i])).collect();
+            let agree = gp.iter().zip(&cp).filter(|(a, b)| a == b).count();
+            println!("[fieldrun] GPU [{}] vs CPU forward: {}/{} top-1 agree · {:.1} GPU fwd/s",
+                     g.name, agree, gp.len(), gp.len() as f64 / gsec);
+            return;
         }
+
         let bundle = Bundle::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
         let arch = bundle.arch.clone();
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
