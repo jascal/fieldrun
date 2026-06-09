@@ -2,6 +2,7 @@
 name = "fieldrun"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"   # default + `--features gpu` both build on stable 1.82 (deps pinned in Cargo.lock); older -> `rustup update`
 description = "Run a decompiled LLM as a single native binary — the three pylm tiers (retrieval / composition / router) in pure Rust, no framework at runtime."
 license = "Apache-2.0"
 

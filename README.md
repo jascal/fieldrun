@@ -137,6 +137,11 @@ active set *before* gate/up (the informed-router / MoE direction) plus SIMD spar
 
 ## Build & run
 
+**Requirements:** stable **Rust ≥ 1.82** (`rustup update` if older) — both the default build and `--features gpu` are
+pinned to build on 1.82. The runtime needs no ML framework. `convert` needs a Hugging Face checkpoint dir
+(safetensors + `config.json`). The validation/quality harness (`scripts/`) uses Python + `transformers`, but the
+binary itself does not.
+
 ```bash
 cargo build --release
 B=../lm-sae/pylm                       # bundles + stores live here (built by pylm/export_bundle.py)
