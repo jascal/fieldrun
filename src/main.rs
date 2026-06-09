@@ -169,8 +169,30 @@ fn main() {
             return;
         }
 
-        eprintln!("[fieldrun] loading {stem}.fieldrun … (mmap + dequant; a big int8 bundle takes a few seconds)");
-        let bundle = Bundle::load(&stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+        // live spinner while the bundle loads (mmap + dequant; a multi-GB int8 model takes a few seconds), so it's
+        // clearly working, not hung — then "loaded", then the mode (chat prompt / server line) appears.
+        let bundle = {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let d2 = done.clone();
+            let sp = std::thread::spawn(move || {
+                let frames = ['|', '/', '-', '\\'];
+                let t0 = std::time::Instant::now();
+                let mut i = 0usize;
+                while !d2.load(Ordering::Relaxed) {
+                    eprint!("\r[fieldrun] loading bundle {} {:.0}s …", frames[i % 4], t0.elapsed().as_secs_f64());
+                    let _ = std::io::stderr().flush();
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    i += 1;
+                }
+            });
+            let b = Bundle::load(&stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+            done.store(true, Ordering::Relaxed);
+            let _ = sp.join();
+            eprintln!("\r[fieldrun] loaded bundle ({} MB)                    ", model_bytes / 1_000_000);
+            b
+        };
         let arch = bundle.arch.clone();
         #[cfg(feature = "api")]
         let eos = bundle.eos.clone(); // for the text API / --chat stop condition
@@ -249,15 +271,6 @@ fn main() {
             println!("[fieldrun]   KV-cache: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
             println!("[fieldrun]   naive   : {naive_s:.2}s  ({:.1} tok/s)", n as f64 / naive_s);
             println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
-            return;
-        }
-        // no mode flag (--chat/--serve/--generate/--explain) and no --ids stream to score: don't silently report 0
-        // positions — tell the user what to do.
-        if ids.is_empty() {
-            eprintln!("[fieldrun] loaded {arch}, but no mode/input given. Try:\n\
-                       \x20 --chat                 interactive chat (REPL)\n\
-                       \x20 --serve <PORT>         OpenAI/Anthropic + token-id HTTP API\n\
-                       \x20 --ids <holdout.json>   batch next-token scoring  (or --generate N)");
             return;
         }
         let t0 = std::time::Instant::now();

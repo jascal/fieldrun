@@ -95,36 +95,44 @@ impl Bundle {
         // and page in on demand. For a non-MoE model this reads only the dense pages — same resident footprint as before.
         let file = std::fs::File::open(format!("{stem}.fieldrun.bin"))?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let mut arrays = HashMap::new();
         let mut experts = HashMap::new();
+        let mut dense: Vec<ArrSpec> = Vec::new();
         for a in h.arrays {
             // MoE expert weights live on disk; their tiny per-column __scale siblings still parse into RAM.
             if a.name.contains(".experts.") && !a.name.ends_with("__scale") {
                 experts.insert(a.name, ExpertSpec { offset: a.offset, bytes: a.bytes, shape: a.shape, dtype: a.dtype });
-                continue;
+            } else {
+                dense.push(a);
             }
-            let raw = &mmap[a.offset..a.offset + a.bytes];
-            let arr = match a.dtype.as_str() {
-                "f32" => Arr::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
-                "f16" => Arr::F16(raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect()),
-                "i8" => {
-                    let (k, n) = (a.shape[0], a.shape[1]);
-                    let mut wt = vec![0i8; k * n];
-                    let mut colsum = vec![0i32; n];
-                    for kk in 0..k {
-                        let base = kk * n;
-                        for j in 0..n {
-                            let w = raw[base + j] as i8;
-                            wt[j * k + kk] = w; // transpose to (out, in) for contiguous-k VNNI dots
-                            colsum[j] += w as i32;
-                        }
-                    }
-                    Arr::I8(I8w { wt, colsum, k, n })
-                }
-                d => panic!("unsupported array dtype {d:?} in bundle"),
-            };
-            arrays.insert(a.name, (a.shape, arr));
         }
+        // parse the dense arrays in parallel — the int8 transpose (the slow part of loading a big bundle) fans out
+        // across cores, so a multi-GB model loads in a few seconds instead of tens.
+        let arrays: HashMap<String, (Vec<usize>, Arr)> = dense
+            .into_par_iter()
+            .map(|a| {
+                let raw = &mmap[a.offset..a.offset + a.bytes];
+                let arr = match a.dtype.as_str() {
+                    "f32" => Arr::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+                    "f16" => Arr::F16(raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect()),
+                    "i8" => {
+                        let (k, n) = (a.shape[0], a.shape[1]);
+                        let mut wt = vec![0i8; k * n];
+                        let mut colsum = vec![0i32; n];
+                        for kk in 0..k {
+                            let base = kk * n;
+                            for j in 0..n {
+                                let w = raw[base + j] as i8;
+                                wt[j * k + kk] = w; // transpose to (out, in) for contiguous-k VNNI dots
+                                colsum[j] += w as i32;
+                            }
+                        }
+                        Arr::I8(I8w { wt, colsum, k, n })
+                    }
+                    d => panic!("unsupported array dtype {d:?} in bundle"),
+                };
+                (a.name, (a.shape, arr))
+            })
+            .collect();
         Ok(Bundle { arch: h.arch, config: h.config, config_f: h.config_f, eos: h.eos, store: h.store, arrays, experts, mmap })
     }
 

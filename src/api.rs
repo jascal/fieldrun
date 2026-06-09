@@ -415,13 +415,43 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
             continue;
         }
         let prompt = tg.chat_prompt(None, &history, user);
-        print!("bot> ");
-        let _ = std::io::stdout().flush();
-        // stream the reply token-by-token to the terminal as it's generated
+        // "thinking" spinner until the first token (the gap = prompt prefill, which is slow on big models), then the
+        // reply streams token-by-token. The spinner runs on its own thread + writes stderr; on the first token we stop
+        // and join it (so it's done writing) before printing the reply, so the two never race on the line.
+        let thinking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let th = thinking.clone();
+        let mut spinner = Some(std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let t0 = std::time::Instant::now();
+            let mut i = 0usize;
+            while th.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r\x1b[2K[ thinking {} {:.0}s ]", frames[i % frames.len()], t0.elapsed().as_secs_f64());
+                let _ = std::io::stderr().flush();
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                i += 1;
+            }
+            eprint!("\r\x1b[2K"); // clear the spinner line
+            let _ = std::io::stderr().flush();
+        });
+        let mut started = false;
         let (text, _, _, _) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
+            if !started {
+                started = true;
+                thinking.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Some(h) = spinner.take() {
+                    let _ = h.join();
+                }
+                print!("bot> ");
+            }
             print!("{chunk}");
             let _ = std::io::stdout().flush();
         });
+        if let Some(h) = spinner.take() {
+            // no tokens were produced (empty/immediate-eos reply) — stop the spinner and still show the prompt
+            thinking.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = h.join();
+            print!("bot> ");
+        }
         println!();
         history.push(("user".into(), user.to_string()));
         history.push(("assistant".into(), text.trim().to_string()));
