@@ -399,7 +399,8 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
 #[cfg(feature = "api")]
 pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
     use std::io::Write;
-    eprintln!("[fieldrun] chat — type a message, Ctrl-D to exit. (greedy, max_tokens={max_tokens}; generic ChatML template)");
+    eprintln!("[fieldrun] chat — type a message; /exit to quit, /help for commands (Ctrl-D also exits). \
+               (greedy, max_tokens={max_tokens}; generic ChatML template)");
     let mut history: Vec<(String, String)> = Vec::new();
     let stdin = std::io::stdin();
     loop {
@@ -412,6 +413,22 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
         }
         let user = line.trim();
         if user.is_empty() {
+            continue;
+        }
+        // slash commands
+        if let Some(cmd) = user.strip_prefix('/') {
+            match cmd.split_whitespace().next().unwrap_or("") {
+                "exit" | "quit" | "q" => {
+                    eprintln!("[fieldrun] bye");
+                    break;
+                }
+                "reset" | "clear" => {
+                    history.clear();
+                    eprintln!("[fieldrun] (conversation reset)");
+                }
+                "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · /help"),
+                other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
+            }
             continue;
         }
         let prompt = tg.chat_prompt(None, &history, user);
