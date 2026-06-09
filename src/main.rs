@@ -286,9 +286,13 @@ fn main() {
             || (ids.is_empty() && serve_port.is_none() && flag(&args, "--generate").is_none());
         #[cfg(feature = "api")]
         if chat_mode {
-            let max_tokens: usize = flag(&args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(256);
+            let want: Option<usize> = flag(&args, "--max-tokens").and_then(|s| s.parse().ok());
             match api::TextGen::load(&stem, eos.clone()) {
-                Some(tg) => api::chat(lm, tg, max_tokens, explain, &arch),
+                // default reply cap depends on the model (reasoning models get a bigger budget); --max-tokens overrides.
+                Some(tg) => {
+                    let max_tokens = want.unwrap_or_else(|| tg.default_max_tokens());
+                    api::chat(lm, tg, max_tokens, explain, &arch);
+                }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
             }
@@ -474,7 +478,7 @@ RUN\n\
   --explain       with --ids: explain that prediction;       --vocab <f>     gpt2 vocab.json for readable explain labels\n\
   \x20               in chat: per-reply explanations (toggle /explain on|off)\n\
   --serve <PORT>  start the HTTP API (--server also works)   --dump <f>      write predictions, one id per line\n\
-  --chat          interactive chat REPL                       --max-tokens N  chat/serve generation cap (default 256)\n\
+  --chat          interactive chat REPL                       --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
   --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );

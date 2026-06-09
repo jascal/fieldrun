@@ -67,6 +67,21 @@ impl TextGen {
         self.tok.decode(&u, true).unwrap_or_default()
     }
 
+    /// Sensible default reply cap when the caller/CLI doesn't set one. Token budget tracks *thinking*, not model size:
+    /// a reasoning model (a tokenizer that knows a `<think>`-style token) spends hundreds-to-thousands of tokens before
+    /// the answer, so 256 would truncate mid-thought — give those 2048; everything else 512. Always overridable
+    /// (`--max-tokens` on the CLI, `"max_tokens"` in an API request).
+    pub fn default_max_tokens(&self) -> usize {
+        let reasoning = ["<think>", "<thinking>", "<|thinking|>", "<reasoning>"]
+            .iter()
+            .any(|t| self.tok.token_to_id(t).is_some());
+        if reasoning {
+            2048
+        } else {
+            512
+        }
+    }
+
     /// ChatML prompt (`<|im_start|>role\n…<|im_end|>`), a common default (Qwen/others). `history` is prior (role, text).
     pub fn chat_prompt(&self, system: Option<&str>, history: &[(String, String)], user: &str) -> String {
         let mut s = String::new();
@@ -207,7 +222,7 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
         max_tokens: Option<usize>,
     }
     let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None });
-    let max_tokens = r.max_tokens.unwrap_or(256).clamp(1, 4096);
+    let max_tokens = r.max_tokens.unwrap_or_else(|| tg.default_max_tokens()).clamp(1, 16384);
     let (prompt, add_special) = if route == "/v1/completions" {
         (r.prompt.clone(), true)
     } else {
@@ -375,7 +390,7 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         Ok(r) => r,
         Err(e) => return err(&format!("bad JSON body: {e}")),
     };
-    let max_tokens = r.max_tokens.unwrap_or(256).clamp(1, 4096);
+    let max_tokens = r.max_tokens.unwrap_or_else(|| tg.default_max_tokens()).clamp(1, 16384);
 
     if route == "/v1/completions" {
         // OpenAI text completion — raw prompt, with the tokenizer's special tokens
@@ -505,7 +520,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             let _ = std::io::stderr().flush();
         }));
         let mut started = false;
-        let (text, _, _, _) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
+        let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
             if !started {
                 started = true;
                 thinking.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -524,6 +539,11 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             print!("bot> ");
         }
         println!();
+        if !finished {
+            // ran into the length cap rather than stopping at EOS — say so, so a truncated reply isn't mistaken for
+            // a broken model (reasoning models especially blow past a small cap mid-thought).
+            eprintln!("[fieldrun] (stopped at max_tokens={max_tokens} — raise with --max-tokens N for longer replies)");
+        }
         // per-reply explanation: the circuits + features behind the model's prediction at the end of this prompt
         // (the decision that produced the first reply token). Decoded via the bundled tokenizer. Off by default.
         if explain {
