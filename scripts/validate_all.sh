@@ -13,7 +13,7 @@ cargo build --release >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 printf "\n%-12s %-10s %-8s %-8s %-8s\n" arch ref f32 f16 int8
 printf '%.0s-' {1..50}; echo
 # arch | bundle --arch flag | torch reference class
-for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "qwen3moe:qwen3moe:Qwen3-MoE" "mla:mla:DeepSeek-V3"; do
+for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "qwen3moe:qwen3moe:Qwen3-MoE" "mla:mla:DeepSeek-V3" "minimax:minimax:MiniMax-M2"; do
   tag="${spec%%:*}"; rest="${spec#*:}"; arch="${rest%%:*}"; ref="${rest##*:}"
   $PY $REF build "$tag" >/dev/null 2>&1 || { printf "%-12s BUILD FAILED\n" "$tag"; continue; }
   row=""

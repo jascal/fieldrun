@@ -157,7 +157,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
         "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, out_stem)?,
         "mla" => convert_mla(&cfg, &m, dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla)"),
+        "minimax" => convert_minimax(&cfg, &m, dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
     };
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
     Ok(())
@@ -572,6 +573,65 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
             write_experts(&mut w, &p, l)?;
             for (fr, hf) in [("shared.gate", "gate_proj"), ("shared.up", "up_proj"), ("shared.down", "down_proj")] {
                 lin(&mut w, &format!("l{l}.{fr}"), &format!("{p}mlp.shared_experts.{hf}.weight"))?;
+            }
+        }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
+/// MiniMax-M2 — the RoPE backbone + FULL-WIDTH q/k-norm (RMSNorm over the whole nh·hd / nkv·hd projection, not
+/// per-head) + an all-MoE FFN with a sigmoid router (sigmoid scores + bias for the choice, sigmoid scores renormed for
+/// the weight; no group limiting, no shared expert). Experts written one int8 array each (offload).
+fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = geti(c, "head_dim").unwrap_or(d / nh);
+    let nl = geti(c, "num_hidden_layers").unwrap();
+    let vocab = geti(c, "vocab_size").unwrap();
+    let inter = geti(c, "intermediate_size").unwrap();
+    let n_exp = geti(c, "num_local_experts").or_else(|| geti(c, "num_experts")).unwrap();
+    let topk = geti(c, "num_experts_per_tok").unwrap();
+    let (theta, eps) = rope_theta_eps(c);
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let config: Vec<usize> = vec![nl, nh, nkv, hd, d, vocab, tie as usize, n_exp, topk, inter];
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "minimax",
+        "config": config, "config_f": [theta, eps] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_small("embed", &ed, &es, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight"); w.put_small("lm_head", &dt, &s, dtype)?;
+    }
+    // MiniMax-M2 uses Mixtral-style MoE naming: block_sparse_moe.{gate, e_score_correction_bias,
+    // experts.{e}.w1/w2/w3} where w1=gate_proj, w2=down_proj, w3=up_proj.
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        let bsm = format!("{p}block_sparse_moe.");
+        norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.q_norm"), &format!("{p}self_attn.q_norm.weight"))?; // full nh*hd width
+        norm(&mut w, &format!("l{l}.k_norm"), &format!("{p}self_attn.k_norm.weight"))?; // full nkv*hd width
+        for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
+            lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+        }
+        lin(&mut w, &format!("l{l}.gate"), &format!("{bsm}gate.weight"))?;
+        let (bs, bd) = m.read(&format!("{bsm}e_score_correction_bias"));
+        w.put_small(&format!("l{l}.gate_bias"), &bd, &bs, dtype)?;
+        for e in 0..n_exp {
+            for (fr, hf) in [("gate", "w1"), ("up", "w3"), ("down", "w2")] {
+                let (s, dt) = m.read(&format!("{bsm}experts.{e}.{hf}.weight"));
+                w.put_lin(&format!("l{l}.experts.{e}.{fr}"), &dt, s[0], s[1], dtype)?;
             }
         }
     }

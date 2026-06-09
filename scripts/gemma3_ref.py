@@ -30,6 +30,24 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
+    if ARCH == "minimax":
+        from transformers import MiniMaxM2Config
+        return MiniMaxM2Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=16,          # expert width
+            num_hidden_layers=3,           # all-MoE
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False,
+            max_position_embeddings=256,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
     if ARCH == "mla":
         from transformers import DeepseekV3Config
         return DeepseekV3Config(
@@ -135,7 +153,8 @@ def build():
     torch.manual_seed(SEED)
     cfg = make_config()
     tf = __import__("transformers")
-    Cls = (tf.DeepseekV3ForCausalLM if ARCH == "mla"
+    Cls = (tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
+           else tf.DeepseekV3ForCausalLM if ARCH == "mla"
            else tf.Qwen3MoeForCausalLM if ARCH == "qwen3moe"
            else tf.Gemma4ForCausalLM if ARCH.startswith("gemma4")
            else tf.Gemma3ForCausalLM)
@@ -169,7 +188,8 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = ("DeepseekV3ForCausalLM" if ARCH == "mla"
+    cls = ("MiniMaxM2ForCausalLM" if ARCH == "minimax"
+           else "DeepseekV3ForCausalLM" if ARCH == "mla"
            else "Qwen3MoeForCausalLM" if ARCH == "qwen3moe"
            else "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM")
     print(f"[gemma3_ref] fieldrun vs torch {cls}: {agree}/{n} top-1 agree ({100*agree/n:.1f}%)")

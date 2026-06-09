@@ -40,6 +40,9 @@ diverges without explaining why.
 - `src/mla.rs` — DeepSeek-V3 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
   split, v_head_dim ≠ qk_head_dim) + DeepSeek MoE (group-limited sigmoid routing with bias-corrected *choice* and
   sigmoid *weight*, an always-on shared expert, first-k-dense layers). Experts paged from the mmap. predict only.
+- `src/minimax.rs` — MiniMax-M2: RoPE backbone + FULL-WIDTH q/k-norm (RMSNorm over the whole nh·hd / nkv·hd, not
+  per-head) + all-MoE with a sigmoid router (+bias for the choice, sigmoid renormed for the weight; no group, no shared
+  expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. predict only.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
   archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe`), `--dtype int8|f16|f32` (f32 = bit-exact, for the faithfulness
   gate). MoE experts written one int8 array each (independently pageable). lm_head (non-tied unembed) stored raw
@@ -52,7 +55,7 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**8 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2)), KV-cache +
+Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 via VNNI W8A8
 + outlier-aware quant), **MoE expert-offload** (experts mmap'd, paged per token, never resident), Tier C
@@ -79,9 +82,8 @@ Still open, with the honest catch on each (none are quick wins — they need har
 - **Frontier-MoE roadmap.** **Qwen3-MoE and MLA (DeepSeek-V3/V4/Kimi-K2) are done** (60/60) — both carried by the
   MoE-FFN + expert-offload; MLA is the last new attention *class*. Remaining tails: Qwen3-MoE **sliding window**
   (`use_sliding_window`, convert asserts off); **DeepSeek-V4 deltas** over V3 + **YaRN** long-context RoPE scaling;
-  **MiniMax-M2** (plain softmax attn + sigmoid-gated MoE → no MLA, a cheap follow-on) and **MiniMax-M3** (newer, weights
-  /class not out yet — validate when they land); and **KV-cache `generate` + `explain`** for the newer archs (currently
-  naive recompute). Beyond kernels the binding constraint is **memory** — these are 100B–1T-param models; expert-offload
+  **MiniMax-M2 done** (60/60); **MiniMax-M3** (newer, weights/class not out yet — validate when they land); and
+  **KV-cache `generate` + `explain`** for the newer archs (currently naive recompute). Beyond kernels the binding constraint is **memory** — these are 100B–1T-param models; expert-offload
   is the lever (resident = shared layers + hot experts), but the shared layers + a usable working set still want a
   bigger box + fast disk. Every kernel is tiny-instance-validatable (`scripts/validate_all.sh`); full weights are the
   hardware ask.

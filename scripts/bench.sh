@@ -11,7 +11,7 @@ NE="${1:-120}"; shift || true; SEEDS=("${@:-0 1 2}"); SEEDS=(${SEEDS[@]})
 cargo build --release >/dev/null 2>&1
 printf "\nquality sweep — %d positions × seeds {%s}\n" "$NE" "${SEEDS[*]}"
 printf "%-12s %-10s %-10s %-10s\n" arch f32 f16 int8; printf '%.0s-' {1..46}; echo
-for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3moe" "mla:mla"; do
+for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3moe" "mla:mla" "minimax:minimax"; do
   tag="${spec%%:*}"; arch="${spec##*:}"
   declare -A ok tot
   for dt in f32 f16 int8; do ok[$dt]=0; tot[$dt]=0; done
