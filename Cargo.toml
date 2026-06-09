@@ -13,10 +13,8 @@ default = ["hub", "api"]
 # opt-in GPU backend (wgpu: Metal on Mac, DX12 on Windows incl. ARM, Vulkan on Linux). The default build is pure-CPU,
 # no GPU dependency — the CPU path stays the faithful reference; GPU is an accelerator for usable generation speed.
 gpu = ["dep:wgpu", "dep:pollster"]
-# opt-in AVX-512 VNNI int8 kernel (x86-64 only, needs NIGHTLY Rust — the avx512 intrinsics + target_feature are still
-# unstable on stable). Default build omits it and uses a portable scalar int8 dot, so it compiles on stable everywhere
-# (incl. Apple Silicon / Intel macOS). Enable on an x86 server with nightly: `cargo +nightly build --release --features vnni`.
-vnni = []
+# (The int8 dot uses NEON `sdot` on aarch64 — stable, auto-detected at runtime — with a scalar fallback everywhere
+# else; no feature flag or nightly needed. The old AVX-512 VNNI path was dropped: it required nightly on stable Rust.)
 # HF hub pull (default): `convert --model org/repo` fetches config + safetensors from Hugging Face over a small ureq
 # client (no torch, no async); auth via `huggingface-cli login` / $HF_TOKEN for gated models. `--no-default-features`
 # drops it for a fully offline / network-free binary.

@@ -23,10 +23,10 @@ diverges without explaining why.
 ## Layout
 
 - `src/retrieval.rs` — Tier A: `Store` ports `lm.py` (induction + n-gram backoff + grammar).
-- `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + scalar int8 W8A8 by
-  default; opt-in AVX-512 VNNI int8 under `--features vnni` = x86 + nightly, bit-exact to scalar — gated so the default
-  build is stable-Rust on every platform) with
-  outlier-aware activation quant), `mm_routed_down` (Tier C), and the row-wise embed helpers.
+- `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + int8 W8A8 with
+  outlier-aware activation quant). The int8 dot (`i8dot`) is signed s8×s8: NEON `sdot`/`vdotq_s32` on aarch64
+  (runtime-detected `dotprod`, `#[target_feature]`-gated — stable Rust) with a scalar fallback everywhere else; no
+  feature flag, no nightly. `mm_routed_down` (Tier C), and the row-wise embed helpers.
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
   (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
   (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1 pattern, no soft-capping. `gemma4.rs`

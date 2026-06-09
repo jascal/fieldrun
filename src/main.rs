@@ -210,15 +210,24 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
         };
 
+        // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
+        let serve_port = flag(&args, "--serve")
+            .or_else(|| flag(&args, "--server"))
+            .and_then(|s| s.parse::<u16>().ok());
+        // --explain: in the chat REPL it turns ON per-reply explanations (toggle live with /explain). With --ids it's
+        // the standalone "explain this prediction" mode. (It used to force standalone mode and panic without --ids.)
+        let explain = has_flag(&args, "--explain");
+
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
-        // human interface — and also runs on explicit --chat. (--serve / --generate / --explain / --ids take precedence.)
+        // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare
+        // --explain with no ids falls through to chat with explanations enabled.)
         let chat_mode = has_flag(&args, "--chat")
-            || (ids.is_empty() && flag(&args, "--serve").is_none() && flag(&args, "--generate").is_none() && !has_flag(&args, "--explain"));
+            || (ids.is_empty() && serve_port.is_none() && flag(&args, "--generate").is_none());
         #[cfg(feature = "api")]
         if chat_mode {
             let max_tokens: usize = flag(&args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(256);
             match api::TextGen::load(&stem, eos.clone()) {
-                Some(tg) => api::chat(lm, tg, max_tokens),
+                Some(tg) => api::chat(lm, tg, max_tokens, explain, &arch),
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
             }
@@ -232,7 +241,12 @@ fn main() {
         }
 
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).
-        if let Some(port) = flag(&args, "--serve").and_then(|s| s.parse::<u16>().ok()) {
+        if let Some(port) = serve_port {
+            if explain {
+                eprintln!("[fieldrun] note: --explain toggles per-reply explanations in the chat REPL. The API server \
+                           ignores it — POST /explain for the structured form, or pass \"explain\":true to the chat \
+                           endpoints. (Use --chat --explain for an explained REPL.)");
+            }
             #[cfg(feature = "api")]
             let textgen = api::TextGen::load(&stem, eos);
             #[cfg(not(feature = "api"))]
@@ -241,8 +255,14 @@ fn main() {
             return;
         }
 
-        // --explain: explain the prediction at the end of the first --ctx tokens (composition circuits + features).
-        if has_flag(&args, "--explain") {
+        // --explain WITH --ids: standalone "explain the prediction at the end of the first --ctx tokens" (circuits +
+        // features). Without ids we'd have already gone to chat above; guard anyway so an empty stream can't index out.
+        if explain {
+            if ids.is_empty() {
+                eprintln!("[fieldrun] --explain standalone mode needs --ids <token stream>. For explained chat replies, \
+                           run with --chat --explain (or just --explain) and toggle /explain in the REPL.");
+                return;
+            }
             let ctx = &ids[..ctx_window.min(ids.len())];
             match lm.explain(ctx) {
                 Some(ex) => {
@@ -346,7 +366,7 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> [--ctx N] [--n-eval N]        score next-token top-1 (Tier B)\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
-  fieldrun --bundle <stem> --chat                                         interactive chat REPL\n\
+  fieldrun --bundle <stem> --chat [--explain]                             interactive chat REPL (/explain to toggle)\n\
   fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: token-id + OpenAI/Anthropic\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\
@@ -366,8 +386,9 @@ RUN\n\
   --bundle <S>    the .fieldrun bundle stem to load          --ctx N         context window / prediction (default 64)\n\
   --n-eval N      positions to score (default 500)           --generate M    greedy-generate M tokens (KV-cache where wired)\n\
   --kv-int8       int8 KV cache during generate              --route-frac F  Tier C: compute only fraction F of MLP neurons\n\
-  --explain       explain the last --ctx token               --vocab <f>     gpt2 vocab.json for readable explain labels\n\
-  --serve <PORT>  start the HTTP API                         --dump <f>      write predictions, one id per line\n\
+  --explain       with --ids: explain that prediction;       --vocab <f>     gpt2 vocab.json for readable explain labels\n\
+  \x20               in chat: per-reply explanations (toggle /explain on|off)\n\
+  --serve <PORT>  start the HTTP API (--server also works)   --dump <f>      write predictions, one id per line\n\
   --chat          interactive chat REPL                       --max-tokens N  chat/serve generation cap (default 256)\n\
   --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu

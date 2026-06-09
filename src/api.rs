@@ -11,7 +11,9 @@
 //!      POST /v1/messages                                                    (Anthropic)
 //!    Greedy generation; `max_tokens` honoured; output stops at the model's EOS. Chat uses a ChatML template (a
 //!    reasonable generic default — not necessarily the model's exact trained template). Not the model's real
-//!    tokenizer? then text endpoints 400; the native endpoints still work. No streaming yet (responses are whole).
+//!    tokenizer? then text endpoints 400; the native endpoints still work. `"stream": true` streams tokens as SSE.
+//!    fieldrun extension: `"explain": true` attaches the structured Explanation under a `fieldrun_explanation` field
+//!    (non-streaming responses; standard clients ignore the unknown field). The canonical form is native POST /explain.
 
 use serde::Deserialize;
 
@@ -331,6 +333,22 @@ struct Msg {
     content: String,
 }
 
+/// The structured Explanation for the model's prediction at the end of `prompt`, as a JSON value to graft onto an API
+/// response. There is no cross-vendor standard for returning interpretability data over the OpenAI/Anthropic schemas
+/// (reasoning/thinking blocks are for CoT *text*, not circuits), so fieldrun returns it in a namespaced extension field
+/// — standard clients ignore unknown fields; the canonical structured form is the native `POST /explain` route.
+#[cfg(feature = "api")]
+fn explanation_json(lm: &dyn Model, tg: &TextGen, prompt: &str, add_special: bool) -> serde_json::Value {
+    let pids = tg.encode(prompt, add_special);
+    if pids.is_empty() {
+        return serde_json::Value::Null;
+    }
+    match lm.explain(&pids) {
+        Some(ex) => serde_json::to_value(&ex).unwrap_or(serde_json::Value::Null),
+        None => serde_json::json!({ "error": "explain not supported for this arch" }),
+    }
+}
+
 #[cfg(feature = "api")]
 fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen) -> String {
     #[derive(serde::Deserialize)]
@@ -343,6 +361,8 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         system: String,
         #[serde(default)]
         max_tokens: Option<usize>,
+        #[serde(default)]
+        explain: bool, // fieldrun extension: attach the structured explanation under "fieldrun_explanation"
     }
     let r: Req = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -353,11 +373,15 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
     if route == "/v1/completions" {
         // OpenAI text completion — raw prompt, with the tokenizer's special tokens
         let (text, pt, ct, eos) = tg.gen(lm, &r.prompt, max_tokens, true, &mut |_| {});
-        return serde_json::json!({
+        let mut v = serde_json::json!({
             "id": format!("cmpl-{}", now()), "object": "text_completion", "created": now(), "model": arch,
             "choices": [{ "text": text, "index": 0, "finish_reason": if eos {"stop"} else {"length"} }],
             "usage": { "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct }
-        }).to_string();
+        });
+        if r.explain {
+            v["fieldrun_explanation"] = explanation_json(lm, tg, &r.prompt, true);
+        }
+        return v.to_string();
     }
 
     // chat (OpenAI /v1/chat/completions and Anthropic /v1/messages share the message shape)
@@ -375,32 +399,45 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
     }
     let prompt = tg.chat_prompt(system.as_deref(), &history, &last_user);
     let (text, pt, ct, eos) = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
+    let explanation = if r.explain { Some(explanation_json(lm, tg, &prompt, false)) } else { None };
 
     if route == "/v1/messages" {
         // Anthropic Messages API
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": format!("msg_{}", now()), "type": "message", "role": "assistant", "model": arch,
             "content": [{ "type": "text", "text": text }],
             "stop_reason": if eos {"end_turn"} else {"max_tokens"},
             "usage": { "input_tokens": pt, "output_tokens": ct }
-        }).to_string()
+        });
+        if let Some(ex) = explanation {
+            v["fieldrun_explanation"] = ex;
+        }
+        v.to_string()
     } else {
         // OpenAI chat completion
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": format!("chatcmpl-{}", now()), "object": "chat.completion", "created": now(), "model": arch,
             "choices": [{ "index": 0, "message": { "role": "assistant", "content": text },
                           "finish_reason": if eos {"stop"} else {"length"} }],
             "usage": { "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct }
-        }).to_string()
+        });
+        if let Some(ex) = explanation {
+            v["fieldrun_explanation"] = ex;
+        }
+        v.to_string()
     }
 }
 
 /// Interactive REPL chat over the bundled tokenizer (the `--chat` mode). Maintains conversation history; ChatML prompt.
+/// `explain` starts per-reply explanation output on (toggle live with `/explain`); `arch` names the model for messages.
 #[cfg(feature = "api")]
-pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
+pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: bool, arch: &str) {
     use std::io::Write;
     eprintln!("[fieldrun] chat — type a message; /exit to quit, /help for commands (Ctrl-D also exits). \
                (greedy, max_tokens={max_tokens}; generic ChatML template)");
+    if explain {
+        eprintln!("[fieldrun] explain ON — each reply is followed by its composition circuits + features (/explain off to stop)");
+    }
     let mut history: Vec<(String, String)> = Vec::new();
     let stdin = std::io::stdin();
     loop {
@@ -417,7 +454,8 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
         }
         // slash commands
         if let Some(cmd) = user.strip_prefix('/') {
-            match cmd.split_whitespace().next().unwrap_or("") {
+            let mut parts = cmd.split_whitespace();
+            match parts.next().unwrap_or("") {
                 "exit" | "quit" | "q" => {
                     eprintln!("[fieldrun] bye");
                     break;
@@ -426,7 +464,16 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
                     history.clear();
                     eprintln!("[fieldrun] (conversation reset)");
                 }
-                "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · /help"),
+                "explain" => {
+                    explain = match parts.next() {
+                        Some("on") | Some("1") | Some("true") => true,
+                        Some("off") | Some("0") | Some("false") => false,
+                        _ => !explain, // bare /explain toggles
+                    };
+                    eprintln!("[fieldrun] explain {}", if explain { "ON" } else { "OFF" });
+                }
+                "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
+                                     /explain [on|off] (per-reply circuits + features) · /help"),
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }
             continue;
@@ -470,6 +517,28 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize) {
             print!("bot> ");
         }
         println!();
+        // per-reply explanation: the circuits + features behind the model's prediction at the end of this prompt
+        // (the decision that produced the first reply token). Decoded via the bundled tokenizer. Off by default.
+        if explain {
+            let pids = tg.encode(&prompt, false);
+            if pids.is_empty() {
+                eprintln!("[fieldrun] (explain: empty prompt)");
+            } else {
+                match lm.explain(&pids) {
+                    Some(ex) => {
+                        let dec = |id: i64| {
+                            let s = tg.decode(&[id]);
+                            if s.is_empty() { format!("[{id}]") } else { format!("{s:?}") }
+                        };
+                        eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec));
+                    }
+                    None => {
+                        eprintln!("[fieldrun] (explain not implemented for arch {arch} — turning off; /explain on to retry)");
+                        explain = false;
+                    }
+                }
+            }
+        }
         history.push(("user".into(), user.to_string()));
         history.push(("assistant".into(), text.trim().to_string()));
     }

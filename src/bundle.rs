@@ -30,14 +30,14 @@ fn default_dtype() -> String {
 enum Arr {
     F32(Vec<f32>),
     F16(Vec<half::f16>),
-    I8(I8w), // per-output-column symmetric int8 (scale in sibling "<name>__scale"), repacked for the VNNI path
+    I8(I8w), // per-output-column symmetric int8 (scale in sibling "<name>__scale"), repacked for the int8-dot path
 }
 
-/// An int8 weight prepared for the VNNI matmul: stored transposed to (out, in) so each output column's contiguous
-/// `k` values feed `vpdpbusd` directly, plus the per-column weight sum (the zero-point correction term).
+/// An int8 weight prepared for the int8 matmul: stored transposed to (out, in) so each output column's contiguous `k`
+/// values feed one signed-int8 dot (`vdotq_s32` on aarch64 NEON, scalar elsewhere). Symmetric per-column quant, so no
+/// zero-point term — the activation is quantised to signed int8 too and the dot is a plain s8×s8 accumulate.
 struct I8w {
-    wt: Vec<i8>,    // (n, k) row-major: wt[j*k + kk] = W[kk, j]
-    colsum: Vec<i32>, // colsum[j] = sum_k W[kk, j]
+    wt: Vec<i8>, // (n, k) row-major: wt[j*k + kk] = W[kk, j]
     k: usize,
     n: usize,
 }
@@ -117,16 +117,13 @@ impl Bundle {
                     "i8" => {
                         let (k, n) = (a.shape[0], a.shape[1]);
                         let mut wt = vec![0i8; k * n];
-                        let mut colsum = vec![0i32; n];
                         for kk in 0..k {
                             let base = kk * n;
                             for j in 0..n {
-                                let w = raw[base + j] as i8;
-                                wt[j * k + kk] = w; // transpose to (out, in) for contiguous-k VNNI dots
-                                colsum[j] += w as i32;
+                                wt[j * k + kk] = raw[base + j] as i8; // transpose to (out, in) for contiguous-k int8 dots
                             }
                         }
-                        Arr::I8(I8w { wt, colsum, k, n })
+                        Arr::I8(I8w { wt, k, n })
                     }
                     d => panic!("unsupported array dtype {d:?} in bundle"),
                 };
@@ -182,7 +179,7 @@ impl Bundle {
     pub fn mm_routed_down(&self, h: &Array2<f32>, name: &str, frac: f32) -> Array2<f32> {
         let (shape, arr) = self.get(name); // down: (ffn, d)
         if matches!(arr, Arr::I8(_)) {
-            return self.mm(h, name); // int8 down is stored transposed for VNNI — routing falls back to dense for now
+            return self.mm(h, name); // int8 down is stored transposed for the int8 dot — routing falls back to dense for now
         }
         let (ffn, d) = (shape[0], shape[1]);
         let keep = ((frac * ffn as f32).ceil() as usize).clamp(1, ffn);
@@ -285,10 +282,10 @@ impl Bundle {
                 }
                 out
             }
-            // int8 W8A8: dynamically quantise each activation row to u8 (offset +128), int8·int8 dot via VNNI, then
-            // dequant: out = scale_a * scale_w[j] * (Σ au·w  −  128·colsum[j]). The +128 makes `a` unsigned for
-            // vpdpbusd (u8×s8); the colsum term cancels that offset. Activations go to int8 too, so this is lossier
-            // than the f16-activation dequant path — it trades a little accuracy for the on-core int8 dot.
+            // int8 W8A8: dynamically quantise each activation row to signed int8, take a signed int8·int8 dot
+            // (`vdotq_s32` on aarch64 NEON, scalar elsewhere), then dequant: out = scale_a * scale_w[j] * Σ a·w + corr.
+            // Symmetric per-column quant means no zero-point term. Activations go to int8 too, so this is lossier than
+            // the f16-activation dequant path — it trades a little accuracy for the on-core int8 dot.
             Arr::I8(w8) => {
                 let scale = self.arr1o(&format!("{name}__scale"));
                 let (kk, nn) = (w8.k, w8.n);
@@ -309,15 +306,16 @@ impl Bundle {
                     }
                     let bulk_max = if t < kk { absv[idx[t]] } else { 0.0 };
                     let sa = if bulk_max > 0.0 { bulk_max / 127.0 } else { 1.0 };
-                    let mut au: Vec<u8> = arow.iter().map(|&v| (((v / sa).round() as i32).clamp(-127, 127) as u8) ^ 0x80).collect();
-                    let ov: Vec<(usize, f32)> = idx[0..t].iter().map(|&o| { au[o] = 128; (o, arow[o]) }).collect();
+                    // signed-int8 activations; outlier channels zeroed here and added back exactly in f32 via `corr`.
+                    let mut a8: Vec<i8> = arow.iter().map(|&v| ((v / sa).round() as i32).clamp(-127, 127) as i8).collect();
+                    let ov: Vec<(usize, f32)> = idx[0..t].iter().map(|&o| { a8[o] = 0; (o, arow[o]) }).collect();
                     let orow: Vec<f32> = (0..nn)
                         .into_par_iter()
                         .map(|j| {
-                            let acc = vnni_udot(&au, &w8.wt[j * kk..(j + 1) * kk]);
                             let base = j * kk;
+                            let acc = i8dot(&a8, &w8.wt[base..base + kk]);
                             let corr: f32 = ov.iter().map(|&(ch, av)| av * w8.wt[base + ch] as f32).sum();
-                            scale[j] * (sa * (acc - 128 * w8.colsum[j]) as f32 + corr)
+                            scale[j] * (sa * acc as f32 + corr)
                         })
                         .collect();
                     out.row_mut(i).assign(&ArrayView1::from(orow.as_slice()));
@@ -407,36 +405,36 @@ impl Bundle {
     }
 }
 
-/// Dot product of unsigned-int8 activations with signed-int8 weights, accumulating in i32. With the opt-in `vnni`
-/// feature (x86-64 + nightly Rust), it uses the on-core AVX-512 VNNI instruction (`vpdpbusd`) when the CPU has it; the
-/// default build is a portable scalar dot (it autovectorises well, and is the path on ARM / Apple Silicon). The
-/// AVX-512 intrinsics + `#[target_feature(avx512*)]` are still unstable on stable Rust, so they're feature-gated to
-/// keep the default build compiling everywhere (stable x86 macOS/Linux, ARM macOS).
-fn vnni_udot(au: &[u8], w: &[i8]) -> i32 {
-    #[cfg(all(target_arch = "x86_64", feature = "vnni"))]
+/// Dot product of signed-int8 activations with signed-int8 weights, accumulating in i32. On aarch64 (Apple Silicon /
+/// ARM) with the `dotprod` feature it uses the on-core NEON instruction `vdotq_s32` (`sdot`, s8×s8 → i32) — stable on
+/// stable Rust, unlike the x86 AVX-512 VNNI intrinsics which are nightly-only. Elsewhere (and on aarch64 without
+/// dotprod) it falls back to a portable scalar dot, which autovectorises well. The runtime feature check + scalar
+/// fallback keep the binary correct on any CPU; the NEON path is just faster where present.
+fn i8dot(a: &[i8], w: &[i8]) -> i32 {
+    #[cfg(target_arch = "aarch64")]
     {
-        if is_x86_feature_detected!("avx512vnni") {
-            return unsafe { vnni_udot_avx512(au, w) };
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { sdot_neon(a, w) };
         }
     }
-    au.iter().zip(w).map(|(&a, &b)| a as i32 * b as i32).sum()
+    a.iter().zip(w).map(|(&x, &y)| x as i32 * y as i32).sum()
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "vnni"))]
-#[target_feature(enable = "avx512f,avx512vnni")]
-unsafe fn vnni_udot_avx512(au: &[u8], w: &[i8]) -> i32 {
-    use std::arch::x86_64::*;
-    let len = au.len();
-    let chunks = len / 64;
-    let mut acc = _mm512_setzero_si512();
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_neon(a: &[i8], w: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    let len = a.len();
+    let chunks = len / 16;
+    let mut acc = vdupq_n_s32(0);
     for c in 0..chunks {
-        let a = _mm512_loadu_si512(au.as_ptr().add(c * 64) as *const i32);
-        let b = _mm512_loadu_si512(w.as_ptr().add(c * 64) as *const i32);
-        acc = _mm512_dpbusd_epi32(acc, a, b); // 16 i32 lanes, each += Σ of 4 u8·s8 products
+        let av = vld1q_s8(a.as_ptr().add(c * 16));
+        let wv = vld1q_s8(w.as_ptr().add(c * 16));
+        acc = vdotq_s32(acc, av, wv); // 4 i32 lanes, each += Σ of 4 s8·s8 products
     }
-    let mut sum = _mm512_reduce_add_epi32(acc);
-    for k in (chunks * 64)..len {
-        sum += au[k] as i32 * w[k] as i32; // tail (k not a multiple of 64)
+    let mut sum = vaddvq_s32(acc); // horizontal add of the 4 lanes
+    for k in (chunks * 16)..len {
+        sum += a[k] as i32 * w[k] as i32; // tail (k not a multiple of 16)
     }
     sum
 }
@@ -508,10 +506,11 @@ mod tests {
     }
 
     #[test]
-    fn vnni_udot_scalar_matches_manual() {
-        let au: Vec<u8> = vec![128, 200, 60, 255];
-        let w: Vec<i8> = vec![1, -2, 3, 4];
-        let want: i32 = au.iter().zip(&w).map(|(&a, &b)| a as i32 * b as i32).sum();
-        assert_eq!(vnni_udot(&au, &w), want);
+    fn i8dot_matches_manual() {
+        // a length that is not a multiple of 16 exercises the NEON tail loop / scalar path identically.
+        let a: Vec<i8> = vec![1, -2, 3, 4, -5, 6, -7, 8, 9, -10, 11, -12, 13, 14, -15, 16, -17, 18];
+        let w: Vec<i8> = vec![-1, 2, -3, 4, 5, -6, 7, 8, -9, 10, -11, 12, 13, -14, 15, 16, 17, -18];
+        let want: i32 = a.iter().zip(&w).map(|(&x, &y)| x as i32 * y as i32).sum();
+        assert_eq!(i8dot(&a, &w), want);
     }
 }

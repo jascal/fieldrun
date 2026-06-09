@@ -18,7 +18,7 @@ bundle (weights blob + JSON manifest + tokenizer) that `convert` produces once a
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
 | **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
-| `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
+| `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py`. In chat: `--explain` / `/explain on`; over the API: native `/explain` or `"explain":true` |
 | API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** (default build) — `--serve PORT` (native `/predict`·`/generate`·`/explain` + `/v1/chat/completions`·`/v1/completions`·`/v1/messages`, streaming) and `--chat` |
 
 **GPU backend** (opt-in, `--features gpu`, via **wgpu** → Metal/DX12/Vulkan): `--device cpu|gpu|auto` + `--max-vram`
@@ -30,9 +30,10 @@ build stays pure-CPU with no GPU dependency.
 
 Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
 stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
-activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The default int8 dot is a portable scalar kernel
-(stable Rust, all platforms); an **AVX-512 VNNI** kernel is available opt-in (`--features vnni`, x86-64 + nightly) and
-is bit-exact to it.
+activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The int8 dot uses the on-core NEON **`sdot`**
+instruction on aarch64 (Apple Silicon / ARM, runtime-detected) with a portable scalar fallback everywhere else — all on
+stable Rust, no feature flag or nightly. (The activations are quantised to *signed* int8 to feed `sdot` directly; this
+is bit-exact to the scalar dot, so the faithfulness numbers are unchanged.)
 
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.
@@ -43,7 +44,7 @@ that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Fa
 Every tier is validated by **top-1 agreement against the Python/torch reference** on the same inputs:
 - **Tier A** — 0 per-position mismatches vs `lm.py` over 500 positions (with and without grammar).
 - **Tier B (GPT-2 / RoPE / Gemma-2)** — exact vs the numpy kernels (= torch): GPT-2 0/200, Qwen2.5 0/32,
-  Gemma-2-2b 0/18 (fp16/fp32); int8+VNNI matches on the sample once activations are outlier-aware-quantised.
+  Gemma-2-2b 0/18 (fp16/fp32); int8 matches on the sample once activations are outlier-aware-quantised.
 - **Tier B (newer archs)** — each scored top-1 against a *tiny random-init* torch model (`scripts/gemma3_ref.py`,
   eager attention), sized to exercise every code path (both sliding+full layers, GQA, QK-norm, dual/partial RoPE,
   window masking, per-layer-type `head_dim`, PLE, MoE routing + experts, MLA latents). No gated download — the
@@ -53,8 +54,8 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   | arch | reference | f32 | f16 | int8 |
   |------|-----------|-----|-----|------|
   | `gemma3`   | Gemma3ForCausalLM        | 60/60 | 60/60 | 59/60 |
-  | `gemma4`   | Gemma4ForCausalLM (dense) | 60/60 | 60/60 | 59/60 |
-  | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 59/60 |
+  | `gemma4`   | Gemma4ForCausalLM (dense) | 60/60 | 60/60 | 58/60 |
+  | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 56/60 |
   | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
   | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
   | `minimax`  | MiniMaxM2ForCausalLM     | 60/60 | 60/60 | 60/60 |
@@ -107,8 +108,8 @@ archs fall back to naive recompute for generation, which is correct but slower.)
 ## Running a big model on a Mac (M3 / M4, unified memory)
 
 The build is pure-CPU and cross-platform — **`cargo build --release` compiles on stable Rust everywhere** (Apple
-Silicon, Intel macOS, Linux); the int8 dot is a portable scalar kernel by default (the AVX-512 VNNI kernel is opt-in,
-x86 + nightly only, and not needed on a Mac). On a 24 GB M-series the lever is **int8 weights + expert offload**:
+Silicon, Intel macOS, Linux); on Apple Silicon the int8 dot uses the NEON `sdot` instruction automatically (scalar
+fallback elsewhere), no flags needed. On a 24 GB M-series the lever is **int8 weights + expert offload**:
 
 ```bash
 cargo build --release                                   # builds on macOS ARM as-is
@@ -127,10 +128,12 @@ archs run on CPU).
 
 ## Performance (16-core box)
 
-- **Generation** (single-stream, KV-cache): GPT-2 ~25 tok/s, Qwen2.5-0.5B ~9 tok/s, Gemma-2-2b int8+VNNI ~3 fwd/s.
+- **Generation** (single-stream, KV-cache): GPT-2 ~25 tok/s, Qwen2.5-0.5B ~9 tok/s.
 - **KV-cache** turns O(n²) recompute into O(n): GPT-2 64→128 tokens is 4.8× over naive.
-- **int8 + AVX-512 VNNI** (Gemma, opt-in `--features vnni`, x86 + nightly): 0.8 → 3.0 fwd/s (3.75×) over the scalar
-  int8 dot; **outlier-aware** activation quant keeps it lossless on the sample (100%).
+- **int8 dot**: NEON `sdot` (s8×s8) on aarch64, scalar fallback elsewhere; **outlier-aware** activation quant keeps it
+  lossless on the sample (100%). On a Mac, prefer `--dtype f16` for the fastest first-token latency on dense models —
+  f16 goes through the blocked SIMD GEMM, whereas int8 trades a little speed for a smaller resident set (its win is on
+  big / memory-bound MoE models, where the matmul isn't the bottleneck).
 - Scoring fans out over positions with rayon; the per-token matmul + unembed are parallel too.
 
 **Tier C note:** `--route-frac` reduces the MLP FLOP *budget* and measures the accuracy-vs-budget curve (GPT-2 keeps 94%
@@ -156,13 +159,17 @@ fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     #
 #   --arch  gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
 #   --dtype int8 (default) | f16 | f32       --hf-token <t> (gated)      -o <stem> (override the default location)
 
-# 2. CHAT — interactive REPL (text in/out)
+# 2. CHAT — interactive REPL (text in/out). Bare `--bundle <name>` defaults to chat. `/help` lists slash commands
+#    (/exit, /reset, /explain [on|off]). `--explain` starts with per-reply explanations on (the circuits + features
+#    behind each reply); toggle them live with `/explain`.
 fieldrun --bundle Qwen2.5-7B-Instruct --chat               # bare name resolves under bundles/
+fieldrun --bundle Qwen2.5-7B-Instruct --chat --explain     # + show why each reply was produced
 
 # 3. SERVE — OpenAI- & Anthropic-compatible HTTP API
 fieldrun --bundle Qwen2.5-7B-Instruct --serve 8731
 #   curl -s localhost:8731/v1/chat/completions -d '{"messages":[{"role":"user","content":"Capital of France?"}]}'
 #   curl -s localhost:8731/v1/messages         -d '{"max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}'
+#   add "stream":true for SSE; add "explain":true to attach the structured explanation (fieldrun_explanation field)
 #   native token-id API too:  /predict {"ids":[…]}  ·  /generate {"prompt":[…],"n":N}  ·  /explain  ·  /health
 
 # 4. SCORE / GENERATE / EXPLAIN against a held-out token-id stream ({"holdout_ids":[…]} from the model's tokenizer)
@@ -172,6 +179,13 @@ fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --ctx 64 --generate 128
 
 A bare `fieldrun` (or `--help`) prints the full flag list. The default build includes HF pull (`hub`) and the
 OpenAI/Anthropic API + `--chat` (`api`); build `--no-default-features` for a lean, offline, token-id-only binary.
+
+## Background / further reading
+
+fieldrun is the distribution form of an ongoing interpretability research program — decompiling an LLM into a flat
+retrieval store plus a small composition kernel, and asking what the irreducible "thinking" part costs. The write-up:
+**[A Field Guide to Attention](https://jascal.github.io/lm-sae/)**. (Not required to use fieldrun — it's here if you
+want the why behind the tiers and the `explain` output.)
 
 ## License
 
