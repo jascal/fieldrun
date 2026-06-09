@@ -122,11 +122,163 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
     eprintln!("[fieldrun] serving {arch} on http://0.0.0.0:{port}  (POST /predict /generate /explain · GET /health{openai})");
     for mut req in server.incoming_requests() {
         let url = req.url().to_string();
+        let route = url.split('?').next().unwrap_or(&url).to_string();
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);
+        // SSE streaming for the text endpoints when the client asks for `"stream": true`.
+        #[cfg(feature = "api")]
+        if let Some(tg) = textgen.as_ref() {
+            let streamable = matches!(route.as_str(), "/v1/chat/completions" | "/v1/completions" | "/v1/messages");
+            if streamable && wants_stream(&body) {
+                serve_stream(req, &route, &body, lm.as_ref(), arch, tg);
+                continue;
+            }
+        }
         let json = handle(&url, &body, lm.as_ref(), arch, textgen.as_ref());
         let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
         let _ = req.respond(tiny_http::Response::from_string(json).with_header(header));
+    }
+}
+
+#[cfg(feature = "api")]
+fn wants_stream(body: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct S {
+        #[serde(default)]
+        stream: bool,
+    }
+    serde_json::from_str::<S>(body).map(|s| s.stream).unwrap_or(false)
+}
+
+/// A `Read` that drains SSE chunks from a channel (fed by the generation thread) — tiny_http reads it lazily and
+/// writes each chunk to the socket (chunked transfer), so tokens stream to the client as they're produced.
+#[cfg(feature = "api")]
+struct SseReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+#[cfg(feature = "api")]
+impl std::io::Read for SseReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                    if self.buf.is_empty() {
+                        return Ok(0);
+                    }
+                }
+                Err(_) => return Ok(0), // generation done, channel closed -> EOF
+            }
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Stream a chat/completion as Server-Sent Events. Generation runs on a scoped thread (borrowing the model — `Model:
+/// Sync` makes `&dyn Model` Send) and pushes SSE frames into a channel that the response reader drains.
+#[cfg(feature = "api")]
+fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen) {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        #[serde(default)]
+        messages: Vec<Msg>,
+        #[serde(default)]
+        prompt: String,
+        #[serde(default)]
+        system: String,
+        #[serde(default)]
+        max_tokens: Option<usize>,
+    }
+    let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None });
+    let max_tokens = r.max_tokens.unwrap_or(256).clamp(1, 4096);
+    let (prompt, add_special) = if route == "/v1/completions" {
+        (r.prompt.clone(), true)
+    } else {
+        let mut system = if r.system.is_empty() { None } else { Some(r.system.clone()) };
+        let mut history: Vec<(String, String)> = Vec::new();
+        let mut last_user = String::new();
+        for (i, m) in r.messages.iter().enumerate() {
+            if m.role == "system" {
+                system = Some(m.content.clone());
+            } else if i == r.messages.len() - 1 && m.role == "user" {
+                last_user = m.content.clone();
+            } else {
+                history.push((m.role.clone(), m.content.clone()));
+            }
+        }
+        (tg.chat_prompt(system.as_deref(), &history, &last_user), false)
+    };
+    let route = route.to_string();
+    let arch = arch.to_string();
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        s.spawn(move || {
+            let id = now();
+            let open = sse_open(&route, &arch, id);
+            if !open.is_empty() {
+                let _ = tx.send(open); // OpenAI has no preamble; never send an empty chunk (the reader treats it as EOF)
+            }
+            let mut on_text = |chunk: &str| {
+                let _ = tx.send(sse_delta(&route, &arch, id, chunk));
+            };
+            tg.gen(lm, &prompt, max_tokens, add_special, &mut on_text);
+            let _ = tx.send(sse_close(&route, &arch, id));
+            // tx dropped here -> channel closes -> reader EOFs
+        });
+        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).unwrap();
+        let resp = tiny_http::Response::new(200.into(), vec![header], SseReader { rx, buf: Vec::new(), pos: 0 }, None, None);
+        let _ = req.respond(resp);
+    });
+}
+
+#[cfg(feature = "api")]
+fn sse_open(route: &str, arch: &str, id: u64) -> Vec<u8> {
+    if route == "/v1/messages" {
+        // Anthropic: message_start + content_block_start
+        let start = serde_json::json!({"type":"message_start","message":{"id":format!("msg_{id}"),"type":"message",
+            "role":"assistant","model":arch,"content":[],"stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0}}});
+        let cbs = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
+        format!("event: message_start\ndata: {start}\n\nevent: content_block_start\ndata: {cbs}\n\n").into_bytes()
+    } else {
+        Vec::new() // OpenAI has no preamble event
+    }
+}
+
+#[cfg(feature = "api")]
+fn sse_delta(route: &str, arch: &str, id: u64, text: &str) -> Vec<u8> {
+    let j = match route {
+        "/v1/messages" => serde_json::json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":text}}),
+        "/v1/completions" => serde_json::json!({"id":format!("cmpl-{id}"),"object":"text_completion","model":arch,
+            "choices":[{"text":text,"index":0,"finish_reason":serde_json::Value::Null}]}),
+        _ => serde_json::json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","model":arch,
+            "choices":[{"index":0,"delta":{"content":text},"finish_reason":serde_json::Value::Null}]}),
+    };
+    if route == "/v1/messages" {
+        format!("event: content_block_delta\ndata: {j}\n\n").into_bytes()
+    } else {
+        format!("data: {j}\n\n").into_bytes()
+    }
+}
+
+#[cfg(feature = "api")]
+fn sse_close(route: &str, arch: &str, id: u64) -> Vec<u8> {
+    if route == "/v1/messages" {
+        let md = serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}});
+        format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                 event: message_delta\ndata: {md}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n").into_bytes()
+    } else {
+        let fin = serde_json::json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","model":arch,
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        format!("data: {fin}\n\ndata: [DONE]\n\n").into_bytes()
     }
 }
 
