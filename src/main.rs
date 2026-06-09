@@ -6,6 +6,10 @@
 //! Tier C (router), `explain`, and the API land on top. The whole point: one static binary, flat-file knowledge,
 //! no framework.
 
+// Some items are used only under `--features gpu` (`arr2`/`arr2o`/`f32_array`, `device` fields) or kept as
+// bundle-format / config surface; allow dead_code so the default stable build is warning-free on every platform.
+#![allow(dead_code)]
+
 mod api;
 mod bundle;
 mod composition;

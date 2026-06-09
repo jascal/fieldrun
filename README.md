@@ -26,9 +26,10 @@ is the optimization pass: on-GPU attention, persistent buffers, tiled/fp16 matmu
 build stays pure-CPU with no GPU dependency.
 
 Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
-stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB), and an **AVX-512 VNNI** int8
-matmul with **outlier-aware** activation quant (on-core int8 dot, runtime-detected + scalar fallback; GPT-2 int8 = fp32
-accuracy, 99% per-position).
+stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
+activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The default int8 dot is a portable scalar kernel
+(stable Rust, all platforms); an **AVX-512 VNNI** kernel is available opt-in (`--features vnni`, x86-64 + nightly) and
+is bit-exact to it.
 
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.
@@ -102,8 +103,9 @@ archs fall back to naive recompute for generation, which is correct but slower.)
 
 ## Running a big model on a Mac (M3 / M4, unified memory)
 
-The build is pure-CPU and cross-platform (the AVX-512 int8 path is x86-gated and falls back to a portable scalar dot on
-ARM; no code change needed). On a 24 GB M-series the lever is **int8 weights + expert offload**:
+The build is pure-CPU and cross-platform — **`cargo build --release` compiles on stable Rust everywhere** (Apple
+Silicon, Intel macOS, Linux); the int8 dot is a portable scalar kernel by default (the AVX-512 VNNI kernel is opt-in,
+x86 + nightly only, and not needed on a Mac). On a 24 GB M-series the lever is **int8 weights + expert offload**:
 
 ```bash
 cargo build --release                                   # builds on macOS ARM as-is
@@ -124,8 +126,8 @@ archs run on CPU).
 
 - **Generation** (single-stream, KV-cache): GPT-2 ~25 tok/s, Qwen2.5-0.5B ~9 tok/s, Gemma-2-2b int8+VNNI ~3 fwd/s.
 - **KV-cache** turns O(n²) recompute into O(n): GPT-2 64→128 tokens is 4.8× over naive.
-- **int8 + AVX-512 VNNI** (Gemma): 0.8 → 3.0 fwd/s (3.75×); **outlier-aware** activation quant keeps it lossless on
-  the sample (100%).
+- **int8 + AVX-512 VNNI** (Gemma, opt-in `--features vnni`, x86 + nightly): 0.8 → 3.0 fwd/s (3.75×) over the scalar
+  int8 dot; **outlier-aware** activation quant keeps it lossless on the sample (100%).
 - Scoring fans out over positions with rayon; the per-token matmul + unembed are parallel too.
 
 **Tier C note:** `--route-frac` reduces the MLP FLOP *budget* and measures the accuracy-vs-budget curve (GPT-2 keeps 94%

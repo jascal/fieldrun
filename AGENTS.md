@@ -23,7 +23,9 @@ diverges without explaining why.
 ## Layout
 
 - `src/retrieval.rs` — Tier A: `Store` ports `lm.py` (induction + n-gram backoff + grammar).
-- `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + VNNI int8 W8A8 with
+- `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + scalar int8 W8A8 by
+  default; opt-in AVX-512 VNNI int8 under `--features vnni` = x86 + nightly, bit-exact to scalar — gated so the default
+  build is stable-Rust on every platform) with
   outlier-aware activation quant), `mm_routed_down` (Tier C), and the row-wise embed helpers.
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
   (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
@@ -57,8 +59,9 @@ diverges without explaining why.
 
 Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
-greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 via VNNI W8A8
-+ outlier-aware quant), **MoE expert-offload** (experts mmap'd, paged per token, never resident), Tier C
+greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 W8A8 +
+outlier-aware quant; scalar int8 dot by default, opt-in AVX-512 VNNI via `--features vnni`), **MoE expert-offload**
+(experts mmap'd, paged per token, never resident), Tier C
 (`--route-frac`), `explain` (GPT-2/RoPE/Gemma-2/Gemma-3), the HTTP API, and a **pure-Rust `convert`** (no torch).
 Gemma-3 / Gemma-4 dense / Gemma-4 MoE are each validated f32 60/60 (f16/int8 ≥59/60) vs a tiny
 `Gemma3ForCausalLM`/`Gemma4ForCausalLM` (`scripts/gemma3_ref.py build {gemma3,gemma4,gemma4moe}`).

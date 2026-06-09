@@ -223,7 +223,7 @@ impl Bundle {
     }
 
     // Zero-copy f32 views — for f32 bundles (GPT-2 / RoPE). Panics on an f16 array (use arr2o/arr1o).
-    pub fn arr2(&self, name: &str) -> ArrayView2<f32> {
+    pub fn arr2(&self, name: &str) -> ArrayView2<'_, f32> {
         let (shape, arr) = self.get(name);
         match arr {
             Arr::F32(v) => ArrayView2::from_shape((shape[0], shape[1]), v).unwrap(),
