@@ -75,9 +75,41 @@ fn numbered_prefix(s: &str) -> Option<usize> {
     }
 }
 
-/// Inline formatting: transliterate LaTeX first, then apply the Markdown spans.
+/// Inline formatting. LaTeX is transliterated ONLY inside math delimiters (`\(…\)`, `\[…\]`, `$…$`); everything else is
+/// plain text with Markdown spans. So an underscore/caret in ordinary text or an identifier (e.g. `<|im_end|>`, a file
+/// name, `my_var`) is left alone — not turned into a sub/superscript.
 pub fn inline(s: &str) -> String {
-    spans(&latex(s))
+    let mut out = String::new();
+    let mut text = String::new(); // pending non-math text
+    let mut rest = s;
+    'scan: while !rest.is_empty() {
+        for (op, cl) in [("\\(", "\\)"), ("\\[", "\\]"), ("$$", "$$")] {
+            if let Some(after) = rest.strip_prefix(op) {
+                if let Some(end) = after.find(cl) {
+                    out.push_str(&spans(&text));
+                    text.clear();
+                    out.push_str(&latex(&after[..end])); // math content
+                    rest = &after[end + cl.len()..];
+                    continue 'scan;
+                }
+            }
+        }
+        // single `$…$` — only when a closing `$` exists (so a lone `$5` stays literal, not math)
+        if let Some(after) = rest.strip_prefix('$') {
+            if let Some(end) = after.find('$') {
+                out.push_str(&spans(&text));
+                text.clear();
+                out.push_str(&latex(&after[..end]));
+                rest = &after[end + 1..];
+                continue 'scan;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        text.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out.push_str(&spans(&text));
+    out
 }
 
 /// Markdown inline spans: `code`, **bold**/__bold__, *italic*, ~~strike~~. Unmatched delimiters are left literal.
@@ -332,6 +364,18 @@ mod tests {
         assert_eq!(plain(&inline("a **bold** b")), "a bold b");
         assert_eq!(plain(&inline("an *em* word")), "an em word");
         assert_eq!(plain(&inline("call `f(x)` now")), "call f(x) now");
+    }
+
+    #[test]
+    fn inline_only_latexes_math() {
+        // plain text / identifiers with _ or ^ are left ALONE (the <|im_end| → imₑnd bug)
+        assert_eq!(plain(&inline("<|im_end|>")), "<|im_end|>");
+        assert_eq!(plain(&inline("set my_var^2 = foo_bar")), "set my_var^2 = foo_bar");
+        // but real math inside delimiters IS transliterated
+        assert_eq!(plain(&inline("value \\(x^2\\) and \\(\\theta\\)")), "value x² and θ");
+        assert!(plain(&inline("inline $a_i$ here")).contains("aᵢ"));
+        // markdown spans still apply around math
+        assert!(inline("**bold** then \\(x^2\\)").contains(BOLD));
     }
 
     #[test]
