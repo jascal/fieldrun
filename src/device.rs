@@ -1,9 +1,9 @@
-//! Device selection — pick CPU or a GPU (wgpu) backend by preference + a memory budget, with CPU fallback.
+//! Device selection + the startup "does this model fit?" line.
 //!
-//! The CPU path is the default and the faithful reference (the "minimum to run on a CPU" thesis); the GPU is an opt-in
-//! accelerator for usable generation speed, built with `--features gpu`. On unified-memory machines (Apple silicon) the
-//! GPU shares the one RAM pool, so the budget is against total memory, not a separate VRAM copy. The budget caps us to
-//! consumer hardware (default 24 GB): GPU is chosen only when an adapter exists AND the model fits the budget, else CPU.
+//! Generation runs on the **CPU** kernels — that's the faithful reference, and the GPU (opt-in `--features gpu`) is
+//! currently used only by `--gpu-check`, not by chat/serve/generate. So the constraint that actually matters is
+//! **system RAM**: the CPU loads the weight bundle into RAM. We detect total RAM and report `model MB / RAM MB`, with
+//! a warning when the model is too big to fit comfortably (→ it will swap). `--max-vram <GB>` overrides the budget.
 
 pub struct Choice {
     pub use_gpu: bool,
@@ -14,34 +14,58 @@ fn mb(b: u64) -> u64 {
     b / 1_000_000
 }
 
-/// Select the compute device. `pref` ∈ {cpu, gpu, auto}; `model_bytes` = resident weight size; `budget_bytes` = the
-/// consumer VRAM/unified-memory cap.
-pub fn select(pref: &str, model_bytes: u64, budget_bytes: u64) -> Choice {
-    let cpu = |why: String| Choice { use_gpu: false, detail: why };
+/// Total system RAM in bytes — the real "does it fit?" budget (the CPU loads the weights into RAM). None if unknown.
+pub fn total_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
+                    return Some(kb * 1024);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+        if let Ok(b) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+            return Some(b);
+        }
+    }
+    None
+}
+
+/// The startup device/fit line. Generation runs on the CPU regardless; `ram_bytes` is the fit budget (detected RAM or
+/// the `--max-vram` override, 0 = unknown). Warns when the model won't fit comfortably (it'll swap).
+pub fn select(pref: &str, model_bytes: u64, ram_bytes: u64) -> Choice {
+    let fit = if ram_bytes > 0 {
+        format!("model {} MB / {} MB RAM", mb(model_bytes), mb(ram_bytes))
+    } else {
+        format!("model {} MB", mb(model_bytes))
+    };
+    // leave ~2 GB headroom for the OS + activations/KV cache; over that, the weights won't fit in RAM → swapping.
+    let warn = if ram_bytes > 0 && model_bytes + 2_000_000_000 > ram_bytes {
+        "  ⚠ exceeds free RAM — expect heavy swapping; use a smaller model or --dtype int8"
+    } else {
+        ""
+    };
+    let cpu = |detail: String| Choice { use_gpu: false, detail };
     match pref {
-        "cpu" => cpu("CPU (requested)".into()),
+        "cpu" => cpu(format!("CPU (requested) · {fit}{warn}")),
         "gpu" | "auto" => {
             #[cfg(feature = "gpu")]
             {
-                match gpu_probe() {
-                    Some(name) if model_bytes <= budget_bytes => Choice {
-                        use_gpu: true,
-                        detail: format!("GPU [{name}] — model {} MB fits {} MB budget", mb(model_bytes), mb(budget_bytes)),
-                    },
-                    Some(name) => cpu(format!(
-                        "CPU fallback — model {} MB exceeds {} MB budget on GPU [{name}]",
-                        mb(model_bytes), mb(budget_bytes)
-                    )),
-                    None => cpu("CPU — no GPU adapter found".into()),
-                }
+                let g = gpu_probe()
+                    .map(|n| format!(" · GPU [{n}] present (used only by --gpu-check; generation runs on CPU)"))
+                    .unwrap_or_default();
+                cpu(format!("CPU · {fit}{warn}{g}"))
             }
             #[cfg(not(feature = "gpu"))]
             {
-                let _ = (model_bytes, budget_bytes);
-                cpu("CPU (built without the gpu feature — rebuild with `--features gpu` for a GPU)".into())
+                cpu(format!("CPU · {fit}{warn}"))
             }
         }
-        other => cpu(format!("CPU (unknown --device {other:?}; use cpu|gpu|auto)")),
+        other => cpu(format!("CPU (unknown --device {other:?}; use cpu|gpu) · {fit}")),
     }
 }
 

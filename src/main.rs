@@ -209,8 +209,14 @@ fn main() {
         // device selection (CPU default + reference; GPU opt-in via --features gpu). Matmul dispatch lands next; this
         // reports the choice + budget/fallback so the plumbing is in place.
         let model_bytes = std::fs::metadata(format!("{stem}.fieldrun.bin")).map(|m| m.len()).unwrap_or(0);
-        let budget_gb: u64 = flag(&args, "--max-vram").and_then(|s| s.parse().ok()).unwrap_or(24);
-        let dev = device::select(flag(&args, "--device").unwrap_or("auto"), model_bytes, budget_gb * 1_000_000_000);
+        // fit budget = detected system RAM (the real constraint — the CPU loads the weights into RAM), overridable
+        // with --max-vram <GB>; 0 if both are unavailable (then the line just shows the model size, no RAM number).
+        let ram_bytes = flag(&args, "--max-vram")
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|gb| gb * 1_000_000_000)
+            .or_else(device::total_ram_bytes)
+            .unwrap_or(0);
+        let dev = device::select(flag(&args, "--device").unwrap_or("auto"), model_bytes, ram_bytes);
         eprintln!("[fieldrun] device: {}", dev.detail);
         // --gpu-check: validate the GPU-resident GPT-2 forward against the CPU forward (top-1 agreement + GPU tok/s).
         #[cfg(feature = "gpu")]
@@ -525,7 +531,7 @@ RUN\n\
   \x20               in chat: per-reply explanations (toggle /explain on|off)\n\
   --serve <PORT>  start the HTTP API (--server also works)   --dump <f>      write predictions, one id per line\n\
   --raw           chat: stream raw text, no Markdown render   --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
-  --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
+  --device cpu|gpu|auto   --max-vram <GB>  override the RAM-fit budget (default: detected system RAM)   GPU: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );
 }
