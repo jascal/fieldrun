@@ -185,6 +185,21 @@ fn main() {
     // Tier B (composition) — the real forward pass from a fieldrun bundle; positions scored in parallel.
     if let Some(raw) = flag(&args, "--bundle") {
         let stem = resolve_bundle(raw); // bare name -> bundles/<name>/<name> if that's where convert put it
+        // Clear "not found" up front (before device/spinner/a raw OS error): --bundle runs a LOCAL bundle and does not
+        // pull from HF, so a missing name almost always means "you haven't converted it yet".
+        if !std::path::Path::new(&format!("{stem}.fieldrun.json")).exists() {
+            eprintln!("[fieldrun] bundle {raw:?} not found — no {stem}.fieldrun.json (looked for an explicit stem, then \
+                       under the cache {}).", bundles_dir());
+            let avail = available_bundles();
+            if avail.is_empty() {
+                eprintln!("[fieldrun] no bundles in the cache yet.");
+            } else {
+                eprintln!("[fieldrun] cached bundles: {}", avail.join(", "));
+            }
+            eprintln!("[fieldrun] --bundle runs a LOCAL bundle; it does NOT download from Hugging Face. To fetch + build:\n  \
+                       fieldrun convert --model <hf-repo-id | local-dir> --arch <arch>   then  --bundle {raw}");
+            std::process::exit(1);
+        }
         // device selection (CPU default + reference; GPU opt-in via --features gpu). Matmul dispatch lands next; this
         // reports the choice + budget/fallback so the plumbing is in place.
         let model_bytes = std::fs::metadata(format!("{stem}.fieldrun.bin")).map(|m| m.len()).unwrap_or(0);
@@ -426,6 +441,25 @@ fn bundles_dir() -> String {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     format!("{home}/.cache/fieldrun/bundles")
+}
+
+/// Bundle names present in the cache (`<dir>/<name>/<name>.fieldrun.json`) — for the "not found" hint.
+fn available_bundles() -> Vec<String> {
+    let mut out = Vec::new();
+    for root in [bundles_dir(), "bundles".to_string()] {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for e in rd.flatten() {
+                if let Some(name) = e.file_name().to_str().map(String::from) {
+                    if std::path::Path::new(&format!("{root}/{name}/{name}.fieldrun.json")).exists() {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Resolve a `--bundle` argument to a stem: an explicit `<raw>.fieldrun.json` if present, else the organized location
