@@ -8,6 +8,7 @@
 
 mod bundle;
 mod composition;
+mod gemma;
 mod model;
 mod retrieval;
 mod rope;
@@ -18,6 +19,7 @@ use rayon::prelude::*;
 
 use bundle::Bundle;
 use composition::Gpt2;
+use gemma::Gemma;
 use model::Model;
 use retrieval::Store;
 use rope::Rope;
@@ -52,7 +54,8 @@ fn main() {
         let lm: Box<dyn Model> = match arch.as_str() {
             "gpt2" => Box::new(Gpt2::new(bundle)),
             "rope" => Box::new(Rope::new(bundle)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope)"),
+            "gemma" => Box::new(Gemma::new(bundle)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
         let t0 = std::time::Instant::now();
         let preds: Vec<i64> = (ctx_window..end).into_par_iter().map(|i| lm.predict(ctx(i))).collect();
