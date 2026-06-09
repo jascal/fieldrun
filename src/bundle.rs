@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
+use rayon::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -116,24 +117,32 @@ impl Bundle {
         match arr {
             Arr::F32(v) => a.dot(&ArrayView2::from_shape((k, n), v).unwrap()),
             Arr::F16(v) => {
-                // Upcast W one column-block at a time into a reused f32 buffer, then SIMD-dot the block (ndarray).
-                // Keeps ndarray's vectorised matmul while bounding the upcast allocation to one block, not the whole
-                // weight — a fresh full upcast per matmul was ~GBs of alloc/write per forward.
-                let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                // Upcast W one column-block at a time into a local f32 buffer, then SIMD-dot the block (ndarray) —
+                // keeps the vectorised matmul while bounding upcast allocation to one block. Blocks are independent
+                // (disjoint output columns), so they run in parallel; under the scoring loop's outer rayon this just
+                // work-steals, but in single-stream generation it gives the per-forward matmul all the cores.
                 let block = 512.min(n);
-                let mut buf = vec![0f32; k * block];
-                let mut c0 = 0;
-                while c0 < n {
-                    let bw = block.min(n - c0);
-                    for kk in 0..k {
-                        let wrow = &v[kk * n + c0..kk * n + c0 + bw];
-                        for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
-                            *b = w.to_f32();
+                let nblocks = n.div_ceil(block);
+                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
+                    .into_par_iter()
+                    .map(|bi| {
+                        let c0 = bi * block;
+                        let bw = block.min(n - c0);
+                        let mut buf = vec![0f32; k * bw];
+                        for kk in 0..k {
+                            let wrow = &v[kk * n + c0..kk * n + c0 + bw];
+                            for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
+                                *b = w.to_f32();
+                            }
                         }
-                    }
-                    let wblock = ArrayView2::from_shape((k, bw), &buf[..k * bw]).unwrap();
-                    out.slice_mut(s![.., c0..c0 + bw]).assign(&a.dot(&wblock));
-                    c0 += bw;
+                        let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
+                        (c0, a.dot(&wblock))
+                    })
+                    .collect();
+                let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                for (c0, ob) in blocks.drain(..) {
+                    let bw = ob.ncols();
+                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
                 }
                 out
             }
@@ -173,7 +182,9 @@ impl Bundle {
     pub fn rowdot_f32(&self, name: &str, x: &[f32]) -> Vec<f32> {
         let (shape, arr) = self.get(name);
         let (rows, d) = (shape[0], shape[1]);
+        // The tied unembed over a 256k vocab is ~the biggest per-token cost; rows are independent → fan out over cores.
         (0..rows)
+            .into_par_iter()
             .map(|r| {
                 let base = r * d;
                 match arr {
