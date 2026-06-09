@@ -115,7 +115,14 @@ impl TextGen {
 pub struct TextGen;
 
 pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>) {
-    let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind port");
+    let server = match tiny_http::Server::http(("0.0.0.0", port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[fieldrun] couldn't bind port {port}: {e} (already in use, or privileged <1024?). \
+                       Try a different --serve PORT.");
+            std::process::exit(1);
+        }
+    };
     let openai = if cfg!(feature = "api") && textgen.is_some() {
         " · OpenAI /v1/chat/completions /v1/completions · Anthropic /v1/messages"
     } else {

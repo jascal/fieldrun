@@ -155,6 +155,37 @@ fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
 
 pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
+    // Pre-flight: catch the common "wrong --arch for this model" mistake with a clear message instead of a deep
+    // missing-config-key panic. Map the HF config's model_type to the fieldrun arch family and only error on a
+    // CONFIDENT mismatch (model_type recognized AND it maps to a different arch) — novel/unknown models pass through.
+    let model_type = cfg["model_type"].as_str().unwrap_or("");
+    if !model_type.is_empty() {
+        // HF model_type → fieldrun arch. Match by longest token that prefixes the model_type, so e.g. "gemma3_text"
+        // resolves to `gemma3` (not `gemma`) and "deepseek_v3" to `mla`. Longest-prefix-wins disambiguates the families.
+        let table: &[(&str, &[&str])] = &[
+            ("gpt2", &["gpt2"]),
+            ("rope", &["llama", "qwen2", "mistral", "phi"]),
+            ("gemma", &["gemma", "gemma2"]),
+            ("gemma3", &["gemma3"]),
+            ("gemma4", &["gemma4"]),
+            ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
+            ("mla", &["deepseek", "deepseek_v3", "deepseek_v4", "kimi"]),
+            ("minimax", &["minimax"]),
+        ];
+        let best = table
+            .iter()
+            .filter_map(|(a, toks)| {
+                toks.iter().filter(|t| model_type.starts_with(**t)).map(|t| t.len()).max().map(|l| (*a, l))
+            })
+            .max_by_key(|&(_, l)| l)
+            .map(|(a, _)| a);
+        if let Some(right) = best {
+            if right != arch {
+                panic!("convert: this checkpoint is model_type={model_type:?}, which fieldrun maps to --arch {right}, \
+                        but you passed --arch {arch}. Re-run with `--arch {right}`.");
+            }
+        }
+    }
     let m = Model::open(model_dir);
     let shards = m.mmaps.len();
     // the bundle stem may live in a subdirectory (the default groups bundles under bundles/<name>/) — create it.

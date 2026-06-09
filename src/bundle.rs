@@ -89,7 +89,10 @@ impl Bundle {
     pub fn load(stem: &str) -> std::io::Result<Bundle> {
         let h: Header = serde_json::from_str(&std::fs::read_to_string(format!("{stem}.fieldrun.json"))?)?;
         if h.format != FORMAT || h.version != VERSION {
-            panic!("unsupported bundle: {} v{} (this fieldrun reads {FORMAT} v{VERSION})", h.format, h.version);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported bundle: {} v{} (this fieldrun reads {FORMAT} v{VERSION})", h.format, h.version),
+            ));
         }
         // mmap the blob (not read-into-RAM): dense arrays parse out of it once at load; MoE expert weights stay mapped
         // and page in on demand. For a non-MoE model this reads only the dense pages — same resident footprint as before.

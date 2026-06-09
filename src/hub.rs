@@ -85,14 +85,14 @@ fn download(url: &str, dest: &Path, token: &Option<String>, name: &str) -> Resul
 /// Fetch `repo_id`'s config + safetensors to a local cache dir and return that dir (what `convert` opens). Sharded
 /// models pull every shard listed in the index; single-file models pull `model.safetensors`. `revision` defaults to
 /// `main`. Files already present are reused (a simple cache).
-pub fn fetch(repo_id: &str, token: Option<String>) -> String {
+pub fn fetch(repo_id: &str, token: Option<String>) -> Result<String, String> {
     let (repo, revision) = match repo_id.split_once('@') {
         Some((r, rev)) => (r, rev),
         None => (repo_id, "main"),
     };
     let base = format!("https://huggingface.co/{repo}/resolve/{revision}");
     let dir = cache_root().join(repo.replace('/', "--")).join(revision);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("[hub] mkdir {}: {e}", dir.display()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("[hub] mkdir {}: {e}", dir.display()))?;
 
     let get = |file: &str| -> Result<(), String> {
         let dest = dir.join(file);
@@ -106,27 +106,29 @@ pub fn fetch(repo_id: &str, token: Option<String>) -> String {
         download(&format!("{base}/{file}"), &dest, &token, file)
     };
 
-    get("config.json").unwrap_or_else(|e| panic!("[hub] {repo}: {e}"));
+    get("config.json").map_err(|e| format!("[hub] {repo}: {e}"))?;
     let _ = get("tokenizer.json"); // best-effort — needed for the OpenAI/Anthropic text API + --chat; absent on some repos
     // sharded if there's an index; else a single safetensors
     match get("model.safetensors.index.json") {
         Ok(()) => {
+            let txt = std::fs::read_to_string(dir.join("model.safetensors.index.json"))
+                .map_err(|e| format!("[hub] {repo}: read index.json: {e}"))?;
             let idx: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap()).unwrap();
-            let wm = idx["weight_map"].as_object().expect("[hub] weight_map in index.json");
+                serde_json::from_str(&txt).map_err(|e| format!("[hub] {repo}: parse index.json: {e}"))?;
+            let wm = idx["weight_map"].as_object().ok_or("[hub] no weight_map in index.json")?;
             let mut files: Vec<String> = wm.values().filter_map(|f| f.as_str().map(String::from)).collect();
             files.sort();
             files.dedup();
             eprintln!("[hub] {repo} ({revision}): {} shard(s)", files.len());
             for f in &files {
-                get(f).unwrap_or_else(|e| panic!("[hub] {repo}: {e}"));
+                get(f).map_err(|e| format!("[hub] {repo}: {e}"))?;
             }
         }
         Err(_) => {
             eprintln!("[hub] {repo} ({revision}): single safetensors");
-            get("model.safetensors").unwrap_or_else(|e| panic!(
-                "[hub] {repo}: no model.safetensors.index.json or model.safetensors (only safetensors checkpoints are supported): {e}"));
+            get("model.safetensors").map_err(|e| format!(
+                "[hub] {repo}: no model.safetensors.index.json or model.safetensors (only safetensors checkpoints are supported): {e}"))?;
         }
     }
-    dir.to_string_lossy().into_owned()
+    Ok(dir.to_string_lossy().into_owned())
 }

@@ -66,6 +66,21 @@ fn has_flag(args: &[String], name: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // User-facing CLI: turn any panic (bad bundle, malformed checkpoint, wrong --arch for the model, …) into a clean
+    // one-line error rather than a Rust backtrace. RUST_BACKTRACE restores the full default for debugging.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unexpected error".to_string());
+            eprintln!("[fieldrun] error: {msg}");
+            eprintln!("[fieldrun] (set RUST_BACKTRACE=1 for a full trace, or run `fieldrun --help`)");
+        }));
+    }
+
     // help: explicit --help/-h, or a bare invocation (the dev-only default store/ids paths would just panic otherwise).
     if args.len() == 1 || has_flag(&args, "--help") || has_flag(&args, "-h") {
         print_help();
@@ -75,10 +90,33 @@ fn main() {
     // `fieldrun convert --model <dir-or-hf-repo-id> --arch rope --dtype int8 -o <stem>` — HF safetensors -> bundle, no torch.
     // `--model` is a local checkpoint dir, OR (with the default `hub` feature) a Hugging Face repo id like `org/name`,
     // which is downloaded to the HF cache first. Token (gated models): `--hf-token` > $HF_TOKEN > `huggingface-cli login`.
-    if args.get(1).map(String::as_str) == Some("convert") {
-        let model = flag(&args, "--model").expect("--model <local-dir | hf-repo-id>");
+    // Accept `--convert` as well as `convert` — `--convert` is a natural typo given every other arg is a `--flag`, and
+    // silently falling through to Tier A (as a bare run does) would be baffling.
+    if matches!(args.get(1).map(String::as_str), Some("convert") | Some("--convert")) {
+        // --model is required; without it, print convert usage and exit cleanly (not a panic/backtrace).
+        let model = match flag(&args, "--model") {
+            Some(m) => m,
+            None => {
+                eprintln!(
+                    "[fieldrun] convert: --model is required.\n  \
+                     fieldrun convert --model <local-dir | hf-repo-id> --arch <arch> [--dtype int8|f16|f32] [-o <stem>]\n  \
+                     e.g.  fieldrun convert --model Qwen/Qwen2.5-1.5B-Instruct --arch rope --dtype f16\n  \
+                     archs: gpt2 | rope | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax   (see `fieldrun --help`)"
+                );
+                std::process::exit(2);
+            }
+        };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
+        const ARCHS: &[&str] = &["gpt2", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax"];
+        if !ARCHS.contains(&arch) {
+            eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
+            std::process::exit(2);
+        }
+        if !["int8", "f16", "f32"].contains(&dtype) {
+            eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int8, f16, f32)");
+            std::process::exit(2);
+        }
         // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the
         // cwd — so converting from a dev checkout doesn't litter it. <name> = the model's last path segment minus @rev.
         let out: String = match flag(&args, "-o").or_else(|| flag(&args, "--out")) {
@@ -98,19 +136,32 @@ fn main() {
         } else {
             #[cfg(feature = "hub")]
             {
-                hub::fetch(model, hub::token(flag(&args, "--hf-token")))
+                match hub::fetch(model, hub::token(flag(&args, "--hf-token"))) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!("[fieldrun] convert: couldn't load --model {model:?} — not a local dir with \
+                                   config.json, and the Hugging Face pull failed:\n  {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             #[cfg(not(feature = "hub"))]
             {
-                panic!("--model {model:?}: not a local dir with config.json. To pull it from the Hugging Face hub by \
-                        repo id, use a build with the `hub` feature (it's on by default; you've disabled it).");
+                eprintln!("[fieldrun] convert: --model {model:?} is not a local dir with config.json. To pull it from \
+                           the Hugging Face hub by repo id, use a build with the `hub` feature (on by default; you've \
+                           disabled it).");
+                std::process::exit(2);
             }
         };
-        convert::convert(&model_dir, arch, dtype, &out).expect("convert");
+        if let Err(e) = convert::convert(&model_dir, arch, dtype, &out) {
+            eprintln!("[fieldrun] convert failed: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
-    let store_path = flag(&args, "--store").unwrap_or("../lm-sae/pylm/store_gpt2.json");
+    let store_explicit = flag(&args, "--store");
+    let store_path = store_explicit.unwrap_or("../lm-sae/pylm/store_gpt2.json");
     let ids_path = flag(&args, "--ids").unwrap_or("../lm-sae/pylm/holdout_gpt2.json");
     let ctx_window: usize = flag(&args, "--ctx").and_then(|s| s.parse().ok()).unwrap_or(64);
     let n_eval: usize = flag(&args, "--n-eval").and_then(|s| s.parse().ok()).unwrap_or(500);
@@ -187,11 +238,21 @@ fn main() {
                     i += 1;
                 }
             });
-            let b = Bundle::load(&stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+            let r = Bundle::load(&stem);
             done.store(true, Ordering::Relaxed);
             let _ = sp.join();
-            eprintln!("\r[fieldrun] loaded bundle ({} MB)                    ", model_bytes / 1_000_000);
-            b
+            match r {
+                Ok(b) => {
+                    eprintln!("\r[fieldrun] loaded bundle ({} MB)                    ", model_bytes / 1_000_000);
+                    b
+                }
+                Err(e) => {
+                    eprintln!("\r[fieldrun] couldn't load bundle {stem:?}: {e}                    ");
+                    eprintln!("[fieldrun] expected {stem}.fieldrun.json + .bin. Convert one first \
+                               (`fieldrun convert --model … --arch …`) or pass the bundle stem/name.");
+                    std::process::exit(1);
+                }
+            }
         };
         let arch = bundle.arch.clone();
         #[cfg(feature = "api")]
@@ -269,7 +330,9 @@ fn main() {
                     let dec = load_decoder(flag(&args, "--vocab"));
                     println!("{}", explain::render(&ex, &dec));
                     if let Some(p) = flag(&args, "--out-json") {
-                        std::fs::write(p, serde_json::to_string_pretty(&ex).unwrap()).expect("write json");
+                        if let Err(e) = std::fs::write(p, serde_json::to_string_pretty(&ex).unwrap()) {
+                            eprintln!("[fieldrun] couldn't write --out-json {p}: {e}");
+                        }
                     }
                 }
                 None => println!("[fieldrun] explain not implemented for arch {arch}"),
@@ -304,8 +367,30 @@ fn main() {
         return;
     }
 
+    // No --bundle, and no explicit --store: the user didn't pick a mode. DON'T silently fall through to Tier A on the
+    // dev-default store path (that's how a `--convert`/`--bundl` typo ends up printing retrieval stats — baffling).
+    // Point them at the right command; flag a likely-meant `convert` if --model is hanging around.
+    if store_explicit.is_none() {
+        if flag(&args, "--model").is_some() {
+            eprintln!("[fieldrun] saw --model but no `convert` subcommand. Did you mean:\n  \
+                       fieldrun convert --model {} --arch <arch> --dtype int8\n  \
+                       (the subcommand is `convert`, not `--convert`/a flag.)",
+                      flag(&args, "--model").unwrap());
+        } else {
+            eprintln!("[fieldrun] no mode selected. Pick one:\n  \
+                       fieldrun --bundle <stem> [--chat | --serve PORT | --ids <ids.json>]   run a model\n  \
+                       fieldrun convert --model <dir|hf-repo-id> --arch <arch>               build a bundle\n  \
+                       fieldrun --store <store.json> --ids <ids.json>                        Tier A (retrieval)\n  \
+                       fieldrun --help                                                       full flag list");
+        }
+        std::process::exit(2);
+    }
+
     // Tier A (retrieval) — induction + n-gram + grammar over the flat store; positions scored in parallel.
-    let store = Store::load(store_path).unwrap_or_else(|e| panic!("load store {store_path}: {e}"));
+    let store = Store::load(store_path).unwrap_or_else(|e| {
+        eprintln!("[fieldrun] couldn't load --store {store_path}: {e}");
+        std::process::exit(1);
+    });
     let out: Vec<(i64, String)> = (ctx_window..end).into_par_iter().map(|i| store.predict(ctx(i))).collect();
     let correct = out.iter().zip(ctx_window..end).filter(|((p, _), i)| *p == ids[*i]).count();
     let preds: Vec<i64> = out.iter().map(|(p, _)| *p).collect();
@@ -398,8 +483,10 @@ RUN\n\
 fn dump_if(args: &[String], preds: &[i64]) {
     if let Some(path) = flag(args, "--dump") {
         let out: String = preds.iter().map(|p| format!("{p}\n")).collect();
-        std::fs::write(path, out).expect("write dump");
-        eprintln!("[fieldrun] wrote {} predictions to {path}", preds.len());
+        match std::fs::write(path, out) {
+            Ok(()) => eprintln!("[fieldrun] wrote {} predictions to {path}", preds.len()),
+            Err(e) => eprintln!("[fieldrun] couldn't write --dump {path}: {e}"),
+        }
     }
 }
 
