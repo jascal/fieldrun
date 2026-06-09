@@ -5,6 +5,11 @@ edition = "2021"
 description = "Run a decompiled LLM as a single native binary — the three pylm tiers (retrieval / composition / router) in pure Rust, no framework at runtime."
 license = "Apache-2.0"
 
+[features]
+# opt-in GPU backend (wgpu: Metal on Mac, DX12 on Windows incl. ARM, Vulkan on Linux). The default build is pure-CPU,
+# no GPU dependency — the CPU path stays the faithful reference; GPU is an accelerator for usable generation speed.
+gpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -12,6 +17,8 @@ ndarray = "0.16"
 rayon = "1"   # data-parallel scoring: independent forward passes fan out across cores
 half = "2"    # f16 weights kept low-precision in RAM (the in-RAM-precision path), upcast per matmul
 tiny_http = "0.12"   # minimal blocking HTTP server for the /predict /generate /explain API
+wgpu = { version = "22", optional = true }       # cross-platform GPU backend (opt-in, --features gpu)
+pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter/device requests
 
 [[bin]]
 name = "fieldrun"

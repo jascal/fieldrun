@@ -9,6 +9,7 @@
 mod api;
 mod bundle;
 mod composition;
+mod device;
 mod explain;
 mod gemma;
 mod model;
@@ -55,6 +56,15 @@ fn main() {
 
     // Tier B (composition) — the real forward pass from a fieldrun bundle; positions scored in parallel.
     if let Some(stem) = flag(&args, "--bundle") {
+        // device selection (CPU default + reference; GPU opt-in via --features gpu). Matmul dispatch lands next; this
+        // reports the choice + budget/fallback so the plumbing is in place.
+        let model_bytes = std::fs::metadata(format!("{stem}.fieldrun.bin")).map(|m| m.len()).unwrap_or(0);
+        let budget_gb: u64 = flag(&args, "--max-vram").and_then(|s| s.parse().ok()).unwrap_or(24);
+        let dev = device::select(flag(&args, "--device").unwrap_or("auto"), model_bytes, budget_gb * 1_000_000_000);
+        eprintln!("[fieldrun] device: {}", dev.detail);
+        if dev.use_gpu {
+            eprintln!("[fieldrun] (GPU matmul dispatch not wired yet — running on CPU this build)");
+        }
         let bundle = Bundle::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
         let arch = bundle.arch.clone();
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
