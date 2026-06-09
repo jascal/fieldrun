@@ -7,9 +7,9 @@ description = "Run a decompiled LLM as a single native binary — the three pylm
 license = "Apache-2.0"
 
 [features]
-# `hub` is ON by default (ease of use: `convert --model org/repo` pulls from HF out of the box). For a lean, fully
-# offline / network-free binary, build with `--no-default-features`.
-default = ["hub"]
+# `hub` (HF pull) and `api` (OpenAI/Anthropic endpoints + `--chat`) are ON by default — convert-by-repo-id and chat
+# work out of the box. For a lean, offline, token-id-only binary, build with `--no-default-features`.
+default = ["hub", "api"]
 # opt-in GPU backend (wgpu: Metal on Mac, DX12 on Windows incl. ARM, Vulkan on Linux). The default build is pure-CPU,
 # no GPU dependency — the CPU path stays the faithful reference; GPU is an accelerator for usable generation speed.
 gpu = ["dep:wgpu", "dep:pollster"]
@@ -40,6 +40,8 @@ pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter
 # no system OpenSSL/SecureTransport needed, same on Mac + Linux). We download by repo id ourselves — ureq follows HF's
 # relative 307 redirects (which hf-hub 0.3 did not) — and read the standard HF token; no login of our own.
 ureq = { version = "=2.9.7", optional = true }
+# onig (a small C regex lib) is required by tokenizers 0.20 — needs a C compiler at build (present in any Rust dev
+# setup: Xcode CLT on macOS, build-essential on Linux). It's only pulled by the default `api` feature.
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 
 [[bin]]

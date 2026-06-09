@@ -19,7 +19,7 @@ bundle (weights blob + JSON manifest + tokenizer) that `convert` produces once a
 | **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
-| API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** — `--serve PORT` (native `/predict`·`/generate`·`/explain`; `--features api` adds `/v1/chat/completions`, `/v1/completions`, `/v1/messages`) and `--chat` |
+| API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** (default build) — `--serve PORT` (native `/predict`·`/generate`·`/explain` + `/v1/chat/completions`·`/v1/completions`·`/v1/messages`, streaming) and `--chat` |
 
 **GPU backend** (opt-in, `--features gpu`, via **wgpu** → Metal/DX12/Vulkan): `--device cpu|gpu|auto` + `--max-vram`
 budget (default 24 GB; exploits Apple unified memory), CPU default + fallback. A **GPU-resident GPT-2 forward** (weights
@@ -147,7 +147,7 @@ local checkpoint dir **or** pulls one from the Hugging Face hub by repo id (the 
 Python + `transformers`, but the binary itself does not.
 
 ```bash
-cargo build --release --features api     # `api` adds the OpenAI/Anthropic text endpoints + `--chat` (needs a tokenizer)
+cargo build --release                    # default build: HF pull + OpenAI/Anthropic API + `--chat` all included
 cargo install --path .                   # optional: puts `fieldrun` on PATH (~/.cargo/bin) so you can drop ./target/release/
 
 # 1. CONVERT — pull from HF by repo id (or a local dir). Bundles default to a home cache (~/.cache/fieldrun/bundles/),
@@ -170,9 +170,8 @@ fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --n-eval 200      # nex
 fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --ctx 64 --generate 128
 ```
 
-A bare `fieldrun` (or `--help`) prints the full flag list. The default build (no `--features api`) still serves the
-native token-id API and all of convert/score/generate; the text endpoints + `--chat` just need the tokenizer the `api`
-feature pulls in.
+A bare `fieldrun` (or `--help`) prints the full flag list. The default build includes HF pull (`hub`) and the
+OpenAI/Anthropic API + `--chat` (`api`); build `--no-default-features` for a lean, offline, token-id-only binary.
 
 ## License
 

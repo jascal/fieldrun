@@ -169,6 +169,7 @@ fn main() {
             return;
         }
 
+        eprintln!("[fieldrun] loading {stem}.fieldrun … (mmap + dequant; a big int8 bundle takes a few seconds)");
         let bundle = Bundle::load(&stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
         let arch = bundle.arch.clone();
         #[cfg(feature = "api")]
@@ -318,8 +319,8 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> [--ctx N] [--n-eval N]        score next-token top-1 (Tier B)\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
-  fieldrun --bundle <stem> --chat                                         interactive chat REPL (needs --features api)\n\
-  fieldrun --bundle <stem> --serve <PORT>                                 HTTP API (token-id; +OpenAI/Anthropic w/ api)\n\
+  fieldrun --bundle <stem> --chat                                         interactive chat REPL\n\
+  fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: token-id + OpenAI/Anthropic\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\
   --bundle takes a stem (<stem>.fieldrun.json) or a bare model name resolved under ~/.cache/fieldrun/bundles/<name>/.\n\
@@ -340,7 +341,7 @@ RUN\n\
   --kv-int8       int8 KV cache during generate              --route-frac F  Tier C: compute only fraction F of MLP neurons\n\
   --explain       explain the last --ctx token               --vocab <f>     gpt2 vocab.json for readable explain labels\n\
   --serve <PORT>  start the HTTP API                         --dump <f>      write predictions, one id per line\n\
-  --chat          interactive chat REPL (--features api)      --max-tokens N  chat/serve generation cap (default 256)\n\
+  --chat          interactive chat REPL                       --max-tokens N  chat/serve generation cap (default 256)\n\
   --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );
