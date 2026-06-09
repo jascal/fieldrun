@@ -88,6 +88,30 @@ impl BundleWriter {
         Ok(())
     }
 
+    fn put_f32(&mut self, name: &str, data: &[f32], shape: &[usize]) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(data.len() * 4);
+        for &v in data {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        self.bin.write_all(&buf)?;
+        self.entry(name, "f32", shape, buf.len());
+        Ok(())
+    }
+
+    /// A "small" 1D/2D array (embed, norms, biases, lm_head): f32 when `dtype=="f32"`, else f16. Big linears keep their
+    /// own int8/f16/f32 path (`put_i8`/`put_lin`); the f32 dtype gives a bit-exact bundle for the faithfulness gate.
+    fn put_small(&mut self, name: &str, data: &[f32], shape: &[usize], dtype: &str) -> std::io::Result<()> {
+        if dtype == "f32" { self.put_f32(name, data, shape) } else { self.put_f16(name, data, shape) }
+    }
+
+    /// A weight linear from an (out, in) source: int8 (transposed, per-column), or f32/f16 transposed to (in, out).
+    fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
+        if dtype == "int8" { return self.put_i8(name, data, out, inp, true); }
+        let mut t = vec![0f32; inp * out];
+        for o in 0..out { for i in 0..inp { t[i * out + o] = data[o * inp + i]; } }
+        self.put_small(name, &t, &[inp, out], dtype)
+    }
+
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
     /// store (in, out); else source is already (in, out) (GPT-2 Conv1D) → store as-is.
     fn put_i8(&mut self, name: &str, data: &[f32], rows: usize, cols: usize, transpose: bool) -> std::io::Result<()> {
@@ -129,7 +153,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "gpt2" => convert_gpt2(&cfg, &m, dtype, out_stem)?,
         "rope" => convert_rope(&cfg, &m, dtype, out_stem)?,
         "gemma" => convert_gemma(&cfg, &m, dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma)"),
+        "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3)"),
     };
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
     Ok(())
@@ -143,25 +168,25 @@ fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
     let mut w = BundleWriter::new(stem)?;
     let i8 = dtype == "int8";
     let pre = if m.has("transformer.wte.weight") { "transformer." } else { "" }; // GPT2LMHeadModel vs bare state dict
-    let f16 = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+    let sml = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, dt) = m.read(hf);
-        w.put_f16(name, &dt, &s)
+        w.put_small(name, &dt, &s, dtype)
     };
-    // wte/wpe/ln_f kept f16; Conv1D weights (already (in,out)) int8 without transpose
-    f16(&mut w, "wte", &format!("{pre}wte.weight"))?;
-    f16(&mut w, "wpe", &format!("{pre}wpe.weight"))?;
-    f16(&mut w, "ln_f.weight", &format!("{pre}ln_f.weight"))?;
-    f16(&mut w, "ln_f.bias", &format!("{pre}ln_f.bias"))?;
+    // wte/wpe/ln_f small (f16 or f32); Conv1D weights (already (in,out)) int8 without transpose, else small as-is
+    sml(&mut w, "wte", &format!("{pre}wte.weight"))?;
+    sml(&mut w, "wpe", &format!("{pre}wpe.weight"))?;
+    sml(&mut w, "ln_f.weight", &format!("{pre}ln_f.weight"))?;
+    sml(&mut w, "ln_f.bias", &format!("{pre}ln_f.bias"))?;
     for l in 0..nl {
         let p = format!("{pre}h.{l}.");
-        f16(&mut w, &format!("h{l}.ln_1.weight"), &format!("{p}ln_1.weight"))?;
-        f16(&mut w, &format!("h{l}.ln_1.bias"), &format!("{p}ln_1.bias"))?;
-        f16(&mut w, &format!("h{l}.ln_2.weight"), &format!("{p}ln_2.weight"))?;
-        f16(&mut w, &format!("h{l}.ln_2.bias"), &format!("{p}ln_2.bias"))?;
+        sml(&mut w, &format!("h{l}.ln_1.weight"), &format!("{p}ln_1.weight"))?;
+        sml(&mut w, &format!("h{l}.ln_1.bias"), &format!("{p}ln_1.bias"))?;
+        sml(&mut w, &format!("h{l}.ln_2.weight"), &format!("{p}ln_2.weight"))?;
+        sml(&mut w, &format!("h{l}.ln_2.bias"), &format!("{p}ln_2.bias"))?;
         for (fr, hf) in [("attn.c_attn", "attn.c_attn"), ("attn.c_proj", "attn.c_proj"), ("mlp.c_fc", "mlp.c_fc"), ("mlp.c_proj", "mlp.c_proj")] {
             let (s, dt) = m.read(&format!("{p}{hf}.weight"));
-            if i8 { w.put_i8(&format!("h{l}.{fr}.weight"), &dt, s[0], s[1], false)?; } else { w.put_f16(&format!("h{l}.{fr}.weight"), &dt, &s)?; }
-            f16(&mut w, &format!("h{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
+            if i8 { w.put_i8(&format!("h{l}.{fr}.weight"), &dt, s[0], s[1], false)?; } else { w.put_small(&format!("h{l}.{fr}.weight"), &dt, &s, dtype)?; }
+            sml(&mut w, &format!("h{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
         }
     }
     let n = w.arrays.len();
@@ -218,38 +243,78 @@ fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> s
     Ok(n)
 }
 
+/// Gemma 3: the Gemma-2 stack plus QK-norm (per-head RMSNorm on q/k), dual-base RoPE (local θ for sliding layers,
+/// global θ for full layers), a 5:1 sliding:full layer pattern, and NO logit soft-capping. head_dim is shared across
+/// layer types (unlike Gemma 4). Per-layer sliding flags (from `layer_types`) are packed into `config` so the kernel
+/// needn't re-derive the pattern. `config_f` carries both RoPE bases.
+fn convert_gemma3(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = geti(c, "head_dim").unwrap_or(d / nh);
+    let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
+    let eps = getf(c, "rms_norm_eps").unwrap_or(1e-6);
+    let qscalar = getf(c, "query_pre_attn_scalar").unwrap_or(hd as f64);
+    let window = geti(c, "sliding_window").unwrap_or(4096);
+    let pattern = geti(c, "sliding_window_pattern").unwrap_or(6);
+    let (theta_local, theta_global) = gemma3_thetas(c);
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true);
+    // per-layer sliding flag: prefer the serialized `layer_types` list, else derive ((i+1)%pattern != 0), last forced full
+    let lt = c.get("layer_types").and_then(|v| v.as_array());
+    let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, ffn, vocab, tie as usize, window];
+    for l in 0..nl {
+        // Gemma 3 (unlike Gemma 4) does NOT force the last layer to full — the pattern stands as-is.
+        let full = lt.and_then(|a| a.get(l)).and_then(|s| s.as_str())
+            .map(|s| s == "full_attention")
+            .unwrap_or((l + 1) % pattern == 0);
+        config.push(if full { 0 } else { 1 });
+    }
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gemma3",
+        "config": config, "config_f": [theta_local, theta_global, eps, qscalar, (d as f64).sqrt()] });
+    let mut w = BundleWriter::new(stem)?;
+    let norms = [("input_layernorm", "input_layernorm"), ("post_attention_layernorm", "post_attention_layernorm"),
+                 ("pre_feedforward_layernorm", "pre_feedforward_layernorm"), ("post_feedforward_layernorm", "post_feedforward_layernorm"),
+                 ("self_attn.q_norm", "self_attn.q_norm"), ("self_attn.k_norm", "self_attn.k_norm")];
+    write_layers(&mut w, c, m, dtype, nl, tie, &norms, true)?;
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
+// Gemma 3 dual RoPE bases: sliding (local) layers vs full (global) layers. Accept both the new `rope_parameters`
+// nesting and the legacy flat `rope_local_base_freq` / `rope_theta`.
+fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
+    let nested = |kind: &str| c.get("rope_parameters").and_then(|v| v.get(kind)).and_then(|t| t.get("rope_theta")).and_then(|t| t.as_f64());
+    let local = nested("sliding_attention").or_else(|| getf(c, "rope_local_base_freq")).unwrap_or(10_000.0);
+    let global = nested("full_attention").or_else(|| getf(c, "rope_theta")).unwrap_or(1_000_000.0);
+    (local, global)
+}
+
 /// Shared Llama/Qwen/Gemma writer: embed (f16) + final norm + per-layer norms (with optional +1 bake) + the
 /// q/k/v/o/gate/up/down Linears (transposed, int8 or f16) + optional q/k/v bias.
 fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, nl: usize, tie: bool,
                 norms: &[(&str, &str)], bake1: bool) -> std::io::Result<()> {
-    let i8 = dtype == "int8";
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, mut dt) = m.read(hf);
         if bake1 { for v in dt.iter_mut() { *v += 1.0; } } // Gemma RMSNorm: x·(1+w)
-        w.put_f16(name, &dt, &s)
+        w.put_small(name, &dt, &s, dtype)
     };
     let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, dt) = m.read(hf); // (out, in)
-        if i8 { w.put_i8(name, &dt, s[0], s[1], true) } else {
-            let (out, inp) = (s[0], s[1]);
-            let mut t = vec![0f32; inp * out];
-            for o in 0..out { for i in 0..inp { t[i * out + o] = dt[o * inp + i]; } }
-            w.put_f16(name, &t, &[inp, out])
-        }
+        w.put_lin(name, &dt, s[0], s[1], dtype)
     };
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_f16("embed", &ed, &es)?;
+    w.put_small("embed", &ed, &es, dtype)?;
     norm(w, "norm", "model.norm.weight")?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight"); // (vocab,d) -> (d,vocab) f16
-        let mut t = vec![0f32; s[0] * s[1]];
-        for o in 0..s[0] { for i in 0..s[1] { t[i * s[0] + o] = dt[o * s[1] + i]; } }
-        w.put_f16("lm_head", &t, &[s[1], s[0]])?;
+        let (s, dt) = m.read("lm_head.weight"); // (vocab,d) -> (d,vocab)
+        w.put_lin("lm_head", &dt, s[0], s[1], dtype)?;
     }
     let _ = c;
     for l in 0..nl {
         let p = format!("model.layers.{l}.");
-        // norms: (fieldrun name, HF name) — rope renames to in_ln/post_ln; gemma keeps the 4 HF norm names
+        // norms: (fieldrun name, HF name) — rope renames to in_ln/post_ln; gemma keeps the HF norm names; gemma3 also
+        // carries per-head self_attn.q_norm / self_attn.k_norm (QK-norm), which fit the same (1+w)-baked path.
         for (frn, hfn) in norms {
             norm(w, &format!("l{l}.{frn}"), &format!("{p}{hfn}.weight"))?;
         }
@@ -259,7 +324,7 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
         for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] {
             if m.has(&format!("{p}{proj}.bias")) {
                 let (s, dt) = m.read(&format!("{p}{proj}.bias"));
-                w.put_f16(&format!("l{l}.{proj}.bias"), &dt, &s)?;
+                w.put_small(&format!("l{l}.{proj}.bias"), &dt, &s, dtype)?;
             }
         }
     }

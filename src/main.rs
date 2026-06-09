@@ -19,6 +19,7 @@ mod gpu_mm;
 #[cfg(feature = "gpu")]
 mod gpu_rope;
 mod gemma;
+mod gemma3;
 mod model;
 mod retrieval;
 mod rope;
@@ -30,6 +31,7 @@ use rayon::prelude::*;
 use bundle::Bundle;
 use composition::Gpt2;
 use gemma::Gemma;
+use gemma3::Gemma3;
 use model::Model;
 use retrieval::Store;
 use rope::Rope;
@@ -122,7 +124,8 @@ fn main() {
             "gpt2" => Box::new(Gpt2::new(bundle, route, kv_int8)),
             "rope" => Box::new(Rope::new(bundle, route, kv_int8)),
             "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
+            "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3)"),
         };
 
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).

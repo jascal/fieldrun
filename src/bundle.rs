@@ -232,7 +232,11 @@ impl Bundle {
                     // a naive per-token scale (TurboQuant's insight), so handling them recovers most of the W8A8 loss.
                     let absv: Vec<f32> = arow.iter().map(|v| v.abs()).collect();
                     let mut idx: Vec<usize> = (0..kk).collect();
-                    idx.select_nth_unstable_by(t, |&x, &y| absv[y].partial_cmp(&absv[x]).unwrap());
+                    // partition so idx[0..t] are the t largest-|a| channels; skip when t==kk (every channel is an
+                    // outlier → the whole dot is taken exactly in f32 via `corr`). select_nth_unstable_by needs t<len.
+                    if t < kk {
+                        idx.select_nth_unstable_by(t, |&x, &y| absv[y].partial_cmp(&absv[x]).unwrap());
+                    }
                     let bulk_max = if t < kk { absv[idx[t]] } else { 0.0 };
                     let sa = if bulk_max > 0.0 { bulk_max / 127.0 } else { 1.0 };
                     let mut au: Vec<u8> = arow.iter().map(|&v| (((v / sa).round() as i32).clamp(-127, 127) as u8) ^ 0x80).collect();
