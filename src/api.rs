@@ -79,6 +79,12 @@ impl TextGen {
     /// a reasoning model (a tokenizer that knows a `<think>`-style token) spends hundreds-to-thousands of tokens before
     /// the answer, so 256 would truncate mid-thought — give those 2048; everything else 512. Always overridable
     /// (`--max-tokens` on the CLI, `"max_tokens"` in an API request).
+    /// Does the tokenizer know the ChatML template token `<|im_start|>`? If not, it's almost certainly a base/completion
+    /// model (e.g. GPT-2), and `--chat` (which wraps input in a ChatML template) will just continue text, not converse.
+    pub fn knows_chatml(&self) -> bool {
+        self.tok.token_to_id("<|im_start|>").is_some()
+    }
+
     pub fn default_max_tokens(&self) -> usize {
         let reasoning = ["<think>", "<thinking>", "<|thinking|>", "<reasoning>"]
             .iter()
@@ -664,6 +670,11 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                to quit. (greedy, max_tokens={max_tokens}; generic ChatML template)");
     eprintln!("[fieldrun] markdown rendering {} (/format to toggle){}", if fmt { "ON" } else { "OFF" },
               if explain { "; explain ON (/explain off to stop)" } else { "" });
+    if !tg.knows_chatml() {
+        eprintln!("[fieldrun] heads-up: this tokenizer has no ChatML template (<|im_start|>) — it looks like a BASE \
+                   model (e.g. GPT-2), not an instruct model, so chat will just CONTINUE your text and won't stop \
+                   cleanly. For a base model, prefer `--ids <stream> --explain` or `--generate` over `--chat`.");
+    }
     let mut history: Vec<(String, String)> = Vec::new();
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
     // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
