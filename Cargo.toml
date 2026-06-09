@@ -11,6 +11,7 @@ serde_json = "1"
 ndarray = "0.16"
 rayon = "1"   # data-parallel scoring: independent forward passes fan out across cores
 half = "2"    # f16 weights kept low-precision in RAM (the in-RAM-precision path), upcast per matmul
+tiny_http = "0.12"   # minimal blocking HTTP server for the /predict /generate /explain API
 
 [[bin]]
 name = "fieldrun"

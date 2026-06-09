@@ -6,6 +6,7 @@
 //! Tier C (router), `explain`, and the API land on top. The whole point: one static binary, flat-file knowledge,
 //! no framework.
 
+mod api;
 mod bundle;
 mod composition;
 mod explain;
@@ -59,6 +60,12 @@ fn main() {
             "gemma" => Box::new(Gemma::new(bundle, route)),
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
+
+        // --serve PORT: start the HTTP API over this loaded model (no ids needed).
+        if let Some(port) = flag(&args, "--serve").and_then(|s| s.parse::<u16>().ok()) {
+            api::serve(lm, &arch, port);
+            return;
+        }
 
         // --explain: explain the prediction at the end of the first --ctx tokens (composition circuits + features).
         if flag(&args, "--explain").is_some() {
