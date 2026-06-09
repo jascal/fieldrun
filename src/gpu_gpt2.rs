@@ -94,6 +94,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var i=0u;i<d;i++){ out[row*d+i]=(x[row*d+i]-mu)*inv*g[i]+b[i]; }
 }"#;
 
+// Tied unembed on the GPU: logits[v] = dot(xf[last_row], wte[v]). One thread per vocab row, reading back only the
+// logits (vocab,) instead of the CPU rowdot over the whole 50k-row table per forward.
+const ROWDOT: &str = r#"
+@group(0) @binding(0) var<storage, read> xf: array<f32>;
+@group(0) @binding(1) var<storage, read> wte: array<f32>;
+@group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(3) var<uniform> dims: vec4<u32>; // vocab,d,last_off,_
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let v=gid.x; let d=dims.y; let off=dims.z; if (v>=dims.x) { return; }
+  var s=0.0; for (var c=0u;c<d;c++){ s=s+xf[off+c]*wte[v*d+c]; }
+  logits[v]=s;
+}"#;
+
 struct W {
     buf: wgpu::Buffer,
     rows: usize,
@@ -105,6 +119,7 @@ pub struct GpuGpt2 {
     queue: wgpu::Queue,
     pl: HashMap<&'static str, wgpu::ComputePipeline>,
     w: HashMap<String, W>, // resident weights (2D: rows,cols) and 1D biases/norms (rows=1)
+    wte: wgpu::Buffer,     // resident token embedding (also the tied unembed), uploaded once
     n_layer: usize,
     n_head: usize,
     d: usize,
@@ -129,14 +144,18 @@ impl GpuGpt2 {
             None,
         )).ok()?;
         let mut pl = HashMap::new();
-        for (k, src) in [("matmul", MATMUL), ("addbias", ADDBIAS), ("add", ADD), ("gelu", GELU), ("layernorm", LAYERNORM), ("attention", ATTENTION)] {
+        for (k, src) in [("matmul", MATMUL), ("addbias", ADDBIAS), ("add", ADD), ("gelu", GELU), ("layernorm", LAYERNORM), ("attention", ATTENTION), ("rowdot", ROWDOT)] {
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(k), source: wgpu::ShaderSource::Wgsl(src.into()) });
             pl.insert(k, device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(k), layout: None, module: &m, entry_point: "main", compilation_options: Default::default(), cache: None,
             }));
         }
         let (n_layer, n_head, d, vocab) = (b.config[0] as usize, b.config[1] as usize, b.config[2] as usize, b.config[4] as usize);
-        let mut g = GpuGpt2 { device, queue, pl, w: HashMap::new(), n_layer, n_head, d, vocab, name };
+        let wte = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wte"), contents: cast(&b.f32_array("wte").1),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        let mut g = GpuGpt2 { device, queue, pl, w: HashMap::new(), wte, n_layer, n_head, d, vocab, name };
         // upload every weight the forward needs (as f32)
         let mut names: Vec<String> = vec!["ln_f.weight".into(), "ln_f.bias".into()];
         for l in 0..n_layer {
@@ -212,7 +231,8 @@ impl GpuGpt2 {
     }
 
     /// GPU forward, batched into ONE command encoder/submit with reused working buffers (no per-op alloc/submit).
-    /// `x0` is the already-embedded input (seq*d). Returns the last-position hidden (d,) for the CPU unembed.
+    /// `x0` is the already-embedded input (seq*d). Runs all layers + the tied unembed on the GPU and reads back the
+    /// logits (vocab,) — the only thing that leaves the device. Argmax happens on the CPU.
     fn last_hidden(&self, x0: &[f32], seq: usize) -> Vec<f32> {
         let (d, hd, nh) = (self.d, self.d / self.n_head, self.n_head);
         // working buffers, allocated once and reused across layers
@@ -245,17 +265,19 @@ impl GpuGpt2 {
         }
         self.record(&mut enc, &mut ku, &mut kb, "layernorm",
                     &[&x, &self.w["ln_f.weight"].buf, &self.w["ln_f.bias"].buf, &xf], [su, du, 0, 0], g1(seq));
+        // tied unembed on the GPU (last row only) → logits, the only thing read back
+        let logits = self.storage(self.vocab);
+        self.record(&mut enc, &mut ku, &mut kb, "rowdot", &[&xf, &self.wte, &logits],
+                    [self.vocab as u32, du, ((seq - 1) * d) as u32, 0], (self.vocab.div_ceil(64) as u32, 1));
         self.queue.submit(Some(enc.finish()));
-        let all = self.read(&xf, seq * d);
-        all[(seq - 1) * d..seq * d].to_vec()
+        self.read(&logits, self.vocab)
     }
 
-    /// Predict the next token: embed (only the needed rows) → GPU forward → CPU unembed (tied wte) for argmax.
+    /// Predict the next token: embed the looked-up rows → GPU forward + GPU unembed → argmax on CPU.
     pub fn predict(&self, ids: &[i64], b: &Bundle) -> i64 {
         let pos: Vec<i64> = (0..ids.len() as i64).collect();
         let x0 = &b.rows_f32("wte", ids) + &b.rows_f32("wpe", &pos); // (seq, d), no full-embedding copy
-        let last = self.last_hidden(x0.as_slice().unwrap(), ids.len());
-        let logits = b.rowdot_f32("wte", &last);
+        let logits = self.last_hidden(x0.as_slice().unwrap(), ids.len());
         logits.iter().enumerate().max_by(|a, c| a.1.partial_cmp(c.1).unwrap()).unwrap().0 as i64
     }
 }
