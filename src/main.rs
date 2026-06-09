@@ -22,6 +22,7 @@ mod gemma;
 mod gemma3;
 mod gemma4;
 mod model;
+mod qwen3moe;
 mod retrieval;
 mod rope;
 
@@ -35,6 +36,7 @@ use gemma::Gemma;
 use gemma3::Gemma3;
 use gemma4::Gemma4;
 use model::Model;
+use qwen3moe::Qwen3Moe;
 use retrieval::Store;
 use rope::Rope;
 
@@ -128,7 +130,8 @@ fn main() {
             "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
             "gemma4" => Box::new(Gemma4::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4)"),
+            "qwen3moe" => Box::new(Qwen3Moe::new(bundle, route, kv_int8)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe)"),
         };
 
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).

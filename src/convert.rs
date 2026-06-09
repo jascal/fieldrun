@@ -155,7 +155,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "gemma" => convert_gemma(&cfg, &m, dtype, out_stem)?,
         "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4)"),
+        "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe)"),
     };
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
     Ok(())
@@ -356,8 +357,8 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
         w.put_small("per_layer_model_projection", &t, &[inp, out], dtype)?;
     }
     if !tie {
-        let (s, dt) = m.read("lm_head.weight");
-        w.put_lin("lm_head", &dt, s[0], s[1], dtype)?;
+        let (s, dt) = m.read("lm_head.weight"); // (vocab, d) — raw for rowdot_f32, low-precision
+        w.put_small("lm_head", &dt, &s, dtype)?;
     }
     for l in 0..nl {
         let p = format!("model.layers.{l}.");
@@ -401,6 +402,77 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
     Ok(n)
 }
 
+/// Qwen3-MoE: the RoPE backbone (RMSNorm, single-base RoPE, GQA, SwiGLU) + QK-norm (per-head RMSNorm on q/k) + a
+/// per-layer MoE-or-dense FFN. The MoE block is a plain-gate router (softmax → top-k → optional renorm, no scales) over
+/// packed experts (same gate_up/down 3D layout as Gemma-4); the router+experts run on the post-attention-normed hidden.
+/// Experts are written one int8 array each (offload), so this reaches Qwen3-MoE on a ≤24 GB box. No attention bias
+/// (Qwen3 dropped it), no embed scale, no soft-capping. Sliding window (use_sliding_window) is a follow-on.
+fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    assert!(!c.get("use_sliding_window").and_then(|v| v.as_bool()).unwrap_or(false), "qwen3moe: sliding window not yet supported");
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = geti(c, "head_dim").unwrap_or(d / nh);
+    let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
+    let (theta, eps) = rope_theta_eps(c);
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_exp = geti(c, "num_experts").or_else(|| geti(c, "num_local_experts")).unwrap_or(0); // Qwen serializes num_local_experts
+    let topk = geti(c, "num_experts_per_tok").unwrap_or(0);
+    let moe_inter = geti(c, "moe_intermediate_size").unwrap_or(0);
+    let norm_topk = c.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sparse_step = geti(c, "decoder_sparse_step").unwrap_or(1);
+    let mlp_only: Vec<usize> = c.get("mlp_only_layers").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect()).unwrap_or_default();
+    let is_moe = |l: usize| !mlp_only.contains(&l) && n_exp > 0 && (l + 1) % sparse_step == 0;
+    let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, ffn, vocab, tie as usize, n_exp, topk, moe_inter, norm_topk as usize];
+    for l in 0..nl { config.push(if is_moe(l) { 1 } else { 0 }); } // MoE flags start at config[12]
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen3moe",
+        "config": config, "config_f": [theta, eps] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); // standard RMSNorm, weight used directly (no bake)
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_small("embed", &ed, &es, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight"); // (vocab, d) — raw for rowdot_f32, low-precision
+        w.put_small("lm_head", &dt, &s, dtype)?;
+    }
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.q_norm"), &format!("{p}self_attn.q_norm.weight"))?;
+        norm(&mut w, &format!("l{l}.k_norm"), &format!("{p}self_attn.k_norm.weight"))?;
+        for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
+            lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+        }
+        if is_moe(l) {
+            lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?; // router (n_exp, d) -> (d, n_exp)
+            // Qwen3-MoE checkpoints store each expert as separate gate_proj/up_proj/down_proj Linears (not packed).
+            for e in 0..n_exp {
+                for (fr, hf) in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")] {
+                    lin(&mut w, &format!("l{l}.experts.{e}.{fr}"), &format!("{p}mlp.experts.{e}.{hf}.weight"))?;
+                }
+            }
+        } else {
+            for proj in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+            }
+        }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
 /// Shared Llama/Qwen/Gemma writer: embed (f16) + final norm + per-layer norms (with optional +1 bake) + the
 /// q/k/v/o/gate/up/down Linears (transposed, int8 or f16) + optional q/k/v bias.
 fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, nl: usize, tie: bool,
@@ -418,8 +490,9 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
     w.put_small("embed", &ed, &es, dtype)?;
     norm(w, "norm", "model.norm.weight")?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight"); // (vocab,d) -> (d,vocab)
-        w.put_lin("lm_head", &dt, s[0], s[1], dtype)?;
+        // unembed is read row-wise by rowdot_f32 as (vocab, d) → store raw (NOT transposed), low-precision like embed
+        let (s, dt) = m.read("lm_head.weight"); // (vocab, d)
+        w.put_small("lm_head", &dt, &s, dtype)?;
     }
     let _ = c;
     for l in 0..nl {

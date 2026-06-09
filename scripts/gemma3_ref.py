@@ -27,6 +27,29 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
+    if ARCH == "qwen3moe":
+        from transformers import Qwen3MoeConfig
+        return Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,          # dense (mlp_only) layers
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False,
+            attention_bias=False,
+            use_sliding_window=False,
+            decoder_sparse_step=2,         # MoE on layers 1,3; dense on 0,2 -> both paths
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            norm_topk_prob=True,           # exercise the top-k renorm
+            max_position_embeddings=256,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
     if ARCH.startswith("gemma4"):
         from transformers import Gemma4TextConfig
         is_moe = ARCH == "gemma4moe"
@@ -79,7 +102,10 @@ def build():
 
     torch.manual_seed(0)
     cfg = make_config()
-    Cls = __import__("transformers").Gemma4ForCausalLM if ARCH.startswith("gemma4") else __import__("transformers").Gemma3ForCausalLM
+    tf = __import__("transformers")
+    Cls = (tf.Qwen3MoeForCausalLM if ARCH == "qwen3moe"
+           else tf.Gemma4ForCausalLM if ARCH.startswith("gemma4")
+           else tf.Gemma3ForCausalLM)
     model = Cls(cfg).eval()
     # randomise the norm weights too (they init to 0 -> (1+w)=1, which would hide a QK-norm/4-norm bug)
     with torch.no_grad():
@@ -102,7 +128,7 @@ def build():
             preds.append(int(logits.argmax()))
     json.dump({"preds": preds, "ctx": CTX, "n": len(preds)}, open(REF_PATH, "w"))
     print(f"[gemma3_ref] saved tiny model to {OUT_DIR}; {len(preds)} torch reference predictions -> {REF_PATH}")
-    print(f"[gemma3_ref] layer_types = {cfg.layer_types}")
+    print(f"[gemma3_ref] layer_types = {getattr(cfg, 'layer_types', '(n/a)')}")
 
 
 def compare(dump_path):
@@ -110,7 +136,8 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM"
+    cls = ("Qwen3MoeForCausalLM" if ARCH == "qwen3moe"
+           else "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM")
     print(f"[gemma3_ref] fieldrun vs torch {cls}: {agree}/{n} top-1 agree ({100*agree/n:.1f}%)")
     if agree != n:
         mism = [(i, ref[i], rust[i]) for i in range(n) if ref[i] != rust[i]][:10]
