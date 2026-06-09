@@ -1,12 +1,15 @@
 # fieldrun
 
-Run a decompiled LLM as a single native binary — the three [`pylm`](../lm-sae/pylm) tiers in pure Rust, no
-deep-learning framework at runtime.
+A single static **binary** (the runtime/tool) that runs an LLM from a flat-file **bundle** — a raw weight blob
+(`.fieldrun.bin`) plus a small JSON manifest (`.fieldrun.json`), and a copied `tokenizer.json` — in pure Rust, with no
+deep-learning framework at runtime. (The model is *not* baked into the binary; it's a portable bundle you convert once
+and point the binary at.)
 
-`pylm` (in the `lm-sae` repo) decompiles a small LLM into two halves: a flat-file **retrieval** store (n-gram /
-induction / grammar / knowledge) that reproduces ~half the model with stdlib-only Python, and a **composition** kernel
-(attention + MLP) that runs the rest as plain numpy matmuls over flat weight arrays — no torch. `fieldrun` is the
-distribution form of that result: the same tiers, ported to Rust, built into one static binary you can hand someone.
+`pylm` (in the [`lm-sae`](../lm-sae/pylm) repo) decompiles a small LLM into two halves: a flat-file **retrieval** store
+(n-gram / induction / grammar / knowledge) that reproduces ~half the model with stdlib-only Python, and a
+**composition** kernel (attention + MLP) that runs the rest as plain numpy matmuls over flat weight arrays — no torch.
+`fieldrun` is the distribution form: those tiers ported to Rust as one static binary, plus the model as a portable
+bundle (weights blob + JSON manifest + tokenizer) that `convert` produces once and the binary loads/mmaps at run time.
 
 ## Tiers
 
@@ -147,9 +150,9 @@ Python + `transformers`, but the binary itself does not.
 cargo build --release --features api     # `api` adds the OpenAI/Anthropic text endpoints + `--chat` (needs a tokenizer)
 cargo install --path .                   # optional: puts `fieldrun` on PATH (~/.cargo/bin) so you can drop ./target/release/
 
-# 1. CONVERT — pull from HF by repo id (or a local dir). Bundles default into bundles/<name>/ (not loose in the cwd);
-#    a tokenizer.json is copied alongside (for chat / the text API). Gated models: `huggingface-cli login` first.
-fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     # -> bundles/Qwen2.5-7B-Instruct/
+# 1. CONVERT — pull from HF by repo id (or a local dir). Bundles default to a home cache (~/.cache/fieldrun/bundles/),
+#    NOT the cwd; a tokenizer.json is copied alongside (for chat / the text API). Gated models: `huggingface-cli login`.
+fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     # -> ~/.cache/fieldrun/bundles/Qwen2.5-7B-Instruct/
 #   --arch  gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
 #   --dtype int8 (default) | f16 | f32       --hf-token <t> (gated)      -o <stem> (override the default location)
 

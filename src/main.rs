@@ -79,13 +79,13 @@ fn main() {
         let model = flag(&args, "--model").expect("--model <local-dir | hf-repo-id>");
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        // -o is optional; default groups bundles under bundles/<name>/<name> (not loose in the cwd). <name> = the
-        // model's last path segment (HF repo basename or dir name), minus any @revision.
+        // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the
+        // cwd — so converting from a dev checkout doesn't litter it. <name> = the model's last path segment minus @rev.
         let out: String = match flag(&args, "-o").or_else(|| flag(&args, "--out")) {
             Some(o) => o.to_string(),
             None => {
                 let name = model.rsplit('/').next().unwrap_or(model).split('@').next().unwrap_or(model);
-                format!("bundles/{name}/{name}")
+                format!("{}/{name}/{name}", bundles_dir())
             }
         };
         let model_dir: String = if std::path::Path::new(model).join("config.json").exists() {
@@ -269,15 +269,29 @@ fn main() {
     println!("[fieldrun] idioms: {}", parts.join(", "));
 }
 
-/// Resolve a `--bundle` argument: an explicit stem if `<raw>.fieldrun.json` exists, else the organized location
-/// `bundles/<raw>/<raw>` that `convert` writes by default, else the raw value (load will error clearly).
+/// The default bundle cache dir (out of the cwd / dev tree), like the HF cache. Override with $FIELDRUN_BUNDLES;
+/// per-convert, `-o <path>` overrides outright and `--bundle <path>` loads any explicit stem.
+fn bundles_dir() -> String {
+    if let Ok(d) = std::env::var("FIELDRUN_BUNDLES") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    format!("{home}/.cache/fieldrun/bundles")
+}
+
+/// Resolve a `--bundle` argument to a stem: an explicit `<raw>.fieldrun.json` if present, else the organized location
+/// `convert` writes by default — the home cache `~/.cache/fieldrun/bundles/<raw>/<raw>` (or a legacy `bundles/<raw>/`
+/// in the cwd) — else the raw value (load errors clearly).
 fn resolve_bundle(raw: &str) -> String {
     if std::path::Path::new(&format!("{raw}.fieldrun.json")).exists() {
         return raw.to_string();
     }
-    let organized = format!("bundles/{raw}/{raw}");
-    if std::path::Path::new(&format!("{organized}.fieldrun.json")).exists() {
-        return organized;
+    for base in [format!("{}/{raw}/{raw}", bundles_dir()), format!("bundles/{raw}/{raw}")] {
+        if std::path::Path::new(&format!("{base}.fieldrun.json")).exists() {
+            return base;
+        }
     }
     raw.to_string()
 }
@@ -297,7 +311,7 @@ USAGE\n\
   fieldrun --bundle <stem> --serve <PORT>                                 HTTP API (token-id; +OpenAI/Anthropic w/ api)\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\
-  --bundle takes a stem (<stem>.fieldrun.json) or a bare name resolved under bundles/<name>/ (where convert puts it).\n\
+  --bundle takes a stem (<stem>.fieldrun.json) or a bare model name resolved under ~/.cache/fieldrun/bundles/<name>/.\n\
 \n\
   --ids expects {{\"holdout_ids\": [<token ids>]}} from the model's tokenizer.\n\
 \n\
@@ -305,7 +319,7 @@ CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
   --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
   --dtype <D>     int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
-  -o, --out <S>   output bundle stem (default: bundles/<model-name>/<model-name>, + a .tokenizer.json for the text API)\n\
+  -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
 \n\
 RUN\n\
