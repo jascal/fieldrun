@@ -29,6 +29,7 @@ fn default_dtype() -> String {
 enum Arr {
     F32(Vec<f32>),
     F16(Vec<half::f16>),
+    I8(Vec<i8>), // per-output-column symmetric int8; its f16 scale lives in the sibling "<name>__scale" array
 }
 
 #[derive(Deserialize)]
@@ -70,6 +71,7 @@ impl Bundle {
             let arr = match a.dtype.as_str() {
                 "f32" => Arr::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
                 "f16" => Arr::F16(raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect()),
+                "i8" => Arr::I8(raw.iter().map(|&b| b as i8).collect()),
                 d => panic!("unsupported array dtype {d:?} in bundle"),
             };
             arrays.insert(a.name, (a.shape, arr));
@@ -90,7 +92,7 @@ impl Bundle {
         let (shape, arr) = self.get(name);
         match arr {
             Arr::F32(v) => ArrayView2::from_shape((shape[0], shape[1]), v).unwrap(),
-            Arr::F16(_) => panic!("arr2: {name} is f16; use arr2o (owned, upcast)"),
+            _ => panic!("arr2: {name} is not f32; use arr2o (owned, upcast) or mm (quantised)"),
         }
     }
 
@@ -98,7 +100,7 @@ impl Bundle {
         let (_, arr) = self.get(name);
         match arr {
             Arr::F32(v) => ArrayView1::from(v.as_slice()),
-            Arr::F16(_) => panic!("arr1: {name} is f16; use arr1o (owned, upcast)"),
+            _ => panic!("arr1: {name} is not f32; use arr1o (owned, upcast)"),
         }
     }
 
@@ -114,8 +116,36 @@ impl Bundle {
     pub fn mm(&self, a: &Array2<f32>, name: &str) -> Array2<f32> {
         let (shape, arr) = self.get(name);
         let (k, n) = (shape[0], shape[1]);
+        // int8: dequant W[k,j] = w_i8 * scale[j] (per output column) into the block buffer, then the same SIMD dot.
+        let scale = if matches!(arr, Arr::I8(_)) { Some(self.arr1o(&format!("{name}__scale"))) } else { None };
         match arr {
             Arr::F32(v) => a.dot(&ArrayView2::from_shape((k, n), v).unwrap()),
+            Arr::I8(v) => {
+                let scale = scale.unwrap();
+                let block = 512.min(n);
+                let nblocks = n.div_ceil(block);
+                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
+                    .into_par_iter()
+                    .map(|bi| {
+                        let c0 = bi * block;
+                        let bw = block.min(n - c0);
+                        let mut buf = vec![0f32; k * bw];
+                        for kk in 0..k {
+                            let wrow = &v[kk * n + c0..kk * n + c0 + bw];
+                            for (jj, (b, w)) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow).enumerate() {
+                                *b = *w as f32 * scale[c0 + jj];
+                            }
+                        }
+                        (c0, a.dot(&ArrayView2::from_shape((k, bw), &buf).unwrap()))
+                    })
+                    .collect();
+                let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                for (c0, ob) in blocks.drain(..) {
+                    let bw = ob.ncols();
+                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                }
+                out
+            }
             Arr::F16(v) => {
                 // Upcast W one column-block at a time into a local f32 buffer, then SIMD-dot the block (ndarray) —
                 // keeps the vectorised matmul while bounding upcast allocation to one block. Blocks are independent
@@ -158,6 +188,7 @@ impl Bundle {
         match arr {
             Arr::F32(v) => v.clone(),
             Arr::F16(v) => v.iter().map(|h| h.to_f32()).collect(),
+            Arr::I8(_) => panic!("upcast: i8 needs its per-column scale; go through mm()"),
         }
     }
 
@@ -172,6 +203,7 @@ impl Bundle {
             match arr {
                 Arr::F32(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, &s)| *o = s),
                 Arr::F16(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, s)| *o = s.to_f32()),
+                Arr::I8(_) => panic!("rows_f32: i8 embed unsupported (embed stays f16)"),
             }
         }
         out
@@ -190,6 +222,7 @@ impl Bundle {
                 match arr {
                     Arr::F32(v) => v[base..base + d].iter().zip(x).map(|(&w, &xi)| w * xi).sum(),
                     Arr::F16(v) => v[base..base + d].iter().zip(x).map(|(w, &xi)| w.to_f32() * xi).sum(),
+                    Arr::I8(_) => panic!("rowdot_f32: i8 unembed unsupported (embed stays f16)"),
                 }
             })
             .collect()
