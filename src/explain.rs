@@ -12,8 +12,9 @@ pub struct HeadCircuit {
     pub head: usize,
     pub role: String,
     pub attends_to: usize,
-    pub attends_tok: i64,
+    pub attends_tok: i64, // the token the head READS (at the attended position)
     pub mass: f32,
+    pub promotes: Vec<i64>, // the tokens the head WRITES to the logits (its direct logit attribution; empty if unknown)
 }
 
 #[derive(Serialize)]
@@ -69,15 +70,51 @@ pub fn top_promoted(logits: &[f32], act: f32, k: usize) -> Vec<i64> {
     top.iter().map(|&i| i as i64).collect()
 }
 
+/// Direct logit attribution for one attention head: its output contribution at the predicting position — the head's
+/// `hd`-wide slice of `attn_last` (the attn-weighted values, attn_out's last row) routed through its `hd` rows of the
+/// output projection `o_proj`, pushed through the final norm and the `unembed` to the top-`k` tokens it WRITES to the
+/// logits. This is the OV/output side, the measured counterpart to "where it attends" (the QK side): for a real
+/// copy/induction head it contains `attends_tok`; a head that does intermediate work (doesn't write to the output)
+/// shows low-signal tokens. `gain` is the final-norm weight (use `1+w` for Gemma; for ranking the 1/rms scale is
+/// irrelevant so we skip it); `center` subtracts the mean first for a LayerNorm model (GPT-2). Mirrors the MLP
+/// `top_promoted`, so heads get the same rigour as neurons.
+pub fn head_dla(b: &crate::bundle::Bundle, o_proj: &str, unembed: &str, attn_last: &[f32], head: usize, hd: usize, gain: &[f32], center: bool, k: usize) -> Vec<i64> {
+    let base = head * hd;
+    let mut acc = vec![0.0f32; gain.len()]; // d
+    for i in 0..hd {
+        let w = b.weight_row(o_proj, base + i); // o_proj row (base+i): a d-vector (the output for that value-dim)
+        let a = attn_last[base + i];
+        for (o, wi) in acc.iter_mut().zip(&w) {
+            *o += a * wi;
+        }
+    }
+    // apply the final norm so this is real DLA: (optionally center) then scale by the per-dim gain — what survives to
+    // the logits. The overall 1/rms factor is a positive scalar, so it doesn't affect the top-k ranking; skip it.
+    if center {
+        let m = acc.iter().sum::<f32>() / acc.len() as f32;
+        acc.iter_mut().for_each(|o| *o -= m);
+    }
+    for (o, g) in acc.iter_mut().zip(gain) {
+        *o *= g;
+    }
+    top_promoted(&b.rowdot_f32(unembed, &acc), 1.0, k) // top-k positive: what the head pushes the logits toward
+}
+
 /// Assemble an Explanation from captured per-layer attention + MLP activations (arch-agnostic). `promote(l, n, act)`
-/// names the top neuron of each layer's MLP. Heads are classified by `idiom_library` signature; sinks are counted.
-pub fn assemble<F: Fn(usize, usize, f32) -> Vec<i64>>(
+/// names the top neuron of each layer's MLP; `head_promote(l, h)` gives the head's direct-logit-attribution tokens (its
+/// "writes"; pass `|_, _| Vec::new()` if an arch hasn't wired it). Heads are classified by `idiom_library` signature.
+pub fn assemble<F, G>(
     ids: &[i64],
     att_last: &[Vec<Vec<f32>>],
     mlp_h: &[Vec<f32>],
     model_predicts: i64,
     promote: F,
-) -> Explanation {
+    head_promote: G,
+) -> Explanation
+where
+    F: Fn(usize, usize, f32) -> Vec<i64>,
+    G: Fn(usize, usize) -> Vec<i64>,
+{
     let mut head_circuits = Vec::new();
     let mut sink_heads = 0;
     for (l, la) in att_last.iter().enumerate() {
@@ -86,13 +123,17 @@ pub fn assemble<F: Fn(usize, usize, f32) -> Vec<i64>>(
             if role == "sink" && mass >= 0.5 {
                 sink_heads += 1;
             } else if matches!(role, "induction" | "duplicate-token" | "previous-token") && mass >= 0.15 {
-                head_circuits.push(HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass });
+                head_circuits.push(HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, promotes: Vec::new() });
             }
         }
     }
     let order = |r: &str| match r { "induction" => 0, "duplicate-token" => 1, _ => 2 };
     head_circuits.sort_by(|a, b| order(&a.role).cmp(&order(&b.role)).then(b.mass.partial_cmp(&a.mass).unwrap()));
     head_circuits.truncate(6);
+    // fill in the OV/output side only for the heads we actually show (one unembed projection each).
+    for hc in head_circuits.iter_mut() {
+        hc.promotes = head_promote(hc.layer, hc.head);
+    }
 
     let mut mlp_features: Vec<MlpFeature> = mlp_h
         .iter()
@@ -113,10 +154,15 @@ pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String) -> String {
     let mut l = vec![
         format!("context …{}", ex.context_tail.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(" ")),
         format!("model predicts {}", dec(ex.model_predicts)),
-        format!("  COMPOSITION  content head circuits ({} idle on sink/NO-OP):", ex.sink_heads),
+        format!("  COMPOSITION  content head circuits ({} idle on sink/NO-OP) — reads → writes:", ex.sink_heads),
     ];
     for h in &ex.head_circuits {
-        l.push(format!("    L{}.H{:<2} {:<15} → {} (mass {:.3})", h.layer, h.head, h.role, dec(h.attends_tok), h.mass));
+        let mut line = format!("    L{}.H{:<2} {:<15} reads {} (mass {:.3})", h.layer, h.head, h.role, dec(h.attends_tok), h.mass);
+        if !h.promotes.is_empty() {
+            let toks = h.promotes.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(", ");
+            line.push_str(&format!("  ⇒ writes {{{toks}}}"));
+        }
+        l.push(line);
     }
     if ex.head_circuits.is_empty() {
         l.push("    (none above threshold — carried by MLP features below)".to_string());

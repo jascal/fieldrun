@@ -161,6 +161,7 @@ impl Gemma {
             x.row_mut(t).assign(&(&emb.row(t) * self.escale));
         }
         let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut head_act: Vec<Vec<f32>> = Vec::new(); // per layer: attn_out's last row — for head direct-logit attribution
         let mut mlp_h: Vec<Vec<f32>> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
@@ -194,6 +195,7 @@ impl Gemma {
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
             }
             att_last.push(layer_att);
+            head_act.push(attn_out.row(seq - 1).to_vec());
             let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
             x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
             let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
@@ -210,10 +212,18 @@ impl Gemma {
         let xf = self.norm(&x, "norm");
         let lg = self.b.rowdot_f32("embed", &xf.row(seq - 1).to_vec());
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
-        assemble(ids, &att_last, &mlp_h, model_predicts, |l, n, act| {
-            let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
-            top_promoted(&self.b.rowdot_f32("embed", &w_out), act, 5)
-        })
+        let gain = self.b.arr1("norm").to_vec(); // final RMSNorm gain (1+w baked at export) — for head DLA
+        assemble(
+            ids,
+            &att_last,
+            &mlp_h,
+            model_predicts,
+            |l, n, act| {
+                let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
+                top_promoted(&self.b.rowdot_f32("embed", &w_out), act, 5)
+            },
+            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), "embed", &head_act[l], head, hd, &gain, false, 5),
+        )
     }
 
     /// Run `m` new positions (rows of `emb`, already √d-scaled) through the layers, caching K/V (post-RoPE, GQA width

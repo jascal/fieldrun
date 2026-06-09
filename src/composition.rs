@@ -109,6 +109,7 @@ impl Gpt2 {
         let hd = self.d / self.n_head;
         let mut x = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &(0..seq as i64).collect::<Vec<_>>());
         let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new(); // per layer, per head, last-position attention row
+        let mut head_act: Vec<Vec<f32>> = Vec::new(); // per layer: attn_out's last row (d) — for head direct-logit attribution
         let mut mlp_h: Vec<Vec<f32>> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
@@ -131,6 +132,7 @@ impl Gpt2 {
                 attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&v));
             }
             att_last.push(layer_att);
+            head_act.push(attn_out.row(seq - 1).to_vec());
             x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight")) + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
             let mut hm = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
@@ -141,10 +143,18 @@ impl Gpt2 {
         let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
         let lg = self.b.rowdot_f32("wte", &xf.row(seq - 1).to_vec());
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
-        assemble(ids, &att_last, &mlp_h, model_predicts, |l, n, act| {
-            let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // neuron n's write direction (any dtype)
-            top_promoted(&self.b.rowdot_f32("wte", &w_out), act, 5)
-        })
+        let gain = self.b.arr1("ln_f.weight").to_vec(); // final LayerNorm gain — for head direct-logit attribution (center=true)
+        assemble(
+            ids,
+            &att_last,
+            &mlp_h,
+            model_predicts,
+            |l, n, act| {
+                let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // neuron n's write direction (any dtype)
+                top_promoted(&self.b.rowdot_f32("wte", &w_out), act, 5)
+            },
+            |l, head| head_dla(&self.b, &format!("h{l}.attn.c_proj.weight"), "wte", &head_act[l], head, hd, &gain, true, 5),
+        )
     }
 
     /// Run `m` new positions (rows of `emb`, already token+position embeddings for absolute positions `cur..cur+m`)

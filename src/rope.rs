@@ -149,6 +149,7 @@ impl Rope {
         let rep = h / nkv;
         let mut x = self.b.rows_f32("embed", ids);
         let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut head_act: Vec<Vec<f32>> = Vec::new(); // per layer: attn_out's last row (h*hd) — for head direct-logit attribution
         let mut mlp_h: Vec<Vec<f32>> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
@@ -176,6 +177,7 @@ impl Rope {
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
             }
             att_last.push(layer_att);
+            head_act.push(attn_out.row(seq - 1).to_vec());
             x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
             let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
             let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
@@ -191,10 +193,18 @@ impl Rope {
         let lg = self.b.rowdot_f32(self.unembed_name(), &xf.row(seq - 1).to_vec());
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
         let un = self.unembed_name();
-        assemble(ids, &att_last, &mlp_h, model_predicts, |l, n, act| {
-            let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
-            top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
-        })
+        let gain = self.b.arr1("norm").to_vec(); // final RMSNorm gain — for head direct-logit attribution
+        assemble(
+            ids,
+            &att_last,
+            &mlp_h,
+            model_predicts,
+            |l, n, act| {
+                let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
+                top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
+            },
+            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), un, &head_act[l], head, hd, &gain, false, 5),
+        )
     }
 
     /// Run `m` new positions through the layers, caching K/V (post-RoPE, GQA width nkv*hd) and attending over the whole
