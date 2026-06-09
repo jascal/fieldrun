@@ -358,7 +358,8 @@ fn main() {
             match lm.explain(ctx) {
                 Some(ex) => {
                     let dec = load_decoder(flag(&args, "--vocab"));
-                    println!("{}", explain::render(&ex, &dec));
+                    let ctx_show = flag(&args, "--explain-context").and_then(|s| s.parse().ok()).unwrap_or(10);
+                    println!("{}", explain::render(&ex, &dec, ctx_show));
                     if let Some(p) = flag(&args, "--out-json") {
                         if let Err(e) = std::fs::write(p, serde_json::to_string_pretty(&ex).unwrap()) {
                             eprintln!("[fieldrun] couldn't write --out-json {p}: {e}");

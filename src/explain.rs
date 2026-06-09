@@ -146,13 +146,20 @@ where
     mlp_features.sort_by(|a, b| b.act.abs().partial_cmp(&a.act.abs()).unwrap());
     mlp_features.truncate(6);
 
-    Explanation { context_tail: ids[ids.len().saturating_sub(8)..].to_vec(), model_predicts, head_circuits, sink_heads, mlp_features }
+    // store the FULL context (it's just the input ids) — render trims the printed preview, but nothing is lost: the
+    // forward pass and every head's attends_to reference the whole sequence.
+    Explanation { context_tail: ids.to_vec(), model_predicts, head_circuits, sink_heads, mlp_features }
 }
 
-/// Render an explanation as human-readable text. `dec` maps a token id to a display string.
-pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String) -> String {
+/// Render an explanation as human-readable text. `dec` maps a token id to a display string; `max_ctx` is how many
+/// trailing context tokens to print (0 = all). This only trims the preview — the model always saw the full context.
+pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String, max_ctx: usize) -> String {
+    let n = ex.context_tail.len();
+    let start = if max_ctx == 0 || max_ctx >= n { 0 } else { n - max_ctx };
+    let lead = if start > 0 { "…" } else { "" };
+    let ctx = ex.context_tail[start..].iter().map(|&t| dec(t)).collect::<Vec<_>>().join(" ");
     let mut l = vec![
-        format!("context …{}", ex.context_tail.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(" ")),
+        format!("context {lead}{ctx}"),
         format!("model predicts {}", dec(ex.model_predicts)),
         format!("  COMPOSITION  content head circuits ({} idle on sink/NO-OP) — reads → writes:", ex.sink_heads),
     ];

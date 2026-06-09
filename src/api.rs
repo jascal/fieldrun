@@ -622,6 +622,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
     eprintln!("[fieldrun] markdown rendering {} (/format to toggle){}", if fmt { "ON" } else { "OFF" },
               if explain { "; explain ON (/explain off to stop)" } else { "" });
     let mut history: Vec<(String, String)> = Vec::new();
+    let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
     let stdin = std::io::stdin();
     loop {
         print!("\nyou> ");
@@ -647,14 +648,29 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                     history.clear();
                     eprintln!("[fieldrun] (conversation reset)");
                 }
-                "explain" => {
-                    explain = match parts.next() {
-                        Some("on") | Some("1") | Some("true") => true,
-                        Some("off") | Some("0") | Some("false") => false,
-                        _ => !explain, // bare /explain toggles
-                    };
-                    eprintln!("[fieldrun] explain {}", if explain { "ON" } else { "OFF" });
-                }
+                "explain" => match parts.next() {
+                    Some("on") | Some("1") | Some("true") => {
+                        explain = true;
+                        eprintln!("[fieldrun] explain ON");
+                    }
+                    Some("off") | Some("0") | Some("false") => {
+                        explain = false;
+                        eprintln!("[fieldrun] explain OFF");
+                    }
+                    Some("context") | Some("ctx") => {
+                        explain_ctx = match parts.next() {
+                            Some("all") | Some("full") | Some("0") => 0,
+                            Some(n) => n.parse().unwrap_or(explain_ctx),
+                            None => explain_ctx,
+                        };
+                        eprintln!("[fieldrun] explain context window = {}",
+                                  if explain_ctx == 0 { "all".to_string() } else { explain_ctx.to_string() });
+                    }
+                    _ => {
+                        explain = !explain; // bare /explain toggles
+                        eprintln!("[fieldrun] explain {}", if explain { "ON" } else { "OFF" });
+                    }
+                },
                 "format" | "md" | "markdown" => {
                     fmt = match parts.next() {
                         Some("on") | Some("1") | Some("true") => true,
@@ -668,7 +684,8 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                     eprintln!("[fieldrun] markdown rendering OFF (raw)");
                 }
                 "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
-                                     /explain [on|off] (circuits + features) · /format [on|off] (markdown) · /help"),
+                                     /explain [on|off] (circuits + features) · /explain context <N|all> · \
+                                     /format [on|off] (markdown) · /help"),
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }
             continue;
@@ -778,7 +795,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                                 format!("{meaning} [{id}]")
                             }
                         };
-                        eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec));
+                        eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec, explain_ctx));
                     }
                     None => {
                         eprintln!("[fieldrun] (explain not implemented for arch {arch} — turning off; /explain on to retry)");
