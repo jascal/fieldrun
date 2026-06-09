@@ -63,6 +63,10 @@ impl Bundle {
         self.arrays.get(name).unwrap_or_else(|| panic!("missing array {name}"))
     }
 
+    pub fn has(&self, name: &str) -> bool {
+        self.arrays.contains_key(name)
+    }
+
     pub fn arr2(&self, name: &str) -> ArrayView2<f32> {
         let (shape, v) = self.get(name);
         ArrayView2::from_shape((shape[0], shape[1]), v).unwrap()

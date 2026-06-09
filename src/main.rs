@@ -8,14 +8,19 @@
 
 mod bundle;
 mod composition;
+mod model;
 mod retrieval;
+mod rope;
 
 use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use bundle::Bundle;
 use composition::Gpt2;
+use model::Model;
 use retrieval::Store;
+use rope::Rope;
 
 #[derive(serde::Deserialize)]
 struct Holdout {
@@ -42,11 +47,21 @@ fn main() {
 
     // Tier B (composition) — the real forward pass from a fieldrun bundle; positions scored in parallel.
     if let Some(stem) = flag(&args, "--bundle") {
-        let lm = Gpt2::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+        let bundle = Bundle::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+        let arch = bundle.arch.clone();
+        let lm: Box<dyn Model> = match arch.as_str() {
+            "gpt2" => Box::new(Gpt2::new(bundle)),
+            "rope" => Box::new(Rope::new(bundle)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope)"),
+        };
+        let t0 = std::time::Instant::now();
         let preds: Vec<i64> = (ctx_window..end).into_par_iter().map(|i| lm.predict(ctx(i))).collect();
+        let secs = t0.elapsed().as_secs_f64();
         let correct = preds.iter().zip(ctx_window..end).filter(|(p, i)| **p == ids[*i]).count();
         dump_if(&args, &preds);
-        report("Tier B (composition)", &format!("bundle {stem}.fieldrun · pure-Rust GPT-2"), correct, preds.len(), threads);
+        report("Tier B (composition)", &format!("bundle {stem}.fieldrun · pure-Rust {arch}"), correct, preds.len(), threads);
+        println!("[fieldrun] throughput: {:.1} forwards/s across {threads} threads ({:.0} ms/forward/core)",
+                 preds.len() as f64 / secs, secs * 1000.0 * threads as f64 / preds.len() as f64);
         return;
     }
 

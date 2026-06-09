@@ -6,6 +6,7 @@
 use ndarray::{s, Array2, ArrayView1, Axis};
 
 use crate::bundle::Bundle;
+use crate::model::Model;
 
 pub struct Gpt2 {
     b: Bundle,
@@ -47,15 +48,15 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gpt2 {
-    pub fn load(stem: &str) -> std::io::Result<Gpt2> {
-        let b = Bundle::load(stem)?;
+    pub fn new(b: Bundle) -> Gpt2 {
         let c = &b.config; // [n_layer, n_head, n_embd, n_positions, vocab]
         let (n_layer, n_head, d) = (c[0] as usize, c[1] as usize, c[2] as usize);
-        Ok(Gpt2 { b, n_layer, n_head, d })
+        Gpt2 { b, n_layer, n_head, d }
     }
 
-    /// Logits for a token-id context (seq, vocab). Mirrors `numpy_lm.NumpyGPT2.logits`.
-    pub fn logits(&self, ids: &[i64]) -> Array2<f32> {
+    /// Final hidden states (seq, d) after the last LayerNorm — the forward pass minus the unembed. Mirrors
+    /// `numpy_lm.NumpyGPT2.logits` up to `x @ wte.T`. The unembed is split out so `predict` projects only the last row.
+    fn hidden(&self, ids: &[i64]) -> Array2<f32> {
         let seq = ids.len();
         let hd = self.d / self.n_head;
         let wte = self.b.arr2("wte");
@@ -93,13 +94,20 @@ impl Gpt2 {
                 + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
 
-        let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
-        xf.dot(&wte.t())
+        layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"))
     }
 
-    pub fn predict(&self, ids: &[i64]) -> i64 {
-        let lg = self.logits(ids);
-        let last = lg.index_axis(Axis(0), ids.len() - 1);
-        last.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    /// Full logits (seq, vocab) — for explain / scoring every position. `predict` uses the cheaper last-row path.
+    pub fn logits(&self, ids: &[i64]) -> Array2<f32> {
+        self.hidden(ids).dot(&self.b.arr2("wte").t())
+    }
+}
+
+impl Model for Gpt2 {
+    fn predict(&self, ids: &[i64]) -> i64 {
+        let xf = self.hidden(ids);
+        let last = xf.index_axis(Axis(0), ids.len() - 1);   // unembed only the predicting position
+        let logits = last.dot(&self.b.arr2("wte").t());
+        logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
 }
