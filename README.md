@@ -13,7 +13,7 @@ distribution form of that result: the same tiers, ported to Rust, built into one
 | Tier | What it adds | Status |
 |------|--------------|--------|
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
-| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen (RoPE), Gemma-2, Gemma-3, Gemma-4** (dense text), each exact vs the Python/torch reference |
+| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen (RoPE), Gemma-2, Gemma-3, Gemma-4** (text, incl. **MoE**), each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
 | API | `/predict` · `/generate` · `/explain` HTTP server | **done** — `--serve PORT` |
@@ -45,7 +45,14 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   QK-norm, dual-base RoPE, window masking — and for Gemma-4 the differing global `head_dim`, partial-rotary RoPE,
   value-norm and the Per-Layer-Embedding block): both **f32 60/60, f16 60/60, int8 59/60** (`scripts/gemma3_ref.py`).
   No gated download — the architecture math is what's validated, and a tiny instance exercises it identically to the
-  full model. (Gemma-4 is the dense text path; the MoE 26B-A4B variant is a follow-on.)
+  full model. The Gemma-4 **MoE** path (router + experts, `enable_moe_block`) validates the same: **f32 60/60, f16/int8
+  59/60**.
+
+**Expert offload (MoE).** MoE is what moves the memory–capability curve: per token only the router's top-k experts are
+touched, so resident set ≠ total params. `convert` writes **each expert as its own int8 array**; the loader **mmaps**
+the blob and keeps expert weights **on disk**, paging only the active experts in per token (the OS page cache holds the
+hot working set) — so a model with far more expert params than RAM runs, resident set = shared layers + hot experts.
+Non-MoE models are unaffected (no expert arrays).
 - **KV-cache** generation produces tokens byte-identical to naive full-recompute on every arch.
 
 ## Performance (16-core box)
