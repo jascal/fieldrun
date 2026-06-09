@@ -117,6 +117,10 @@ f32/f16 matmuls through Apple's tuned BLAS (a large speedup over the pure-Rust k
 default and the faithful reference). Dense models run **f16** (`--dtype f16`); int8 is for memory-bound MoE, not dense
 speed. (Linux: `--features openblas`, needs `libopenblas`.)
 
+> macOS may print `ld: warning: … Accelerate … was built for newer 'macOS' version … than being linked` — it's
+> **harmless** (Rust's default deployment target is older than the system SDK; the binary still builds and runs). Silence
+> it by matching your macOS: `MACOSX_DEPLOYMENT_TARGET=15.0 cargo build --release --features accelerate`.
+
 On a 24 GB M-series the lever for *big MoE* is **int8 weights + expert offload**:
 
 ```bash
