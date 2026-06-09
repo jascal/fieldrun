@@ -9,6 +9,7 @@
 mod api;
 mod bundle;
 mod composition;
+mod convert;
 mod device;
 mod explain;
 #[cfg(feature = "gpu")]
@@ -48,6 +49,17 @@ fn has_flag(args: &[String], name: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `fieldrun convert --model <hf-dir> --arch rope --dtype int8 -o <stem>` — HF safetensors -> bundle, no torch.
+    if args.get(1).map(String::as_str) == Some("convert") {
+        let model = flag(&args, "--model").expect("--model <hf-model-dir>");
+        let arch = flag(&args, "--arch").unwrap_or("rope");
+        let dtype = flag(&args, "--dtype").unwrap_or("int8");
+        let out = flag(&args, "-o").or_else(|| flag(&args, "--out")).expect("-o <bundle-stem>");
+        convert::convert(model, arch, dtype, out).expect("convert");
+        return;
+    }
+
     let store_path = flag(&args, "--store").unwrap_or("../lm-sae/pylm/store_gpt2.json");
     let ids_path = flag(&args, "--ids").unwrap_or("../lm-sae/pylm/holdout_gpt2.json");
     let ctx_window: usize = flag(&args, "--ctx").and_then(|s| s.parse().ok()).unwrap_or(64);

@@ -17,6 +17,8 @@ ndarray = "0.16"
 rayon = "1"   # data-parallel scoring: independent forward passes fan out across cores
 half = "2"    # f16 weights kept low-precision in RAM (the in-RAM-precision path), upcast per matmul
 tiny_http = "0.12"   # minimal blocking HTTP server for the /predict /generate /explain API
+safetensors = "0.4"  # read HF weights directly (pure Rust, no torch) for the `convert` subcommand
+memmap2 = "0.9"      # mmap the safetensors so convert streams one tensor at a time (RAM ≈ one tensor)
 wgpu = { version = "22", optional = true }       # cross-platform GPU backend (opt-in, --features gpu)
 pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter/device requests
 
