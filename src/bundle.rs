@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use memmap2::Mmap;
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -54,12 +55,25 @@ struct Header {
     arrays: Vec<ArrSpec>,
 }
 
+/// An MoE expert weight that is NOT parsed into RAM at load — its bytes live in the mmap'd blob and are read +
+/// dequantised on demand, so cold experts never occupy RAM (the OS page cache handles the working set). This is the
+/// expert-offload contract: per token only the router's top-k experts are touched, so a model with far more expert
+/// params than RAM still runs (and a hot expert stays warm in the page cache for free).
+struct ExpertSpec {
+    offset: usize,
+    bytes: usize,
+    shape: Vec<usize>,
+    dtype: String,
+}
+
 pub struct Bundle {
     pub arch: String,
     pub config: Vec<i64>,
     pub config_f: Vec<f64>,
     pub store: Option<serde_json::Value>,
-    arrays: HashMap<String, (Vec<usize>, Arr)>,   // parsed once at load, kept in on-disk precision
+    arrays: HashMap<String, (Vec<usize>, Arr)>,   // parsed once at load, kept in on-disk precision (the resident set)
+    experts: HashMap<String, ExpertSpec>,         // MoE experts: read on demand from the mmap (paged, never resident)
+    mmap: Mmap,                                    // the blob, kept mapped so expert reads page in on demand
 }
 
 pub const FORMAT: &str = "fieldrun-bundle";
@@ -74,10 +88,19 @@ impl Bundle {
         if h.format != FORMAT || h.version != VERSION {
             panic!("unsupported bundle: {} v{} (this fieldrun reads {FORMAT} v{VERSION})", h.format, h.version);
         }
-        let data = std::fs::read(format!("{stem}.fieldrun.bin"))?;
+        // mmap the blob (not read-into-RAM): dense arrays parse out of it once at load; MoE expert weights stay mapped
+        // and page in on demand. For a non-MoE model this reads only the dense pages — same resident footprint as before.
+        let file = std::fs::File::open(format!("{stem}.fieldrun.bin"))?;
+        let mmap = unsafe { Mmap::map(&file)? };
         let mut arrays = HashMap::new();
+        let mut experts = HashMap::new();
         for a in h.arrays {
-            let raw = &data[a.offset..a.offset + a.bytes];
+            // MoE expert weights live on disk; their tiny per-column __scale siblings still parse into RAM.
+            if a.name.contains(".experts.") && !a.name.ends_with("__scale") {
+                experts.insert(a.name, ExpertSpec { offset: a.offset, bytes: a.bytes, shape: a.shape, dtype: a.dtype });
+                continue;
+            }
+            let raw = &mmap[a.offset..a.offset + a.bytes];
             let arr = match a.dtype.as_str() {
                 "f32" => Arr::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
                 "f16" => Arr::F16(raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect()),
@@ -99,11 +122,47 @@ impl Bundle {
             };
             arrays.insert(a.name, (a.shape, arr));
         }
-        Ok(Bundle { arch: h.arch, config: h.config, config_f: h.config_f, store: h.store, arrays })
+        Ok(Bundle { arch: h.arch, config: h.config, config_f: h.config_f, store: h.store, arrays, experts, mmap })
     }
 
     fn get(&self, name: &str) -> &(Vec<usize>, Arr) {
         self.arrays.get(name).unwrap_or_else(|| panic!("missing array {name}"))
+    }
+
+    pub fn has_expert(&self, name: &str) -> bool {
+        self.experts.contains_key(name)
+    }
+
+    /// Read one MoE expert weight on demand from the mmap and dequantise to f32 (i8 via its per-column `__scale`
+    /// sibling, which is resident). Cold experts fault in from disk; hot ones stay in the OS page cache. Returns
+    /// (shape, data) with the same (in, out) row-major layout `mm` expects.
+    pub fn expert_f32(&self, name: &str) -> (Vec<usize>, Vec<f32>) {
+        let e = self.experts.get(name).unwrap_or_else(|| panic!("missing expert array {name}"));
+        let raw = &self.mmap[e.offset..e.offset + e.bytes];
+        let v = match e.dtype.as_str() {
+            "i8" => {
+                let (inp, out) = (e.shape[0], e.shape[1]); // stored (in, out) row-major (put_i8 transpose)
+                let scale = self.arr1o(&format!("{name}__scale"));
+                let mut v = vec![0f32; inp * out];
+                for i in 0..inp {
+                    for j in 0..out {
+                        v[i * out + j] = raw[i * out + j] as i8 as f32 * scale[j];
+                    }
+                }
+                v
+            }
+            "f16" => raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            "f32" => raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            d => panic!("expert dtype {d:?} unsupported"),
+        };
+        (e.shape.clone(), v)
+    }
+
+    /// `x (tokens, in) @ expert_W (in, out)` for an on-demand expert weight — dequantised from the mmap per call.
+    pub fn expert_mm(&self, x: &Array2<f32>, name: &str) -> Array2<f32> {
+        let (shape, w) = self.expert_f32(name);
+        let wv = ArrayView2::from_shape((shape[0], shape[1]), &w).unwrap();
+        x.dot(&wv)
     }
 
     /// Tier C — routed MLP down-projection. For each row keep only the top `frac` neurons by |activation| and sum just

@@ -11,6 +11,8 @@
 //! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate). MoE / attention_k_eq_v /
 //! KV-sharing are not yet implemented (the convert asserts they're off).
 
+use std::collections::HashMap;
+
 use ndarray::{s, Array2};
 
 use crate::bundle::Bundle;
@@ -34,6 +36,10 @@ pub struct Gemma4 {
     window: usize,
     sliding: Vec<bool>,
     tied: bool,
+    moe: bool,        // MoE-FFN layers (dense MLP + a sparse top-k expert branch, summed)
+    n_exp: usize,
+    topk: usize,
+    moe_inter: usize,
 }
 
 fn gelu_tanh(x: f32) -> f32 {
@@ -55,14 +61,16 @@ fn softmax_rows(a: &mut Array2<f32>) {
 
 impl Gemma4 {
     pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Gemma4 {
-        // config: [nl, nh, nkv, nkv_g, hd_local, hd_global, d, ffn, vocab, tied, window, ple, <nl sliding flags>]
+        // config: [nl, nh, nkv, nkv_g, hd_local, hd_global, d, ffn, vocab, tied, window, ple,
+        //          moe, n_exp, topk, moe_inter, <nl sliding flags>]
         let c = &b.config;
         let (n_layer, h, nkv) = (c[0] as usize, c[1] as usize, c[2] as usize);
         let (hd_local, hd_global, d) = (c[4] as usize, c[5] as usize, c[6] as usize);
         let tied = c[9] != 0;
         let window = c[10] as usize;
         let ple = c[11] as usize;
-        let sliding: Vec<bool> = (0..n_layer).map(|l| c[12 + l] != 0).collect();
+        let (moe, n_exp, topk, moe_inter) = (c[12] != 0, c[13] as usize, c[14] as usize, c[15] as usize);
+        let sliding: Vec<bool> = (0..n_layer).map(|l| c[16 + l] != 0).collect();
         // config_f: [theta_local, theta_global, eps, partial_rotary_factor]
         let (theta_local, theta_global, eps, prf) =
             (b.config_f[0] as f32, b.config_f[1] as f32, b.config_f[2] as f32, b.config_f[3] as f32);
@@ -76,8 +84,63 @@ impl Gemma4 {
         Gemma4 {
             b, n_layer, h, nkv, hd_local, hd_global, d, ple, eps,
             escale: (d as f32).sqrt(), ple_escale: (ple as f32).sqrt(), proj_scale: (d as f32).powf(-0.5),
-            inv_local, inv_global, window, sliding, tied,
+            inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter,
         }
+    }
+
+    /// The MoE-FFN expert branch for one layer: route each token to its top-k experts, then for each *active* expert
+    /// dequantise its weights once (paged in from the mmap) and run its assigned tokens. `x_pre` is the pre-FFN hidden
+    /// (= the residual the router and experts both read). Returns the (already pre/post-normed) expert contribution.
+    fn moe_branch(&self, l: usize, x_pre: &Array2<f32>) -> Array2<f32> {
+        let p = format!("l{l}.");
+        let seq = x_pre.nrows();
+        // --- router (norm has no weight; then * scale * 1/√d; proj; softmax; top-k; renorm; per-expert scale) ---
+        let hn = self.rmsnorm(x_pre, None);
+        let scale = self.b.arr1o(&format!("{p}router.scale"));
+        let mut hs = hn;
+        let dscale = (self.d as f32).powf(-0.5);
+        for mut row in hs.rows_mut() {
+            for (i, v) in row.iter_mut().enumerate() { *v = *v * scale[i] * dscale; }
+        }
+        let scores = self.b.mm(&hs, &format!("{p}router.proj")); // (seq, E)
+        let pes = self.b.arr1o(&format!("{p}router.per_expert_scale"));
+        // per token → its top-k (expert, weight); group tokens by expert for one dequant per active expert
+        let mut assign: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for t in 0..seq {
+            let row = scores.row(t);
+            let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|v| (v - m).exp()).collect();
+            let denom: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / denom).collect();
+            let mut idx: Vec<usize> = (0..self.n_exp).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            idx.truncate(self.topk);
+            let tksum: f32 = idx.iter().map(|&e| probs[e]).sum();
+            for &e in &idx {
+                let w = probs[e] / tksum * pes[e];
+                assign.entry(e).or_default().push((t, w));
+            }
+        }
+        // --- experts (pre-norm’d input; each active expert dequantised once from the mmap) ---
+        let h2_in = self.norm(x_pre, &format!("{p}pre_feedforward_layernorm_2"));
+        let mut h2 = Array2::<f32>::zeros((seq, self.d));
+        let mi = self.moe_inter;
+        for (e, toks) in &assign {
+            let mut rows = Array2::<f32>::zeros((toks.len(), self.d));
+            for (i, &(t, _)) in toks.iter().enumerate() { rows.row_mut(i).assign(&h2_in.row(t)); }
+            let gate_up = self.b.expert_mm(&rows, &format!("{p}experts.{e}.gate_up")); // (ntok, 2*mi)
+            let mut hh = Array2::<f32>::zeros((toks.len(), mi));
+            for i in 0..toks.len() {
+                for c in 0..mi {
+                    hh[[i, c]] = gelu_tanh(gate_up[[i, c]]) * gate_up[[i, c + mi]];
+                }
+            }
+            let outp = self.b.expert_mm(&hh, &format!("{p}experts.{e}.down")); // (ntok, d)
+            for (i, &(t, w)) in toks.iter().enumerate() {
+                for c in 0..self.d { h2[[t, c]] += w * outp[[i, c]]; }
+            }
+        }
+        self.norm(&h2, &format!("{p}post_feedforward_layernorm_2"))
     }
 
     fn unembed(&self) -> &str {
@@ -222,7 +285,7 @@ impl Gemma4 {
             let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
             x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
 
-            // --- MLP ---
+            // --- MLP (dense; + a summed MoE expert branch on MoE layers) ---
             let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
             let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
             let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
@@ -231,7 +294,14 @@ impl Gemma4 {
                 *hv = gelu_tanh(*hv) * uv;
             }
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
-            x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
+            let combined = if self.moe {
+                // dense path normed by post_ffn_norm_1, expert path normed by post_ffn_norm_2 (inside moe_branch), summed
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
 
             // --- PLE gated-residual block ---
             let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate")); // (seq, ple)

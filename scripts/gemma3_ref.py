@@ -27,8 +27,9 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
-    if ARCH == "gemma4":
+    if ARCH.startswith("gemma4"):
         from transformers import Gemma4TextConfig
+        is_moe = ARCH == "gemma4moe"
         return Gemma4TextConfig(
             vocab_size=64,
             vocab_size_per_layer_input=64,
@@ -44,7 +45,10 @@ def make_config():
             rms_norm_eps=1e-6,
             max_position_embeddings=256,
             tie_word_embeddings=True,
-            enable_moe_block=False,
+            enable_moe_block=is_moe,
+            num_experts=4 if is_moe else None,
+            top_k_experts=2 if is_moe else None,
+            moe_intermediate_size=16 if is_moe else None,
             attention_k_eq_v=False,
             num_kv_shared_layers=0,
             attn_implementation="eager",
@@ -75,7 +79,7 @@ def build():
 
     torch.manual_seed(0)
     cfg = make_config()
-    Cls = __import__("transformers").Gemma4ForCausalLM if ARCH == "gemma4" else __import__("transformers").Gemma3ForCausalLM
+    Cls = __import__("transformers").Gemma4ForCausalLM if ARCH.startswith("gemma4") else __import__("transformers").Gemma3ForCausalLM
     model = Cls(cfg).eval()
     # randomise the norm weights too (they init to 0 -> (1+w)=1, which would hide a QK-norm/4-norm bug)
     with torch.no_grad():
@@ -106,7 +110,7 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = "Gemma4ForCausalLM" if ARCH == "gemma4" else "Gemma3ForCausalLM"
+    cls = "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM"
     print(f"[gemma3_ref] fieldrun vs torch {cls}: {agree}/{n} top-1 agree ({100*agree/n:.1f}%)")
     if agree != n:
         mism = [(i, ref[i], rust[i]) for i in range(n) if ref[i] != rust[i]][:10]

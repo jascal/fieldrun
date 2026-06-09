@@ -297,9 +297,12 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
 /// RoPE on global layers (handled in the kernel by zero-padding inv_freq), and the Per-Layer-Embedding gated-residual
 /// block. MoE / attention_k_eq_v / KV-sharing are separate follow-on increments (this asserts they're off).
 fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
-    assert!(!c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false), "gemma4: MoE not yet supported");
     assert!(!c.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false), "gemma4: attention_k_eq_v not yet supported");
     assert_eq!(geti(c, "num_kv_shared_layers").unwrap_or(0), 0, "gemma4: KV-sharing not yet supported");
+    let moe = c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_exp = geti(c, "num_experts").unwrap_or(0);
+    let topk = geti(c, "top_k_experts").unwrap_or(0);
+    let moe_inter = geti(c, "moe_intermediate_size").unwrap_or(0);
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let nkv_g = geti(c, "num_global_key_value_heads").unwrap_or(nkv);
@@ -320,8 +323,9 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
         .map(|s| s == "full_attention").unwrap_or((l + 1) % pattern == 0);
     // Gemma 4 forces the last layer to full_attention.
     let is_full = |l: usize| full_of(l) || l + 1 == nl;
-    let mut config: Vec<usize> = vec![nl, nh, nkv, nkv_g, hd, hd_g, d, ffn, vocab, tie as usize, window, ple];
-    for l in 0..nl { config.push(if is_full(l) { 0 } else { 1 }); }
+    let mut config: Vec<usize> = vec![nl, nh, nkv, nkv_g, hd, hd_g, d, ffn, vocab, tie as usize, window, ple,
+                                      moe as usize, n_exp, topk, moe_inter];
+    for l in 0..nl { config.push(if is_full(l) { 0 } else { 1 }); } // sliding flags start at config[16]
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gemma4",
         "config": config, "config_f": [theta_local, theta_global, eps, prf] });
 
@@ -365,6 +369,30 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
         for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"] {
             lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+        }
+        if moe {
+            // extra MoE norms (RMSNorm, no bake); router.norm is with_scale=False (no weight).
+            for nm in ["post_feedforward_layernorm_1", "post_feedforward_layernorm_2", "pre_feedforward_layernorm_2"] {
+                norm(&mut w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
+            }
+            // router: proj (Linear d->E), scale (d), per_expert_scale (E) — all small, f16/f32
+            lin(&mut w, &format!("l{l}.router.proj"), &format!("{p}router.proj.weight"))?;
+            let (ss, sd) = m.read(&format!("{p}router.scale"));
+            w.put_small(&format!("l{l}.router.scale"), &sd, &ss, dtype)?;
+            let (ps, pd) = m.read(&format!("{p}router.per_expert_scale"));
+            w.put_small(&format!("l{l}.router.per_expert_scale"), &pd, &ps, dtype)?;
+            // experts: gate_up_proj (E, 2*moe_inter, d), down_proj (E, d, moe_inter) — write EACH expert as its own
+            // int8 array so a single expert can be paged in independently (the mmap-offload contract).
+            let (gus, gud) = m.read(&format!("{p}experts.gate_up_proj")); // (E, 2*mi, d)
+            let (dns, dnd) = m.read(&format!("{p}experts.down_proj"));     // (E, d, mi)
+            let (gu_out, gu_in) = (gus[1], gus[2]); // (2*mi, d)
+            let (dn_out, dn_in) = (dns[1], dns[2]); // (d, mi)
+            for e in 0..n_exp {
+                let gu = &gud[e * gu_out * gu_in..(e + 1) * gu_out * gu_in];
+                w.put_lin(&format!("l{l}.experts.{e}.gate_up"), gu, gu_out, gu_in, dtype)?;
+                let dn = &dnd[e * dn_out * dn_in..(e + 1) * dn_out * dn_in];
+                w.put_lin(&format!("l{l}.experts.{e}.down"), dn, dn_out, dn_in, dtype)?;
+            }
         }
     }
     let _ = i8;
