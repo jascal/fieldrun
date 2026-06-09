@@ -25,6 +25,8 @@ mod gpu_rope;
 mod gemma;
 mod gemma3;
 mod gemma4;
+#[cfg(feature = "api")]
+mod mdfmt;
 #[cfg(feature = "hub")]
 mod hub;
 mod minimax;
@@ -47,6 +49,7 @@ use gemma3::Gemma3;
 use gemma4::Gemma4;
 use minimax::MiniMax;
 use mla::Mla;
+// mdfmt (Markdown→ANSI for the chat REPL) is only used by the api `chat`; module declared below under cfg(api).
 use model::Model;
 use qwen3moe::Qwen3Moe;
 use retrieval::Store;
@@ -293,7 +296,7 @@ fn main() {
                 // default reply cap depends on the model (reasoning models get a bigger budget); --max-tokens overrides.
                 Some(tg) => {
                     let max_tokens = want.unwrap_or_else(|| tg.default_max_tokens());
-                    api::chat(lm, tg, max_tokens, explain, &arch);
+                    api::chat(lm, tg, max_tokens, explain, has_flag(&args, "--raw"), &arch);
                 }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
@@ -457,7 +460,7 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> [--ctx N] [--n-eval N]        score next-token top-1 (Tier B)\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
-  fieldrun --bundle <stem> --chat [--explain]                             interactive chat REPL (/explain to toggle)\n\
+  fieldrun --bundle <stem> --chat [--explain] [--raw]                     chat REPL (/explain, /format in-REPL)\n\
   fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: token-id + OpenAI/Anthropic\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\
@@ -480,7 +483,7 @@ RUN\n\
   --explain       with --ids: explain that prediction;       --vocab <f>     gpt2 vocab.json for readable explain labels\n\
   \x20               in chat: per-reply explanations (toggle /explain on|off)\n\
   --serve <PORT>  start the HTTP API (--server also works)   --dump <f>      write predictions, one id per line\n\
-  --chat          interactive chat REPL                       --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
+  --raw           chat: stream raw text, no Markdown render   --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
   --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );

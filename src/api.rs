@@ -604,15 +604,17 @@ fn render_chat(system_extra: Option<&str>, msgs: &[Msg]) -> String {
 }
 
 /// Interactive REPL chat over the bundled tokenizer (the `--chat` mode). Maintains conversation history; ChatML prompt.
-/// `explain` starts per-reply explanation output on (toggle live with `/explain`); `arch` names the model for messages.
+/// `explain` starts per-reply explanation output on (toggle live with `/explain`); `raw` disables Markdown rendering;
+/// `arch` names the model for messages.
 #[cfg(feature = "api")]
-pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: bool, arch: &str) {
-    use std::io::Write;
+pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: bool, raw: bool, arch: &str) {
+    use std::io::{IsTerminal, Write};
+    // render Markdown→ANSI only when writing to a real terminal (piped output stays raw, for scripts) and not --raw.
+    let mut fmt = std::io::stdout().is_terminal() && !raw;
     eprintln!("[fieldrun] chat — type a message; /exit to quit, /help for commands (Ctrl-D also exits). \
                (greedy, max_tokens={max_tokens}; generic ChatML template)");
-    if explain {
-        eprintln!("[fieldrun] explain ON — each reply is followed by its composition circuits + features (/explain off to stop)");
-    }
+    eprintln!("[fieldrun] markdown rendering {} (/format to toggle){}", if fmt { "ON" } else { "OFF" },
+              if explain { "; explain ON (/explain off to stop)" } else { "" });
     let mut history: Vec<(String, String)> = Vec::new();
     let stdin = std::io::stdin();
     loop {
@@ -647,8 +649,20 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                     };
                     eprintln!("[fieldrun] explain {}", if explain { "ON" } else { "OFF" });
                 }
+                "format" | "md" | "markdown" => {
+                    fmt = match parts.next() {
+                        Some("on") | Some("1") | Some("true") => true,
+                        Some("off") | Some("0") | Some("false") => false,
+                        _ => !fmt,
+                    };
+                    eprintln!("[fieldrun] markdown rendering {}", if fmt { "ON" } else { "OFF" });
+                }
+                "raw" => {
+                    fmt = false;
+                    eprintln!("[fieldrun] markdown rendering OFF (raw)");
+                }
                 "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
-                                     /explain [on|off] (per-reply circuits + features) · /help"),
+                                     /explain [on|off] (circuits + features) · /format [on|off] (markdown) · /help"),
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }
             continue;
@@ -673,6 +687,11 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             let _ = std::io::stderr().flush();
         }));
         let mut started = false;
+        // when formatting, buffer the current line and render it (Markdown→ANSI) once it's complete, so the reply
+        // still streams a line at a time; `in_code` carries an open ``` fence across lines. Raw mode prints chunks
+        // verbatim (the fastest, most faithful path — and what a pipe gets).
+        let mut linebuf = String::new();
+        let mut in_code = false;
         let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
             if !started {
                 started = true;
@@ -682,7 +701,17 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                 }
                 print!("bot> ");
             }
-            print!("{chunk}");
+            if !fmt {
+                print!("{chunk}");
+                let _ = std::io::stdout().flush();
+                return;
+            }
+            linebuf.push_str(chunk);
+            while let Some(nl) = linebuf.find('\n') {
+                let line = linebuf[..nl].to_string();
+                linebuf.drain(..=nl);
+                println!("{}", crate::mdfmt::render_line(&line, &mut in_code));
+            }
             let _ = std::io::stdout().flush();
         });
         if let Some(h) = spinner.take() {
@@ -690,8 +719,15 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             thinking.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = h.join();
             print!("bot> ");
+            println!();
+        } else if fmt {
+            // render any buffered final line (a reply with no trailing newline); otherwise it's already terminated
+            if !linebuf.is_empty() {
+                println!("{}", crate::mdfmt::render_line(&linebuf, &mut in_code));
+            }
+        } else {
+            println!(); // the raw stream had no trailing newline
         }
-        println!();
         if !finished {
             // ran into the length cap rather than stopping at EOS — say so, so a truncated reply isn't mistaken for
             // a broken model (reasoning models especially blow past a small cap mid-thought).

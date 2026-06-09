@@ -160,9 +160,10 @@ fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     #
 #   --arch  gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
 #   --dtype int8 (default) | f16 | f32       --hf-token <t> (gated)      -o <stem> (override the default location)
 
-# 2. CHAT — interactive REPL (text in/out). Bare `--bundle <name>` defaults to chat. `/help` lists slash commands
-#    (/exit, /reset, /explain [on|off]). `--explain` starts with per-reply explanations on (the circuits + features
-#    behind each reply); toggle them live with `/explain`.
+# 2. CHAT — interactive REPL (text in/out). Bare `--bundle <name>` defaults to chat. Replies are rendered from Markdown
+#    to ANSI in a terminal (bold/headers/lists/code, and LaTeX math transliterated to Unicode: \theta→θ, x^2→x²);
+#    `--raw` or `/format off` keeps it plain (and piped output is always raw). `/help` lists slash commands
+#    (/exit, /reset, /explain [on|off], /format [on|off]). `--explain` starts with per-reply explanations on.
 fieldrun --bundle Qwen2.5-7B-Instruct --chat               # bare name resolves under bundles/
 fieldrun --bundle Qwen2.5-7B-Instruct --chat --explain     # + show why each reply was produced
 

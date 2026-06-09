@@ -55,6 +55,9 @@ diverges without explaining why.
   rowdot_f32, NOT transposed like the other Linears.
 - `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
+- `src/mdfmt.rs` — dependency-free Markdown→ANSI for the chat REPL (headings/lists/bold/italic/code + LaTeX
+  transliteration: `\theta`→θ, `\frac{a}{b}`→(a)/(b), `x^2`→x², math delimiters stripped). Line-buffered so it
+  streams; TTY-gated (raw when piped or `--raw`/`/format off`).
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`): native token-id routes always (`/predict`,`/generate`,
   `/explain`,`/health`); under `--features api` (default-off) a `TextGen` (the `tokenizers` crate) adds the
   **OpenAI** (`/v1/chat/completions`,`/v1/completions`,`/v1/models`) + **Anthropic** (`/v1/messages`) text endpoints and
