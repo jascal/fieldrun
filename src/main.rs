@@ -33,6 +33,8 @@ mod model;
 mod qwen3moe;
 mod retrieval;
 mod rope;
+#[cfg(feature = "api")]
+mod tools;
 
 use std::collections::HashMap;
 

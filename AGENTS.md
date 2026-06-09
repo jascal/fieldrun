@@ -58,7 +58,12 @@ diverges without explaining why.
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`): native token-id routes always (`/predict`,`/generate`,
   `/explain`,`/health`); under `--features api` (default-off) a `TextGen` (the `tokenizers` crate) adds the
   **OpenAI** (`/v1/chat/completions`,`/v1/completions`,`/v1/models`) + **Anthropic** (`/v1/messages`) text endpoints and
-  the **`--chat`** REPL (ChatML prompt, greedy, EOS-stop). Tokenizer is loaded from `<stem>.tokenizer.json`.
+  the **`--chat`** REPL (ChatML prompt, greedy, EOS-stop). Tokenizer is loaded from `<stem>.tokenizer.json`. Also
+  **tool/function calling**: `render_chat` renders the OpenAI/Anthropic message list (incl. prior tool_calls/results)
+  into the ChatML prompt; tool requests are answered non-streaming and return structured `tool_calls`/`tool_use`.
+- `src/tools.rs` — tool calling helpers (api): parse `tools` (OpenAI/Anthropic shapes) → a Hermes-style system
+  preamble; parse the model's output back into calls across formats (Hermes/Qwen `<tool_call>`, Mistral `[TOOL_CALLS]`,
+  Llama/generic JSON; `arguments`/`parameters` normalised, JSON-string args decoded). Best-effort, model-agnostic.
 - `src/hub.rs` — `--features hub` (default): pull a model from HF by repo id with a small ureq client (token auth,
   relative-307-aware); used by `convert --model org/repo`.
 - `src/device.rs` / `src/gpu_mm.rs` / `src/gpu_gpt2.rs` — the opt-in GPU backend (`--features gpu`, wgpu): device

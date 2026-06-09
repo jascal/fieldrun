@@ -12,8 +12,10 @@
 //!    Greedy generation; `max_tokens` honoured; output stops at the model's EOS. Chat uses a ChatML template (a
 //!    reasonable generic default — not necessarily the model's exact trained template). Not the model's real
 //!    tokenizer? then text endpoints 400; the native endpoints still work. `"stream": true` streams tokens as SSE.
-//!    fieldrun extension: `"explain": true` attaches the structured Explanation under a `fieldrun_explanation` field
-//!    (non-streaming responses; standard clients ignore the unknown field). The canonical form is native POST /explain.
+//!    Tool/function calling: pass `tools` (OpenAI `{type:"function",function:{…}}` or Anthropic `{name,input_schema}`)
+//!    and fieldrun declares them in the prompt and returns structured `tool_calls` / `tool_use` (see `tools.rs`; tool
+//!    requests are answered non-streaming). fieldrun extension: `"explain": true` attaches the structured Explanation
+//!    under a `fieldrun_explanation` field (non-streaming; clients ignore the unknown field; canonical: POST /explain).
 
 use serde::Deserialize;
 
@@ -154,7 +156,9 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
         #[cfg(feature = "api")]
         if let Some(tg) = textgen.as_ref() {
             let streamable = matches!(route.as_str(), "/v1/chat/completions" | "/v1/completions" | "/v1/messages");
-            if streamable && wants_stream(&body) {
+            // tool requests don't stream — we need the whole output to parse calls out of it, so they go to handle().
+            let has_tools = !crate::tools::parse_tools(&serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)).is_empty();
+            if streamable && !has_tools && wants_stream(&body) {
                 serve_stream(req, &route, &body, lm.as_ref(), arch, tg);
                 continue;
             }
@@ -223,22 +227,13 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
     }
     let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None });
     let max_tokens = r.max_tokens.unwrap_or_else(|| tg.default_max_tokens()).clamp(1, 16384);
+    // tool calls don't stream (we parse the whole output) — serve() routes tool requests to the non-streaming handler,
+    // so here messages carry at most prior tool calls/results, which render_chat renders into the prompt.
     let (prompt, add_special) = if route == "/v1/completions" {
         (r.prompt.clone(), true)
     } else {
-        let mut system = if r.system.is_empty() { None } else { Some(r.system.clone()) };
-        let mut history: Vec<(String, String)> = Vec::new();
-        let mut last_user = String::new();
-        for (i, m) in r.messages.iter().enumerate() {
-            if m.role == "system" {
-                system = Some(m.content.clone());
-            } else if i == r.messages.len() - 1 && m.role == "user" {
-                last_user = m.content.clone();
-            } else {
-                history.push((m.role.clone(), m.content.clone()));
-            }
-        }
-        (tg.chat_prompt(system.as_deref(), &history, &last_user), false)
+        let sys = if r.system.is_empty() { None } else { Some(r.system.as_str()) };
+        (render_chat(sys, &r.messages), false)
     };
     let route = route.to_string();
     let arch = arch.to_string();
@@ -349,10 +344,58 @@ fn now() -> u64 {
 }
 
 #[cfg(feature = "api")]
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct Msg {
+    #[serde(default)]
     role: String,
-    content: String,
+    // content is a string (OpenAI/most), an array of blocks (Anthropic), or null (an OpenAI assistant turn that is
+    // only tool_calls). serde_json::Value absorbs all three.
+    #[serde(default)]
+    content: serde_json::Value,
+    #[serde(default)]
+    tool_calls: Vec<serde_json::Value>, // OpenAI: assistant's prior tool calls
+    #[serde(default)]
+    tool_call_id: Option<String>, // OpenAI: links a role:"tool" result to its call
+    #[serde(default)]
+    name: Option<String>, // OpenAI legacy function name on a tool/function message
+}
+
+#[cfg(feature = "api")]
+impl Msg {
+    /// The plain text of this message — the string content, or the concatenated `text` blocks of an array content.
+    fn text(&self) -> String {
+        match &self.content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The content blocks of an Anthropic-style message (empty if content isn't an array).
+#[cfg(feature = "api")]
+fn content_blocks(content: &serde_json::Value) -> &[serde_json::Value] {
+    content.as_array().map(|a| a.as_slice()).unwrap_or(&[])
+}
+
+/// Flatten an Anthropic `tool_result` block's `content` (a string, or an array of text blocks) to text.
+#[cfg(feature = "api")]
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()).or_else(|| b.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 /// The structured Explanation for the model's prediction at the end of `prompt`, as a JSON value to graft onto an API
@@ -406,48 +449,158 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         return v.to_string();
     }
 
-    // chat (OpenAI /v1/chat/completions and Anthropic /v1/messages share the message shape)
-    let mut system = if r.system.is_empty() { None } else { Some(r.system.clone()) };
-    let mut history: Vec<(String, String)> = Vec::new();
-    let mut last_user = String::new();
-    for (i, m) in r.messages.iter().enumerate() {
-        if m.role == "system" {
-            system = Some(m.content.clone());
-        } else if i == r.messages.len() - 1 && m.role == "user" {
-            last_user = m.content.clone();
-        } else {
-            history.push((m.role.clone(), m.content.clone()));
-        }
+    // chat (OpenAI /v1/chat/completions and Anthropic /v1/messages share the message shape). Tools (either request
+    // shape) are declared via a system preamble and parsed back out of the output; the round-trip (prior tool_calls +
+    // results in `messages`) is rendered by render_chat.
+    let bv: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let tools = crate::tools::parse_tools(&bv);
+    let mut sys_extra = String::new();
+    if !tools.is_empty() {
+        sys_extra.push_str(&crate::tools::preamble(&tools));
     }
-    let prompt = tg.chat_prompt(system.as_deref(), &history, &last_user);
+    if !r.system.is_empty() {
+        if !sys_extra.is_empty() {
+            sys_extra.push_str("\n\n");
+        }
+        sys_extra.push_str(&r.system);
+    }
+    let prompt = render_chat(if sys_extra.is_empty() { None } else { Some(&sys_extra) }, &r.messages);
     let (text, pt, ct, eos) = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
     let explanation = if r.explain { Some(explanation_json(lm, tg, &prompt, false)) } else { None };
+    let attach = |mut v: serde_json::Value| -> String {
+        if let Some(ex) = explanation {
+            v["fieldrun_explanation"] = ex;
+        }
+        v.to_string()
+    };
+    let calls = if tools.is_empty() || crate::tools::choice_none(&bv) {
+        Vec::new()
+    } else {
+        crate::tools::parse_calls(&text)
+    };
+
+    if !calls.is_empty() {
+        let lead = crate::tools::leading_text(&text);
+        if route == "/v1/messages" {
+            // Anthropic: optional leading text block + one tool_use block per call
+            let mut content = Vec::new();
+            if !lead.is_empty() {
+                content.push(serde_json::json!({ "type": "text", "text": lead }));
+            }
+            for (i, c) in calls.iter().enumerate() {
+                content.push(serde_json::json!({ "type": "tool_use", "id": format!("toolu_{}_{i}", now()),
+                    "name": c.name, "input": c.arguments }));
+            }
+            return attach(serde_json::json!({
+                "id": format!("msg_{}", now()), "type": "message", "role": "assistant", "model": arch,
+                "content": content, "stop_reason": "tool_use", "usage": { "input_tokens": pt, "output_tokens": ct }
+            }));
+        }
+        // OpenAI: message.tool_calls (arguments is a JSON *string*) + finish_reason "tool_calls"
+        let tcs: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| serde_json::json!({ "id": format!("call_{}_{i}", now()), "type": "function",
+                "function": { "name": c.name, "arguments": serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into()) } }))
+            .collect();
+        let content = if lead.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(lead) };
+        return attach(serde_json::json!({
+            "id": format!("chatcmpl-{}", now()), "object": "chat.completion", "created": now(), "model": arch,
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": content, "tool_calls": tcs },
+                          "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct }
+        }));
+    }
 
     if route == "/v1/messages" {
         // Anthropic Messages API
-        let mut v = serde_json::json!({
+        attach(serde_json::json!({
             "id": format!("msg_{}", now()), "type": "message", "role": "assistant", "model": arch,
             "content": [{ "type": "text", "text": text }],
             "stop_reason": if eos {"end_turn"} else {"max_tokens"},
             "usage": { "input_tokens": pt, "output_tokens": ct }
-        });
-        if let Some(ex) = explanation {
-            v["fieldrun_explanation"] = ex;
-        }
-        v.to_string()
+        }))
     } else {
         // OpenAI chat completion
-        let mut v = serde_json::json!({
+        attach(serde_json::json!({
             "id": format!("chatcmpl-{}", now()), "object": "chat.completion", "created": now(), "model": arch,
             "choices": [{ "index": 0, "message": { "role": "assistant", "content": text },
                           "finish_reason": if eos {"stop"} else {"length"} }],
             "usage": { "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct }
-        });
-        if let Some(ex) = explanation {
-            v["fieldrun_explanation"] = ex;
-        }
-        v.to_string()
+        }))
     }
+}
+
+/// Build a ChatML prompt from a message list, rendering OpenAI/Anthropic tool calls + results so the model can do the
+/// tool round-trip. `system_extra` (tool preamble + any top-level system) is merged with role:"system" messages, and
+/// the final `<|im_start|>assistant\n` opens the model's turn.
+#[cfg(feature = "api")]
+fn render_chat(system_extra: Option<&str>, msgs: &[Msg]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut sys: Vec<String> = Vec::new();
+    if let Some(e) = system_extra {
+        if !e.is_empty() {
+            sys.push(e.to_string());
+        }
+    }
+    for m in msgs.iter().filter(|m| m.role == "system") {
+        let t = m.text();
+        if !t.is_empty() {
+            sys.push(t);
+        }
+    }
+    if !sys.is_empty() {
+        let _ = write!(s, "<|im_start|>system\n{}<|im_end|>\n", sys.join("\n\n"));
+    }
+    for m in msgs {
+        match m.role.as_str() {
+            "system" => {}
+            "tool" => {
+                // OpenAI tool result
+                let _ = write!(s, "<|im_start|>tool\n<tool_response>\n{}\n</tool_response><|im_end|>\n", m.text());
+            }
+            "assistant" => {
+                let mut body = m.text();
+                for tc in &m.tool_calls {
+                    if let Some(f) = tc.get("function") {
+                        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let raw = f.get("arguments").cloned().unwrap_or_else(|| serde_json::json!("{}"));
+                        let argv = match &raw {
+                            serde_json::Value::String(x) => serde_json::from_str(x).unwrap_or(raw.clone()),
+                            v => v.clone(),
+                        };
+                        let _ = write!(body, "\n<tool_call>\n{}\n</tool_call>", serde_json::json!({"name": name, "arguments": argv}));
+                    }
+                }
+                for blk in content_blocks(&m.content) {
+                    if blk.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        let name = blk.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let input = blk.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        let _ = write!(body, "\n<tool_call>\n{}\n</tool_call>", serde_json::json!({"name": name, "arguments": input}));
+                    }
+                }
+                let _ = write!(s, "<|im_start|>assistant\n{body}<|im_end|>\n");
+            }
+            _ => {
+                // user — Anthropic carries tool_result blocks inside a user message; render them as tool turns first
+                let mut had_result = false;
+                for blk in content_blocks(&m.content) {
+                    if blk.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        had_result = true;
+                        let _ = write!(s, "<|im_start|>tool\n<tool_response>\n{}\n</tool_response><|im_end|>\n",
+                            tool_result_text(blk.get("content")));
+                    }
+                }
+                let t = m.text();
+                if !t.is_empty() || !had_result {
+                    let _ = write!(s, "<|im_start|>user\n{t}<|im_end|>\n");
+                }
+            }
+        }
+    }
+    s.push_str("<|im_start|>assistant\n");
+    s
 }
 
 /// Interactive REPL chat over the bundled tokenizer (the `--chat` mode). Maintains conversation history; ChatML prompt.
@@ -585,6 +738,40 @@ mod tests {
         assert!(!wants_stream(r#"{"stream":false}"#));
         assert!(!wants_stream(r#"{"messages":[]}"#));
         assert!(!wants_stream("not json"));
+    }
+
+    #[test]
+    fn render_chat_openai_tool_roundtrip() {
+        // user → assistant(tool_calls) → tool result: the prior call + result must land in the prompt as
+        // <tool_call>/<tool_response>, and the prompt must open the assistant's next turn.
+        let msgs: Vec<Msg> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": serde_json::Value::Null,
+             "tool_calls": [{"id": "c1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "15C sunny"}
+        ]))
+        .unwrap();
+        let p = render_chat(Some("You are helpful."), &msgs);
+        assert!(p.contains("<|im_start|>system\nYou are helpful.<|im_end|>"), "{p}");
+        assert!(p.contains("<tool_call>") && p.contains("get_weather") && p.contains("\"city\":\"Paris\""), "{p}");
+        assert!(p.contains("<tool_response>") && p.contains("15C sunny"), "{p}");
+        assert!(p.ends_with("<|im_start|>assistant\n"), "{p}");
+    }
+
+    #[test]
+    fn render_chat_anthropic_tool_roundtrip() {
+        // Anthropic carries tool_use (assistant) + tool_result (user) as content blocks.
+        let msgs: Vec<Msg> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "weather?"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "get_weather",
+                "input": {"city": "Paris"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "15C"}]}
+        ]))
+        .unwrap();
+        let p = render_chat(None, &msgs);
+        assert!(p.contains("<tool_call>") && p.contains("get_weather"), "{p}");
+        assert!(p.contains("<tool_response>") && p.contains("15C"), "{p}");
     }
 
     #[test]
