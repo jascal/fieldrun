@@ -42,6 +42,12 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+// Force-link the selected BLAS backend (Accelerate/OpenBLAS). blas-src only emits its `-framework Accelerate` /
+// `-lopenblas` link directives when the crate is actually referenced; without this `use`, the backend isn't linked and
+// the build fails at link with "undefined symbol: cblas_sgemm" (e.g. "ld: ... for architecture arm64" on macOS).
+#[cfg(feature = "blas")]
+use blas_src as _;
+
 use bundle::Bundle;
 use composition::Gpt2;
 use gemma::Gemma;
