@@ -15,11 +15,13 @@ distribution form of that result: the same tiers, ported to Rust, built into one
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
 | **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen (RoPE), Gemma-2**, each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
-| `explain` | "explain this prediction": live circuits + named features | **done (GPT-2)** — byte-identical to `explain.py` |
+| `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
 | API | `/predict` · `/generate` · `/explain` HTTP server | **done** — `--serve PORT` |
 
-Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles** (Gemma-2-2b in 3.2 GB, fits
-8 GB), and an **AVX-512 VNNI** int8 matmul (on-core int8 dot, runtime-detected + scalar fallback).
+Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
+stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB), and an **AVX-512 VNNI** int8
+matmul with **outlier-aware** activation quant (on-core int8 dot, runtime-detected + scalar fallback; GPT-2 int8 = fp32
+accuracy, 99% per-position).
 
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.

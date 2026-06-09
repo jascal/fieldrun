@@ -32,8 +32,21 @@ diverges without explaining why.
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-What's intentionally still open: int8 for GPT-2/RoPE (only Gemma int8 so far), ARM NEON SDOT (VNNI is x86), a true
-informed-router for a Tier-C wall-clock speedup, RoPE/Gemma `explain`, and a real KV-cache speedup at long context.
+Done across the board: Tier A/B (4 archs), KV-cache, fp16/int8 bundles (int8 for **all** of GPT-2/RoPE/Gemma now —
+embeddings stay fp16, linear weights int8 via VNNI W8A8 + outlier-aware quant), Tier C (`--route-frac`), `explain` for
+all three archs, the HTTP API.
+
+Still open, with the honest catch on each (none are quick wins — they need hardware or a deep kernel, not more glue):
+- **ARM NEON SDOT** (Peter's M2): can't be *validated* on this x86 box, and shipping unvalidated SIMD would break the
+  faithfulness gate. ARM already runs correctly today via the scalar fallback; SDOT is a perf path to add + verify on
+  real ARM hardware. (Note: ARM `sdot` is s8×s8, so it can skip the VNNI u8-offset/colsum trick — a *different* quant
+  packing, which is exactly why it needs its own validation.)
+- **Tier-C wall-clock speedup**: confirmed the bottleneck — sparse-scalar gather loses to dense-SIMD on CPU, and the
+  gate/up still run full. A real speedup needs SIMD sparse kernels (gather into dense sub-weights with weights stored
+  transposed for contiguous gather) + a predictor that skips gate/up. That's a deep build, and on CPU the payoff is
+  uncertain (the gather read can cost as much as the dense pass).
+- **KV-cache quant** (TurboQuant-style): a *memory* win (4× smaller cache) that only manifests at long context, which
+  these short-context demos don't exercise — validatable by token-identity but not demonstrable as a real saving here.
 
 ## Conventions
 
