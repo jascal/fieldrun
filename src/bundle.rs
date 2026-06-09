@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -105,6 +105,39 @@ impl Bundle {
     pub fn arr2o(&self, name: &str) -> Array2<f32> {
         let (shape, arr) = self.get(name);
         Array2::from_shape_vec((shape[0], shape[1]), self.upcast(arr)).unwrap()
+    }
+
+    /// Fused matmul `a (seq, K) @ W (K, N) -> (seq, N)`. For an f16 weight this converts on the fly in a cache-friendly
+    /// `ikj` loop (contiguous W-row and output-row access) — no f32 copy of the weight, which is the real cost of the
+    /// in-RAM-precision path (a fresh upcast per matmul is ~GBs of alloc/write per forward). f32 falls back to ndarray.
+    pub fn mm(&self, a: &Array2<f32>, name: &str) -> Array2<f32> {
+        let (shape, arr) = self.get(name);
+        let (k, n) = (shape[0], shape[1]);
+        match arr {
+            Arr::F32(v) => a.dot(&ArrayView2::from_shape((k, n), v).unwrap()),
+            Arr::F16(v) => {
+                // Upcast W one column-block at a time into a reused f32 buffer, then SIMD-dot the block (ndarray).
+                // Keeps ndarray's vectorised matmul while bounding the upcast allocation to one block, not the whole
+                // weight — a fresh full upcast per matmul was ~GBs of alloc/write per forward.
+                let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                let block = 512.min(n);
+                let mut buf = vec![0f32; k * block];
+                let mut c0 = 0;
+                while c0 < n {
+                    let bw = block.min(n - c0);
+                    for kk in 0..k {
+                        let wrow = &v[kk * n + c0..kk * n + c0 + bw];
+                        for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
+                            *b = w.to_f32();
+                        }
+                    }
+                    let wblock = ArrayView2::from_shape((k, bw), &buf[..k * bw]).unwrap();
+                    out.slice_mut(s![.., c0..c0 + bw]).assign(&a.dot(&wblock));
+                    c0 += bw;
+                }
+                out
+            }
+        }
     }
 
     pub fn arr1o(&self, name: &str) -> Array1<f32> {

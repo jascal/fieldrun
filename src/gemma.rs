@@ -97,9 +97,9 @@ impl Gemma {
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let mut q = a.dot(&self.b.arr2o(&format!("{p}self_attn.q_proj")));
-            let mut k = a.dot(&self.b.arr2o(&format!("{p}self_attn.k_proj")));
-            let v = a.dot(&self.b.arr2o(&format!("{p}self_attn.v_proj")));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
             self.rope(&mut q, h);
             self.rope(&mut k, nkv);
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
@@ -123,17 +123,17 @@ impl Gemma {
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
             }
-            let o = attn_out.dot(&self.b.arr2o(&format!("{p}self_attn.o_proj")));
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
             x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm")); // post-norm before the residual
 
             let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
-            let gate = a2.dot(&self.b.arr2o(&format!("{p}mlp.gate_proj")));
-            let up = a2.dot(&self.b.arr2o(&format!("{p}mlp.up_proj")));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
             let mut hidden = gate;
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = gelu_tanh(*hv) * uv;
             }
-            let mlp = hidden.dot(&self.b.arr2o(&format!("{p}mlp.down_proj")));
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
         }
         self.norm(&x, "norm")
