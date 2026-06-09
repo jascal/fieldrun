@@ -27,9 +27,10 @@ openblas = ["blas", "blas-src/openblas"]
 # client (no torch, no async); auth via `huggingface-cli login` / $HF_TOKEN for gated models. `--no-default-features`
 # drops it for a fully offline / network-free binary.
 hub = ["dep:ureq"]
-# opt-in OpenAI- + Anthropic-compatible HTTP endpoints (text in/out). Pulls in a tokenizer (`tokenizers`), so it's not
-# in the default build (which serves the native token-id API). Build: `cargo build --release --features api`.
-api = ["dep:tokenizers"]
+# opt-in OpenAI- + Anthropic-compatible HTTP endpoints (text in/out) + the `--chat` REPL. Pulls in a tokenizer
+# (`tokenizers`) and `rustyline` (line editing + history + tab-completion of slash commands). On by default; build
+# `--no-default-features` for the lean token-id-only binary.
+api = ["dep:tokenizers", "dep:rustyline"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -51,6 +52,9 @@ ureq = { version = "=2.9.7", optional = true }
 # onig (a small C regex lib) is required by tokenizers 0.20 — needs a C compiler at build (present in any Rust dev
 # setup: Xcode CLT on macOS, build-essential on Linux). It's only pulled by the default `api` feature.
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+# REPL line editing + history + tab-completion for `--chat` (only pulled by the `api` feature). default-features off to
+# skip the on-disk history file (fd-lock etc.) — in-memory history + completion are core, so this stays lean + 1.82-safe.
+rustyline = { version = "14", optional = true, default-features = false }
 
 [[bin]]
 name = "fieldrun"

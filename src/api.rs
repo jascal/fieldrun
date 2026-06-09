@@ -609,6 +609,49 @@ fn render_chat(system_extra: Option<&str>, msgs: &[Msg]) -> String {
     s
 }
 
+/// rustyline helper that Tab-completes the REPL slash commands (and their sub-arguments). Line editing, history, and
+/// the other Helper traits are no-ops/defaults.
+#[cfg(feature = "api")]
+struct SlashHelper;
+
+#[cfg(feature = "api")]
+impl rustyline::completion::Completer for SlashHelper {
+    type Candidate = rustyline::completion::Pair;
+    fn complete(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<rustyline::completion::Pair>)> {
+        let upto = &line[..pos];
+        if !upto.starts_with('/') {
+            return Ok((pos, Vec::new()));
+        }
+        let pair = |s: &str| rustyline::completion::Pair { display: s.to_string(), replacement: s.to_string() };
+        // sub-argument completion (after the command + a space), else complete the command name itself
+        if let Some(sp) = upto.find(' ') {
+            let cmd = &upto[..sp];
+            let arg_start = upto.rfind(' ').unwrap() + 1;
+            let frag = &upto[arg_start..];
+            let subs: &[&str] = match cmd {
+                "/explain" => &["on", "off", "context", "all"],
+                "/format" => &["on", "off"],
+                _ => &[],
+            };
+            Ok((arg_start, subs.iter().filter(|s| s.starts_with(frag)).map(|s| pair(s)).collect()))
+        } else {
+            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/format", "/raw", "/help"];
+            Ok((0, CMDS.iter().filter(|c| c.starts_with(upto)).map(|c| pair(c)).collect()))
+        }
+    }
+}
+
+#[cfg(feature = "api")]
+impl rustyline::hint::Hinter for SlashHelper {
+    type Hint = String;
+}
+#[cfg(feature = "api")]
+impl rustyline::highlight::Highlighter for SlashHelper {}
+#[cfg(feature = "api")]
+impl rustyline::validate::Validator for SlashHelper {}
+#[cfg(feature = "api")]
+impl rustyline::Helper for SlashHelper {}
+
 /// Interactive REPL chat over the bundled tokenizer (the `--chat` mode). Maintains conversation history; ChatML prompt.
 /// `explain` starts per-reply explanation output on (toggle live with `/explain`); `raw` disables Markdown rendering;
 /// `arch` names the model for messages.
@@ -617,21 +660,41 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
     use std::io::{IsTerminal, Write};
     // render Markdown→ANSI only when writing to a real terminal (piped output stays raw, for scripts) and not --raw.
     let mut fmt = std::io::stdout().is_terminal() && !raw;
-    eprintln!("[fieldrun] chat — type a message; /exit to quit, /help for commands (Ctrl-D also exits). \
-               (greedy, max_tokens={max_tokens}; generic ChatML template)");
+    eprintln!("[fieldrun] chat — type a message; /help for commands, Tab completes them, ↑/↓ history, /exit or Ctrl-D \
+               to quit. (greedy, max_tokens={max_tokens}; generic ChatML template)");
     eprintln!("[fieldrun] markdown rendering {} (/format to toggle){}", if fmt { "ON" } else { "OFF" },
               if explain { "; explain ON (/explain off to stop)" } else { "" });
     let mut history: Vec<(String, String)> = Vec::new();
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
-    let stdin = std::io::stdin();
-    loop {
-        print!("\nyou> ");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if stdin.read_line(&mut line).unwrap_or(0) == 0 {
-            eprintln!("\n[fieldrun] bye");
-            break;
+    // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
+    // during readline; the generation/streaming below runs in normal mode exactly as before.
+    let cfg = rustyline::Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .auto_add_history(true)
+        .build();
+    let mut rl = match rustyline::Editor::<SlashHelper, rustyline::history::MemHistory>::with_history(cfg, rustyline::history::MemHistory::new()) {
+        Ok(mut e) => {
+            e.set_helper(Some(SlashHelper));
+            e
         }
+        Err(e) => {
+            eprintln!("[fieldrun] couldn't start the line editor: {e}");
+            return;
+        }
+    };
+    loop {
+        let line = match rl.readline("\nyou> ") {
+            Ok(l) => l,
+            Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C cancels the current line
+            Err(rustyline::error::ReadlineError::Eof) => {
+                eprintln!("[fieldrun] bye");
+                break;
+            }
+            Err(e) => {
+                eprintln!("[fieldrun] input error: {e}");
+                break;
+            }
+        };
         let user = line.trim();
         if user.is_empty() {
             continue;
