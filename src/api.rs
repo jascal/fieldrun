@@ -64,6 +64,12 @@ impl TextGen {
             .unwrap_or_default()
     }
 
+    /// The token string for an id, including special tokens (e.g. 151644 → "<|im_start|>") — for explain labels, where
+    /// `decode` blanks special tokens. Returns the raw vocab token; None if the id is out of range.
+    fn id_to_token(&self, id: i64) -> Option<String> {
+        u32::try_from(id).ok().and_then(|u| self.tok.id_to_token(u))
+    }
+
     fn decode(&self, ids: &[i64]) -> String {
         let u: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         self.tok.decode(&u, true).unwrap_or_default()
@@ -760,7 +766,12 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                     Some(ex) => {
                         let dec = |id: i64| {
                             let s = tg.decode(&[id]);
-                            if s.is_empty() { format!("[{id}]") } else { format!("{s:?}") }
+                            if !s.is_empty() {
+                                format!("{s:?}")
+                            } else {
+                                // special tokens decode to "" — show their name (e.g. <|im_start|>) instead of a bare id
+                                tg.id_to_token(id).unwrap_or_else(|| format!("[{id}]"))
+                            }
                         };
                         eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec));
                     }
