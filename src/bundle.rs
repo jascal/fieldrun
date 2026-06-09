@@ -64,6 +64,7 @@ pub struct Bundle {
 
 pub const FORMAT: &str = "fieldrun-bundle";
 pub const VERSION: u32 = 1;
+const OUTLIER_T: usize = 32; // activation channels kept in f32 per row in the W8A8 path (outlier-aware quant)
 
 impl Bundle {
     /// Load a fieldrun bundle: `<stem>.fieldrun.json` (manifest) + `<stem>.fieldrun.bin` (blob). f32 arrays hand out
@@ -147,18 +148,28 @@ impl Bundle {
             Arr::I8(w8) => {
                 let scale = self.arr1o(&format!("{name}__scale"));
                 let (kk, nn) = (w8.k, w8.n);
+                let t = OUTLIER_T.min(kk); // keep the T largest-magnitude activation channels in f32
                 let mut out = Array2::<f32>::zeros((a.nrows(), nn));
                 for i in 0..a.nrows() {
                     let arow = a.row(i);
                     let arow = arow.as_slice().unwrap();
-                    let amax = arow.iter().fold(0f32, |mx, &v| mx.max(v.abs()));
-                    let sa = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                    let au: Vec<u8> = arow.iter().map(|&v| ((v / sa).round() as i32).clamp(-127, 127) as u8 ^ 0x80).collect();
+                    // outlier-aware activation quant: the int8 scale fits the BULK (outliers excluded), and the few
+                    // outlier channels are added back exactly in f32 — the massive-activation outliers are what wreck
+                    // a naive per-token scale (TurboQuant's insight), so handling them recovers most of the W8A8 loss.
+                    let absv: Vec<f32> = arow.iter().map(|v| v.abs()).collect();
+                    let mut idx: Vec<usize> = (0..kk).collect();
+                    idx.select_nth_unstable_by(t, |&x, &y| absv[y].partial_cmp(&absv[x]).unwrap());
+                    let bulk_max = if t < kk { absv[idx[t]] } else { 0.0 };
+                    let sa = if bulk_max > 0.0 { bulk_max / 127.0 } else { 1.0 };
+                    let mut au: Vec<u8> = arow.iter().map(|&v| (((v / sa).round() as i32).clamp(-127, 127) as u8) ^ 0x80).collect();
+                    let ov: Vec<(usize, f32)> = idx[0..t].iter().map(|&o| { au[o] = 128; (o, arow[o]) }).collect();
                     let orow: Vec<f32> = (0..nn)
                         .into_par_iter()
                         .map(|j| {
                             let acc = vnni_udot(&au, &w8.wt[j * kk..(j + 1) * kk]);
-                            sa * scale[j] * (acc - 128 * w8.colsum[j]) as f32
+                            let base = j * kk;
+                            let corr: f32 = ov.iter().map(|&(ch, av)| av * w8.wt[base + ch] as f32).sum();
+                            scale[j] * (sa * (acc - 128 * w8.colsum[j]) as f32 + corr)
                         })
                         .collect();
                     out.row_mut(i).assign(&ArrayView1::from(orow.as_slice()));
