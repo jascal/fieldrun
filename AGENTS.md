@@ -32,7 +32,8 @@ diverges without explaining why.
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (4 archs), KV-cache, fp16/int8 bundles (int8 for **all** of GPT-2/RoPE/Gemma now —
+Done across the board: Tier A/B (4 archs), KV-cache + **int8 KV cache** (`--kv-int8`, all archs, ~4x smaller, lossy:
+near-lossless short-run, occasional greedy flips long-run), fp16/int8 bundles (int8 for **all** of GPT-2/RoPE/Gemma —
 embeddings stay fp16, linear weights int8 via VNNI W8A8 + outlier-aware quant), Tier C (`--route-frac`), `explain` for
 all three archs, the HTTP API.
 
