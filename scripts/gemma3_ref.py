@@ -27,6 +27,35 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
+    if ARCH == "mla":
+        from transformers import DeepseekV3Config
+        return DeepseekV3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,          # dense layers
+            moe_intermediate_size=16,      # expert + shared-expert width
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            q_lora_rank=16,
+            kv_lora_rank=16,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,            # qk_head_dim = 12
+            v_head_dim=8,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            n_group=4,                     # 2 experts/group
+            topk_group=2,                  # -> 4 eligible, then top-2 (exercises group limiting)
+            norm_topk_prob=True,
+            routed_scaling_factor=2.5,
+            first_k_dense_replace=1,       # layer 0 dense, 1-3 MoE -> both paths
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False,
+            max_position_embeddings=256,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
     if ARCH == "qwen3moe":
         from transformers import Qwen3MoeConfig
         return Qwen3MoeConfig(
@@ -103,7 +132,8 @@ def build():
     torch.manual_seed(0)
     cfg = make_config()
     tf = __import__("transformers")
-    Cls = (tf.Qwen3MoeForCausalLM if ARCH == "qwen3moe"
+    Cls = (tf.DeepseekV3ForCausalLM if ARCH == "mla"
+           else tf.Qwen3MoeForCausalLM if ARCH == "qwen3moe"
            else tf.Gemma4ForCausalLM if ARCH.startswith("gemma4")
            else tf.Gemma3ForCausalLM)
     model = Cls(cfg).eval()
@@ -136,7 +166,8 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = ("Qwen3MoeForCausalLM" if ARCH == "qwen3moe"
+    cls = ("DeepseekV3ForCausalLM" if ARCH == "mla"
+           else "Qwen3MoeForCausalLM" if ARCH == "qwen3moe"
            else "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM")
     print(f"[gemma3_ref] fieldrun vs torch {cls}: {agree}/{n} top-1 agree ({100*agree/n:.1f}%)")
     if agree != n:

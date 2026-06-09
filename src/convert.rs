@@ -156,7 +156,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
         "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe)"),
+        "mla" => convert_mla(&cfg, &m, dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla)"),
     };
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
     Ok(())
@@ -465,6 +466,112 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -
         } else {
             for proj in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
                 lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+            }
+        }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
+/// DeepSeek-V3 / Kimi-K2 — MLA (multi-head latent attention) + DeepSeek MoE. MLA compresses q and kv through low-rank
+/// down→up projections (q_a/q_b, kv_a/kv_b) with a 128-dim no-RoPE part and a 64-dim shared decoupled-RoPE part, and a
+/// distinct v_head_dim. The MoE has a shared always-on expert plus group-limited sigmoid routing (with a learned bias
+/// correction). The first `first_k_dense_replace` layers are dense. Experts written one int8 array each (offload).
+fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    let nl = geti(c, "num_hidden_layers").unwrap();
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let d = geti(c, "hidden_size").unwrap();
+    let q_lora = geti(c, "q_lora_rank").unwrap_or(0);
+    let kv_lora = geti(c, "kv_lora_rank").unwrap();
+    let qk_nope = geti(c, "qk_nope_head_dim").unwrap();
+    let qk_rope = geti(c, "qk_rope_head_dim").unwrap();
+    let v_head = geti(c, "v_head_dim").unwrap();
+    let vocab = geti(c, "vocab_size").unwrap();
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_routed = geti(c, "n_routed_experts").or_else(|| geti(c, "num_local_experts")).unwrap();
+    let n_shared = geti(c, "n_shared_experts").unwrap_or(1);
+    let topk = geti(c, "num_experts_per_tok").unwrap();
+    let moe_inter = geti(c, "moe_intermediate_size").unwrap();
+    let n_group = geti(c, "n_group").unwrap_or(1);
+    let topk_group = geti(c, "topk_group").unwrap_or(1);
+    let norm_topk = c.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
+    let first_k = geti(c, "first_k_dense_replace").unwrap_or(0);
+    let ffn_dense = geti(c, "intermediate_size").unwrap();
+    let (theta, eps) = rope_theta_eps(c);
+    let routed_scaling = getf(c, "routed_scaling_factor").unwrap_or(1.0);
+    let config: Vec<usize> = vec![nl, nh, d, q_lora, kv_lora, qk_nope, qk_rope, v_head, vocab, tie as usize,
+        n_routed, n_shared, topk, moe_inter, n_group, topk_group, norm_topk as usize, first_k, ffn_dense];
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "mla",
+        "config": config, "config_f": [theta, eps, routed_scaling] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); w.put_small(name, &dt, &s, dtype) // standard RMSNorm, weight used directly
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_small("embed", &ed, &es, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight"); w.put_small("lm_head", &dt, &s, dtype)?;
+    }
+    // experts ship either packed (experts.gate_up_proj/down_proj 3D) or per-expert Linears — write per-expert gate/up/down either way.
+    let mut write_experts = |w: &mut BundleWriter, p: &str, l: usize| -> std::io::Result<()> {
+        let packed = format!("{p}mlp.experts.gate_up_proj");
+        if m.has(&packed) {
+            let (gus, gud) = m.read(&packed);        // (E, 2*mi, d)
+            let (dns, dnd) = m.read(&format!("{p}mlp.experts.down_proj")); // (E, d, mi)
+            let (gu_out, gu_in) = (gus[1], gus[2]);
+            let (dn_out, dn_in) = (dns[1], dns[2]);
+            let mi = gu_out / 2;
+            for e in 0..n_routed {
+                let base = e * gu_out * gu_in;
+                w.put_lin(&format!("l{l}.experts.{e}.gate"), &gud[base..base + mi * gu_in], mi, gu_in, dtype)?;
+                w.put_lin(&format!("l{l}.experts.{e}.up"), &gud[base + mi * gu_in..base + gu_out * gu_in], mi, gu_in, dtype)?;
+                let db = e * dn_out * dn_in;
+                w.put_lin(&format!("l{l}.experts.{e}.down"), &dnd[db..db + dn_out * dn_in], dn_out, dn_in, dtype)?;
+            }
+        } else {
+            for e in 0..n_routed {
+                for (fr, hf) in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")] {
+                    let (s, dt) = m.read(&format!("{p}mlp.experts.{e}.{hf}.weight"));
+                    w.put_lin(&format!("l{l}.experts.{e}.{fr}"), &dt, s[0], s[1], dtype)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
+        // MLA projections
+        if q_lora > 0 {
+            lin(&mut w, &format!("l{l}.q_a"), &format!("{p}self_attn.q_a_proj.weight"))?;
+            norm(&mut w, &format!("l{l}.q_a_ln"), &format!("{p}self_attn.q_a_layernorm.weight"))?;
+            lin(&mut w, &format!("l{l}.q_b"), &format!("{p}self_attn.q_b_proj.weight"))?;
+        } else {
+            lin(&mut w, &format!("l{l}.q"), &format!("{p}self_attn.q_proj.weight"))?;
+        }
+        lin(&mut w, &format!("l{l}.kv_a"), &format!("{p}self_attn.kv_a_proj_with_mqa.weight"))?;
+        norm(&mut w, &format!("l{l}.kv_a_ln"), &format!("{p}self_attn.kv_a_layernorm.weight"))?;
+        lin(&mut w, &format!("l{l}.kv_b"), &format!("{p}self_attn.kv_b_proj.weight"))?;
+        lin(&mut w, &format!("l{l}.o_proj"), &format!("{p}self_attn.o_proj.weight"))?;
+        // FFN: dense for the first k layers, else MoE (routed experts + shared expert)
+        if l < first_k {
+            for proj in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+            }
+        } else {
+            lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?; // router (n_routed, d) -> (d, n_routed)
+            let (bs, bd) = m.read(&format!("{p}mlp.gate.e_score_correction_bias"));
+            w.put_small(&format!("l{l}.gate_bias"), &bd, &bs, dtype)?;
+            write_experts(&mut w, &p, l)?;
+            for (fr, hf) in [("shared.gate", "gate_proj"), ("shared.up", "up_proj"), ("shared.down", "down_proj")] {
+                lin(&mut w, &format!("l{l}.{fr}"), &format!("{p}mlp.shared_experts.{hf}.weight"))?;
             }
         }
     }
