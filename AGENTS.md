@@ -46,12 +46,19 @@ diverges without explaining why.
   per-head) + all-MoE with a sigmoid router (+bias for the choice, sigmoid renormed for the weight; no group, no shared
   expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. predict only.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
-  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe`), `--dtype int8|f16|f32` (f32 = bit-exact, for the faithfulness
-  gate). MoE experts written one int8 array each (independently pageable). lm_head (non-tied unembed) stored raw
-  (vocab, d) low-precision — it's read row-wise by rowdot_f32, NOT transposed like the other Linears.
+  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax`), `--dtype int8|f16|f32` (f32 = bit-exact, for the
+  faithfulness gate). `-o` defaults to `bundles/<name>/<name>` (grouped, not loose in cwd); copies `tokenizer.json` next
+  to the bundle + records `eos` in the manifest (for chat / the text API). MoE experts written one int8 array each
+  (independently pageable). lm_head (non-tied unembed) stored raw (vocab, d) low-precision — read row-wise by
+  rowdot_f32, NOT transposed like the other Linears.
 - `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
-- `src/api.rs` — the `tiny_http` server (`--serve PORT`).
+- `src/api.rs` — the `tiny_http` server (`--serve PORT`): native token-id routes always (`/predict`,`/generate`,
+  `/explain`,`/health`); under `--features api` (default-off) a `TextGen` (the `tokenizers` crate) adds the
+  **OpenAI** (`/v1/chat/completions`,`/v1/completions`,`/v1/models`) + **Anthropic** (`/v1/messages`) text endpoints and
+  the **`--chat`** REPL (ChatML prompt, greedy, EOS-stop). Tokenizer is loaded from `<stem>.tokenizer.json`.
+- `src/hub.rs` — `--features hub` (default): pull a model from HF by repo id with a small ureq client (token auth,
+  relative-307-aware); used by `convert --model org/repo`.
 - `src/device.rs` / `src/gpu_mm.rs` / `src/gpu_gpt2.rs` — the opt-in GPU backend (`--features gpu`, wgpu): device
   selection + budget/fallback, the validated matmul primitive, and the GPU-resident GPT-2 forward (`--gpu-check`).
   Default build excludes all of this (no GPU dependency).

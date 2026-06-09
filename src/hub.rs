@@ -107,6 +107,7 @@ pub fn fetch(repo_id: &str, token: Option<String>) -> String {
     };
 
     get("config.json").unwrap_or_else(|e| panic!("[hub] {repo}: {e}"));
+    let _ = get("tokenizer.json"); // best-effort — needed for the OpenAI/Anthropic text API + --chat; absent on some repos
     // sharded if there's an index; else a single safetensors
     match get("model.safetensors.index.json") {
         Ok(()) => {

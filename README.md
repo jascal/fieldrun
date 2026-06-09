@@ -16,7 +16,7 @@ distribution form of that result: the same tiers, ported to Rust, built into one
 | **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
-| API | `/predict` · `/generate` · `/explain` HTTP server | **done** — `--serve PORT` |
+| API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** — `--serve PORT` (native `/predict`·`/generate`·`/explain`; `--features api` adds `/v1/chat/completions`, `/v1/completions`, `/v1/messages`) and `--chat` |
 
 **GPU backend** (opt-in, `--features gpu`, via **wgpu** → Metal/DX12/Vulkan): `--device cpu|gpu|auto` + `--max-vram`
 budget (default 24 GB; exploits Apple unified memory), CPU default + fallback. A **GPU-resident GPT-2 forward** (weights
@@ -144,32 +144,32 @@ local checkpoint dir **or** pulls one from the Hugging Face hub by repo id (the 
 Python + `transformers`, but the binary itself does not.
 
 ```bash
-cargo build --release
-B=../lm-sae/pylm                       # bundles + stores live here (built by pylm/export_bundle.py)
+cargo build --release --features api     # `api` adds the OpenAI/Anthropic text endpoints + `--chat` (needs a tokenizer)
+cargo install --path .                   # optional: puts `fieldrun` on PATH (~/.cargo/bin) so you can drop ./target/release/
 
-# Tier A — retrieval over the flat store
-./target/release/fieldrun --store $B/store_gpt2.json --ids $B/holdout_gpt2.json
-# Convert a checkpoint -> bundle, pure Rust, no torch (single-file or sharded safetensors).
-#   --model  a LOCAL dir, OR an HF repo id like `Qwen/Qwen3-30B-A3B` — pulled straight from the hub (default `hub`
-#            feature). Gated models (Gemma/Llama): `huggingface-cli login` once, or `--hf-token <tok>` / $HF_TOKEN.
-#   --arch   gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
-#   --dtype  int8 (default) | f16 | f32 (f32 = bit-exact bundle, used by the faithfulness gate)
-./target/release/fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8 -o $B/qwen7b   # pulls from HF
-./target/release/fieldrun convert --model ./local-gemma-3-1b-it      --arch gemma3 --dtype int8 -o $B/gemma3_1b  # local dir
-# Tier B — score the real forward pass over a bundle (gpt2 / qwen05b / gemma2_2b[_int8] / gemma3_*)
-./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --n-eval 200   # --dump preds.txt for the diff
-# Generate (KV-cache) — compares cached vs naive, prints tok/s
-./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --ctx 64 --generate 128
-# Tier C — conditional MLP (top fraction of neurons/token)
-./target/release/fieldrun --bundle $B/gpt2 --ids $B/holdout_gpt2.json --route-frac 0.6
-# Explain a prediction (GPT-2)
-./target/release/fieldrun --bundle $B/gpt2 --ids ctx.json --ctx 12 --explain --vocab $B/vocab_gpt2.json
-# Serve the HTTP API
-./target/release/fieldrun --bundle $B/gpt2 --serve 8731
-#   curl -s localhost:8731/predict  -d '{"ids":[...]}'
-#   curl -s localhost:8731/generate -d '{"prompt":[...],"n":16}'
-#   curl -s localhost:8731/explain  -d '{"ids":[...]}'
+# 1. CONVERT — pull from HF by repo id (or a local dir). Bundles default into bundles/<name>/ (not loose in the cwd);
+#    a tokenizer.json is copied alongside (for chat / the text API). Gated models: `huggingface-cli login` first.
+fieldrun convert --model Qwen/Qwen2.5-7B-Instruct --arch rope --dtype int8     # -> bundles/Qwen2.5-7B-Instruct/
+#   --arch  gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi) | minimax
+#   --dtype int8 (default) | f16 | f32       --hf-token <t> (gated)      -o <stem> (override the default location)
+
+# 2. CHAT — interactive REPL (text in/out)
+fieldrun --bundle Qwen2.5-7B-Instruct --chat               # bare name resolves under bundles/
+
+# 3. SERVE — OpenAI- & Anthropic-compatible HTTP API
+fieldrun --bundle Qwen2.5-7B-Instruct --serve 8731
+#   curl -s localhost:8731/v1/chat/completions -d '{"messages":[{"role":"user","content":"Capital of France?"}]}'
+#   curl -s localhost:8731/v1/messages         -d '{"max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}'
+#   native token-id API too:  /predict {"ids":[…]}  ·  /generate {"prompt":[…],"n":N}  ·  /explain  ·  /health
+
+# 4. SCORE / GENERATE / EXPLAIN against a held-out token-id stream ({"holdout_ids":[…]} from the model's tokenizer)
+fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --n-eval 200      # next-token top-1
+fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --ctx 64 --generate 128
 ```
+
+A bare `fieldrun` (or `--help`) prints the full flag list. The default build (no `--features api`) still serves the
+native token-id API and all of convert/score/generate; the text endpoints + `--chat` just need the tokenizer the `api`
+feature pulls in.
 
 ## License
 

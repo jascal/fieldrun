@@ -2,3 +2,4 @@
 *.npz
 *.fieldrun.json
 *.fieldrun.bin
+/bundles

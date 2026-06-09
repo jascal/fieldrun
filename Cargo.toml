@@ -21,6 +21,9 @@ vnni = []
 # client (no torch, no async); auth via `huggingface-cli login` / $HF_TOKEN for gated models. `--no-default-features`
 # drops it for a fully offline / network-free binary.
 hub = ["dep:ureq"]
+# opt-in OpenAI- + Anthropic-compatible HTTP endpoints (text in/out). Pulls in a tokenizer (`tokenizers`), so it's not
+# in the default build (which serves the native token-id API). Build: `cargo build --release --features api`.
+api = ["dep:tokenizers"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -37,6 +40,7 @@ pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter
 # no system OpenSSL/SecureTransport needed, same on Mac + Linux). We download by repo id ourselves — ureq follows HF's
 # relative 307 redirects (which hf-hub 0.3 did not) — and read the standard HF token; no login of our own.
 ureq = { version = "=2.9.7", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 
 [[bin]]
 name = "fieldrun"

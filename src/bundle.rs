@@ -51,6 +51,8 @@ struct Header {
     #[serde(default)]
     config_f: Vec<f64>,
     #[serde(default)]
+    eos: Vec<i64>,
+    #[serde(default)]
     store: Option<serde_json::Value>,
     arrays: Vec<ArrSpec>,
 }
@@ -70,6 +72,7 @@ pub struct Bundle {
     pub arch: String,
     pub config: Vec<i64>,
     pub config_f: Vec<f64>,
+    pub eos: Vec<i64>, // end-of-sequence token id(s) from the source config — used to stop API generation
     pub store: Option<serde_json::Value>,
     arrays: HashMap<String, (Vec<usize>, Arr)>,   // parsed once at load, kept in on-disk precision (the resident set)
     experts: HashMap<String, ExpertSpec>,         // MoE experts: read on demand from the mmap (paged, never resident)
@@ -122,7 +125,7 @@ impl Bundle {
             };
             arrays.insert(a.name, (a.shape, arr));
         }
-        Ok(Bundle { arch: h.arch, config: h.config, config_f: h.config_f, store: h.store, arrays, experts, mmap })
+        Ok(Bundle { arch: h.arch, config: h.config, config_f: h.config_f, eos: h.eos, store: h.store, arrays, experts, mmap })
     }
 
     fn get(&self, name: &str) -> &(Vec<usize>, Arr) {

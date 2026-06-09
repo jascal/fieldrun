@@ -145,10 +145,24 @@ fn getf(c: &serde_json::Value, k: &str) -> Option<f64> {
     c.get(k).and_then(|v| v.as_f64())
 }
 
+fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
+    match c.get("eos_token_id") {
+        Some(serde_json::Value::Number(n)) => n.as_i64().map(|x| vec![x]).unwrap_or_default(),
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_i64()).collect(),
+        _ => vec![],
+    }
+}
+
 pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
     let m = Model::open(model_dir);
     let shards = m.mmaps.len();
+    // the bundle stem may live in a subdirectory (the default groups bundles under bundles/<name>/) — create it.
+    if let Some(p) = std::path::Path::new(out_stem).parent() {
+        if !p.as_os_str().is_empty() {
+            std::fs::create_dir_all(p)?;
+        }
+    }
     let n = match arch {
         "gpt2" => convert_gpt2(&cfg, &m, dtype, out_stem)?,
         "rope" => convert_rope(&cfg, &m, dtype, out_stem)?,
@@ -160,7 +174,20 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "minimax" => convert_minimax(&cfg, &m, dtype, out_stem)?,
         other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
     };
-    println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
+    // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
+    let eos = eos_ids(&cfg);
+    if !eos.is_empty() {
+        let mf = format!("{out_stem}.fieldrun.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mf)?)?;
+        v["eos"] = serde_json::json!(eos);
+        std::fs::write(&mf, serde_json::to_string(&v)?)?;
+    }
+    // copy the tokenizer next to the bundle so `--serve` (OpenAI/Anthropic) and `--chat` can do text I/O.
+    let tok_src = format!("{model_dir}/tokenizer.json");
+    if std::path::Path::new(&tok_src).exists() {
+        let _ = std::fs::copy(&tok_src, format!("{out_stem}.tokenizer.json"));
+    }
+    println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), eos={eos:?}, no torch)");
     Ok(())
 }
 

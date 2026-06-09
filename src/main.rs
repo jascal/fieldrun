@@ -79,7 +79,15 @@ fn main() {
         let model = flag(&args, "--model").expect("--model <local-dir | hf-repo-id>");
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        let out = flag(&args, "-o").or_else(|| flag(&args, "--out")).expect("-o <bundle-stem>");
+        // -o is optional; default groups bundles under bundles/<name>/<name> (not loose in the cwd). <name> = the
+        // model's last path segment (HF repo basename or dir name), minus any @revision.
+        let out: String = match flag(&args, "-o").or_else(|| flag(&args, "--out")) {
+            Some(o) => o.to_string(),
+            None => {
+                let name = model.rsplit('/').next().unwrap_or(model).split('@').next().unwrap_or(model);
+                format!("bundles/{name}/{name}")
+            }
+        };
         let model_dir: String = if std::path::Path::new(model).join("config.json").exists() {
             model.to_string() // a local checkpoint directory
         } else {
@@ -93,7 +101,7 @@ fn main() {
                         repo id, use a build with the `hub` feature (it's on by default; you've disabled it).");
             }
         };
-        convert::convert(&model_dir, arch, dtype, out).expect("convert");
+        convert::convert(&model_dir, arch, dtype, &out).expect("convert");
         return;
     }
 
@@ -102,15 +110,20 @@ fn main() {
     let ctx_window: usize = flag(&args, "--ctx").and_then(|s| s.parse().ok()).unwrap_or(64);
     let n_eval: usize = flag(&args, "--n-eval").and_then(|s| s.parse().ok()).unwrap_or(500);
 
-    let hold: Holdout = serde_json::from_str(&std::fs::read_to_string(ids_path).expect("read ids"))
-        .expect("parse ids");
-    let ids = hold.holdout_ids;
+    // ids are needed for scoring / --generate / --explain / Tier A; --serve and --chat don't use them, so load
+    // gracefully (empty if absent) rather than panicking when someone just wants to serve or chat.
+    let ids: Vec<i64> = std::fs::read_to_string(ids_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Holdout>(&s).ok())
+        .map(|h| h.holdout_ids)
+        .unwrap_or_default();
     let end = (ctx_window + n_eval).min(ids.len());
     let ctx = |i: usize| &ids[i.saturating_sub(ctx_window)..i];
     let threads = rayon::current_num_threads();
 
     // Tier B (composition) — the real forward pass from a fieldrun bundle; positions scored in parallel.
-    if let Some(stem) = flag(&args, "--bundle") {
+    if let Some(raw) = flag(&args, "--bundle") {
+        let stem = resolve_bundle(raw); // bare name -> bundles/<name>/<name> if that's where convert put it
         // device selection (CPU default + reference; GPU opt-in via --features gpu). Matmul dispatch lands next; this
         // reports the choice + budget/fallback so the plumbing is in place.
         let model_bytes = std::fs::metadata(format!("{stem}.fieldrun.bin")).map(|m| m.len()).unwrap_or(0);
@@ -120,7 +133,7 @@ fn main() {
         // --gpu-check: validate the GPU-resident GPT-2 forward against the CPU forward (top-1 agreement + GPU tok/s).
         #[cfg(feature = "gpu")]
         if has_flag(&args, "--gpu-check") {
-            let b1 = Bundle::load(stem).expect("load bundle");
+            let b1 = Bundle::load(&stem).expect("load bundle");
             let n = n_eval.min(50);
             let last = (ctx_window + n).min(ids.len());
             let ctxs: Vec<&[i64]> = (ctx_window..last).map(|i| &ids[i.saturating_sub(ctx_window)..i]).collect();
@@ -128,7 +141,7 @@ fn main() {
             let (cp, name, t0, gp) = match b1.arch.as_str() {
                 "gpt2" => {
                     let g = gpu_gpt2::GpuGpt2::new(&b1).expect("no GPU adapter");
-                    let cpu = Gpt2::new(Bundle::load(stem).expect("load"), 0.0, false);
+                    let cpu = Gpt2::new(Bundle::load(&stem).expect("load"), 0.0, false);
                     let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
                     let t0 = std::time::Instant::now();
                     let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
@@ -136,7 +149,7 @@ fn main() {
                 }
                 "rope" => {
                     let g = gpu_rope::GpuRope::new(&b1).expect("no GPU adapter");
-                    let cpu = Rope::new(Bundle::load(stem).expect("load"), 0.0, false);
+                    let cpu = Rope::new(Bundle::load(&stem).expect("load"), 0.0, false);
                     let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
                     let t0 = std::time::Instant::now();
                     let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
@@ -151,8 +164,10 @@ fn main() {
             return;
         }
 
-        let bundle = Bundle::load(stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
+        let bundle = Bundle::load(&stem).unwrap_or_else(|e| panic!("load bundle {stem}: {e}"));
         let arch = bundle.arch.clone();
+        #[cfg(feature = "api")]
+        let eos = bundle.eos.clone(); // for the text API / --chat stop condition
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let kv_int8 = has_flag(&args, "--kv-int8");
         let lm: Box<dyn Model> = match arch.as_str() {
@@ -167,9 +182,29 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
         };
 
+        // --chat: interactive REPL (text in/out; needs the `api` feature + a tokenizer next to the bundle). No ids.
+        #[cfg(feature = "api")]
+        if has_flag(&args, "--chat") {
+            let max_tokens: usize = flag(&args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(256);
+            match api::TextGen::load(&stem, eos.clone()) {
+                Some(tg) => api::chat(lm, tg, max_tokens),
+                None => eprintln!("[fieldrun] --chat needs a tokenizer: re-run `convert` so {stem}.tokenizer.json is written"),
+            }
+            return;
+        }
+        #[cfg(not(feature = "api"))]
+        if has_flag(&args, "--chat") {
+            eprintln!("[fieldrun] --chat needs a build with `--features api` (text in/out via a tokenizer)");
+            return;
+        }
+
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).
         if let Some(port) = flag(&args, "--serve").and_then(|s| s.parse::<u16>().ok()) {
-            api::serve(lm, &arch, port);
+            #[cfg(feature = "api")]
+            let textgen = api::TextGen::load(&stem, eos);
+            #[cfg(not(feature = "api"))]
+            let textgen: Option<api::TextGen> = None;
+            api::serve(lm, &arch, port, textgen);
             return;
         }
 
@@ -234,6 +269,19 @@ fn main() {
     println!("[fieldrun] idioms: {}", parts.join(", "));
 }
 
+/// Resolve a `--bundle` argument: an explicit stem if `<raw>.fieldrun.json` exists, else the organized location
+/// `bundles/<raw>/<raw>` that `convert` writes by default, else the raw value (load will error clearly).
+fn resolve_bundle(raw: &str) -> String {
+    if std::path::Path::new(&format!("{raw}.fieldrun.json")).exists() {
+        return raw.to_string();
+    }
+    let organized = format!("bundles/{raw}/{raw}");
+    if std::path::Path::new(&format!("{organized}.fieldrun.json")).exists() {
+        return organized;
+    }
+    raw.to_string()
+}
+
 fn print_help() {
     let gpu = if cfg!(feature = "gpu") { "on" } else { "off (build --features gpu)" };
     let hub = if cfg!(feature = "hub") { "on" } else { "off (default; you built --no-default-features)" };
@@ -245,8 +293,11 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> [--ctx N] [--n-eval N]        score next-token top-1 (Tier B)\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
-  fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: /predict /generate /explain\n\
+  fieldrun --bundle <stem> --chat                                         interactive chat REPL (needs --features api)\n\
+  fieldrun --bundle <stem> --serve <PORT>                                 HTTP API (token-id; +OpenAI/Anthropic w/ api)\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
+\n\
+  --bundle takes a stem (<stem>.fieldrun.json) or a bare name resolved under bundles/<name>/ (where convert puts it).\n\
 \n\
   --ids expects {{\"holdout_ids\": [<token ids>]}} from the model's tokenizer.\n\
 \n\
@@ -254,7 +305,7 @@ CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
   --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
   --dtype <D>     int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
-  -o, --out <S>   output bundle stem (writes <S>.fieldrun.json + .bin)\n\
+  -o, --out <S>   output bundle stem (default: bundles/<model-name>/<model-name>, + a .tokenizer.json for the text API)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
 \n\
 RUN\n\
@@ -263,6 +314,7 @@ RUN\n\
   --kv-int8       int8 KV cache during generate              --route-frac F  Tier C: compute only fraction F of MLP neurons\n\
   --explain       explain the last --ctx token               --vocab <f>     gpt2 vocab.json for readable explain labels\n\
   --serve <PORT>  start the HTTP API                         --dump <f>      write predictions, one id per line\n\
+  --chat          interactive chat REPL (--features api)      --max-tokens N  chat/serve generation cap (default 256)\n\
   --device cpu|gpu|auto   --max-vram <GB> (24)   --gpu-check (vs CPU)        GPU backend: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );
