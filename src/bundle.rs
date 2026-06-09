@@ -34,7 +34,7 @@ enum Arr {
 }
 
 /// An int8 weight prepared for the int8 matmul: stored transposed to (out, in) so each output column's contiguous `k`
-/// values feed one signed-int8 dot (`vdotq_s32` on aarch64 NEON, scalar elsewhere). Symmetric per-column quant, so no
+/// values feed one signed-int8 dot (stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere). Symmetric per-column quant, so no
 /// zero-point term — the activation is quantised to signed int8 too and the dot is a plain s8×s8 accumulate.
 struct I8w {
     wt: Vec<i8>, // (n, k) row-major: wt[j*k + kk] = W[kk, j]
@@ -283,7 +283,7 @@ impl Bundle {
                 out
             }
             // int8 W8A8: dynamically quantise each activation row to signed int8, take a signed int8·int8 dot
-            // (`vdotq_s32` on aarch64 NEON, scalar elsewhere), then dequant: out = scale_a * scale_w[j] * Σ a·w + corr.
+            // (stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), then dequant: out = scale_a*scale_w[j]*Σ a·w + corr.
             // Symmetric per-column quant means no zero-point term. Activations go to int8 too, so this is lossier than
             // the f16-activation dequant path — it trades a little accuracy for the on-core int8 dot.
             Arr::I8(w8) => {
@@ -406,14 +406,16 @@ impl Bundle {
 }
 
 /// Dot product of signed-int8 activations with signed-int8 weights, accumulating in i32. On aarch64 (Apple Silicon /
-/// ARM) with the `dotprod` feature it uses the on-core NEON instruction `vdotq_s32` (`sdot`, s8×s8 → i32) — stable on
-/// stable Rust, unlike the x86 AVX-512 VNNI intrinsics which are nightly-only. Elsewhere (and on aarch64 without
-/// dotprod) it falls back to a portable scalar dot, which autovectorises well. The runtime feature check + scalar
-/// fallback keep the binary correct on any CPU; the NEON path is just faster where present.
+/// ARM) it vectorises with **stable** NEON intrinsics — `vmull_s8` (s8×s8 → s16) then `vpadalq_s16` (pairwise-add into
+/// an i32 accumulator), 16 lanes/iteration. (We deliberately avoid the one-instruction `sdot`/`vdotq_s32`: it's gated
+/// behind the still-unstable `stdarch_neon_dotprod` feature, so it would need nightly — exactly the trap the x86
+/// AVX-512 VNNI path fell into. `vmull`/`vpadal` are stable since the base NEON intrinsics, so this builds on stable
+/// 1.82.) Other targets use a portable scalar dot, which autovectorises well. NEON is baseline on aarch64, so the
+/// runtime check always passes there; the scalar fallback keeps any non-aarch64 CPU correct.
 fn i8dot(a: &[i8], w: &[i8]) -> i32 {
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("dotprod") {
+        if std::arch::is_aarch64_feature_detected!("neon") {
             return unsafe { sdot_neon(a, w) };
         }
     }
@@ -421,7 +423,7 @@ fn i8dot(a: &[i8], w: &[i8]) -> i32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
+#[target_feature(enable = "neon")]
 unsafe fn sdot_neon(a: &[i8], w: &[i8]) -> i32 {
     use std::arch::aarch64::*;
     let len = a.len();
@@ -430,7 +432,11 @@ unsafe fn sdot_neon(a: &[i8], w: &[i8]) -> i32 {
     for c in 0..chunks {
         let av = vld1q_s8(a.as_ptr().add(c * 16));
         let wv = vld1q_s8(w.as_ptr().add(c * 16));
-        acc = vdotq_s32(acc, av, wv); // 4 i32 lanes, each += Σ of 4 s8·s8 products
+        // s8×s8 -> s16 products for the low and high 8 lanes, then pairwise-add each into the i32 accumulator.
+        let p_lo = vmull_s8(vget_low_s8(av), vget_low_s8(wv)); // int16x8
+        let p_hi = vmull_s8(vget_high_s8(av), vget_high_s8(wv)); // int16x8
+        acc = vpadalq_s16(acc, p_lo); // acc[i] += p_lo[2i] + p_lo[2i+1]
+        acc = vpadalq_s16(acc, p_hi);
     }
     let mut sum = vaddvq_s32(acc); // horizontal add of the 4 lanes
     for k in (chunks * 16)..len {

@@ -24,9 +24,11 @@ diverges without explaining why.
 
 - `src/retrieval.rs` — Tier A: `Store` ports `lm.py` (induction + n-gram backoff + grammar).
 - `src/bundle.rs` — the fieldrun bundle loader (f32/f16/i8), the matmul `mm` (parallel f32/f16 + int8 W8A8 with
-  outlier-aware activation quant). The int8 dot (`i8dot`) is signed s8×s8: NEON `sdot`/`vdotq_s32` on aarch64
-  (runtime-detected `dotprod`, `#[target_feature]`-gated — stable Rust) with a scalar fallback everywhere else; no
-  feature flag, no nightly. `mm_routed_down` (Tier C), and the row-wise embed helpers.
+  outlier-aware activation quant). The int8 dot (`i8dot`) is signed s8×s8: **stable NEON** `vmull_s8` → `vpadalq_s16`
+  on aarch64 (`#[target_feature(enable="neon")]`, neon is baseline so the runtime check always passes) with a scalar
+  fallback everywhere else; no feature flag, no nightly. NB: we deliberately do *not* use the one-instruction
+  `sdot`/`vdotq_s32` — it's gated behind the unstable `stdarch_neon_dotprod` feature and would force nightly (the same
+  trap the dropped x86 AVX-512 VNNI path hit). `mm_routed_down` (Tier C), and the row-wise embed helpers.
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
   (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
   (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1 pattern, no soft-capping. `gemma4.rs`
@@ -67,17 +69,19 @@ diverges without explaining why.
 Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 W8A8 +
-outlier-aware quant; scalar int8 dot by default, opt-in AVX-512 VNNI via `--features vnni`), **MoE expert-offload**
+outlier-aware quant; signed int8 dot — stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), **MoE expert-offload**
 (experts mmap'd, paged per token, never resident), Tier C
 (`--route-frac`), `explain` (GPT-2/RoPE/Gemma-2/Gemma-3), the HTTP API, and a **pure-Rust `convert`** (no torch).
 Gemma-3 / Gemma-4 dense / Gemma-4 MoE are each validated f32 60/60 (f16/int8 ≥59/60) vs a tiny
 `Gemma3ForCausalLM`/`Gemma4ForCausalLM` (`scripts/gemma3_ref.py build {gemma3,gemma4,gemma4moe}`).
 
 Still open, with the honest catch on each (none are quick wins — they need hardware or a deep kernel, not more glue):
-- **ARM NEON SDOT** (Peter's M2): can't be *validated* on this x86 box, and shipping unvalidated SIMD would break the
-  faithfulness gate. ARM already runs correctly today via the scalar fallback; SDOT is a perf path to add + verify on
-  real ARM hardware. (Note: ARM `sdot` is s8×s8, so it can skip the VNNI u8-offset/colsum trick — a *different* quant
-  packing, which is exactly why it needs its own validation.)
+- **ARM NEON int8 validation**: the stable-NEON `vmull`/`vpadal` int8 dot is wired and *compiles* for aarch64
+  (`cargo check --target aarch64-unknown-linux-gnu --no-default-features` on this x86 box), but its numerical output
+  can't be *run-validated* here. The scalar path is proven bit-exact to the prior scheme (int8 dumps diff clean), and
+  the NEON path is a straightforward vectorisation of that same signed s8×s8 sum — but per the faithfulness gate it
+  still needs an on-device run: on an M-series, `scripts/validate_all.sh` (the int8 column) confirms NEON == torch.
+  (The faster one-instruction `sdot`/`vdotq_s32` stays out: unstable `stdarch_neon_dotprod`, i.e. nightly-only.)
 - **Tier-C wall-clock speedup**: confirmed the bottleneck — sparse-scalar gather loses to dense-SIMD on CPU, and the
   gate/up still run full. A real speedup needs SIMD sparse kernels (gather into dense sub-weights with weights stored
   transposed for contiguous gather) + a predictor that skips gate/up. That's a deep build, and on CPU the payoff is

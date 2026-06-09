@@ -30,10 +30,11 @@ build stays pure-CPU with no GPU dependency.
 
 Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
 stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
-activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The int8 dot uses the on-core NEON **`sdot`**
-instruction on aarch64 (Apple Silicon / ARM, runtime-detected) with a portable scalar fallback everywhere else — all on
-stable Rust, no feature flag or nightly. (The activations are quantised to *signed* int8 to feed `sdot` directly; this
-is bit-exact to the scalar dot, so the faithfulness numbers are unchanged.)
+activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The int8 dot is vectorised on aarch64 (Apple Silicon /
+ARM) with **stable NEON** intrinsics (`vmull_s8` → `vpadalq_s16`, 16 lanes/iter) and a portable scalar fallback
+everywhere else — all on stable Rust, no feature flag or nightly. (Activations are quantised to *signed* int8; this is
+bit-exact to the scalar dot, so the faithfulness numbers are unchanged. We avoid the one-instruction `sdot`/`vdotq_s32`
+on purpose — it's still behind an unstable feature and would force nightly.)
 
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.
@@ -108,8 +109,8 @@ archs fall back to naive recompute for generation, which is correct but slower.)
 ## Running a big model on a Mac (M3 / M4, unified memory)
 
 The build is pure-CPU and cross-platform — **`cargo build --release` compiles on stable Rust everywhere** (Apple
-Silicon, Intel macOS, Linux); on Apple Silicon the int8 dot uses the NEON `sdot` instruction automatically (scalar
-fallback elsewhere), no flags needed. On a 24 GB M-series the lever is **int8 weights + expert offload**:
+Silicon, Intel macOS, Linux); on Apple Silicon the int8 dot vectorises with stable NEON automatically (scalar fallback
+elsewhere), no flags needed. On a 24 GB M-series the lever is **int8 weights + expert offload**:
 
 ```bash
 cargo build --release                                   # builds on macOS ARM as-is
@@ -130,7 +131,7 @@ archs run on CPU).
 
 - **Generation** (single-stream, KV-cache): GPT-2 ~25 tok/s, Qwen2.5-0.5B ~9 tok/s.
 - **KV-cache** turns O(n²) recompute into O(n): GPT-2 64→128 tokens is 4.8× over naive.
-- **int8 dot**: NEON `sdot` (s8×s8) on aarch64, scalar fallback elsewhere; **outlier-aware** activation quant keeps it
+- **int8 dot**: stable NEON `vmull_s8`/`vpadalq_s16` (s8×s8) on aarch64, scalar fallback elsewhere; **outlier-aware** activation quant keeps it
   lossless on the sample (100%). On a Mac, prefer `--dtype f16` for the fastest first-token latency on dense models —
   f16 goes through the blocked SIMD GEMM, whereas int8 trades a little speed for a smaller resident set (its win is on
   big / memory-bound MoE models, where the matmul isn't the bottleneck).
