@@ -61,8 +61,8 @@ fn main() {
         let kv_int8 = has_flag(&args, "--kv-int8");
         let lm: Box<dyn Model> = match arch.as_str() {
             "gpt2" => Box::new(Gpt2::new(bundle, route, kv_int8)),
-            "rope" => Box::new(Rope::new(bundle, route)),
-            "gemma" => Box::new(Gemma::new(bundle, route)),
+            "rope" => Box::new(Rope::new(bundle, route, kv_int8)),
+            "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma)"),
         };
 

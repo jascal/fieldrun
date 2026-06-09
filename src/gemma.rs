@@ -24,7 +24,8 @@ pub struct Gemma {
     escale: f32,
     inv: Vec<f32>,
     window: usize,
-    route: f32, // Tier C: fraction of MLP neurons per token (0 = off; int8 down falls back to dense)
+    route: f32,    // Tier C: fraction of MLP neurons per token (0 = off; int8 down falls back to dense)
+    kv_int8: bool, // store the KV cache (GQA width) as int8 with a per-kv-head scale
 }
 
 fn gelu_tanh(x: f32) -> f32 {
@@ -45,14 +46,14 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gemma {
-    pub fn new(b: Bundle, route: f32) -> Gemma {
+    pub fn new(b: Bundle, route: f32, kv_int8: bool) -> Gemma {
         // config: [n_layer, H, nkv, hd, d, ffn, vocab, tied]; config_f: [theta, eps, attn_cap, final_cap, qscalar, escale]
         let (n_layer, h, nkv, hd, d) = (b.config[0] as usize, b.config[1] as usize, b.config[2] as usize,
                                         b.config[3] as usize, b.config[4] as usize);
         let (theta, eps, attn_cap, final_cap, qscalar, escale) = (b.config_f[0] as f32, b.config_f[1] as f32,
             b.config_f[2] as f32, b.config_f[3] as f32, b.config_f[4] as f32, b.config_f[5] as f32);
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
-        Gemma { b, n_layer, h, nkv, hd, d, eps, attn_cap, final_cap, scale: qscalar.powf(-0.5), escale, inv, window: 4096, route }
+        Gemma { b, n_layer, h, nkv, hd, d, eps, attn_cap, final_cap, scale: qscalar.powf(-0.5), escale, inv, window: 4096, route, kv_int8 }
     }
 
     fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
@@ -270,6 +271,107 @@ impl Gemma {
         self.norm(&x, "norm")
     }
 
+    /// `forward_block` with an int8 KV cache (GQA width, per-kv-head scale), keeping Gemma's soft-cap + sliding window.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_q(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>],
+                       vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]) -> Array2<f32> {
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let kvdim = nkv * hd;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let q8 = |v: f32, sc: f32| (v / sc).round().clamp(-127.0, 127.0) as i8;
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.rope(&mut q, h, cur);
+            self.rope(&mut k, nkv, cur);
+            for i in 0..m {
+                let pos = cur + i;
+                for kh in 0..nkv {
+                    let base = kh * hd;
+                    let sck = ((0..hd).fold(0f32, |mx, c| mx.max(k[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    let scv = ((0..hd).fold(0f32, |mx, c| mx.max(v[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    ks[l][pos * nkv + kh] = sck;
+                    vs[l][pos * nkv + kh] = scv;
+                    for c in 0..hd {
+                        kc[l][pos * kvdim + base + c] = q8(k[[i, base + c]], sck);
+                        vc[l][pos * kvdim + base + c] = q8(v[[i, base + c]], scv);
+                    }
+                }
+            }
+            let sliding = l % 2 == 0;
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let mut kh_a = Array2::<f32>::zeros((klen, hd));
+                let mut vh_a = Array2::<f32>::zeros((klen, hd));
+                for pos in 0..klen {
+                    let (sck, scv) = (ks[l][pos * nkv + kv], vs[l][pos * nkv + kv]);
+                    for c in 0..hd {
+                        kh_a[[pos, c]] = kc[l][pos * kvdim + kv * hd + c] as f32 * sck;
+                        vh_a[[pos, c]] = vc[l][pos * kvdim + kv * hd + c] as f32 * scv;
+                    }
+                }
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let mut scores = qh.dot(&kh_a.t()) * self.scale;
+                if self.attn_cap > 0.0 {
+                    scores.mapv_inplace(|s| self.attn_cap * (s / self.attn_cap).tanh());
+                }
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (sliding && abs >= self.window && j <= abs - self.window) {
+                            scores[[i, j]] = -1e30;
+                        }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh_a));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = gelu_tanh(*hv) * uv;
+            }
+            let mlp = self.down(&hidden, &format!("{p}mlp.down_proj"));
+            x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
+        }
+        self.norm(&x, "norm")
+    }
+
+    fn generate_kv_int8(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        let total = prompt.len() + n_new;
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * kvdim]).collect();
+        let mut vc = kc.clone();
+        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+        let mut vs = ks.clone();
+        let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+        let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            emb = self.b.rows_f32("embed", &[next]) * self.escale;
+            let xb = self.forward_block_q(&emb, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+    }
+
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
         let last = xfn.row(xfn.nrows() - 1).to_vec();
         let logits = self.b.rowdot_f32("embed", &last); // tied unembed, streamed f16; softcap is monotone → skip
@@ -291,6 +393,9 @@ impl Model for Gemma {
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        if self.kv_int8 {
+            return self.generate_kv_int8(prompt, n_new);
+        }
         let total = prompt.len() + n_new;
         let kvdim = self.nkv * self.hd;
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
