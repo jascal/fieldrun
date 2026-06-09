@@ -687,21 +687,22 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             let _ = std::io::stderr().flush();
         }));
         let mut started = false;
-        // when formatting, buffer the current line and render it (Markdown→ANSI) once it's complete, so the reply
-        // still streams a line at a time; `in_code` carries an open ``` fence across lines. Raw mode prints chunks
-        // verbatim (the fastest, most faithful path — and what a pipe gets).
+        // Stop the spinner + print the "bot> " prefix only when there's VISIBLE output — for raw that's the first
+        // token; for formatted it's the first COMPLETED line (Markdown renders a line at a time). Until then the
+        // spinner keeps running, so on a slow model you see "[ thinking Ns ]", never an empty "bot> " sitting there
+        // looking like an editable input prompt while it's still generating. `in_code` carries an open ``` fence.
         let mut linebuf = String::new();
         let mut in_code = false;
         let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, false, &mut |chunk| {
-            if !started {
-                started = true;
-                thinking.store(false, std::sync::atomic::Ordering::Relaxed);
-                if let Some(h) = spinner.take() {
-                    let _ = h.join();
-                }
-                print!("bot> ");
-            }
             if !fmt {
+                if !started {
+                    started = true;
+                    thinking.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(h) = spinner.take() {
+                        let _ = h.join();
+                    }
+                    print!("bot> ");
+                }
                 print!("{chunk}");
                 let _ = std::io::stdout().flush();
                 return;
@@ -710,23 +711,38 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
             while let Some(nl) = linebuf.find('\n') {
                 let line = linebuf[..nl].to_string();
                 linebuf.drain(..=nl);
+                if !started {
+                    started = true;
+                    thinking.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(h) = spinner.take() {
+                        let _ = h.join();
+                    }
+                    print!("bot> ");
+                }
                 println!("{}", crate::mdfmt::render_line(&line, &mut in_code));
             }
             let _ = std::io::stdout().flush();
         });
-        if let Some(h) = spinner.take() {
-            // no tokens were produced (empty/immediate-eos reply) — stop the spinner and still show the prompt
+        // Generation finished. If nothing visible was emitted yet (empty reply, or a formatted reply that never hit a
+        // newline), stop the spinner now and print the prefix + whatever remains in the buffer.
+        if !started {
             thinking.store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = h.join();
+            if let Some(h) = spinner.take() {
+                let _ = h.join();
+            }
             print!("bot> ");
-            println!();
+            if fmt && !linebuf.is_empty() {
+                println!("{}", crate::mdfmt::render_line(&linebuf, &mut in_code));
+            } else {
+                println!();
+            }
         } else if fmt {
-            // render any buffered final line (a reply with no trailing newline); otherwise it's already terminated
+            // flush a trailing partial line (reply with no final newline); otherwise we're already on a fresh line
             if !linebuf.is_empty() {
                 println!("{}", crate::mdfmt::render_line(&linebuf, &mut in_code));
             }
         } else {
-            println!(); // the raw stream had no trailing newline
+            println!(); // raw stream had no trailing newline
         }
         if !finished {
             // ran into the length cap rather than stopping at EOS — say so, so a truncated reply isn't mistaken for
