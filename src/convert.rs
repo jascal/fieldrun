@@ -154,7 +154,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "rope" => convert_rope(&cfg, &m, dtype, out_stem)?,
         "gemma" => convert_gemma(&cfg, &m, dtype, out_stem)?,
         "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3)"),
+        "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4)"),
     };
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), no torch)");
     Ok(())
@@ -288,6 +289,88 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
     let local = nested("sliding_attention").or_else(|| getf(c, "rope_local_base_freq")).unwrap_or(10_000.0);
     let global = nested("full_attention").or_else(|| getf(c, "rope_theta")).unwrap_or(1_000_000.0);
     (local, global)
+}
+
+/// Gemma 4 (dense text path: PLE on, MoE off). Adds to the Gemma-3 backbone: RMSNorm uses the weight *directly*
+/// (NOT (1+w) — Gemma 4 inits norm weights to 1.0), value-norm (RMS, no weight → no array), attention scaling = 1.0,
+/// a *different* head_dim on global layers (so q/k/v/o shapes differ per layer type), partial-rotary "proportional"
+/// RoPE on global layers (handled in the kernel by zero-padding inv_freq), and the Per-Layer-Embedding gated-residual
+/// block. MoE / attention_k_eq_v / KV-sharing are separate follow-on increments (this asserts they're off).
+fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    assert!(!c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false), "gemma4: MoE not yet supported");
+    assert!(!c.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false), "gemma4: attention_k_eq_v not yet supported");
+    assert_eq!(geti(c, "num_kv_shared_layers").unwrap_or(0), 0, "gemma4: KV-sharing not yet supported");
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
+    let nkv_g = geti(c, "num_global_key_value_heads").unwrap_or(nkv);
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = geti(c, "head_dim").unwrap_or(d / nh);
+    let hd_g = geti(c, "global_head_dim").unwrap_or(hd);
+    let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
+    let ple = geti(c, "hidden_size_per_layer_input").unwrap_or(256);
+    let eps = getf(c, "rms_norm_eps").unwrap_or(1e-6);
+    let window = geti(c, "sliding_window").unwrap_or(512);
+    let pattern = geti(c, "sliding_window_pattern").unwrap_or(6);
+    let (theta_local, theta_global) = gemma3_thetas(c);
+    let prf = c.get("rope_parameters").and_then(|v| v.get("full_attention")).and_then(|t| t.get("partial_rotary_factor"))
+        .and_then(|t| t.as_f64()).unwrap_or(0.25);
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true);
+    let lt = c.get("layer_types").and_then(|v| v.as_array());
+    let full_of = |l: usize| lt.and_then(|a| a.get(l)).and_then(|s| s.as_str())
+        .map(|s| s == "full_attention").unwrap_or((l + 1) % pattern == 0);
+    // Gemma 4 forces the last layer to full_attention.
+    let is_full = |l: usize| full_of(l) || l + 1 == nl;
+    let mut config: Vec<usize> = vec![nl, nh, nkv, nkv_g, hd, hd_g, d, ffn, vocab, tie as usize, window, ple];
+    for l in 0..nl { config.push(if is_full(l) { 0 } else { 1 }); }
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gemma4",
+        "config": config, "config_f": [theta_local, theta_global, eps, prf] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let i8 = dtype == "int8";
+    // RMSNorm: Gemma 4 uses the weight directly (no +1 bake).
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); // (out, in)
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    // main + PLE embeddings (both f16/f32, never int8 — embed stays low-precision)
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_small("embed", &ed, &es, dtype)?;
+    let (es2, ed2) = m.read("model.embed_tokens_per_layer.weight"); // (vocab_per_layer, nl*ple)
+    w.put_small("embed_per_layer", &ed2, &es2, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    norm(&mut w, "per_layer_projection_norm", "model.per_layer_projection_norm.weight")?;
+    // per_layer_model_projection: Linear(d -> nl*ple); the int8 W8A8 path needs the weight, so keep it f16/f32 like a norm
+    {
+        let (s, dt) = m.read("model.per_layer_model_projection.weight"); // (nl*ple, d)
+        let (out, inp) = (s[0], s[1]);
+        let mut t = vec![0f32; inp * out];
+        for o in 0..out { for i in 0..inp { t[i * out + o] = dt[o * inp + i]; } }
+        w.put_small("per_layer_model_projection", &t, &[inp, out], dtype)?;
+    }
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight");
+        w.put_lin("lm_head", &dt, s[0], s[1], dtype)?;
+    }
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        for nm in ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm",
+                   "self_attn.q_norm", "self_attn.k_norm", "post_per_layer_input_norm"] {
+            norm(&mut w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
+        }
+        // v_norm has with_scale=False (no weight) → nothing to write.
+        for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                     "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"] {
+            lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+        }
+    }
+    let _ = i8;
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
 }
 
 /// Shared Llama/Qwen/Gemma writer: embed (f16) + final norm + per-layer norms (with optional +1 bake) + the
