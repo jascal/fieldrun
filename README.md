@@ -38,15 +38,21 @@ that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Fa
 
 Every tier is validated by **top-1 agreement against the Python/torch reference** on the same inputs:
 - **Tier A** — 0 per-position mismatches vs `lm.py` over 500 positions (with and without grammar).
-- **Tier B** — exact vs the numpy kernels (= torch): GPT-2 0/200, Qwen 0/32, Gemma-2-2b 0/18 (fp16/fp32); int8+VNNI
-  matches on the sample once activations are outlier-aware-quantised.
-- **Gemma-3 / Gemma-4** — `convert --dtype f32` gives a bit-exact bundle, scored top-1 against a tiny random-init
-  `Gemma3ForCausalLM` / `Gemma4ForCausalLM` (eager attention; sized to exercise both sliding+full layers, GQA,
-  QK-norm, dual-base RoPE, window masking — and for Gemma-4 the differing global `head_dim`, partial-rotary RoPE,
-  value-norm and the Per-Layer-Embedding block): both **f32 60/60, f16 60/60, int8 59/60** (`scripts/gemma3_ref.py`).
-  No gated download — the architecture math is what's validated, and a tiny instance exercises it identically to the
-  full model. The Gemma-4 **MoE** path (router + experts, `enable_moe_block`) validates the same: **f32 60/60, f16/int8
-  59/60**.
+- **Tier B (GPT-2 / RoPE / Gemma-2)** — exact vs the numpy kernels (= torch): GPT-2 0/200, Qwen2.5 0/32,
+  Gemma-2-2b 0/18 (fp16/fp32); int8+VNNI matches on the sample once activations are outlier-aware-quantised.
+- **Tier B (newer archs)** — each scored top-1 against a *tiny random-init* torch model (`scripts/gemma3_ref.py`,
+  eager attention), sized to exercise every code path (both sliding+full layers, GQA, QK-norm, dual/partial RoPE,
+  window masking, per-layer-type `head_dim`, PLE, MoE routing + experts, MLA latents). No gated download — the
+  architecture *math* is what's validated, and a tiny instance exercises it identically to the full model. `f32` is
+  the gate (the math); `f16`/`int8` are lossy by design. Reproduce: `scripts/validate_all.sh`.
+
+  | arch | reference | f32 | f16 | int8 |
+  |------|-----------|-----|-----|------|
+  | `gemma3`   | Gemma3ForCausalLM        | 60/60 | 60/60 | 59/60 |
+  | `gemma4`   | Gemma4ForCausalLM (dense) | 60/60 | 60/60 | 59/60 |
+  | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 59/60 |
+  | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
+  | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
 
 **Expert offload (MoE).** MoE is what moves the memory–capability curve: per token only the router's top-k experts are
 touched, so resident set ≠ total params. `convert` writes **each expert as its own int8 array**; the loader **mmaps**
@@ -56,6 +62,47 @@ Non-MoE models are unaffected (no expert arrays). Validated on **Gemma-4 MoE** a
 Qwen3-MoE needs no new attention — it's the RoPE backbone + QK-norm + the MoE block — so it's the first frontier-MoE
 family reachable end-to-end; the remaining kernel class for DeepSeek-V4 / Kimi is MLA.
 - **KV-cache** generation produces tokens byte-identical to naive full-recompute on every arch.
+
+## Supported models
+
+`convert` reads a Hugging Face checkpoint (single-file or sharded safetensors) straight to a bundle, in pure Rust.
+Pick `--arch` by family:
+
+| `--arch` | Models | Notes |
+|----------|--------|-------|
+| `gpt2`   | GPT-2 (124M–1.5B) | learned pos, LayerNorm, tied wte |
+| `rope`   | Llama-3.x, Qwen2.5, Mistral, Phi | RMSNorm + RoPE + GQA + SwiGLU; optional q/k/v bias |
+| `gemma`  | Gemma-2 | √d embed, 4-norm sandwich, logit soft-cap, sliding window |
+| `gemma3` | Gemma-3 (1B/4B/12B/27B) | + QK-norm, dual-base RoPE, 5:1 local/global, no soft-cap |
+| `gemma4` | Gemma-4 (E2B/E4B dense, **26B-A4B MoE**) | + value-norm, per-layer-type `head_dim`, partial-rotary global RoPE, PLE, MoE |
+| `qwen3moe` | Qwen3-MoE (e.g. 30B-A3B) | RoPE + QK-norm + sparse MoE; no new attention kernel |
+| `mla`    | DeepSeek-V3, DeepSeek-V4, **Kimi-K2** | multi-head latent attention + group-limited sigmoid MoE + shared expert |
+
+All validated to top-1 agreement vs the torch reference (see the gate above). Big MoE models (Gemma-4 26B, Qwen3-MoE,
+DeepSeek/Kimi) use **expert offload** — the experts stay mmap'd on disk and only the active top-k page in per token, so
+the resident set is the shared layers + a working set of hot experts, not the whole model. (Predict/score is fully
+supported on every arch; KV-cache `generate` + `explain` are wired for GPT-2 / RoPE / Gemma-2 / Gemma-3 — the newer
+archs fall back to naive recompute for generation, which is correct but slower.)
+
+## Running a big model on a Mac (M3 / M4, unified memory)
+
+The build is pure-CPU and cross-platform (the AVX-512 int8 path is x86-gated and falls back to a portable scalar dot on
+ARM; no code change needed). On a 24 GB M-series the lever is **int8 weights + expert offload**:
+
+```bash
+cargo build --release                                   # builds on macOS ARM as-is
+# 1. download a checkpoint (e.g. Qwen3-MoE) with the HF CLI or hf_hub; you just need its safetensors + config.json
+# 2. convert to an int8 bundle — streams one tensor at a time, so RAM ≈ one tensor, not the whole model
+./target/release/fieldrun convert --model <hf-model-dir> --arch qwen3moe --dtype int8 -o qwen3moe
+# 3. run: score next-token over a held-out id stream (experts page in from the .bin on demand)
+./target/release/fieldrun --bundle qwen3moe --ids holdout.json --ctx 64 --n-eval 50
+```
+
+Why a model far bigger than RAM still runs: `convert` writes each expert as its own int8 array; at load the blob is
+`mmap`'d and only the small dense/shared layers are resident — each token's router picks its top-k experts, those pages
+fault in (and stay warm in the OS page cache), the rest never touch RAM. Headroom = your free disk + page cache, not
+just VRAM. Optional GPU backend (Metal via wgpu) is `--features gpu` (correctness-validated for GPT-2/RoPE; the newer
+archs run on CPU).
 
 ## Performance (16-core box)
 
@@ -79,7 +126,7 @@ B=../lm-sae/pylm                       # bundles + stores live here (built by py
 # Tier A — retrieval over the flat store
 ./target/release/fieldrun --store $B/store_gpt2.json --ids $B/holdout_gpt2.json
 # Convert a Hugging Face checkpoint -> bundle, pure Rust, no torch (single-file or sharded safetensors)
-#   --arch gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe
+#   --arch gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 (incl. MoE) | qwen3moe | mla (DeepSeek/Kimi)
 #   --dtype int8 (default) | f16 | f32 (f32 = bit-exact bundle, used by the faithfulness gate)
 ./target/release/fieldrun convert --model ~/.cache/huggingface/hub/.../gemma-3-1b-it --arch gemma3 --dtype int8 -o $B/gemma3_1b
 # Tier B — score the real forward pass over a bundle (gpt2 / qwen05b / gemma2_2b[_int8] / gemma3_*)
