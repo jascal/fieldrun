@@ -450,4 +450,31 @@ impl Model for Gemma3 {
             pos += 1;
         }
     }
+
+    // KV-cached streaming (early-stop at eos + per-token emit) for chat/serve; mirrors `generate`'s f32 loop.
+    fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
+        let total = prompt.len() + max_tokens;
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
+        let mut vc = kc.clone();
+        let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+        let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::new();
+        let mut pos = prompt.len();
+        loop {
+            if eos.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if !emit(next) || out.len() == max_tokens {
+                break;
+            }
+            emb = self.b.rows_f32("embed", &[next]) * self.escale;
+            let xb = self.forward_block(&emb, pos, &mut kc, &mut vc);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+        out
+    }
 }

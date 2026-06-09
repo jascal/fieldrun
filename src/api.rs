@@ -122,6 +122,7 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
     eprintln!("[fieldrun] serving {arch} on http://0.0.0.0:{port}  (POST /predict /generate /explain · GET /health{openai})");
     for mut req in server.incoming_requests() {
         let url = req.url().to_string();
+        #[cfg(feature = "api")]
         let route = url.split('?').next().unwrap_or(&url).to_string();
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);

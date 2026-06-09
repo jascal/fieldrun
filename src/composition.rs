@@ -317,4 +317,32 @@ impl Model for Gpt2 {
             pos += 1;
         }
     }
+
+    // KV-cached streaming (early-stop at eos + per-token emit) for chat/serve; mirrors `generate`'s f32 loop.
+    fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
+        let d = self.d;
+        let total = prompt.len() + max_tokens;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, d))).collect();
+        let mut vc = kc.clone();
+        let ppos: Vec<i64> = (0..prompt.len() as i64).collect();
+        let emb = &self.b.rows_f32("wte", prompt) + &self.b.rows_f32("wpe", &ppos);
+        let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::new();
+        let mut pos = prompt.len();
+        loop {
+            if eos.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if !emit(next) || out.len() == max_tokens {
+                break;
+            }
+            let e = &self.b.rows_f32("wte", &[next]) + &self.b.rows_f32("wpe", &[pos as i64]);
+            let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+        out
+    }
 }

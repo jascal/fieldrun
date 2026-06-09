@@ -88,6 +88,11 @@ fn main() {
                 format!("{}/{name}/{name}", bundles_dir())
             }
         };
+        // skip if this bundle already exists (don't re-download/re-convert) unless --force. Checked before the HF pull.
+        if std::path::Path::new(&format!("{out}.fieldrun.json")).exists() && !has_flag(&args, "--force") {
+            println!("[convert] {out}.fieldrun already exists — skipping (use --force to rebuild)");
+            return;
+        }
         let model_dir: String = if std::path::Path::new(model).join("config.json").exists() {
             model.to_string() // a local checkpoint directory
         } else {
@@ -286,11 +291,17 @@ fn bundles_dir() -> String {
 /// in the cwd) — else the raw value (load errors clearly).
 fn resolve_bundle(raw: &str) -> String {
     if std::path::Path::new(&format!("{raw}.fieldrun.json")).exists() {
-        return raw.to_string();
+        return raw.to_string(); // explicit stem / path
     }
-    for base in [format!("{}/{raw}/{raw}", bundles_dir()), format!("bundles/{raw}/{raw}")] {
-        if std::path::Path::new(&format!("{base}.fieldrun.json")).exists() {
-            return base;
+    // accept the bundle name OR the full HF repo id (org/name[@rev]) — convert names the bundle by the basename, so
+    // resolve under the cache by both forms (and a legacy ./bundles).
+    let name = raw.rsplit('/').next().unwrap_or(raw).split('@').next().unwrap_or(raw);
+    for n in [raw, name] {
+        for root in [bundles_dir(), "bundles".to_string()] {
+            let cand = format!("{root}/{n}/{n}");
+            if std::path::Path::new(&format!("{cand}.fieldrun.json")).exists() {
+                return cand;
+            }
         }
     }
     raw.to_string()
@@ -321,6 +332,7 @@ CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --dtype <D>     int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
+  --force         re-convert even if the bundle already exists (default: skip)\n\
 \n\
 RUN\n\
   --bundle <S>    the .fieldrun bundle stem to load          --ctx N         context window / prediction (default 64)\n\
