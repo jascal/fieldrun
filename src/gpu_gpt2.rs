@@ -54,6 +54,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   x[i]=0.5*v*(1.0+tanh(c*(v+0.044715*v*v*v)));
 }"#;
 
+// Causal multi-head attention over a (seq, 3d) qkv buffer → (seq, d). One thread per (query i, head h); two passes
+// (max, then weighted-sum) with a function-local accumulator (hd ≤ 64 for GPT-2). Keeps attention on the GPU so the
+// residual never leaves the device.
+const ATTENTION: &str = r#"
+@group(0) @binding(0) var<storage, read> qkv: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>; // seq,d,nh,hd
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx=gid.x; let seq=dims.x; let d=dims.y; let nh=dims.z; let hd=dims.w;
+  if (idx>=seq*nh) { return; }
+  let i=idx/nh; let h=idx%nh; let qb=i*3u*d + h*hd; let scale=1.0/sqrt(f32(hd));
+  var mx=-1e30;
+  for (var j=0u;j<=i;j++){ let kb=j*3u*d+d+h*hd; var s=0.0; for (var c=0u;c<hd;c++){ s=s+qkv[qb+c]*qkv[kb+c]; } mx=max(mx,s*scale); }
+  var acc: array<f32,64>; for (var c=0u;c<hd;c++){ acc[c]=0.0; }
+  var den=0.0;
+  for (var j=0u;j<=i;j++){
+    let kb=j*3u*d+d+h*hd; let vb=j*3u*d+2u*d+h*hd;
+    var s=0.0; for (var c=0u;c<hd;c++){ s=s+qkv[qb+c]*qkv[kb+c]; }
+    let w=exp(s*scale-mx); den=den+w;
+    for (var c=0u;c<hd;c++){ acc[c]=acc[c]+w*qkv[vb+c]; }
+  }
+  for (var c=0u;c<hd;c++){ out[i*d+h*hd+c]=acc[c]/den; }
+}"#;
+
 const LAYERNORM: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> g: array<f32>;
@@ -104,7 +129,7 @@ impl GpuGpt2 {
             None,
         )).ok()?;
         let mut pl = HashMap::new();
-        for (k, src) in [("matmul", MATMUL), ("addbias", ADDBIAS), ("add", ADD), ("gelu", GELU), ("layernorm", LAYERNORM)] {
+        for (k, src) in [("matmul", MATMUL), ("addbias", ADDBIAS), ("add", ADD), ("gelu", GELU), ("layernorm", LAYERNORM), ("attention", ATTENTION)] {
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(k), source: wgpu::ShaderSource::Wgsl(src.into()) });
             pl.insert(k, device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(k), layout: None, module: &m, entry_point: "main", compilation_options: Default::default(), cache: None,
@@ -150,23 +175,25 @@ impl GpuGpt2 {
         })
     }
 
-    fn run(&self, name: &str, bufs: &[&wgpu::Buffer], dims: [u32; 4], groups: (u32, u32)) {
+    /// Record one shader dispatch into a shared encoder (its own compute pass — wgpu inserts the barriers between
+    /// passes for dependent buffers). The uniform + bind group are kept alive in `ku`/`kb` until submit.
+    fn record(&self, enc: &mut wgpu::CommandEncoder, ku: &mut Vec<wgpu::Buffer>, kb: &mut Vec<wgpu::BindGroup>,
+              name: &str, bufs: &[&wgpu::Buffer], dims: [u32; 4], groups: (u32, u32)) {
         let pipe = &self.pl[name];
-        let dbuf = self.uniform(dims);
+        let u = self.uniform(dims);
         let mut entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate()
             .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
-        entries.push(wgpu::BindGroupEntry { binding: bufs.len() as u32, resource: dbuf.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: bufs.len() as u32, resource: u.as_entire_binding() });
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None, layout: &pipe.get_bind_group_layout(0), entries: &entries,
         });
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(groups.0, groups.1, 1);
-        }
-        self.queue.submit(Some(enc.finish()));
+        drop(entries);
+        ku.push(u);
+        kb.push(bind);
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, kb.last().unwrap(), &[]);
+        pass.dispatch_workgroups(groups.0, groups.1, 1);
     }
 
     fn read(&self, buf: &wgpu::Buffer, len: usize) -> Vec<f32> {
@@ -184,88 +211,50 @@ impl GpuGpt2 {
         out
     }
 
-    fn matmul(&self, a: &wgpu::Buffer, m: usize, k: usize, wname: &str) -> wgpu::Buffer {
-        let wt = &self.w[wname];
-        let (k2, n) = (wt.rows, wt.cols);
-        assert_eq!(k, k2, "matmul k mismatch for {wname}");
-        let c = self.storage(m * n);
-        self.run("matmul", &[a, &wt.buf, &c], [m as u32, k as u32, n as u32, 0], (m.div_ceil(8) as u32, n.div_ceil(8) as u32));
-        c
-    }
-
-    fn add_bias(&self, c: &wgpu::Buffer, m: usize, n: usize, bname: &str) {
-        self.run("addbias", &[c, &self.w[bname].buf], [m as u32, n as u32, 0, 0], ((m * n).div_ceil(64) as u32, 1));
-    }
-
-    fn layernorm(&self, x: &wgpu::Buffer, m: usize, gname: &str, bname: &str) -> wgpu::Buffer {
-        let out = self.storage(m * self.d);
-        self.run("layernorm", &[x, &self.w[gname].buf, &self.w[bname].buf, &out], [m as u32, self.d as u32, 0, 0], (m.div_ceil(64) as u32, 1));
-        out
-    }
-
-    /// GPU forward; returns the last-position hidden (d,) read back for the CPU unembed.
-    fn last_hidden(&self, ids: &[i64], wte: &[f32], wpe: &[f32]) -> Vec<f32> {
-        let (seq, d, hd) = (ids.len(), self.d, self.d / self.n_head);
-        let mut x0 = vec![0f32; seq * d]; // embed on CPU
-        for (t, &id) in ids.iter().enumerate() {
-            for c in 0..d {
-                x0[t * d + c] = wte[id as usize * d + c] + wpe[t * d + c];
-            }
-        }
-        let x = self.storage_init(&x0);
+    /// GPU forward, batched into ONE command encoder/submit with reused working buffers (no per-op alloc/submit).
+    /// `x0` is the already-embedded input (seq*d). Returns the last-position hidden (d,) for the CPU unembed.
+    fn last_hidden(&self, x0: &[f32], seq: usize) -> Vec<f32> {
+        let (d, hd, nh) = (self.d, self.d / self.n_head, self.n_head);
+        // working buffers, allocated once and reused across layers
+        let x = self.storage_init(x0);
+        let (a, qkv, attn, proj) = (self.storage(seq * d), self.storage(seq * 3 * d), self.storage(seq * d), self.storage(seq * d));
+        let (a2, hb, mp, xf) = (self.storage(seq * d), self.storage(seq * 4 * d), self.storage(seq * d), self.storage(seq * d));
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let (mut ku, mut kb) = (Vec::new(), Vec::new());
+        let mm = |m: usize, n: usize| (m.div_ceil(8) as u32, n.div_ceil(8) as u32);
+        let g1 = |n: usize| (n.div_ceil(64) as u32, 1u32);
+        let (su, du, td, fd) = (seq as u32, d as u32, (3 * d) as u32, (4 * d) as u32);
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
-            let a = self.layernorm(&x, seq, &format!("{p}ln_1.weight"), &format!("{p}ln_1.bias"));
-            let qkv = self.matmul(&a, seq, d, &format!("{p}attn.c_attn.weight"));
-            self.add_bias(&qkv, seq, 3 * d, &format!("{p}attn.c_attn.bias"));
-            // attention on CPU (v1): read qkv, masked softmax per head, upload attn_out
-            let qkv_c = self.read(&qkv, seq * 3 * d);
-            let mut attn = vec![0f32; seq * d];
-            for head in 0..self.n_head {
-                for i in 0..seq {
-                    let mut sc = vec![0f32; i + 1];
-                    let mut mx = f32::NEG_INFINITY;
-                    for (j, scj) in sc.iter_mut().enumerate() {
-                        let mut s = 0.0;
-                        for c in 0..hd {
-                            s += qkv_c[i * 3 * d + head * hd + c] * qkv_c[j * 3 * d + d + head * hd + c];
-                        }
-                        *scj = s / (hd as f32).sqrt();
-                        mx = mx.max(*scj);
-                    }
-                    let mut den = 0.0;
-                    for s in sc.iter_mut() { *s = (*s - mx).exp(); den += *s; }
-                    for c in 0..hd {
-                        let mut o = 0.0;
-                        for (j, &s) in sc.iter().enumerate() {
-                            o += s / den * qkv_c[j * 3 * d + 2 * d + head * hd + c];
-                        }
-                        attn[i * d + head * hd + c] = o;
-                    }
-                }
-            }
-            let attn_b = self.storage_init(&attn);
-            let proj = self.matmul(&attn_b, seq, d, &format!("{p}attn.c_proj.weight"));
-            self.add_bias(&proj, seq, d, &format!("{p}attn.c_proj.bias"));
-            self.run("add", &[&x, &proj], [(seq * d) as u32, 0, 0, 0], ((seq * d).div_ceil(64) as u32, 1));
-            let a2 = self.layernorm(&x, seq, &format!("{p}ln_2.weight"), &format!("{p}ln_2.bias"));
-            let h = self.matmul(&a2, seq, d, &format!("{p}mlp.c_fc.weight"));
-            self.add_bias(&h, seq, 4 * d, &format!("{p}mlp.c_fc.bias"));
-            self.run("gelu", &[&h], [(seq * 4 * d) as u32, 0, 0, 0], ((seq * 4 * d).div_ceil(64) as u32, 1));
-            let mp = self.matmul(&h, seq, 4 * d, &format!("{p}mlp.c_proj.weight"));
-            self.add_bias(&mp, seq, d, &format!("{p}mlp.c_proj.bias"));
-            self.run("add", &[&x, &mp], [(seq * d) as u32, 0, 0, 0], ((seq * d).div_ceil(64) as u32, 1));
+            let wb = |s: &str| &self.w[&format!("{p}{s}")].buf;
+            let mut r = |name, bufs: &[&wgpu::Buffer], dims, groups| self.record(&mut enc, &mut ku, &mut kb, name, bufs, dims, groups);
+            r("layernorm", &[&x, wb("ln_1.weight"), wb("ln_1.bias"), &a], [su, du, 0, 0], g1(seq));
+            r("matmul", &[&a, wb("attn.c_attn.weight"), &qkv], [su, du, td, 0], mm(seq, 3 * d));
+            r("addbias", &[&qkv, wb("attn.c_attn.bias")], [su, td, 0, 0], g1(seq * 3 * d));
+            r("attention", &[&qkv, &attn], [su, du, nh as u32, hd as u32], ((seq * nh).div_ceil(64) as u32, 1));
+            r("matmul", &[&attn, wb("attn.c_proj.weight"), &proj], [su, du, du, 0], mm(seq, d));
+            r("addbias", &[&proj, wb("attn.c_proj.bias")], [su, du, 0, 0], g1(seq * d));
+            r("add", &[&x, &proj], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
+            r("layernorm", &[&x, wb("ln_2.weight"), wb("ln_2.bias"), &a2], [su, du, 0, 0], g1(seq));
+            r("matmul", &[&a2, wb("mlp.c_fc.weight"), &hb], [su, du, fd, 0], mm(seq, 4 * d));
+            r("addbias", &[&hb, wb("mlp.c_fc.bias")], [su, fd, 0, 0], g1(seq * 4 * d));
+            r("gelu", &[&hb], [(seq * 4 * d) as u32, 0, 0, 0], g1(seq * 4 * d));
+            r("matmul", &[&hb, wb("mlp.c_proj.weight"), &mp], [su, fd, du, 0], mm(seq, d));
+            r("addbias", &[&mp, wb("mlp.c_proj.bias")], [su, du, 0, 0], g1(seq * d));
+            r("add", &[&x, &mp], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
         }
-        let xf = self.layernorm(&x, seq, "ln_f.weight", "ln_f.bias");
+        self.record(&mut enc, &mut ku, &mut kb, "layernorm",
+                    &[&x, &self.w["ln_f.weight"].buf, &self.w["ln_f.bias"].buf, &xf], [su, du, 0, 0], g1(seq));
+        self.queue.submit(Some(enc.finish()));
         let all = self.read(&xf, seq * d);
         all[(seq - 1) * d..seq * d].to_vec()
     }
 
-    /// Predict the next token: GPU forward for the hidden state, CPU unembed (tied wte) for argmax.
+    /// Predict the next token: embed (only the needed rows) → GPU forward → CPU unembed (tied wte) for argmax.
     pub fn predict(&self, ids: &[i64], b: &Bundle) -> i64 {
-        let (_, wte) = b.f32_array("wte");
-        let (_, wpe) = b.f32_array("wpe");
-        let last = self.last_hidden(ids, &wte, &wpe);
+        let pos: Vec<i64> = (0..ids.len() as i64).collect();
+        let x0 = &b.rows_f32("wte", ids) + &b.rows_f32("wpe", &pos); // (seq, d), no full-embedding copy
+        let last = self.last_hidden(x0.as_slice().unwrap(), ids.len());
         let logits = b.rowdot_f32("wte", &last);
         logits.iter().enumerate().max_by(|a, c| a.1.partial_cmp(c.1).unwrap()).unwrap().0 as i64
     }
