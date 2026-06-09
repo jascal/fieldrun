@@ -5,8 +5,12 @@
 //! kv_b to per-head (qk_nope + v_head). Each head's key/query is [no-RoPE part (qk_nope) ‖ RoPE part (qk_rope)], where
 //! the RoPE part of the key is a SINGLE shared vector (MQA-style) broadcast to all heads. v_head_dim ≠ qk_head_dim.
 //! The MoE has a shared always-on expert plus group-limited sigmoid routing with a learned bias correction; the first
-//! `first_k_dense_replace` layers are dense. Experts read on demand from the mmap (offload). A faithful port of
-//! `DeepseekV3ForCausalLM`, validated top-1 against a tiny random-init instance. predict only (generate/explain TBD).
+//! `first_k_dense_replace` layers are dense. Experts read on demand from the mmap (offload). YaRN long-context RoPE
+//! scaling (the real DeepSeek-V3/R1/Kimi-K2 configs all ship it) is supported: the inv_freq ramp blend, the
+//! mscale/mscale_all_dim attention factor on cos/sin, and the mscale² softmax-scale correction. Interleaved rotary
+//! weights (`rope_interleave`, the DeepSeek default) are de-interleaved at convert time, so this kernel's split-half
+//! rope is exact either way. A faithful port of `DeepseekV3ForCausalLM`, validated top-1 against a tiny random-init
+//! instance. predict only (generate/explain TBD).
 
 use std::collections::HashMap;
 
@@ -27,7 +31,8 @@ pub struct Mla {
     v_head: usize,
     qkh: usize, // qk_head_dim = qk_nope + qk_rope
     eps: f32,
-    scale: f32, // qk_head_dim^-0.5
+    scale: f32,      // qk_head_dim^-0.5, ×mscale² under YaRN
+    att_factor: f32, // YaRN attention factor on cos/sin (1.0 without YaRN)
     inv: Vec<f32>,
     n_routed: usize,
     n_group: usize,
@@ -52,6 +57,28 @@ fn softmax_rows(a: &mut Array2<f32>) {
     }
 }
 
+/// YaRN's mscale helper (`yarn_get_mscale`): 1 below scale 1, else `0.1·m·ln(scale) + 1`.
+fn yarn_mscale(scale: f64, m: f64) -> f64 {
+    if scale <= 1.0 { 1.0 } else { 0.1 * m * scale.ln() + 1.0 }
+}
+
+/// YaRN inverse frequencies (transformers `_compute_yarn_parameters`): blend the interpolated (`1/(factor·θ^{2j/dim})`)
+/// and extrapolated (`1/θ^{2j/dim}`) frequencies with a linear ramp between the beta_fast/beta_slow correction dims,
+/// computed over the pre-scaling (`original_max_position_embeddings`) context.
+fn yarn_inv_freq(theta: f64, dim: usize, factor: f64, beta_fast: f64, beta_slow: f64,
+                 orig_max: f64, truncate: bool) -> Vec<f32> {
+    let corr_dim = |rot: f64| (dim as f64 * (orig_max / (rot * 2.0 * std::f64::consts::PI)).ln()) / (2.0 * theta.ln());
+    let (mut low, mut high) = (corr_dim(beta_fast), corr_dim(beta_slow));
+    if truncate { low = low.floor(); high = high.ceil(); }
+    let (low, mut high) = (low.max(0.0), high.min(dim as f64 - 1.0));
+    if high == low { high += 0.001; } // prevent singularity (as upstream)
+    (0..dim / 2).map(|j| {
+        let pf = theta.powf(2.0 * j as f64 / dim as f64);
+        let extrap = 1.0 - ((j as f64 - low) / (high - low)).clamp(0.0, 1.0);
+        ((1.0 / (factor * pf)) * (1.0 - extrap) + (1.0 / pf) * extrap) as f32
+    }).collect()
+}
+
 impl Mla {
     pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Mla {
         // config: [nl, nh, d, q_lora, kv_lora, qk_nope, qk_rope, v_head, vocab, tied,
@@ -64,10 +91,31 @@ impl Mla {
         let (n_routed, topk) = (c[10] as usize, c[12] as usize);
         let (n_group, topk_group, norm_topk, first_k) = (c[14] as usize, c[15] as usize, c[16] != 0, c[17] as usize);
         let qkh = qk_nope + qk_rope;
-        let (theta, eps, routed_scaling) = (b.config_f[0] as f32, b.config_f[1] as f32, b.config_f[2] as f32);
-        let inv = (0..qk_rope / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / qk_rope as f32)).collect();
+        // config_f: [theta, eps, routed_scaling] + optional YaRN block
+        //           [yarn(0/1), factor, beta_fast, beta_slow, mscale, mscale_all_dim, original_max_pos, truncate(0/1),
+        //            attention_factor (0 = derive from mscale/mscale_all_dim)]
+        let cf = &b.config_f;
+        let (theta, eps, routed_scaling) = (cf[0] as f32, cf[1] as f32, cf[2] as f32);
+        let mut scale = (qkh as f32).powf(-0.5);
+        let (inv, att_factor) = if cf.len() > 3 && cf[3] != 0.0 {
+            let (factor, beta_fast, beta_slow) = (cf[4], cf[5], cf[6]);
+            let (mscale, mscale_all_dim, orig_max) = (cf[7], cf[8], cf[9]);
+            let (truncate, att_explicit) = (cf[10] != 0.0, cf[11]);
+            let inv = yarn_inv_freq(cf[0], qk_rope, factor, beta_fast, beta_slow, orig_max, truncate);
+            let att = if att_explicit != 0.0 { att_explicit }
+                      else if mscale != 0.0 && mscale_all_dim != 0.0 {
+                          yarn_mscale(factor, mscale) / yarn_mscale(factor, mscale_all_dim)
+                      } else { yarn_mscale(factor, 1.0) };
+            if mscale_all_dim != 0.0 {
+                let m = yarn_mscale(factor, mscale_all_dim); // softmax-scale correction (DeepseekV3Attention)
+                scale *= (m * m) as f32;
+            }
+            (inv, att as f32)
+        } else {
+            ((0..qk_rope / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / qk_rope as f32)).collect(), 1.0)
+        };
         Mla { b, nl, nh, d, q_lora, kv_lora, qk_nope, qk_rope, v_head, qkh, eps,
-              scale: (qkh as f32).powf(-0.5), inv, n_routed, n_group, topk_group, topk, norm_topk, routed_scaling,
+              scale, att_factor, inv, n_routed, n_group, topk_group, topk, norm_topk, routed_scaling,
               first_k, tied }
     }
 
@@ -85,15 +133,16 @@ impl Mla {
         out
     }
 
-    /// split-half RoPE on a single qk_rope-length slice at position `pos`.
+    /// split-half RoPE on a single qk_rope-length slice at position `pos`. The YaRN attention factor scales cos/sin
+    /// upstream (i.e. the whole rotated slice); it is 1.0 without YaRN.
     fn rope_one(&self, slice: &mut [f32], pos: usize) {
         let half = self.qk_rope / 2;
         for j in 0..half {
             let ang = pos as f32 * self.inv[j];
             let (c, s) = (ang.cos(), ang.sin());
             let (a, b) = (slice[j], slice[j + half]);
-            slice[j] = a * c - b * s;
-            slice[j + half] = b * c + a * s;
+            slice[j] = (a * c - b * s) * self.att_factor;
+            slice[j + half] = (b * c + a * s) * self.att_factor;
         }
     }
 

@@ -42,11 +42,16 @@ diverges without explaining why.
   but expert weights stay on disk and `expert_f32`/`expert_mm` read+dequant them on demand (per token only the active
   top-k fault in; the OS page cache holds the hot working set). Non-MoE models: no expert arrays, footprint unchanged.
 - `src/qwen3moe.rs` — Qwen3-MoE: the RoPE backbone + QK-norm (per-head RMSNorm on q/k) + per-layer MoE-or-dense
-  (plain-gate router: softmax → top-k → optional renorm; SwiGLU experts read from the mmap). No new attention kernel —
-  reuses the MoE-FFN + expert-offload. predict only (generate=naive / explain TBD).
-- `src/mla.rs` — DeepSeek-V3 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
+  (plain-gate router: softmax → top-k → optional renorm; SwiGLU experts read from the mmap) + optional **sliding
+  window** (`use_sliding_window`: ONE window on every layer — no per-layer pattern, unlike Gemma 3). No new attention
+  kernel — reuses the MoE-FFN + expert-offload. predict only (generate=naive / explain TBD).
+- `src/mla.rs` — DeepSeek-V3/R1 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
   split, v_head_dim ≠ qk_head_dim) + DeepSeek MoE (group-limited sigmoid routing with bias-corrected *choice* and
-  sigmoid *weight*, an always-on shared expert, first-k-dense layers). Experts paged from the mmap. predict only.
+  sigmoid *weight*, an always-on shared expert, first-k-dense layers). **YaRN** rope scaling (every real
+  DeepSeek-V3/R1/Kimi config ships it): the inv_freq ramp, the mscale attention factor on cos/sin, and the mscale²
+  softmax-scale correction. **Interleaved rotary** (`rope_interleave`, the DeepSeek default) is de-interleaved at
+  convert time (the permutation is baked into the q_b/q + kv_a rotary rows), so the kernel keeps split-half rope and
+  matches exactly. Experts paged from the mmap. predict only.
 - `src/minimax.rs` — MiniMax-M2: RoPE backbone + FULL-WIDTH q/k-norm (RMSNorm over the whole nh·hd / nkv·hd, not
   per-head) + all-MoE with a sigmoid router (+bias for the choice, sigmoid renormed for the weight; no group, no shared
   expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. predict only.
@@ -77,7 +82,7 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2), **MiniMax-M2**), KV-cache +
+Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE** incl. sliding window, **MLA** (DeepSeek-V3/R1/Kimi-K2, incl. YaRN + interleaved rotary; V4 is a different attention class, see below), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 W8A8 +
 outlier-aware quant; signed int8 dot — stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), **MoE expert-offload**
@@ -104,14 +109,18 @@ Still open, with the honest catch on each (none are quick wins — they need har
   (`num_kv_shared_layers` — later layers reuse an earlier layer's K/V); a **KV-cache `generate` + `explain`** for gemma4
   (currently naive recompute / TBD); and an **explicit LRU + prefetch** over the page cache (perf, not correctness — the
   current path leans on the OS page cache, the chosen "no extra bookkeeping" strategy).
-- **Frontier-MoE roadmap.** **Qwen3-MoE and MLA (DeepSeek-V3/V4/Kimi-K2) are done** (60/60) — both carried by the
-  MoE-FFN + expert-offload; MLA is the last new attention *class*. Remaining tails: Qwen3-MoE **sliding window**
-  (`use_sliding_window`, convert asserts off); **DeepSeek-V4 deltas** over V3 + **YaRN** long-context RoPE scaling;
-  **MiniMax-M2 done** (60/60); **MiniMax-M3** (newer, weights/class not out yet — validate when they land); and
-  **KV-cache `generate` + `explain`** for the newer archs (currently naive recompute). Beyond kernels the binding constraint is **memory** — these are 100B–1T-param models; expert-offload
-  is the lever (resident = shared layers + hot experts), but the shared layers + a usable working set still want a
-  bigger box + fast disk. Every kernel is tiny-instance-validatable (`scripts/validate_all.sh`); full weights are the
-  hardware ask.
+- **Frontier-MoE roadmap.** **Qwen3-MoE (incl. sliding window) and MLA (DeepSeek-V3/R1/Kimi-K2, incl. YaRN +
+  interleaved rotary) are done** (60/60 each, with dedicated discriminating columns in `validate_all.sh`) — both
+  carried by the MoE-FFN + expert-offload; MLA is the last new attention *class* among the *supported* set.
+  **DeepSeek-V4 is rescoped**: transformers ships it as a NEW attention class (hierarchical/compressed-sparse
+  attention — compressors, a lightning indexer, grouped o_proj, sliding-window shared-KV MQA), *not* "V3 plus
+  deltas"; it would be its own kernel, and `convert` now refuses `model_type=deepseek_v4` explicitly instead of
+  mis-routing it to `mla`. Remaining tails: **DeepSeek-V4 (HCA/CSA) as a new arch**; **MiniMax-M2 done** (60/60);
+  **MiniMax-M3** (newer, weights/class not out yet — validate when they land); and **KV-cache `generate` + `explain`**
+  for the newer archs (currently naive recompute). Beyond kernels the binding constraint is **memory** — these are
+  100B–1T-param models; expert-offload is the lever (resident = shared layers + hot experts), but the shared layers +
+  a usable working set still want a bigger box + fast disk. Every kernel is tiny-instance-validatable
+  (`scripts/validate_all.sh`); full weights are the hardware ask.
 
 ## Conventions
 

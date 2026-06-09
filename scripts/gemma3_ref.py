@@ -48,8 +48,21 @@ def make_config():
             attn_implementation="eager",
             torch_dtype=torch.float32,
         )
-    if ARCH == "mla":
+    if ARCH.startswith("mla"):
         from transformers import DeepseekV3Config
+        yarn = ARCH == "mlayarn"
+        extra = {}
+        if yarn:
+            # YaRN + a deliberately LARGE init: with the default 0.02 init the interleave-vs-split-half rotary
+            # difference is ~1e-2 in the logits and rarely flips top-1 — a big init makes this column a
+            # discriminating gate for the rotary details (yarn ramp, mscale factors, de-interleave), not a lucky pass.
+            extra = dict(
+                initializer_range=0.2,
+                max_position_embeddings=128,   # = 4 x original_max -> implicit factor matches the explicit one
+                rope_parameters={"rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0,
+                                 "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 0.8, "mscale_all_dim": 0.5,
+                                 "original_max_position_embeddings": 32},
+            )
         return DeepseekV3Config(
             vocab_size=64,
             hidden_size=32,
@@ -73,12 +86,14 @@ def make_config():
             first_k_dense_replace=1,       # layer 0 dense, 1-3 MoE -> both paths
             rms_norm_eps=1e-6,
             tie_word_embeddings=False,
-            max_position_embeddings=256,
             attn_implementation="eager",
             torch_dtype=torch.float32,
+            **({"max_position_embeddings": 256} if not yarn else {}),
+            **extra,
         )
-    if ARCH == "qwen3moe":
+    if ARCH.startswith("qwen3moe"):
         from transformers import Qwen3MoeConfig
+        swa = ARCH == "qwen3moeswa"
         return Qwen3MoeConfig(
             vocab_size=64,
             hidden_size=32,
@@ -90,7 +105,8 @@ def make_config():
             rms_norm_eps=1e-6,
             tie_word_embeddings=False,
             attention_bias=False,
-            use_sliding_window=False,
+            use_sliding_window=swa,
+            sliding_window=4 if swa else None,  # small so seq>window actually masks (all layers in Qwen3)
             decoder_sparse_step=2,         # MoE on layers 1,3; dense on 0,2 -> both paths
             num_experts=4,
             num_experts_per_tok=2,
@@ -154,16 +170,19 @@ def build():
     cfg = make_config()
     tf = __import__("transformers")
     Cls = (tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
-           else tf.DeepseekV3ForCausalLM if ARCH == "mla"
-           else tf.Qwen3MoeForCausalLM if ARCH == "qwen3moe"
+           else tf.DeepseekV3ForCausalLM if ARCH.startswith("mla")
+           else tf.Qwen3MoeForCausalLM if ARCH.startswith("qwen3moe")
            else tf.Gemma4ForCausalLM if ARCH.startswith("gemma4")
            else tf.Gemma3ForCausalLM)
     model = Cls(cfg).eval()
-    # randomise the norm weights too (they init to 0 -> (1+w)=1, which would hide a QK-norm/4-norm bug)
+    # randomise the norm weights too (they init to 0 -> (1+w)=1, which would hide a QK-norm/4-norm bug).
+    # mlayarn uses mean-1 norms: mean-0 norms shrink q/k so attention is near-uniform and rotary details can't
+    # flip top-1 — mean-1 keeps attention sharp, making the column a discriminating gate for the YaRN ramp,
+    # the mscale factors, and the rope de-interleave (measured: a wrong interleave agrees only ~11/60).
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
-                p.copy_(torch.randn_like(p) * 0.1)
+                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH == "mlayarn" else 0.0))
     model.save_pretrained(OUT_DIR, safe_serialization=True)
 
     g = torch.Generator().manual_seed(1000 + SEED)
@@ -189,8 +208,8 @@ def compare(dump_path):
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
     cls = ("MiniMaxM2ForCausalLM" if ARCH == "minimax"
-           else "DeepseekV3ForCausalLM" if ARCH == "mla"
-           else "Qwen3MoeForCausalLM" if ARCH == "qwen3moe"
+           else "DeepseekV3ForCausalLM" if ARCH.startswith("mla")
+           else "Qwen3MoeForCausalLM" if ARCH.startswith("qwen3moe")
            else "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM")
     print(f"[gemma3_ref] fieldrun vs torch {cls}: {agree}/{n} top-1 agree ({100*agree/n:.1f}%)")
     if agree != n:

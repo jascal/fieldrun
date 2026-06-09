@@ -11,14 +11,16 @@ NE="${1:-120}"; shift || true; SEEDS=("${@:-0 1 2}"); SEEDS=(${SEEDS[@]})
 cargo build --release >/dev/null 2>&1
 printf "\nquality sweep — %d positions × seeds {%s}\n" "$NE" "${SEEDS[*]}"
 printf "%-12s %-10s %-10s %-10s\n" arch f32 f16 int8; printf '%.0s-' {1..46}; echo
-for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3moe" "mla:mla" "minimax:minimax"; do
+for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3moe" "qwen3moeswa:qwen3moe" "mla:mla" "mlayarn:mla" "minimax:minimax"; do
   tag="${spec%%:*}"; arch="${spec##*:}"
   declare -A ok tot
   for dt in f32 f16 int8; do ok[$dt]=0; tot[$dt]=0; done
   for s in "${SEEDS[@]}"; do
     SEED=$s N_EVAL=$NE $PY $REF build "$tag" >/dev/null 2>&1 || continue
     for dt in f32 f16 int8; do
-      $BIN convert --model /tmp/${tag}tiny --arch "$arch" --dtype "$dt" -o /tmp/${tag}_$dt >/dev/null 2>&1
+      # --force: each seed reseeds the tiny model, so a bundle left from the previous seed would be compared
+      # against the WRONG reference (same trap validate_all.sh hit — convert skips existing bundles by default).
+      $BIN convert --model /tmp/${tag}tiny --arch "$arch" --dtype "$dt" -o /tmp/${tag}_$dt --force >/dev/null 2>&1
       $BIN --bundle /tmp/${tag}_$dt --ids /tmp/${tag}_holdout.json --ctx 16 --n-eval "$NE" --dump /tmp/${tag}_${dt}.txt >/dev/null 2>&1
       r=$(SEED=$s N_EVAL=$NE $PY $REF compare /tmp/${tag}_${dt}.txt "$tag" 2>/dev/null | grep -oE '[0-9]+/[0-9]+ top-1' | grep -oE '^[0-9]+/[0-9]+')
       [ -n "$r" ] && { ok[$dt]=$(( ${ok[$dt]} + ${r%/*} )); tot[$dt]=$(( ${tot[$dt]} + ${r#*/} )); }

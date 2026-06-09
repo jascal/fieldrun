@@ -169,9 +169,16 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
             ("gemma3", &["gemma3"]),
             ("gemma4", &["gemma4"]),
             ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
-            ("mla", &["deepseek", "deepseek_v3", "deepseek_v4", "kimi"]),
+            ("mla", &["deepseek", "deepseek_v3", "kimi"]),
             ("minimax", &["minimax"]),
         ];
+        // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with hierarchical/compressed-sparse attention
+        // (compressors, an indexer, grouped o_proj, sliding-window shared-KV MQA) — a different attention class.
+        // Refuse loudly rather than mis-route it to `mla` and convert garbage.
+        if model_type == "deepseek_v4" {
+            panic!("convert: model_type \"deepseek_v4\" uses HCA/CSA attention — a different attention class from \
+                    V3's MLA, not yet supported. The `mla` arch covers DeepSeek-V3/R1 and Kimi-K2 (incl. YaRN).");
+        }
         let best = table
             .iter()
             .filter_map(|(a, toks)| {
@@ -466,9 +473,11 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
 /// per-layer MoE-or-dense FFN. The MoE block is a plain-gate router (softmax → top-k → optional renorm, no scales) over
 /// packed experts (same gate_up/down 3D layout as Gemma-4); the router+experts run on the post-attention-normed hidden.
 /// Experts are written one int8 array each (offload), so this reaches Qwen3-MoE on a ≤24 GB box. No attention bias
-/// (Qwen3 dropped it), no embed scale, no soft-capping. Sliding window (use_sliding_window) is a follow-on.
+/// (Qwen3 dropped it), no embed scale, no soft-capping. Sliding window (`use_sliding_window`) applies ONE window to
+/// every layer (no per-layer pattern; the window is appended to `config` after the MoE flags, 0 = full attention).
 fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
-    assert!(!c.get("use_sliding_window").and_then(|v| v.as_bool()).unwrap_or(false), "qwen3moe: sliding window not yet supported");
+    let swa = c.get("use_sliding_window").and_then(|v| v.as_bool()).unwrap_or(false);
+    let window = if swa { geti(c, "sliding_window").unwrap_or(4096) } else { 0 };
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -486,6 +495,7 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -
     let is_moe = |l: usize| !mlp_only.contains(&l) && n_exp > 0 && (l + 1) % sparse_step == 0;
     let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, ffn, vocab, tie as usize, n_exp, topk, moe_inter, norm_topk as usize];
     for l in 0..nl { config.push(if is_moe(l) { 1 } else { 0 }); } // MoE flags start at config[12]
+    config.push(window); // sliding window, all layers (0 = full attention)
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen3moe",
         "config": config, "config_f": [theta, eps] });
 
@@ -537,6 +547,10 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -
 /// down→up projections (q_a/q_b, kv_a/kv_b) with a 128-dim no-RoPE part and a 64-dim shared decoupled-RoPE part, and a
 /// distinct v_head_dim. The MoE has a shared always-on expert plus group-limited sigmoid routing (with a learned bias
 /// correction). The first `first_k_dense_replace` layers are dense. Experts written one int8 array each (offload).
+/// YaRN rope scaling (`rope_parameters`/`rope_scaling` with type "yarn" — every real DeepSeek-V3/R1/Kimi-K2 config)
+/// is passed through in `config_f`. Interleaved rotary weights (`rope_interleave`, the DeepSeek default) are
+/// de-interleaved here — the permutation is baked into the q_b/q and kv_a rotary rows so the runtime's split-half
+/// rope matches the torch interleave path exactly.
 fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
     let nl = geti(c, "num_hidden_layers").unwrap();
     let nh = geti(c, "num_attention_heads").unwrap();
@@ -561,8 +575,29 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
     let routed_scaling = getf(c, "routed_scaling_factor").unwrap_or(1.0);
     let config: Vec<usize> = vec![nl, nh, d, q_lora, kv_lora, qk_nope, qk_rope, v_head, vocab, tie as usize,
         n_routed, n_shared, topk, moe_inter, n_group, topk_group, norm_topk as usize, first_k, ffn_dense];
+    // YaRN rope scaling → config_f[3..]: [yarn, factor, beta_fast, beta_slow, mscale, mscale_all_dim,
+    // original_max_pos, truncate, attention_factor(0=derive)]. Accept the new `rope_parameters` nesting or the
+    // legacy flat `rope_scaling` (real hub checkpoints); refuse rope types we don't implement rather than ignore them.
+    let mut config_f: Vec<f64> = vec![theta, eps, routed_scaling];
+    let rp = c.get("rope_parameters").or_else(|| c.get("rope_scaling")).filter(|v| !v.is_null());
+    let rope_type = rp.and_then(|v| v.get("rope_type").or_else(|| v.get("type"))).and_then(|t| t.as_str()).unwrap_or("default");
+    match rope_type {
+        "default" => {}
+        "yarn" => {
+            let rp = rp.unwrap();
+            let g = |k: &str| rp.get(k).and_then(|v| v.as_f64());
+            let orig = g("original_max_position_embeddings").unwrap_or(4096.0);
+            // factor defaults to the post/pre-scaling context ratio (as upstream) when absent
+            let factor = g("factor").unwrap_or_else(|| geti(c, "max_position_embeddings").map_or(1.0, |mp| mp as f64 / orig));
+            config_f.extend([1.0, factor, g("beta_fast").unwrap_or(32.0), g("beta_slow").unwrap_or(1.0),
+                             g("mscale").unwrap_or(0.0), g("mscale_all_dim").unwrap_or(0.0), orig,
+                             if rp.get("truncate").and_then(|v| v.as_bool()).unwrap_or(true) { 1.0 } else { 0.0 },
+                             g("attention_factor").unwrap_or(0.0)]);
+        }
+        other => panic!("convert: mla rope_type {other:?} not supported (default, yarn)"),
+    }
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "mla",
-        "config": config, "config_f": [theta, eps, routed_scaling] });
+        "config": config, "config_f": config_f });
 
     let mut w = BundleWriter::new(stem)?;
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
@@ -571,6 +606,28 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
     let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, dt) = m.read(hf); w.put_lin(name, &dt, s[0], s[1], dtype)
     };
+    // rope_interleave (DeepSeek's default, true): torch de-interleaves the rotary slice ([x0,x1,..] → evens‖odds)
+    // before a split-half rotation. Baking that permutation into the projection ROWS that produce each rotary slice
+    // makes the runtime's plain split-half rope bit-equivalent. `starts` lists each rotary block's first output row.
+    let interleave = c.get("rope_interleave").and_then(|v| v.as_bool()).unwrap_or(true);
+    let lin_rot = |w: &mut BundleWriter, name: &str, hf: &str, starts: &[usize]| -> std::io::Result<()> {
+        let (s, mut dt) = m.read(hf);
+        if interleave {
+            let (inp, half) = (s[1], qk_rope / 2);
+            let mut tmp = vec![0f32; qk_rope * inp];
+            for &start in starts {
+                for j in 0..half {
+                    tmp[j * inp..(j + 1) * inp].copy_from_slice(&dt[(start + 2 * j) * inp..(start + 2 * j + 1) * inp]);
+                    tmp[(half + j) * inp..(half + j + 1) * inp]
+                        .copy_from_slice(&dt[(start + 2 * j + 1) * inp..(start + 2 * j + 2) * inp]);
+                }
+                dt[start * inp..(start + qk_rope) * inp].copy_from_slice(&tmp);
+            }
+        }
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let qkh = qk_nope + qk_rope;
+    let q_rot_starts: Vec<usize> = (0..nh).map(|h| h * qkh + qk_nope).collect();
     let (es, ed) = m.read("model.embed_tokens.weight");
     w.put_small("embed", &ed, &es, dtype)?;
     norm(&mut w, "norm", "model.norm.weight")?;
@@ -611,11 +668,11 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
         if q_lora > 0 {
             lin(&mut w, &format!("l{l}.q_a"), &format!("{p}self_attn.q_a_proj.weight"))?;
             norm(&mut w, &format!("l{l}.q_a_ln"), &format!("{p}self_attn.q_a_layernorm.weight"))?;
-            lin(&mut w, &format!("l{l}.q_b"), &format!("{p}self_attn.q_b_proj.weight"))?;
+            lin_rot(&mut w, &format!("l{l}.q_b"), &format!("{p}self_attn.q_b_proj.weight"), &q_rot_starts)?;
         } else {
-            lin(&mut w, &format!("l{l}.q"), &format!("{p}self_attn.q_proj.weight"))?;
+            lin_rot(&mut w, &format!("l{l}.q"), &format!("{p}self_attn.q_proj.weight"), &q_rot_starts)?;
         }
-        lin(&mut w, &format!("l{l}.kv_a"), &format!("{p}self_attn.kv_a_proj_with_mqa.weight"))?;
+        lin_rot(&mut w, &format!("l{l}.kv_a"), &format!("{p}self_attn.kv_a_proj_with_mqa.weight"), &[kv_lora])?;
         norm(&mut w, &format!("l{l}.kv_a_ln"), &format!("{p}self_attn.kv_a_layernorm.weight"))?;
         lin(&mut w, &format!("l{l}.kv_b"), &format!("{p}self_attn.kv_b_proj.weight"))?;
         lin(&mut w, &format!("l{l}.o_proj"), &format!("{p}self_attn.o_proj.weight"))?;

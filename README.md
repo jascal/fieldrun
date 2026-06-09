@@ -61,13 +61,19 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   | `gemma4`   | Gemma4ForCausalLM (dense) | 60/60 | 60/60 | 58/60 |
   | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 56/60 |
   | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
+  | `qwen3moe` (sliding window) | Qwen3MoeForCausalLM `use_sliding_window` | 60/60 | 60/60 | 60/60 |
   | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
+  | `mla` (YaRN) | DeepseekV3ForCausalLM yarn `rope_parameters` | 60/60 | 59/60 | 54/60 |
   | `minimax`  | MiniMaxM2ForCausalLM     | 60/60 | 60/60 | 60/60 |
 
+  The YaRN row is built deliberately *sharp* (mean-1 norm weights, large init) so it actually gates the rotary
+  details — a wrong rope de-interleave agrees only ~11/60, a missing YaRN ramp ~32/60; its int8 dip is that same
+  sharpness amplifying near-tie flips, not a kernel gap.
+
 **Quality (precision sweep, `scripts/bench.sh`).** Aggregating 3 seeds × 120 positions per arch — `f32` holds 100%
-(the math is exact); `f16` is 99.7–100%; `int8` is 95.6–100%. The int8 dips are near-tie argmax flips on *tiny random*
-weights — real checkpoints quantize better (e.g. real GPT-2 int8 == f32 top-1, 50.0%). This is the announce-gate
-quality signal, not the correctness gate (that's `f32` above).
+(the math is exact); `f16` is 99.7–100%; `int8` is 90.8–100%. The int8 dips are near-tie argmax flips on *tiny random*
+weights (largest on the deliberately-sharp YaRN config) — real checkpoints quantize better (e.g. real GPT-2 int8 ==
+f32 top-1, 50.0%). This is the announce-gate quality signal, not the correctness gate (that's `f32` above).
 
   | arch | f32 | f16 | int8 |
   |------|-----|-----|------|
@@ -75,16 +81,19 @@ quality signal, not the correctness gate (that's `f32` above).
   | `gemma4`   | 100.0% | 99.7%  | 98.3% |
   | `gemma4` (MoE) | 100.0% | 99.7% | 96.1% |
   | `qwen3moe` | 100.0% | 100.0% | 100.0% |
+  | `qwen3moe` (sliding window) | 100.0% | 99.7% | 99.7% |
   | `mla`      | 100.0% | 100.0% | 100.0% |
+  | `mla` (YaRN) | 100.0% | 99.7% | 90.8% |
   | `minimax`  | 100.0% | 100.0% | 100.0% |
 
 **Expert offload (MoE).** MoE is what moves the memory–capability curve: per token only the router's top-k experts are
 touched, so resident set ≠ total params. `convert` writes **each expert as its own int8 array**; the loader **mmaps**
 the blob and keeps expert weights **on disk**, paging only the active experts in per token (the OS page cache holds the
 hot working set) — so a model with far more expert params than RAM runs, resident set = shared layers + hot experts.
-Non-MoE models are unaffected (no expert arrays). Validated on **Gemma-4 MoE** and **Qwen3-MoE** (f32 60/60).
-Qwen3-MoE needs no new attention — it's the RoPE backbone + QK-norm + the MoE block — so it's the first frontier-MoE
-family reachable end-to-end; the remaining kernel class for DeepSeek-V4 / Kimi is MLA.
+Non-MoE models are unaffected (no expert arrays). Validated on **Gemma-4 MoE**, **Qwen3-MoE**, **DeepSeek-V3/Kimi-K2
+(MLA)**, and **MiniMax-M2** (each f32 60/60). Qwen3-MoE needs no new attention — it's the RoPE backbone + QK-norm +
+the MoE block; MLA was the last new attention class. (DeepSeek-**V4** is *not* MLA — it ships a new
+hierarchical/compressed-sparse attention; `convert` refuses it explicitly rather than mis-converting.)
 - **KV-cache** generation produces tokens byte-identical to naive full-recompute on every arch.
 
 ## Supported models
@@ -99,8 +108,8 @@ Pick `--arch` by family:
 | `gemma`  | Gemma-2 | √d embed, 4-norm sandwich, logit soft-cap, sliding window |
 | `gemma3` | Gemma-3 (1B/4B/12B/27B) | + QK-norm, dual-base RoPE, 5:1 local/global, no soft-cap |
 | `gemma4` | Gemma-4 (E2B/E4B dense, **26B-A4B MoE**) | + value-norm, per-layer-type `head_dim`, partial-rotary global RoPE, PLE, MoE |
-| `qwen3moe` | Qwen3-MoE (e.g. 30B-A3B) | RoPE + QK-norm + sparse MoE; no new attention kernel |
-| `mla`    | DeepSeek-V3, DeepSeek-V4, **Kimi-K2** | multi-head latent attention + group-limited sigmoid MoE + shared expert |
+| `qwen3moe` | Qwen3-MoE (e.g. 30B-A3B) | RoPE + QK-norm + sparse MoE + optional sliding window; no new attention kernel |
+| `mla`    | DeepSeek-V3/R1, **Kimi-K2** | multi-head latent attention (incl. interleaved rotary + YaRN long-context) + group-limited sigmoid MoE + shared expert |
 | `minimax`| MiniMax-M2 | softmax attn + full-width q/k-norm + sigmoid-router MoE (no MLA, no shared expert) |
 
 All validated to top-1 agreement vs the torch reference (see the gate above). Big MoE models (Gemma-4 26B, Qwen3-MoE,

@@ -3,8 +3,10 @@
 //! per-layer **MoE FFN** — a plain-gate router (softmax → top-k → optional renorm, no scales) over packed experts,
 //! running on the post-attention-normed hidden; layers not selected by `decoder_sparse_step` / `mlp_only_layers` use a
 //! dense SwiGLU. Experts are read on demand from the mmap (the offload path), so a Qwen3-MoE whose expert weights far
-//! exceed RAM still runs. No attention bias, no embed scale, no soft-capping. A faithful port of `Qwen3MoeForCausalLM`,
-//! validated top-1 against a tiny random-init instance.
+//! exceed RAM still runs. Sliding-window attention (`use_sliding_window`) applies one window size to EVERY layer (no
+//! per-layer pattern, unlike Gemma 3; single RoPE base) — window 0 in the bundle means full attention. No attention
+//! bias, no embed scale, no soft-capping. A faithful port of `Qwen3MoeForCausalLM`, validated top-1 against a tiny
+//! random-init instance.
 
 use std::collections::HashMap;
 
@@ -28,6 +30,7 @@ pub struct Qwen3Moe {
     moe_inter: usize,
     norm_topk: bool,
     moe: Vec<bool>,
+    window: usize, // sliding-window size, all layers (0 = full attention)
     tied: bool,
 }
 
@@ -49,16 +52,17 @@ fn softmax_rows(a: &mut Array2<f32>) {
 
 impl Qwen3Moe {
     pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Qwen3Moe {
-        // config: [nl, nh, nkv, hd, d, ffn, vocab, tied, n_exp, topk, moe_inter, norm_topk, <nl moe flags>]
+        // config: [nl, nh, nkv, hd, d, ffn, vocab, tied, n_exp, topk, moe_inter, norm_topk, <nl moe flags>, window]
         let c = &b.config;
         let (n_layer, h, nkv, hd, d) = (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize, c[4] as usize);
         let tied = c[7] != 0;
         let (n_exp, topk, moe_inter, norm_topk) = (c[8] as usize, c[9] as usize, c[10] as usize, c[11] != 0);
         let moe: Vec<bool> = (0..n_layer).map(|l| c[12 + l] != 0).collect();
+        let window = if c.len() > 12 + n_layer { c[12 + n_layer] as usize } else { 0 }; // absent in older bundles
         let (theta, eps) = (b.config_f[0] as f32, b.config_f[1] as f32);
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
         Qwen3Moe { b, n_layer, h, nkv, hd, d, eps, scale: (hd as f32).powf(-0.5), inv,
-                   n_exp, topk, moe_inter, norm_topk, moe, tied }
+                   n_exp, topk, moe_inter, norm_topk, moe, window, tied }
     }
 
     fn unembed(&self) -> &str {
@@ -175,7 +179,9 @@ impl Qwen3Moe {
                 let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
                 let mut scores = qh.dot(&kh.t()) * self.scale;
                 for i in 0..seq {
-                    for j in (i + 1)..seq { scores[[i, j]] = -1e30; } // causal
+                    for j in 0..seq {
+                        if j > i || (self.window > 0 && j + self.window <= i) { scores[[i, j]] = -1e30; } // causal + window
+                    }
                 }
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
