@@ -37,6 +37,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked   # default features include `api`, so the api/SSE tests run too
+      # type-check the BLAS matmul path (the `accelerate`/`openblas` code path) — `check` needs no cblas lib to link.
+      - run: cargo check --features blas --locked
 
   # (No `cargo fmt --check` gate: this codebase is hand-formatted to ~120 cols with one-line method chains and
   # backslash-continued string literals, which rustfmt reflows at any max_width — there's no config that conforms it

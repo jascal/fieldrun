@@ -110,7 +110,14 @@ archs fall back to naive recompute for generation, which is correct but slower.)
 
 The build is pure-CPU and cross-platform — **`cargo build --release` compiles on stable Rust everywhere** (Apple
 Silicon, Intel macOS, Linux); on Apple Silicon the int8 dot vectorises with stable NEON automatically (scalar fallback
-elsewhere), no flags needed. On a 24 GB M-series the lever is **int8 weights + expert offload**:
+elsewhere), no flags needed.
+
+**For dense models, build with Apple Accelerate** — `cargo build --release --features accelerate`. This routes the
+f32/f16 matmuls through Apple's tuned BLAS (a large speedup over the pure-Rust kernel; the pure-Rust path stays the
+default and the faithful reference). Dense models run **f16** (`--dtype f16`); int8 is for memory-bound MoE, not dense
+speed. (Linux: `--features openblas`, needs `libopenblas`.)
+
+On a 24 GB M-series the lever for *big MoE* is **int8 weights + expert offload**:
 
 ```bash
 cargo build --release                                   # builds on macOS ARM as-is
@@ -131,6 +138,8 @@ archs run on CPU).
 
 - **Generation** (single-stream, KV-cache): GPT-2 ~25 tok/s, Qwen2.5-0.5B ~9 tok/s.
 - **KV-cache** turns O(n²) recompute into O(n): GPT-2 64→128 tokens is 4.8× over naive.
+- **f32/f16 matmul**: pure-Rust (`matrixmultiply`, rayon over column blocks) by default; **`--features accelerate`**
+  (Mac) / `openblas` (Linux) routes it through a tuned BLAS — the lever for usable *dense* large-model speed on CPU.
 - **int8 dot**: stable NEON `vmull_s8`/`vpadalq_s16` (s8×s8) on aarch64, scalar fallback elsewhere; **outlier-aware** activation quant keeps it
   lossless on the sample (100%). On a Mac, prefer `--dtype f16` for the fastest first-token latency on dense models —
   f16 goes through the blocked SIMD GEMM, whereas int8 trades a little speed for a smaller resident set (its win is on
@@ -152,6 +161,7 @@ Python + `transformers`, but the binary itself does not.
 
 ```bash
 cargo build --release                    # default build: HF pull + OpenAI/Anthropic API + `--chat` all included
+cargo build --release --features accelerate   # Mac: tuned BLAS matmul (much faster dense models; openblas on Linux)
 cargo install --path .                   # optional: puts `fieldrun` on PATH (~/.cargo/bin) so you can drop ./target/release/
 
 # 1. CONVERT — pull from HF by repo id (or a local dir). Bundles default to a home cache (~/.cache/fieldrun/bundles/),

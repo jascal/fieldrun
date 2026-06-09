@@ -28,7 +28,10 @@ diverges without explaining why.
   on aarch64 (`#[target_feature(enable="neon")]`, neon is baseline so the runtime check always passes) with a scalar
   fallback everywhere else; no feature flag, no nightly. NB: we deliberately do *not* use the one-instruction
   `sdot`/`vdotq_s32` — it's gated behind the unstable `stdarch_neon_dotprod` feature and would force nightly (the same
-  trap the dropped x86 AVX-512 VNNI path hit). `mm_routed_down` (Tier C), and the row-wise embed helpers.
+  trap the dropped x86 AVX-512 VNNI path hit). The f32/f16 GEMM goes through ndarray `.dot()`, which routes to a tuned
+  **cblas (sgemm)** when built with a BLAS backend — `--features accelerate` (macOS) or `openblas` (Linux) — the lever
+  for usable *dense* large-model speed on CPU; the pure-Rust column-block path is the default + faithful reference
+  (int8 always uses `i8dot`). `mm_routed_down` (Tier C), and the row-wise embed helpers.
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
   (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
   (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1 pattern, no soft-capping. `gemma4.rs`

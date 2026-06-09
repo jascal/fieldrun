@@ -254,6 +254,9 @@ impl Bundle {
         Array2::from_shape_vec((shape[0], shape[1]), self.upcast(arr)).unwrap()
     }
 
+    // NB: the f32/f16 GEMM goes through ndarray's `.dot()`, which routes to a tuned cblas (sgemm) when built with a
+    // BLAS backend (`--features accelerate`/`openblas`/`blis`) — far faster for dense models; the pure-Rust column-block
+    // path is the default + faithful reference. int8 keeps its own dot regardless. See the `[features]` in Cargo.toml.
     /// Fused matmul `a (seq, K) @ W (K, N) -> (seq, N)`. For an f16 weight this converts on the fly in a cache-friendly
     /// `ikj` loop (contiguous W-row and output-row access) — no f32 copy of the weight, which is the real cost of the
     /// in-RAM-precision path (a fresh upcast per matmul is ~GBs of alloc/write per forward). f32 falls back to ndarray.
@@ -262,28 +265,37 @@ impl Bundle {
         let (k, n) = (shape[0], shape[1]);
         match arr {
             Arr::F32(v) => {
-                // Parallelise over output-column blocks (each independent + exact). Single-stream generation gets all
-                // cores per forward; under the scoring loop's outer rayon it work-steals. Small matmuls = one block.
                 let w = ArrayView2::from_shape((k, n), v).unwrap();
-                let block = 512.min(n.max(1));
-                let nblocks = n.div_ceil(block);
-                if nblocks <= 1 {
-                    return a.dot(&w);
+                // With a BLAS backend (--features accelerate/openblas/blis), hand the whole GEMM to cblas sgemm, which
+                // is tuned + threads internally — far faster than the pure-Rust kernel on big dense models.
+                #[cfg(feature = "blas")]
+                {
+                    a.dot(&w)
                 }
-                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
-                    .into_par_iter()
-                    .map(|bi| {
-                        let c0 = bi * block;
-                        let bw = block.min(n - c0);
-                        (c0, a.dot(&w.slice(s![.., c0..c0 + bw])))
-                    })
-                    .collect();
-                let mut out = Array2::<f32>::zeros((a.nrows(), n));
-                for (c0, ob) in blocks.drain(..) {
-                    let bw = ob.ncols();
-                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                // Pure-Rust default: parallelise over output-column blocks (each independent + exact). Single-stream
+                // generation gets all cores per forward; under the scoring loop's outer rayon it work-steals.
+                #[cfg(not(feature = "blas"))]
+                {
+                    let block = 512.min(n.max(1));
+                    let nblocks = n.div_ceil(block);
+                    if nblocks <= 1 {
+                        return a.dot(&w);
+                    }
+                    let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
+                        .into_par_iter()
+                        .map(|bi| {
+                            let c0 = bi * block;
+                            let bw = block.min(n - c0);
+                            (c0, a.dot(&w.slice(s![.., c0..c0 + bw])))
+                        })
+                        .collect();
+                    let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                    for (c0, ob) in blocks.drain(..) {
+                        let bw = ob.ncols();
+                        out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                    }
+                    out
                 }
-                out
             }
             // int8 W8A8: dynamically quantise each activation row to signed int8, take a signed int8·int8 dot
             // (stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), then dequant: out = scale_a*scale_w[j]*Σ a·w + corr.
@@ -326,16 +338,16 @@ impl Bundle {
                 out
             }
             Arr::F16(v) => {
-                // Upcast W one column-block at a time into a local f32 buffer, then SIMD-dot the block (ndarray) —
-                // keeps the vectorised matmul while bounding upcast allocation to one block. Blocks are independent
-                // (disjoint output columns), so they run in parallel; under the scoring loop's outer rayon this just
-                // work-steals, but in single-stream generation it gives the per-forward matmul all the cores.
-                let block = 512.min(n);
-                let nblocks = n.div_ceil(block);
-                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
-                    .into_par_iter()
-                    .map(|bi| {
-                        let c0 = bi * block;
+                // Upcast W one column-block at a time into a local f32 buffer, then GEMM the block — this keeps the
+                // vectorised matmul while bounding the f32 upcast to one block (so a multi-GB f16 weight is never
+                // fully materialised as f32). Block width 512.
+                let block = 512.min(n.max(1));
+                // With BLAS: upcast + sgemm each block serially (cblas threads internally; one f32 block buffer live).
+                #[cfg(feature = "blas")]
+                {
+                    let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                    let mut c0 = 0;
+                    while c0 < n {
                         let bw = block.min(n - c0);
                         let mut buf = vec![0f32; k * bw];
                         for kk in 0..k {
@@ -345,15 +357,38 @@ impl Bundle {
                             }
                         }
                         let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
-                        (c0, a.dot(&wblock))
-                    })
-                    .collect();
-                let mut out = Array2::<f32>::zeros((a.nrows(), n));
-                for (c0, ob) in blocks.drain(..) {
-                    let bw = ob.ncols();
-                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                        out.slice_mut(s![.., c0..c0 + bw]).assign(&a.dot(&wblock));
+                        c0 += bw;
+                    }
+                    out
                 }
-                out
+                // Pure-Rust default: blocks are independent (disjoint output columns), so run them in parallel.
+                #[cfg(not(feature = "blas"))]
+                {
+                    let nblocks = n.div_ceil(block);
+                    let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
+                        .into_par_iter()
+                        .map(|bi| {
+                            let c0 = bi * block;
+                            let bw = block.min(n - c0);
+                            let mut buf = vec![0f32; k * bw];
+                            for kk in 0..k {
+                                let wrow = &v[kk * n + c0..kk * n + c0 + bw];
+                                for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
+                                    *b = w.to_f32();
+                                }
+                            }
+                            let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
+                            (c0, a.dot(&wblock))
+                        })
+                        .collect();
+                    let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                    for (c0, ob) in blocks.drain(..) {
+                        let bw = ob.ncols();
+                        out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                    }
+                    out
+                }
             }
         }
     }

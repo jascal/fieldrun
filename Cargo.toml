@@ -15,6 +15,14 @@ default = ["hub", "api"]
 gpu = ["dep:wgpu", "dep:pollster"]
 # (The int8 dot uses NEON `sdot` on aarch64 — stable, auto-detected at runtime — with a scalar fallback everywhere
 # else; no feature flag or nightly needed. The old AVX-512 VNNI path was dropped: it required nightly on stable Rust.)
+# opt-in tuned BLAS for the f32/f16 matmuls — a big speedup for dense models on CPU (the int8 path keeps its own
+# kernel). Routes ndarray's `.dot()` through the system cblas (`cblas_sgemm`). Pick ONE backend:
+#   accelerate → macOS, links Apple's Accelerate framework (provides cblas, no install);
+#   openblas   → Linux/other, links libopenblas (install it: e.g. `apt install libopenblas-dev`).
+# The pure-Rust default build is unchanged (this is off by default and the CPU matmul stays the faithful reference).
+blas = ["ndarray/blas", "dep:blas-src"]
+accelerate = ["blas", "blas-src/accelerate"]
+openblas = ["blas", "blas-src/openblas"]
 # HF hub pull (default): `convert --model org/repo` fetches config + safetensors from Hugging Face over a small ureq
 # client (no torch, no async); auth via `huggingface-cli login` / $HF_TOKEN for gated models. `--no-default-features`
 # drops it for a fully offline / network-free binary.
@@ -34,6 +42,8 @@ safetensors = "0.4"  # read HF weights directly (pure Rust, no torch) for the `c
 memmap2 = "0.9"      # mmap the safetensors so convert streams one tensor at a time (RAM ≈ one tensor)
 wgpu = { version = "22", optional = true }       # cross-platform GPU backend (opt-in, --features gpu)
 pollster = { version = "0.3", optional = true }  # block on wgpu's async adapter/device requests
+# opt-in BLAS backend (--features accelerate|openblas|blis); routes ndarray GEMM through cblas. Default build omits it.
+blas-src = { version = "0.10", optional = true, default-features = false }
 # HF hub pull (default feature `hub`): blocking ureq client, no async/tokio. ureq's default TLS is rustls (pure-Rust,
 # no system OpenSSL/SecureTransport needed, same on Mac + Linux). We download by repo id ourselves — ureq follows HF's
 # relative 307 redirects (which hf-hub 0.3 did not) — and read the standard HF token; no login of our own.
