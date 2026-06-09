@@ -188,19 +188,24 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
         };
 
-        // --chat: interactive REPL (text in/out; needs the `api` feature + a tokenizer next to the bundle). No ids.
+        // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
+        // human interface — and also runs on explicit --chat. (--serve / --generate / --explain / --ids take precedence.)
+        let chat_mode = has_flag(&args, "--chat")
+            || (ids.is_empty() && flag(&args, "--serve").is_none() && flag(&args, "--generate").is_none() && !has_flag(&args, "--explain"));
         #[cfg(feature = "api")]
-        if has_flag(&args, "--chat") {
+        if chat_mode {
             let max_tokens: usize = flag(&args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(256);
             match api::TextGen::load(&stem, eos.clone()) {
                 Some(tg) => api::chat(lm, tg, max_tokens),
-                None => eprintln!("[fieldrun] --chat needs a tokenizer: re-run `convert` so {stem}.tokenizer.json is written"),
+                None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
+                                   Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
             }
             return;
         }
         #[cfg(not(feature = "api"))]
-        if has_flag(&args, "--chat") {
-            eprintln!("[fieldrun] --chat needs a build with `--features api` (text in/out via a tokenizer)");
+        if chat_mode {
+            eprintln!("[fieldrun] chat isn't in this build (built --no-default-features). Rebuild with default features \
+                       for chat/API, or use --ids <holdout.json> to score / --serve <PORT>.");
             return;
         }
 
@@ -244,6 +249,15 @@ fn main() {
             println!("[fieldrun]   KV-cache: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
             println!("[fieldrun]   naive   : {naive_s:.2}s  ({:.1} tok/s)", n as f64 / naive_s);
             println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
+            return;
+        }
+        // no mode flag (--chat/--serve/--generate/--explain) and no --ids stream to score: don't silently report 0
+        // positions — tell the user what to do.
+        if ids.is_empty() {
+            eprintln!("[fieldrun] loaded {arch}, but no mode/input given. Try:\n\
+                       \x20 --chat                 interactive chat (REPL)\n\
+                       \x20 --serve <PORT>         OpenAI/Anthropic + token-id HTTP API\n\
+                       \x20 --ids <holdout.json>   batch next-token scoring  (or --generate N)");
             return;
         }
         let t0 = std::time::Instant::now();
