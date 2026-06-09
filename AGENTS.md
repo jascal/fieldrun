@@ -37,6 +37,9 @@ diverges without explaining why.
 - `src/qwen3moe.rs` — Qwen3-MoE: the RoPE backbone + QK-norm (per-head RMSNorm on q/k) + per-layer MoE-or-dense
   (plain-gate router: softmax → top-k → optional renorm; SwiGLU experts read from the mmap). No new attention kernel —
   reuses the MoE-FFN + expert-offload. predict only (generate=naive / explain TBD).
+- `src/mla.rs` — DeepSeek-V3 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
+  split, v_head_dim ≠ qk_head_dim) + DeepSeek MoE (group-limited sigmoid routing with bias-corrected *choice* and
+  sigmoid *weight*, an always-on shared expert, first-k-dense layers). Experts paged from the mmap. predict only.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
   archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe`), `--dtype int8|f16|f32` (f32 = bit-exact, for the faithfulness
   gate). MoE experts written one int8 array each (independently pageable). lm_head (non-tied unembed) stored raw
@@ -49,7 +52,7 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**7 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**), KV-cache +
+Done across the board: Tier A/B (**8 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE**, **MLA** (DeepSeek-V3/V4/Kimi-K2)), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 via VNNI W8A8
 + outlier-aware quant), **MoE expert-offload** (experts mmap'd, paged per token, never resident), Tier C
@@ -73,14 +76,15 @@ Still open, with the honest catch on each (none are quick wins — they need har
   (`num_kv_shared_layers` — later layers reuse an earlier layer's K/V); a **KV-cache `generate` + `explain`** for gemma4
   (currently naive recompute / TBD); and an **explicit LRU + prefetch** over the page cache (perf, not correctness — the
   current path leans on the OS page cache, the chosen "no extra bookkeeping" strategy).
-- **Frontier-MoE roadmap** (Qwen3.x, Kimi-2.x, DeepSeek-V4, MiniMax-M3). **Qwen3-MoE is done** (60/60) — it needed no
-  new attention (RoPE + QK-norm + the MoE block), so the MoE-FFN + expert-offload carried it. Remaining for the family:
-  Qwen3-MoE **sliding window** (`use_sliding_window`, convert asserts off); and **MLA** (multi-head latent attention,
-  the DeepSeek-V4 / Kimi compressed-KV scheme) — the one remaining kernel *class*. Beyond kernels, the binding
-  constraint is **memory**: these are 100B–1T-param models — expert-offload is exactly the lever (resident set = shared
-  layers + hot experts), but the shared layers + a usable working set still want a bigger box and fast disk.
-  `transformers` 5.10 exposes the classes, so each kernel is validatable on a tiny random-init instance with no gated
-  download; the *full* weights are the hardware ask.
+- **Frontier-MoE roadmap.** **Qwen3-MoE and MLA (DeepSeek-V3/V4/Kimi-K2) are done** (60/60) — both carried by the
+  MoE-FFN + expert-offload; MLA is the last new attention *class*. Remaining tails: Qwen3-MoE **sliding window**
+  (`use_sliding_window`, convert asserts off); **DeepSeek-V4 deltas** over V3 + **YaRN** long-context RoPE scaling;
+  **MiniMax-M2** (plain softmax attn + sigmoid-gated MoE → no MLA, a cheap follow-on) and **MiniMax-M3** (newer, weights
+  /class not out yet — validate when they land); and **KV-cache `generate` + `explain`** for the newer archs (currently
+  naive recompute). Beyond kernels the binding constraint is **memory** — these are 100B–1T-param models; expert-offload
+  is the lever (resident = shared layers + hot experts), but the shared layers + a usable working set still want a
+  bigger box + fast disk. Every kernel is tiny-instance-validatable (`scripts/validate_all.sh`); full weights are the
+  hardware ask.
 
 ## Conventions
 

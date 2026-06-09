@@ -54,6 +54,19 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
   | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
 
+**Quality (precision sweep, `scripts/bench.sh`).** Aggregating 3 seeds × 120 positions per arch — `f32` holds 100%
+(the math is exact); `f16` is 99.7–100%; `int8` is 95.6–100%. The int8 dips are near-tie argmax flips on *tiny random*
+weights — real checkpoints quantize better (e.g. real GPT-2 int8 == f32 top-1, 50.0%). This is the announce-gate
+quality signal, not the correctness gate (that's `f32` above).
+
+  | arch | f32 | f16 | int8 |
+  |------|-----|-----|------|
+  | `gemma3`   | 100.0% | 100.0% | 95.6% |
+  | `gemma4`   | 100.0% | 99.7%  | 98.3% |
+  | `gemma4` (MoE) | 100.0% | 99.7% | 96.1% |
+  | `qwen3moe` | 100.0% | 100.0% | 100.0% |
+  | `mla`      | 100.0% | 100.0% | 100.0% |
+
 **Expert offload (MoE).** MoE is what moves the memory–capability curve: per token only the router's top-k experts are
 touched, so resident set ≠ total params. `convert` writes **each expert as its own int8 array**; the loader **mmaps**
 the blob and keeps expert weights **on disk**, paging only the active experts in per token (the OS page cache holds the

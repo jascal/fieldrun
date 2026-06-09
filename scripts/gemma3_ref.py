@@ -11,16 +11,19 @@ No gated download needed: the architecture math is what we validate, and a tiny 
 the full model. Run with the torch venv:  lm-sae/.venv/bin/python scripts/gemma3_ref.py build|compare ...
 """
 import json
+import os
 import sys
 
+SEED = int(os.environ.get("SEED", "0"))        # vary for the quality sweep (scripts/bench.sh)
+N_EVAL_ENV = int(os.environ.get("N_EVAL", "0"))  # 0 -> default
 ARCH = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[1] == "build" else (
     sys.argv[3] if len(sys.argv) >= 4 else "gemma3")
 OUT_DIR = f"/tmp/{ARCH}tiny"
 IDS_PATH = f"/tmp/{ARCH}_holdout.json"
 REF_PATH = f"/tmp/{ARCH}_torch_preds.json"
 CTX = 16
-N_EVAL = 60
-SEQ_LEN = 96
+N_EVAL = N_EVAL_ENV or 60
+SEQ_LEN = CTX + N_EVAL + 4
 
 
 def make_config():
@@ -129,7 +132,7 @@ def build():
     import torch
     from transformers import AutoModelForCausalLM
 
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
     cfg = make_config()
     tf = __import__("transformers")
     Cls = (tf.DeepseekV3ForCausalLM if ARCH == "mla"
@@ -144,7 +147,7 @@ def build():
                 p.copy_(torch.randn_like(p) * 0.1)
     model.save_pretrained(OUT_DIR, safe_serialization=True)
 
-    g = torch.Generator().manual_seed(1)
+    g = torch.Generator().manual_seed(1000 + SEED)
     ids = torch.randint(0, cfg.vocab_size, (SEQ_LEN,), generator=g).tolist()
     json.dump({"holdout_ids": ids}, open(IDS_PATH, "w"))
 
