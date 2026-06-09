@@ -18,6 +18,13 @@ distribution form of that result: the same tiers, ported to Rust, built into one
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py` |
 | API | `/predict` · `/generate` · `/explain` HTTP server | **done** — `--serve PORT` |
 
+**GPU backend** (opt-in, `--features gpu`, via **wgpu** → Metal/DX12/Vulkan): `--device cpu|gpu|auto` + `--max-vram`
+budget (default 24 GB; exploits Apple unified memory), CPU default + fallback. A **GPU-resident GPT-2 forward** (weights
++ residual on-device, matmul/LayerNorm/GELU/residual as WGSL shaders) is **validated 20/20 top-1 vs CPU** on an RTX 5050
+(Vulkan) — `--gpu-check`. It's correctness-first (not yet faster than the rayon CPU batch on a small model; the speedup
+is the optimization pass: on-GPU attention, persistent buffers, tiled/fp16 matmul, and a bigger model). The default
+build stays pure-CPU with no GPU dependency.
+
 Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
 stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB), and an **AVX-512 VNNI** int8
 matmul with **outlier-aware** activation quant (on-core int8 dot, runtime-detected + scalar fallback; GPT-2 int8 = fp32

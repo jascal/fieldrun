@@ -30,6 +30,9 @@ diverges without explaining why.
 - `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
 - `src/api.rs` — the `tiny_http` server (`--serve PORT`).
+- `src/device.rs` / `src/gpu_mm.rs` / `src/gpu_gpt2.rs` — the opt-in GPU backend (`--features gpu`, wgpu): device
+  selection + budget/fallback, the validated matmul primitive, and the GPU-resident GPT-2 forward (`--gpu-check`).
+  Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
 Done across the board: Tier A/B (4 archs), KV-cache + **int8 KV cache** (`--kv-int8`, all archs, ~4x smaller, lossy:
