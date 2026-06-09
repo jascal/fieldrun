@@ -76,7 +76,7 @@ impl Rope {
     }
 
     fn proj(&self, a: &Array2<f32>, name: &str) -> Array2<f32> {
-        let mut y = a.dot(&self.b.arr2(name));
+        let mut y = self.b.mm(a, name);
         let bias = format!("{name}.bias");
         if self.b.has(&bias) {
             y = y + &self.b.arr1(&bias);
@@ -117,16 +117,16 @@ impl Rope {
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
             }
-            x = &x + &attn_out.dot(&self.b.arr2(&format!("{p}self_attn.o_proj")));
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
 
             let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
-            let gate = a2.dot(&self.b.arr2(&format!("{p}mlp.gate_proj")));
-            let up = a2.dot(&self.b.arr2(&format!("{p}mlp.up_proj")));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
             let mut hidden = gate;
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = silu(*hv) * uv;
             }
-            x = &x + &hidden.dot(&self.b.arr2(&format!("{p}mlp.down_proj")));
+            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
         }
 
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
@@ -169,15 +169,15 @@ impl Rope {
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
             }
-            x = &x + &attn_out.dot(&self.b.arr2(&format!("{p}self_attn.o_proj")));
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
             let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
-            let gate = a2.dot(&self.b.arr2(&format!("{p}mlp.gate_proj")));
-            let up = a2.dot(&self.b.arr2(&format!("{p}mlp.up_proj")));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
             let mut hidden = gate;
             for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
                 *hv = silu(*hv) * uv;
             }
-            x = &x + &hidden.dot(&self.b.arr2(&format!("{p}mlp.down_proj")));
+            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
         }
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }

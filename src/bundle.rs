@@ -140,7 +140,30 @@ impl Bundle {
         let (shape, arr) = self.get(name);
         let (k, n) = (shape[0], shape[1]);
         match arr {
-            Arr::F32(v) => a.dot(&ArrayView2::from_shape((k, n), v).unwrap()),
+            Arr::F32(v) => {
+                // Parallelise over output-column blocks (each independent + exact). Single-stream generation gets all
+                // cores per forward; under the scoring loop's outer rayon it work-steals. Small matmuls = one block.
+                let w = ArrayView2::from_shape((k, n), v).unwrap();
+                let block = 512.min(n.max(1));
+                let nblocks = n.div_ceil(block);
+                if nblocks <= 1 {
+                    return a.dot(&w);
+                }
+                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
+                    .into_par_iter()
+                    .map(|bi| {
+                        let c0 = bi * block;
+                        let bw = block.min(n - c0);
+                        (c0, a.dot(&w.slice(s![.., c0..c0 + bw])))
+                    })
+                    .collect();
+                let mut out = Array2::<f32>::zeros((a.nrows(), n));
+                for (c0, ob) in blocks.drain(..) {
+                    let bw = ob.ncols();
+                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                }
+                out
+            }
             // int8 W8A8: dynamically quantise each activation row to u8 (offset +128), int8·int8 dot via VNNI, then
             // dequant: out = scale_a * scale_w[j] * (Σ au·w  −  128·colsum[j]). The +128 makes `a` unsigned for
             // vpdpbusd (u8×s8); the colsum term cancels that offset. Activations go to int8 too, so this is lossier

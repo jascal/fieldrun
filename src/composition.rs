@@ -69,7 +69,7 @@ impl Gpt2 {
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
             let a = layernorm(&x, self.b.arr1(&format!("{p}ln_1.weight")), self.b.arr1(&format!("{p}ln_1.bias")));
-            let qkv = a.dot(&self.b.arr2(&format!("{p}attn.c_attn.weight"))) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
+            let qkv = self.b.mm(&a, &format!("{p}attn.c_attn.weight")) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
             let mut attn_out = Array2::<f32>::zeros((seq, self.d));
             for h in 0..self.n_head {
                 let q = qkv.slice(s![.., h * hd..(h + 1) * hd]);
@@ -84,13 +84,13 @@ impl Gpt2 {
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&v));
             }
-            x = &x + &(attn_out.dot(&self.b.arr2(&format!("{p}attn.c_proj.weight")))
+            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight"))
                 + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
 
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
-            let mut h_mlp = a2.dot(&self.b.arr2(&format!("{p}mlp.c_fc.weight"))) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
+            let mut h_mlp = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
             gelu(&mut h_mlp);
-            x = &x + &(h_mlp.dot(&self.b.arr2(&format!("{p}mlp.c_proj.weight")))
+            x = &x + &(self.b.mm(&h_mlp, &format!("{p}mlp.c_proj.weight"))
                 + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
 
@@ -114,7 +114,7 @@ impl Gpt2 {
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
             let a = layernorm(&x, self.b.arr1(&format!("{p}ln_1.weight")), self.b.arr1(&format!("{p}ln_1.bias")));
-            let qkv = a.dot(&self.b.arr2(&format!("{p}attn.c_attn.weight"))) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
+            let qkv = self.b.mm(&a, &format!("{p}attn.c_attn.weight")) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
             kc[l].slice_mut(s![cur..klen, ..]).assign(&qkv.slice(s![.., d..2 * d])); // append new K/V to the cache
             vc[l].slice_mut(s![cur..klen, ..]).assign(&qkv.slice(s![.., 2 * d..3 * d]));
             let q = qkv.slice(s![.., 0..d]);
@@ -132,11 +132,11 @@ impl Gpt2 {
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., hh * hd..(hh + 1) * hd]).assign(&scores.dot(&vh));
             }
-            x = &x + &(attn_out.dot(&self.b.arr2(&format!("{p}attn.c_proj.weight"))) + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
+            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight")) + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
-            let mut hm = a2.dot(&self.b.arr2(&format!("{p}mlp.c_fc.weight"))) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
+            let mut hm = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
             gelu(&mut hm);
-            x = &x + &(hm.dot(&self.b.arr2(&format!("{p}mlp.c_proj.weight"))) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+            x = &x + &(self.b.mm(&hm, &format!("{p}mlp.c_proj.weight")) + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
         }
         x
     }
