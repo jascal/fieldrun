@@ -11,6 +11,9 @@ and point the binary at.)
 `fieldrun` is the distribution form: those tiers ported to Rust as one static binary, plus the model as a portable
 bundle (weights blob + JSON manifest + tokenizer) that `convert` produces once and the binary loads/mmaps at run time.
 
+**New here?** [`QUICKSTART.md`](QUICKSTART.md) is a clean-machine walkthrough — install Rust, build, convert a small
+model, chat — in five copy-paste steps.
+
 ## Tiers
 
 | Tier | What it adds | Status |
