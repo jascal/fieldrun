@@ -3,12 +3,14 @@
 # fieldrun bundle at each dtype, run the pure-Rust kernel, and report top-1 agreement vs torch. f32 is the gate (the
 # architecture math); f16/int8 are lossy by design. No gated downloads — a tiny instance exercises every code path.
 #
-# Usage: scripts/validate_all.sh   (run from the repo root; needs the torch venv + a release build)
+# Usage: scripts/validate_all.sh                       (run from the repo root; needs the torch venv)
+#        FEATURES=accelerate scripts/validate_all.sh   (validate a BLAS build, e.g. on macOS — f32 column is the gate)
 set -u
 PY="${PY:-../lm-sae/.venv/bin/python}"
 BIN=./target/release/fieldrun
 REF=scripts/gemma3_ref.py
-cargo build --release >/dev/null 2>&1 || { echo "build failed"; exit 1; }
+# FEATURES lets you validate a non-default build (e.g. the Apple Accelerate / OpenBLAS matmul) with the same sweep.
+cargo build --release ${FEATURES:+--features "$FEATURES"} >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 
 printf "\n%-12s %-10s %-8s %-8s %-8s\n" arch ref f32 f16 int8
 printf '%.0s-' {1..50}; echo
