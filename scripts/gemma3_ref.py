@@ -130,13 +130,19 @@ def make_config():
         from transformers import Gemma4TextConfig
         is_moe = ARCH == "gemma4moe"
         is_keqv = ARCH == "gemma4keqv"  # global layers: V = K (no v_proj), num_global_key_value_heads KV heads
+        is_kvshare = ARCH == "gemma4kvshare"  # last 2 layers borrow K/V — one sliding (6←4), one full (7←5)
+        # kvshare uses an 8-layer pattern with full layers placed EARLY so the shared tail of each type has a source.
+        nl = 8 if is_kvshare else 7
+        layer_types = (["sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+                        "sliding_attention", "full_attention", "sliding_attention", "full_attention"]
+                       if is_kvshare else None)
         return Gemma4TextConfig(
             vocab_size=64,
             vocab_size_per_layer_input=64,
             hidden_size=32,
             hidden_size_per_layer_input=8,   # PLE dim
             intermediate_size=64,
-            num_hidden_layers=7,             # 0-4 sliding, 5 full, 6 forced full -> both paths + per-layer-type head_dim
+            num_hidden_layers=nl,            # 0-4 sliding, 5 full, 6 forced full -> both paths + per-layer-type head_dim
             num_attention_heads=4,
             num_key_value_heads=2,
             head_dim=8,                      # sliding head_dim
@@ -145,13 +151,14 @@ def make_config():
             rms_norm_eps=1e-6,
             max_position_embeddings=256,
             tie_word_embeddings=True,
+            layer_types=layer_types,
             enable_moe_block=is_moe,
             num_experts=4 if is_moe else None,
             top_k_experts=2 if is_moe else None,
             moe_intermediate_size=16 if is_moe else None,
             attention_k_eq_v=is_keqv,
             num_global_key_value_heads=1 if is_keqv else None,  # 1 < num_key_value_heads(2) → discriminates nkv_g
-            num_kv_shared_layers=0,
+            num_kv_shared_layers=2 if is_kvshare else 0,
             attn_implementation="eager",
             torch_dtype=torch.float32,
         )
@@ -195,7 +202,7 @@ def build():
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
-                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv") else 0.0))
+                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv", "gemma4kvshare") else 0.0))
             # Identity-init router scales (Gemma-4 MoE): mean-1 so the `*scale`/`*per_expert_scale` terms become
             # discriminating — at the ones() default a bug in either is invisible.
             elif name.endswith(("router.scale", "router.per_expert_scale")):

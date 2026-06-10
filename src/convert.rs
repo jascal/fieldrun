@@ -409,12 +409,15 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
 /// (NOT (1+w) — Gemma 4 inits norm weights to 1.0), value-norm (RMS, no weight → no array), attention scaling = 1.0,
 /// a *different* head_dim on global layers (so q/k/v/o shapes differ per layer type), partial-rotary "proportional"
 /// RoPE on global layers (handled in the kernel by zero-padding inv_freq), and the Per-Layer-Embedding gated-residual
-/// block. attention_k_eq_v is supported (global layers drop v_proj); KV-sharing is a follow-on (this asserts it's off).
+/// block. attention_k_eq_v (global layers drop v_proj) and KV-sharing (the last num_kv_shared_layers drop k/v/k_norm) are
+/// both supported.
 fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
     // attention_k_eq_v: GLOBAL layers carry no v_proj — V is the k_proj output (value-normed) — and use
     // num_global_key_value_heads KV heads. We record the flag and skip the absent v_proj weights below.
     let k_eq_v = c.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false);
-    assert_eq!(geti(c, "num_kv_shared_layers").unwrap_or(0), 0, "gemma4: KV-sharing not yet supported");
+    // KV-sharing: the last `n_kv_shared` layers carry no k_proj/v_proj/k_norm — they reuse an earlier same-type layer's
+    // assembled K/V. We record the count and skip those absent weights below (the kernel resolves the source layer).
+    let n_kv_shared = geti(c, "num_kv_shared_layers").unwrap_or(0);
     let moe = c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false);
     let n_exp = geti(c, "num_experts").unwrap_or(0);
     let topk = geti(c, "top_k_experts").unwrap_or(0);
@@ -450,6 +453,9 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
                                       moe as usize, n_exp, topk, moe_inter];
     for l in 0..nl { config.push(if is_full(l) { 0 } else { 1 }); } // sliding flags start at config[16]
     config.push(k_eq_v as usize); // attention_k_eq_v flag at config[16+nl]
+    config.push(n_kv_shared);     // num_kv_shared_layers at config[17+nl]
+    let first_shared = nl - n_kv_shared;
+    let is_shared = |l: usize| n_kv_shared > 0 && l >= first_shared; // shared layers drop k_proj/v_proj/k_norm
     let mut config_f: Vec<f64> = vec![theta_local, theta_global, eps, prf];
     config_f.extend(&layer_scalar); // config_f[4..4+nl] = per-layer layer_scalar
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gemma4",
@@ -489,6 +495,10 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
         let p = format!("model.layers.{l}.");
         for nm in ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm",
                    "self_attn.q_norm", "self_attn.k_norm", "post_per_layer_input_norm"] {
+            // KV-shared layers reuse an earlier layer's K, so they have no k_norm.
+            if nm == "self_attn.k_norm" && is_shared(l) {
+                continue;
+            }
             norm(&mut w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
         }
         // v_norm has with_scale=False (no weight) → nothing to write.
@@ -496,6 +506,10 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
                      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"] {
             // attention_k_eq_v global layers have no v_proj (the kernel reuses k_proj as V) → skip the absent weight.
             if proj == "self_attn.v_proj" && k_eq_v && is_full(l) {
+                continue;
+            }
+            // KV-shared layers have no k_proj/v_proj (they reuse an earlier same-type layer's assembled K/V).
+            if (proj == "self_attn.k_proj" || proj == "self_attn.v_proj") && is_shared(l) {
                 continue;
             }
             lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
