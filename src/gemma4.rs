@@ -690,4 +690,23 @@ impl Model for Gemma4 {
         }
         out
     }
+
+    fn generate_stream_prefix(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool, cache: &mut crate::model::PrefixKv) -> Vec<i64> {
+        if self.kv_int8 {
+            cache.clear();
+            return self.generate_stream(prompt, max_tokens, eos, emit);
+        }
+        let n_layer = self.n_layer;
+        // per-layer GQA width: local and global layers have different head_dim, so kc[l] width = nkv * hd_of(l)
+        let alloc = |total: usize| {
+            let kc: Vec<Array2<f32>> = (0..n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+            let vc = kc.clone();
+            (kc, vc)
+        };
+        let mut fwd = |ids: &[i64], cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]| {
+            let emb = self.b.rows_f32("embed", ids) * self.escale;
+            self.forward_block(ids, &emb, cur, kc, vc)
+        };
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb))
+    }
 }

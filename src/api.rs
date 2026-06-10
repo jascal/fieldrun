@@ -47,6 +47,10 @@ struct ExplainReq {
 pub struct TextGen {
     tok: tokenizers::Tokenizer,
     eos: Vec<i64>,
+    // Single-slot prefix-KV cache shared across requests so a growing chat reuses the K/V of its common prefix instead
+    // of re-prefilling the whole context each turn. The server handles one request at a time (the SSE generation runs
+    // on a scoped thread that joins before the next request), so this lock is always uncontended.
+    prefix: std::sync::Mutex<crate::model::PrefixKv>,
 }
 
 #[cfg(feature = "api")]
@@ -54,7 +58,9 @@ impl TextGen {
     /// Load `<stem>.tokenizer.json` (written by `convert`); `eos` from the bundle. None if there's no tokenizer.
     pub fn load(stem: &str, eos: Vec<i64>) -> Option<TextGen> {
         let path = format!("{stem}.tokenizer.json");
-        tokenizers::Tokenizer::from_file(&path).ok().map(|tok| TextGen { tok, eos })
+        tokenizers::Tokenizer::from_file(&path)
+            .ok()
+            .map(|tok| TextGen { tok, eos, prefix: std::sync::Mutex::new(crate::model::PrefixKv::default()) })
     }
 
     fn encode(&self, text: &str, add_special: bool) -> Vec<i64> {
@@ -123,8 +129,11 @@ impl TextGen {
         let ids = self.encode(prompt, add_special);
         let mut acc: Vec<i64> = Vec::new();
         let mut prev = String::new();
-        // decode the full accumulator each step and emit the byte-prefix delta — robust to BPE multi-byte/merge tokens.
-        let out = lm.generate_stream(&ids, max_tokens, &self.eos, &mut |t| {
+        // Reuse the K/V of the prefix this prompt shares with the previous turn (uncontended lock; recover a poisoned
+        // mutex rather than cascade a panic). decode the full accumulator each step and emit the byte-prefix delta —
+        // robust to BPE multi-byte/merge tokens.
+        let mut cache = self.prefix.lock().unwrap_or_else(|e| e.into_inner());
+        let out = lm.generate_stream_prefix(&ids, max_tokens, &self.eos, &mut |t| {
             acc.push(t);
             let text = self.decode(&acc);
             if text.starts_with(&prev) {
@@ -135,7 +144,7 @@ impl TextGen {
             }
             prev = text;
             true
-        });
+        }, &mut cache);
         (prev, ids.len(), out.len(), out.len() < max_tokens)
     }
 }

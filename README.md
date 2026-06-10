@@ -32,7 +32,9 @@ is the optimization pass: on-GPU attention, persistent buffers, tiled/fp16 matmu
 build stays pure-CPU with no GPU dependency.
 
 Plus: **KV-cache generation** (all archs, tokens identical to naive, with an optional int8 KV cache in both the one-shot
-and the streaming/serve decode loop), **fp16/int8/int4 bundles for every arch** (embeddings stay fp16, linear weights
+and the streaming/serve decode loop, and **prefix-KV reuse** across turns in the chat/serve path — a growing
+conversation re-prefills only the new suffix, byte-identical to a cold prefill), **fp16/int8/int4 bundles for every
+arch** (embeddings stay fp16, linear weights
 int8 or group-wise int4; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
 activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The int8 dot is vectorised on aarch64 (Apple Silicon /
 ARM) with **stable NEON** intrinsics (`vmull_s8` → `vpadalq_s16`, 16 lanes/iter) and a portable scalar fallback
