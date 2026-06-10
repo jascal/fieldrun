@@ -10,9 +10,11 @@
 //!     projection of the input embedding, gated by the post-FFN hidden and added back.
 //!   - a per-layer **`layer_scalar`** (a persistent buffer, default 1.0) multiplied into the residual as the LAST op of
 //!     each decoder layer; read from the checkpoint into config_f so a non-1.0 value runs faithfully.
+//!   - **attention_k_eq_v**: GLOBAL (full) layers carry no v_proj — V is the k_proj output (value-normed, NOT RoPE'd) —
+//!     and use `num_global_key_value_heads` KV heads; sliding layers are unaffected (per-layer `nkv_of(l)`).
 //! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate), dense and MoE. Incremental
 //! KV-cache `generate`/`generate_stream` (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and
-//! `explain` are wired. attention_k_eq_v / KV-sharing are not yet implemented (the convert asserts they're off).
+//! `explain` are wired. KV-sharing (num_kv_shared_layers) is the remaining tail (the convert asserts it's off).
 
 use std::collections::HashMap;
 
@@ -26,6 +28,8 @@ pub struct Gemma4 {
     n_layer: usize,
     h: usize,
     nkv: usize,
+    nkv_g: usize,     // KV heads on GLOBAL layers under attention_k_eq_v (else == nkv)
+    k_eq_v: bool,     // attention_k_eq_v: global layers reuse K as V (no v_proj), with nkv_g KV heads
     hd_local: usize,
     hd_global: usize,
     d: usize,
@@ -69,13 +73,15 @@ impl Gemma4 {
         // config: [nl, nh, nkv, nkv_g, hd_local, hd_global, d, ffn, vocab, tied, window, ple,
         //          moe, n_exp, topk, moe_inter, <nl sliding flags>]
         let c = &b.config;
-        let (n_layer, h, nkv) = (c[0] as usize, c[1] as usize, c[2] as usize);
+        let (n_layer, h, nkv, nkv_g) = (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize);
         let (hd_local, hd_global, d) = (c[4] as usize, c[5] as usize, c[6] as usize);
         let tied = c[9] != 0;
         let window = c[10] as usize;
         let ple = c[11] as usize;
         let (moe, n_exp, topk, moe_inter) = (c[12] != 0, c[13] as usize, c[14] as usize, c[15] as usize);
         let sliding: Vec<bool> = (0..n_layer).map(|l| c[16 + l] != 0).collect();
+        // attention_k_eq_v flag packed right after the sliding flags (c[16+nl]); absent (older bundles) → off.
+        let k_eq_v = c.len() > 16 + n_layer && c[16 + n_layer] != 0;
         // config_f: [theta_local, theta_global, eps, partial_rotary_factor, <nl layer_scalar>]
         let (theta_local, theta_global, eps, prf) =
             (b.config_f[0] as f32, b.config_f[1] as f32, b.config_f[2] as f32, b.config_f[3] as f32);
@@ -91,7 +97,7 @@ impl Gemma4 {
             .map(|j| if j < angles { 1.0 / theta_global.powf(2.0 * j as f32 / hd_global as f32) } else { 0.0 })
             .collect();
         Gemma4 {
-            b, n_layer, h, nkv, hd_local, hd_global, d, ple, eps,
+            b, n_layer, h, nkv, nkv_g, k_eq_v, hd_local, hd_global, d, ple, eps,
             escale: (d as f32).sqrt(), ple_escale: (ple as f32).sqrt(), proj_scale: (d as f32).powf(-0.5),
             inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter, layer_scalar, kv_int8,
         }
@@ -164,6 +170,11 @@ impl Gemma4 {
 
     fn hd_of(&self, l: usize) -> usize {
         if self.sliding[l] { self.hd_local } else { self.hd_global }
+    }
+
+    /// KV-head count for layer `l`: global (full) layers use `nkv_g` under attention_k_eq_v, everything else `nkv`.
+    fn nkv_of(&self, l: usize) -> usize {
+        if self.k_eq_v && !self.sliding[l] { self.nkv_g } else { self.nkv }
     }
 
     fn inv_for(&self, l: usize) -> &[f32] {
@@ -260,14 +271,20 @@ impl Gemma4 {
     /// Returns post-norm, post-RoPE (q, k, v): q has `h` heads, k/v have `nkv` heads, all of width `hd_of(l)`.
     fn derive_qkv(&self, l: usize, a: &Array2<f32>, pos: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
         let p = format!("l{l}.");
-        let (hd, nkv) = (self.hd_of(l), self.nkv);
+        let (hd, nkv) = (self.hd_of(l), self.nkv_of(l));
         let inv = self.inv_for(l);
         let mut q = self.b.mm(a, &format!("{p}self_attn.q_proj"));
         let mut k = self.b.mm(a, &format!("{p}self_attn.k_proj"));
-        let mut v = self.b.mm(a, &format!("{p}self_attn.v_proj"));
         self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), self.h, hd);
+        // value: under attention_k_eq_v a global layer has NO v_proj — V is the k_proj OUTPUT (value-normed, NOT RoPE'd),
+        // captured here before k_norm/RoPE mutate `k`. Otherwise the usual v_proj. v-norm is RMS-only (no weight).
+        let mut v = if self.k_eq_v && !self.sliding[l] {
+            k.clone()
+        } else {
+            self.b.mm(a, &format!("{p}self_attn.v_proj"))
+        };
         self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
-        self.head_norm(&mut v, None, nkv, hd); // value-norm: RMS only, no weight
+        self.head_norm(&mut v, None, nkv, hd);
         self.rope(&mut q, self.h, hd, pos, inv);
         self.rope(&mut k, nkv, hd, pos, inv);
         (q, k, v)
@@ -275,7 +292,7 @@ impl Gemma4 {
 
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
         let seq = ids.len();
-        let (h, nkv) = (self.h, self.nkv);
+        let h = self.h;
         let emb = self.b.rows_f32("embed", ids);
         let mut x = Array2::<f32>::zeros((seq, self.d));
         for t in 0..seq {
@@ -286,6 +303,7 @@ impl Gemma4 {
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
             let rep = h / nkv;
             // --- attention ---
             let a = self.norm(&x, &format!("{p}input_layernorm"));
@@ -348,7 +366,7 @@ impl Gemma4 {
     fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
         use crate::explain::*;
         let seq = ids.len();
-        let (h, nkv) = (self.h, self.nkv);
+        let h = self.h;
         let emb = self.b.rows_f32("embed", ids);
         let mut x = Array2::<f32>::zeros((seq, self.d));
         for t in 0..seq {
@@ -362,6 +380,7 @@ impl Gemma4 {
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
             let (q, k, v) = self.derive_qkv(l, &a, 0);
@@ -432,7 +451,7 @@ impl Gemma4 {
     /// window). The PLE gated-residual block is per-token, so it is recomputed for the new rows only. cur = absolute
     /// position of the first new row.
     fn forward_block(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> Array2<f32> {
-        let (h, nkv) = (self.h, self.nkv);
+        let h = self.h;
         let m = emb.nrows();
         let klen = cur + m;
         let mut x = emb.clone();
@@ -440,6 +459,7 @@ impl Gemma4 {
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
             let (q, k, v) = self.derive_qkv(l, &a, cur);
@@ -491,7 +511,7 @@ impl Gemma4 {
     #[allow(clippy::too_many_arguments)]
     fn forward_block_q(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>],
                        vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]) -> Array2<f32> {
-        let (h, nkv) = (self.h, self.nkv);
+        let h = self.h;
         let m = emb.nrows();
         let klen = cur + m;
         let mut x = emb.clone();
@@ -500,6 +520,7 @@ impl Gemma4 {
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
             let rep = h / nkv;
             let kvdim = nkv * hd;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
@@ -569,9 +590,9 @@ impl Gemma4 {
 
     fn generate_kv_int8(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         let total = prompt.len() + n_new;
-        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv * self.hd_of(l)]).collect();
+        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv_of(l) * self.hd_of(l)]).collect();
         let mut vc = kc.clone();
-        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|l| vec![0f32; total * self.nkv_of(l)]).collect();
         let mut vs = ks.clone();
         let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
         let xb = self.forward_block_q(prompt, &emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
@@ -608,8 +629,8 @@ impl Model for Gemma4 {
             return self.generate_kv_int8(prompt, n_new);
         }
         let total = prompt.len() + n_new;
-        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
-        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv_of(l) * self.hd_of(l)))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv_of(l) * self.hd_of(l)))).collect();
         let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
         let xb = self.forward_block(prompt, &emb, 0, &mut kc, &mut vc);
         let mut next = self.head_argmax(&xb);
@@ -630,9 +651,9 @@ impl Model for Gemma4 {
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let total = prompt.len() + max_tokens;
         if self.kv_int8 {
-            let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv * self.hd_of(l)]).collect();
+            let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv_of(l) * self.hd_of(l)]).collect();
             let mut vc = kc.clone();
-            let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+            let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|l| vec![0f32; total * self.nkv_of(l)]).collect();
             let mut vs = ks.clone();
             let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
             let xb = self.forward_block_q(prompt, &emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
@@ -654,8 +675,8 @@ impl Model for Gemma4 {
             }
             return out;
         }
-        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
-        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv_of(l) * self.hd_of(l)))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv_of(l) * self.hd_of(l)))).collect();
         let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
         let xb = self.forward_block(prompt, &emb, 0, &mut kc, &mut vc);
         let mut next = self.head_argmax(&xb);
@@ -685,7 +706,7 @@ impl Model for Gemma4 {
         let n_layer = self.n_layer;
         // per-layer GQA width: local and global layers have different head_dim, so kc[l] width = nkv * hd_of(l)
         let alloc = |total: usize| {
-            let kc: Vec<Array2<f32>> = (0..n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+            let kc: Vec<Array2<f32>> = (0..n_layer).map(|l| Array2::zeros((total, self.nkv_of(l) * self.hd_of(l)))).collect();
             let vc = kc.clone();
             (kc, vc)
         };
