@@ -255,6 +255,24 @@ impl Gemma4 {
             .collect()
     }
 
+    /// Project + per-head-norm + RoPE the q/k/v for layer `l` at absolute position `pos` — the derivation shared by all
+    /// four forward paths (full `hidden`, `explanation`, KV-cache f32 `forward_block`, int8-KV `forward_block_q`).
+    /// Returns post-norm, post-RoPE (q, k, v): q has `h` heads, k/v have `nkv` heads, all of width `hd_of(l)`.
+    fn derive_qkv(&self, l: usize, a: &Array2<f32>, pos: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        let p = format!("l{l}.");
+        let (hd, nkv) = (self.hd_of(l), self.nkv);
+        let inv = self.inv_for(l);
+        let mut q = self.b.mm(a, &format!("{p}self_attn.q_proj"));
+        let mut k = self.b.mm(a, &format!("{p}self_attn.k_proj"));
+        let mut v = self.b.mm(a, &format!("{p}self_attn.v_proj"));
+        self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), self.h, hd);
+        self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
+        self.head_norm(&mut v, None, nkv, hd); // value-norm: RMS only, no weight
+        self.rope(&mut q, self.h, hd, pos, inv);
+        self.rope(&mut k, nkv, hd, pos, inv);
+        (q, k, v)
+    }
+
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
         let seq = ids.len();
         let (h, nkv) = (self.h, self.nkv);
@@ -271,15 +289,7 @@ impl Gemma4 {
             let rep = h / nkv;
             // --- attention ---
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
-            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
-            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
-            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
-            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
-            self.head_norm(&mut v, None, nkv, hd); // value-norm: RMS only, no weight
-            let inv = self.inv_for(l);
-            self.rope(&mut q, h, hd, 0, inv);
-            self.rope(&mut k, nkv, hd, 0, inv);
+            let (q, k, v) = self.derive_qkv(l, &a, 0);
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             for head in 0..h {
@@ -354,15 +364,7 @@ impl Gemma4 {
             let hd = self.hd_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
-            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
-            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
-            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
-            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
-            self.head_norm(&mut v, None, nkv, hd);
-            let inv = self.inv_for(l);
-            self.rope(&mut q, h, hd, 0, inv);
-            self.rope(&mut k, nkv, hd, 0, inv);
+            let (q, k, v) = self.derive_qkv(l, &a, 0);
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             let mut layer_att = Vec::with_capacity(h);
@@ -440,15 +442,7 @@ impl Gemma4 {
             let hd = self.hd_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
-            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
-            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
-            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
-            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
-            self.head_norm(&mut v, None, nkv, hd);
-            let inv = self.inv_for(l);
-            self.rope(&mut q, h, hd, cur, inv);
-            self.rope(&mut k, nkv, hd, cur, inv);
+            let (q, k, v) = self.derive_qkv(l, &a, cur);
             kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
             vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
             let sliding = self.sliding[l];
@@ -509,15 +503,7 @@ impl Gemma4 {
             let rep = h / nkv;
             let kvdim = nkv * hd;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
-            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
-            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
-            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
-            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
-            self.head_norm(&mut v, None, nkv, hd);
-            let inv = self.inv_for(l);
-            self.rope(&mut q, h, hd, cur, inv);
-            self.rope(&mut k, nkv, hd, cur, inv);
+            let (q, k, v) = self.derive_qkv(l, &a, cur);
             for i in 0..m {
                 let pos = cur + i;
                 for kh in 0..nkv {
