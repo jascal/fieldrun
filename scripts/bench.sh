@@ -14,10 +14,10 @@ printf "%-12s %-10s %-10s %-10s\n" arch f32 f16 int8; printf '%.0s-' {1..46}; ec
 for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3moe" "qwen3moeswa:qwen3moe" "mla:mla" "mlayarn:mla" "minimax:minimax"; do
   tag="${spec%%:*}"; arch="${spec##*:}"
   declare -A ok tot
-  for dt in f32 f16 int8; do ok[$dt]=0; tot[$dt]=0; done
+  for dt in f32 f16 int8 int4; do ok[$dt]=0; tot[$dt]=0; done
   for s in "${SEEDS[@]}"; do
     SEED=$s N_EVAL=$NE $PY $REF build "$tag" >/dev/null 2>&1 || continue
-    for dt in f32 f16 int8; do
+    for dt in f32 f16 int8 int4; do
       # --force: each seed reseeds the tiny model, so a bundle left from the previous seed would be compared
       # against the WRONG reference (same trap validate_all.sh hit — convert skips existing bundles by default).
       $BIN convert --model /tmp/${tag}tiny --arch "$arch" --dtype "$dt" -o /tmp/${tag}_$dt --force >/dev/null 2>&1
@@ -27,7 +27,7 @@ for spec in "gemma3:gemma3" "gemma4:gemma4" "gemma4moe:gemma4" "qwen3moe:qwen3mo
     done
   done
   row=""
-  for dt in f32 f16 int8; do
+  for dt in f32 f16 int8 int4; do
     if [ "${tot[$dt]}" -gt 0 ]; then row="$row $(printf '%-10s' "$(awk "BEGIN{printf \"%.1f%%\", 100*${ok[$dt]}/${tot[$dt]}}") (${ok[$dt]}/${tot[$dt]})")"; else row="$row $(printf '%-10s' ERR)"; fi
   done
   printf "%-12s%s\n" "$tag" "$row"
