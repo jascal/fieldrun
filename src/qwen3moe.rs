@@ -32,6 +32,7 @@ pub struct Qwen3Moe {
     moe: Vec<bool>,
     window: usize, // sliding-window size, all layers (0 = full attention)
     tied: bool,
+    kv_int8: bool, // store the KV cache (GQA width) as int8 with a per-kv-head scale during generate
 }
 
 fn silu(x: f32) -> f32 {
@@ -51,7 +52,7 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Qwen3Moe {
-    pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Qwen3Moe {
+    pub fn new(b: Bundle, _route: f32, kv_int8: bool) -> Qwen3Moe {
         // config: [nl, nh, nkv, hd, d, ffn, vocab, tied, n_exp, topk, moe_inter, norm_topk, <nl moe flags>, window]
         let c = &b.config;
         let (n_layer, h, nkv, hd, d) = (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize, c[4] as usize);
@@ -62,7 +63,7 @@ impl Qwen3Moe {
         let (theta, eps) = (b.config_f[0] as f32, b.config_f[1] as f32);
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
         Qwen3Moe { b, n_layer, h, nkv, hd, d, eps, scale: (hd as f32).powf(-0.5), inv,
-                   n_exp, topk, moe_inter, norm_topk, moe, window, tied }
+                   n_exp, topk, moe_inter, norm_topk, moe, window, tied, kv_int8 }
     }
 
     fn unembed(&self) -> &str {
@@ -95,13 +96,15 @@ impl Qwen3Moe {
         }
     }
 
-    fn rope(&self, x: &mut Array2<f32>, n_heads: usize) {
+    /// Rotary embedding on a (m, n_heads*hd) block; row i is absolute position `pos0 + i` (pos0 > 0 for KV-cache decode).
+    fn rope(&self, x: &mut Array2<f32>, n_heads: usize, pos0: usize) {
         let (hd, half) = (self.hd, self.hd / 2);
         for (i, mut row) in x.rows_mut().into_iter().enumerate() {
+            let pos = pos0 + i;
             for head in 0..n_heads {
                 let base = head * hd;
                 for j in 0..half {
-                    let ang = i as f32 * self.inv[j];
+                    let ang = pos as f32 * self.inv[j];
                     let (c, s) = (ang.cos(), ang.sin());
                     let (a, b) = (row[base + j], row[base + j + half]);
                     row[base + j] = a * c - b * s;
@@ -169,8 +172,8 @@ impl Qwen3Moe {
             let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
             self.head_norm(&mut q, &format!("{p}q_norm"), h);   // QK-norm before RoPE
             self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
-            self.rope(&mut q, h);
-            self.rope(&mut k, nkv);
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             for head in 0..h {
                 let kv = head / rep;
@@ -194,6 +197,238 @@ impl Qwen3Moe {
         }
         self.norm(&x, "norm")
     }
+
+    fn unembed_argmax(&self, xfn: &Array2<f32>) -> i64 {
+        let logits = self.b.rowdot_f32(self.unembed(), &xfn.row(xfn.nrows() - 1).to_vec());
+        logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    /// For explain: on a MoE layer, the dominant expert (highest softmax route) for one token's post-attention-normed
+    /// hidden `row` (a (1, d) array) and that expert's SwiGLU hidden — names the layer's "MLP feature".
+    fn top_expert_feature(&self, l: usize, row: &Array2<f32>) -> (usize, Vec<f32>) {
+        let p = format!("l{l}.");
+        let mut logits = self.b.mm(row, &format!("{p}gate"));
+        softmax_rows(&mut logits);
+        let r = logits.row(0);
+        let e = (0..self.n_exp).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap();
+        let gate = self.b.expert_mm(row, &format!("{p}experts.{e}.gate"));
+        let up = self.b.expert_mm(row, &format!("{p}experts.{e}.up"));
+        let mut hh = gate;
+        for (h, u) in hh.iter_mut().zip(up.iter()) { *h = silu(*h) * u; }
+        (e, hh.row(0).to_vec())
+    }
+
+    fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
+        use crate::explain::*;
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut head_act: Vec<Vec<f32>> = Vec::new();
+        let mut mlp_h: Vec<Vec<f32>> = Vec::new();
+        let mut feat_src: Vec<Option<usize>> = Vec::new(); // Some(e) = MoE expert e; None = dense mlp.down_proj
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, &format!("{p}q_norm"), h);
+            self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            let mut layer_att = Vec::with_capacity(h);
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) * self.scale;
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (self.window > 0 && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                layer_att.push(scores.row(seq - 1).to_vec());
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            att_last.push(layer_att);
+            head_act.push(attn_out.row(seq - 1).to_vec());
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            if self.moe[l] {
+                let last = a2.slice(s![seq - 1..seq, ..]).to_owned();
+                let (e, hidden) = self.top_expert_feature(l, &last);
+                feat_src.push(Some(e));
+                mlp_h.push(hidden);
+            } else {
+                let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+                let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+                let mut hidden = gate;
+                for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = silu(*hv) * uv; }
+                feat_src.push(None);
+                mlp_h.push(hidden.row(seq - 1).to_vec());
+            }
+            let mlp = if self.moe[l] { self.moe_branch(l, &a2) } else { self.dense_mlp(l, &a2) };
+            x = &x + &mlp;
+        }
+        let xf = self.norm(&x, "norm");
+        let un = self.unembed();
+        let lg = self.b.rowdot_f32(un, &xf.row(seq - 1).to_vec());
+        let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+        let gain = self.b.arr1("norm").to_vec();
+        assemble(
+            ids,
+            &att_last,
+            &mlp_h,
+            model_predicts,
+            |l, n, act| {
+                let w_out = match feat_src[l] {
+                    Some(e) => self.b.expert_row(&format!("l{l}.experts.{e}.down"), n),
+                    None => self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
+                };
+                top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
+            },
+            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), un, &head_act[l], head, hd, &gain, false, 5),
+        )
+    }
+
+    /// Run `m` new positions through the layers, caching K/V (post-RoPE/QK-norm, GQA width nkv*hd) and attending over the
+    /// whole cache (causal + sliding window). cur = absolute position of the first new row.
+    fn forward_block(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> Array2<f32> {
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, &format!("{p}q_norm"), h);
+            self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
+            self.rope(&mut q, h, cur);
+            self.rope(&mut k, nkv, cur);
+            kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
+            vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = kc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let vh = vc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) * self.scale;
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (self.window > 0 && j + self.window <= abs) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let mlp = if self.moe[l] { self.moe_branch(l, &a2) } else { self.dense_mlp(l, &a2) };
+            x = &x + &mlp;
+        }
+        self.norm(&x, "norm")
+    }
+
+    /// `forward_block` with an int8 KV cache (GQA width, per-kv-head scale): ~4x smaller cache, ~identical tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_q(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>],
+                       vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]) -> Array2<f32> {
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let kvdim = nkv * hd;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let q8 = |v: f32, sc: f32| (v / sc).round().clamp(-127.0, 127.0) as i8;
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, &format!("{p}q_norm"), h);
+            self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
+            self.rope(&mut q, h, cur);
+            self.rope(&mut k, nkv, cur);
+            for i in 0..m {
+                let pos = cur + i;
+                for kh in 0..nkv {
+                    let base = kh * hd;
+                    let sck = ((0..hd).fold(0f32, |mx, c| mx.max(k[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    let scv = ((0..hd).fold(0f32, |mx, c| mx.max(v[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    ks[l][pos * nkv + kh] = sck;
+                    vs[l][pos * nkv + kh] = scv;
+                    for c in 0..hd {
+                        kc[l][pos * kvdim + base + c] = q8(k[[i, base + c]], sck);
+                        vc[l][pos * kvdim + base + c] = q8(v[[i, base + c]], scv);
+                    }
+                }
+            }
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let mut kh_a = Array2::<f32>::zeros((klen, hd));
+                let mut vh_a = Array2::<f32>::zeros((klen, hd));
+                for pos in 0..klen {
+                    let (sck, scv) = (ks[l][pos * nkv + kv], vs[l][pos * nkv + kv]);
+                    for c in 0..hd {
+                        kh_a[[pos, c]] = kc[l][pos * kvdim + kv * hd + c] as f32 * sck;
+                        vh_a[[pos, c]] = vc[l][pos * kvdim + kv * hd + c] as f32 * scv;
+                    }
+                }
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let mut scores = qh.dot(&kh_a.t()) * self.scale;
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (self.window > 0 && j + self.window <= abs) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh_a));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let mlp = if self.moe[l] { self.moe_branch(l, &a2) } else { self.dense_mlp(l, &a2) };
+            x = &x + &mlp;
+        }
+        self.norm(&x, "norm")
+    }
+
+    fn generate_kv_int8(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        let total = prompt.len() + n_new;
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * kvdim]).collect();
+        let mut vc = kc.clone();
+        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+        let mut vs = ks.clone();
+        let emb = self.b.rows_f32("embed", prompt);
+        let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+        let mut next = self.unembed_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            let e = self.b.rows_f32("embed", &[next]);
+            let xb = self.forward_block_q(&e, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+            next = self.unembed_argmax(&xb);
+            pos += 1;
+        }
+    }
 }
 
 impl Model for Qwen3Moe {
@@ -202,5 +437,60 @@ impl Model for Qwen3Moe {
         let last = xf.row(ids.len() - 1).to_vec();
         let logits = self.b.rowdot_f32(self.unembed(), &last);
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {
+        Some(self.explanation(ids))
+    }
+
+    fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        if self.kv_int8 {
+            return self.generate_kv_int8(prompt, n_new);
+        }
+        let total = prompt.len() + n_new;
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
+        let emb = self.b.rows_f32("embed", prompt);
+        let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
+        let mut next = self.unembed_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            let e = self.b.rows_f32("embed", &[next]);
+            let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
+            next = self.unembed_argmax(&xb);
+            pos += 1;
+        }
+    }
+
+    fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
+        let total = prompt.len() + max_tokens;
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
+        let mut vc = kc.clone();
+        let emb = self.b.rows_f32("embed", prompt);
+        let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
+        let mut next = self.unembed_argmax(&xb);
+        let mut out = Vec::new();
+        let mut pos = prompt.len();
+        loop {
+            if eos.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if !emit(next) || out.len() == max_tokens {
+                break;
+            }
+            let e = self.b.rows_f32("embed", &[next]);
+            let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
+            next = self.unembed_argmax(&xb);
+            pos += 1;
+        }
+        out
     }
 }

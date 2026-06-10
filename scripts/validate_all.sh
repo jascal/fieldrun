@@ -32,6 +32,23 @@ for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma
 done
 echo
 
+# Generate + explain gate: incremental KV-cache decode must be BYTE-IDENTICAL to the naive full-recompute path (the f32
+# correctness gate for generation — naive is itself top-1-validated vs torch above, so KV==naive ⇒ KV==torch), for both
+# the f32 and int8-KV caches; and `explain` (the runtime circuit/feature readout) must run on every arch. Reuses the f32
+# bundles + holdouts built above.
+printf "%-12s %-22s %-12s %s\n" arch "generate f32(KV==naive)" "int8-KV" explain
+printf '%.0s-' {1..56}; echo
+for spec in gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mla:mla mlayarn:mla minimax:minimax; do
+  tag="${spec%%:*}"; b=/tmp/${tag}_f32; ids=/tmp/${tag}_holdout.json
+  [ -f "$b.fieldrun.json" ] || { printf "%-12s (no f32 bundle — built above?)\n" "$tag"; continue; }
+  idn=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  id8=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 --kv-int8 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  ex=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --explain 2>/dev/null | grep -c 'model predicts')
+  exl=$([ "${ex:-0}" -ge 1 ] && echo ok || echo MISSING)
+  printf "%-12s %-22s %-12s %s\n" "$tag" "${idn:-ERR}" "${id8:-ERR}" "$exl"
+done
+echo
+
 # Real-model round-trips from the HF cache (the convert + run path on actual weights), where present.
 GPT2=$(find ~/.cache/huggingface/hub/models--gpt2/snapshots -name config.json -exec dirname {} \; 2>/dev/null | head -1)
 if [ -n "${GPT2:-}" ] && [ -f ../lm-sae/pylm/holdout_gpt2.json ]; then

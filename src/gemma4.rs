@@ -1,5 +1,5 @@
-//! Tier B — composition, Gemma 4 (dense text path: Per-Layer Embeddings on, MoE off). A faithful Rust port of
-//! `Gemma4ForCausalLM`'s text model. On top of the Gemma-3 backbone it adds:
+//! Tier B — composition, Gemma 4 (text path: Per-Layer Embeddings on; dense FFN, with an optional summed top-k MoE
+//! expert branch). A faithful Rust port of `Gemma4ForCausalLM`'s text model. On top of the Gemma-3 backbone it adds:
 //!   - RMSNorm uses the stored weight *directly* (NOT (1+w) — Gemma 4 inits norm weights to 1.0);
 //!   - per-head **value-norm** (RMS over head_dim, no learnable weight) alongside the q/k norms;
 //!   - attention **scaling = 1.0** (QK-norm makes the 1/√d unnecessary);
@@ -8,8 +8,9 @@
 //!     rest are zero-padded → identity), local layers full-rotate at the lower base;
 //!   - the **Per-Layer-Embedding (PLE) gated-residual block** per layer: a token-identity aux embedding + a context
 //!     projection of the input embedding, gated by the post-FFN hidden and added back.
-//! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate). MoE / attention_k_eq_v /
-//! KV-sharing are not yet implemented (the convert asserts they're off).
+//! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate), dense and MoE. Incremental
+//! KV-cache `generate`/`generate_stream` (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and
+//! `explain` are wired. attention_k_eq_v / KV-sharing are not yet implemented (the convert asserts they're off).
 
 use std::collections::HashMap;
 
@@ -40,6 +41,7 @@ pub struct Gemma4 {
     n_exp: usize,
     topk: usize,
     moe_inter: usize,
+    kv_int8: bool,    // store the KV cache (per-layer GQA width) as int8 with a per-kv-head scale during generate
 }
 
 fn gelu_tanh(x: f32) -> f32 {
@@ -60,7 +62,7 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Gemma4 {
-    pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Gemma4 {
+    pub fn new(b: Bundle, _route: f32, kv_int8: bool) -> Gemma4 {
         // config: [nl, nh, nkv, nkv_g, hd_local, hd_global, d, ffn, vocab, tied, window, ple,
         //          moe, n_exp, topk, moe_inter, <nl sliding flags>]
         let c = &b.config;
@@ -84,7 +86,7 @@ impl Gemma4 {
         Gemma4 {
             b, n_layer, h, nkv, hd_local, hd_global, d, ple, eps,
             escale: (d as f32).sqrt(), ple_escale: (ple as f32).sqrt(), proj_scale: (d as f32).powf(-0.5),
-            inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter,
+            inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter, kv_int8,
         }
     }
 
@@ -193,13 +195,14 @@ impl Gemma4 {
         }
     }
 
-    fn rope(&self, x: &mut Array2<f32>, n_heads: usize, hd: usize, inv: &[f32]) {
+    fn rope(&self, x: &mut Array2<f32>, n_heads: usize, hd: usize, pos0: usize, inv: &[f32]) {
         let half = hd / 2;
         for (i, mut row) in x.rows_mut().into_iter().enumerate() {
+            let pos = pos0 + i;
             for head in 0..n_heads {
                 let base = head * hd;
                 for j in 0..half {
-                    let ang = i as f32 * inv[j];
+                    let ang = pos as f32 * inv[j];
                     let (cs, sn) = (ang.cos(), ang.sin());
                     let (a, b) = (row[base + j], row[base + j + half]);
                     row[base + j] = a * cs - b * sn;
@@ -262,8 +265,8 @@ impl Gemma4 {
             self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
             self.head_norm(&mut v, None, nkv, hd); // value-norm: RMS only, no weight
             let inv = self.inv_for(l);
-            self.rope(&mut q, h, hd, inv);
-            self.rope(&mut k, nkv, hd, inv);
+            self.rope(&mut q, h, hd, 0, inv);
+            self.rope(&mut k, nkv, hd, 0, inv);
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             for head in 0..h {
@@ -312,6 +315,277 @@ impl Gemma4 {
         }
         self.norm(&x, "norm")
     }
+
+    fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
+        let logits = self.b.rowdot_f32(self.unembed(), &xfn.row(xfn.nrows() - 1).to_vec());
+        logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
+        use crate::explain::*;
+        let seq = ids.len();
+        let (h, nkv) = (self.h, self.nkv);
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut att_last: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut head_act: Vec<Vec<f32>> = Vec::new();
+        let mut head_hd: Vec<usize> = Vec::new(); // per-layer head_dim (local vs global) — for head DLA
+        let mut mlp_h: Vec<Vec<f32>> = Vec::new();
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
+            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
+            self.head_norm(&mut v, None, nkv, hd);
+            let inv = self.inv_for(l);
+            self.rope(&mut q, h, hd, 0, inv);
+            self.rope(&mut k, nkv, hd, 0, inv);
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            let mut layer_att = Vec::with_capacity(h);
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()); // scaling = 1.0
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                layer_att.push(scores.row(seq - 1).to_vec());
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            att_last.push(layer_att);
+            head_act.push(attn_out.row(seq - 1).to_vec());
+            head_hd.push(hd);
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            mlp_h.push(hidden.row(seq - 1).to_vec());
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+            g.mapv_inplace(gelu_tanh);
+            g = &g * &pli[l];
+            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+        }
+        let xf = self.norm(&x, "norm");
+        let un = self.unembed();
+        let lg = self.b.rowdot_f32(un, &xf.row(seq - 1).to_vec());
+        let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+        let gain = self.b.arr1("norm").to_vec();
+        assemble(
+            ids,
+            &att_last,
+            &mlp_h,
+            model_predicts,
+            |l, n, act| {
+                let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
+                top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
+            },
+            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), un, &head_act[l], head, head_hd[l], &gain, false, 5),
+        )
+    }
+
+    /// Run `m` new positions through the layers, caching K/V (post value-norm / RoPE; per-layer GQA width nkv*hd_of(l),
+    /// which differs between local and global layers) and attending over the whole cache (causal + per-layer sliding
+    /// window). The PLE gated-residual block is per-token, so it is recomputed for the new rows only. cur = absolute
+    /// position of the first new row.
+    fn forward_block(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> Array2<f32> {
+        let (h, nkv) = (self.h, self.nkv);
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let pli = self.per_layer_inputs(ids, &x);
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
+            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
+            self.head_norm(&mut v, None, nkv, hd);
+            let inv = self.inv_for(l);
+            self.rope(&mut q, h, hd, cur, inv);
+            self.rope(&mut k, nkv, hd, cur, inv);
+            kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
+            vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = kc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let vh = vc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (sliding && j + self.window <= abs) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+            g.mapv_inplace(gelu_tanh);
+            g = &g * &pli[l];
+            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+        }
+        self.norm(&x, "norm")
+    }
+
+    /// `forward_block` with an int8 KV cache (per-layer GQA width, per-kv-head scale): ~4x smaller cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_q(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>],
+                       vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]) -> Array2<f32> {
+        let (h, nkv) = (self.h, self.nkv);
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let pli = self.per_layer_inputs(ids, &x);
+        let q8 = |v: f32, sc: f32| (v / sc).round().clamp(-127.0, 127.0) as i8;
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let rep = h / nkv;
+            let kvdim = nkv * hd;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let mut v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), h, hd);
+            self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
+            self.head_norm(&mut v, None, nkv, hd);
+            let inv = self.inv_for(l);
+            self.rope(&mut q, h, hd, cur, inv);
+            self.rope(&mut k, nkv, hd, cur, inv);
+            for i in 0..m {
+                let pos = cur + i;
+                for kh in 0..nkv {
+                    let base = kh * hd;
+                    let sck = ((0..hd).fold(0f32, |mx, c| mx.max(k[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    let scv = ((0..hd).fold(0f32, |mx, c| mx.max(v[[i, base + c]].abs())) / 127.0).max(1e-8);
+                    ks[l][pos * nkv + kh] = sck;
+                    vs[l][pos * nkv + kh] = scv;
+                    for c in 0..hd {
+                        kc[l][pos * kvdim + base + c] = q8(k[[i, base + c]], sck);
+                        vc[l][pos * kvdim + base + c] = q8(v[[i, base + c]], scv);
+                    }
+                }
+            }
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let mut kh_a = Array2::<f32>::zeros((klen, hd));
+                let mut vh_a = Array2::<f32>::zeros((klen, hd));
+                for pos in 0..klen {
+                    let (sck, scv) = (ks[l][pos * nkv + kv], vs[l][pos * nkv + kv]);
+                    for c in 0..hd {
+                        kh_a[[pos, c]] = kc[l][pos * kvdim + kv * hd + c] as f32 * sck;
+                        vh_a[[pos, c]] = vc[l][pos * kvdim + kv * hd + c] as f32 * scv;
+                    }
+                }
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let mut scores = qh.dot(&kh_a.t());
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (sliding && j + self.window <= abs) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh_a));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+            g.mapv_inplace(gelu_tanh);
+            g = &g * &pli[l];
+            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+        }
+        self.norm(&x, "norm")
+    }
+
+    fn generate_kv_int8(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        let total = prompt.len() + n_new;
+        let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv * self.hd_of(l)]).collect();
+        let mut vc = kc.clone();
+        let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+        let mut vs = ks.clone();
+        let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+        let xb = self.forward_block_q(prompt, &emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            emb = self.b.rows_f32("embed", &[next]) * self.escale;
+            let xb = self.forward_block_q(&[next], &emb, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+    }
 }
 
 impl Model for Gemma4 {
@@ -320,5 +594,58 @@ impl Model for Gemma4 {
         let last = xf.row(ids.len() - 1).to_vec();
         let logits = self.b.rowdot_f32(self.unembed(), &last);
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {
+        Some(self.explanation(ids))
+    }
+
+    fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
+        if self.kv_int8 {
+            return self.generate_kv_int8(prompt, n_new);
+        }
+        let total = prompt.len() + n_new;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+        let xb = self.forward_block(prompt, &emb, 0, &mut kc, &mut vc);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::with_capacity(n_new);
+        let mut pos = prompt.len();
+        loop {
+            out.push(next);
+            if out.len() == n_new {
+                return out;
+            }
+            emb = self.b.rows_f32("embed", &[next]) * self.escale;
+            let xb = self.forward_block(&[next], &emb, pos, &mut kc, &mut vc);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+    }
+
+    fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
+        let total = prompt.len() + max_tokens;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
+        let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+        let xb = self.forward_block(prompt, &emb, 0, &mut kc, &mut vc);
+        let mut next = self.head_argmax(&xb);
+        let mut out = Vec::new();
+        let mut pos = prompt.len();
+        loop {
+            if eos.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if !emit(next) || out.len() == max_tokens {
+                break;
+            }
+            emb = self.b.rows_f32("embed", &[next]) * self.escale;
+            let xb = self.forward_block(&[next], &emb, pos, &mut kc, &mut vc);
+            next = self.head_argmax(&xb);
+            pos += 1;
+        }
+        out
     }
 }
