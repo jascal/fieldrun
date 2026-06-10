@@ -381,8 +381,20 @@ impl Model for Gpt2 {
 
     fn generate_stream_prefix(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool, cache: &mut crate::model::PrefixKv) -> Vec<i64> {
         if self.kv_int8 {
-            cache.clear();
-            return self.generate_stream(prompt, max_tokens, eos, emit);
+            let (d, n_head, n_layer) = (self.d, self.n_head, self.n_layer);
+            let alloc = |total: usize| {
+                let kc: Vec<Vec<i8>> = (0..n_layer).map(|_| vec![0i8; total * d]).collect();
+                let vc = kc.clone();
+                let ks: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0f32; total * n_head]).collect();
+                let vs = ks.clone();
+                (kc, vc, ks, vs)
+            };
+            let mut fwd = |ids: &[i64], cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>], vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]| {
+                let ppos: Vec<i64> = (cur..cur + ids.len()).map(|i| i as i64).collect();
+                let emb = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &ppos);
+                self.forward_block_q(&emb, cur, kc, ks, vc, vs)
+            };
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb));
         }
         let (d, n_layer) = (self.d, self.n_layer);
         let alloc = |total: usize| {

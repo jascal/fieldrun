@@ -477,8 +477,19 @@ impl Model for Rope {
 
     fn generate_stream_prefix(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool, cache: &mut crate::model::PrefixKv) -> Vec<i64> {
         if self.kv_int8 {
-            cache.clear();
-            return self.generate_stream(prompt, max_tokens, eos, emit);
+            let (kvdim, nkv, n_layer) = (self.nkv * self.hd, self.nkv, self.n_layer);
+            let alloc = |total: usize| {
+                let kc: Vec<Vec<i8>> = (0..n_layer).map(|_| vec![0i8; total * kvdim]).collect();
+                let vc = kc.clone();
+                let ks: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0f32; total * nkv]).collect();
+                let vs = ks.clone();
+                (kc, vc, ks, vs)
+            };
+            let mut fwd = |ids: &[i64], cur: usize, kc: &mut [Vec<i8>], ks: &mut [Vec<f32>], vc: &mut [Vec<i8>], vs: &mut [Vec<f32>]| {
+                let emb = self.b.rows_f32("embed", ids);
+                self.forward_block_q(&emb, cur, kc, ks, vc, vs)
+            };
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb));
         }
         let (kvdim, n_layer) = (self.nkv * self.hd, self.n_layer);
         let alloc = |total: usize| {
