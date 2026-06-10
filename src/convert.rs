@@ -802,6 +802,13 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
                 w.put_small(&format!("l{l}.{proj}.bias"), &dt, &s, dtype)?;
             }
         }
+        // Qwen3-dense QK-norm: per-head RMSNorm on q/k, present only on Qwen3 (not Llama/Qwen2.5). Standard RMSNorm
+        // (no (1+w) bake), so it rides the same `norm` path; skip if this arch already wrote it via `norms` (gemma3).
+        for nm in ["self_attn.q_norm", "self_attn.k_norm"] {
+            if m.has(&format!("{p}{nm}.weight")) && !norms.iter().any(|(_, h)| *h == nm) {
+                norm(w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
+            }
+        }
     }
     Ok(())
 }

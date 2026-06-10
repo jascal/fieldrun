@@ -1,6 +1,8 @@
-//! Tier B — composition, RoPE family (Llama-3.2 / Qwen2.5). A faithful Rust port of pylm's `numpy_rope.py`: RMSNorm +
-//! rotary position embedding + grouped-query attention + SwiGLU MLP, over a fieldrun bundle (`arch: "rope"`). Mirrors
-//! the numpy kernel array-for-array, so it reproduces it (and torch) exactly. fp32 in.
+//! Tier B — composition, RoPE family (Llama-3.2 / Qwen2.5 / Qwen3-dense / Mistral / Phi). A faithful Rust port of pylm's
+//! `numpy_rope.py`: RMSNorm + rotary position embedding + grouped-query attention + SwiGLU MLP, over a fieldrun bundle
+//! (`arch: "rope"`). Optional per-head **QK-norm** (Qwen3-dense) is applied when the bundle carries `q_norm`/`k_norm`;
+//! optional q/k/v bias (Qwen2.5) too. Mirrors the numpy kernel array-for-array, so it reproduces it (and torch)
+//! exactly. fp32 in.
 
 use ndarray::{s, Array1, Array2};
 
@@ -17,6 +19,7 @@ pub struct Rope {
     inv: Vec<f32>, // rotary frequencies, length hd/2
     route: f32,    // Tier C: fraction of MLP neurons to compute per token (0 = off)
     kv_int8: bool, // store the KV cache (GQA width) as int8 with a per-kv-head scale
+    qk_norm: bool, // Qwen3-dense: per-head RMSNorm on q/k after projection, before RoPE (absent on Llama/Qwen2.5)
 }
 
 fn rmsnorm(x: &Array2<f32>, w: Array1<f32>, eps: f32) -> Array2<f32> {
@@ -55,7 +58,25 @@ impl Rope {
         let theta = b.config_f[0] as f32;
         let eps = b.config_f[1] as f32;
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
-        Rope { b, n_layer, h, nkv, hd, eps, inv, route, kv_int8 }
+        let qk_norm = b.has("l0.self_attn.q_norm"); // Qwen3-dense ships it; Llama/Qwen2.5/Mistral/Phi don't
+        Rope { b, n_layer, h, nkv, hd, eps, inv, route, kv_int8, qk_norm }
+    }
+
+    /// Per-head RMSNorm over head_dim (Qwen3 QK-norm), weight applied directly — on the q/k projection output
+    /// (n_heads heads of width hd packed per row) before RoPE. A no-op unless the bundle carries q_norm/k_norm.
+    fn head_norm(&self, x: &mut Array2<f32>, name: &str, n_heads: usize) {
+        let w = self.b.arr1o(name);
+        let hd = self.hd;
+        for mut row in x.rows_mut() {
+            for head in 0..n_heads {
+                let base = head * hd;
+                let ms = (0..hd).map(|c| { let v = row[base + c]; v * v }).sum::<f32>() / hd as f32;
+                let inv = 1.0 / (ms + self.eps).sqrt();
+                for c in 0..hd {
+                    row[base + c] = row[base + c] * inv * w[c];
+                }
+            }
+        }
     }
 
     fn down(&self, h: &Array2<f32>, name: &str) -> Array2<f32> {
@@ -106,6 +127,10 @@ impl Rope {
             let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
             let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
             let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
             self.rope(&mut q, h, 0);
             self.rope(&mut k, nkv, 0);
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
@@ -157,6 +182,10 @@ impl Rope {
             let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
             let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
             let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
             self.rope(&mut q, h, 0);
             self.rope(&mut k, nkv, 0);
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
@@ -221,6 +250,10 @@ impl Rope {
             let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
             let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
             let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
             self.rope(&mut q, h, cur);
             self.rope(&mut k, nkv, cur);
             kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
@@ -271,6 +304,10 @@ impl Rope {
             let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
             let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
             let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
             self.rope(&mut q, h, cur);
             self.rope(&mut k, nkv, cur);
             for i in 0..m {

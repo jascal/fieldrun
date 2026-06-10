@@ -104,7 +104,7 @@ Pick `--arch` by family:
 | `--arch` | Models | Notes |
 |----------|--------|-------|
 | `gpt2`   | GPT-2 (124M–1.5B) | learned pos, LayerNorm, tied wte |
-| `rope`   | Llama-3.x, Qwen2.5, Mistral, Phi | RMSNorm + RoPE + GQA + SwiGLU; optional q/k/v bias |
+| `rope`   | Llama-3.x, Qwen2.5, **Qwen3 (4B/8B dense)**, Mistral, Phi | RMSNorm + RoPE + GQA + SwiGLU; optional q/k/v bias; optional **QK-norm** (Qwen3) |
 | `gemma`  | Gemma-2 | √d embed, 4-norm sandwich, logit soft-cap, sliding window |
 | `gemma3` | Gemma-3 (1B/4B/12B/27B) | + QK-norm, dual-base RoPE, 5:1 local/global, no soft-cap |
 | `gemma4` | Gemma-4 (E2B/E4B dense, **26B-A4B MoE**) | + value-norm, per-layer-type `head_dim`, partial-rotary global RoPE, PLE, MoE |
@@ -114,9 +114,10 @@ Pick `--arch` by family:
 
 All validated to top-1 agreement vs the torch reference (see the gate above). Big MoE models (Gemma-4 26B, Qwen3-MoE,
 DeepSeek/Kimi) use **expert offload** — the experts stay mmap'd on disk and only the active top-k page in per token, so
-the resident set is the shared layers + a working set of hot experts, not the whole model. (Predict/score is fully
-supported on every arch; KV-cache `generate` + `explain` are wired for GPT-2 / RoPE / Gemma-2 / Gemma-3 — the newer
-archs fall back to naive recompute for generation, which is correct but slower.)
+the resident set is the shared layers + a working set of hot experts, not the whole model. Predict/score, KV-cache
+`generate`/`generate_stream` (+ optional int8 KV), and `explain` (live circuits + features) are wired for **every**
+arch — the incremental KV-cache decode is byte-identical to the naive full recompute (the f32 generation gate in
+`scripts/validate_all.sh`).
 
 ## Running a big model on a Mac (M3 / M4, unified memory)
 

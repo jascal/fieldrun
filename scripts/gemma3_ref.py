@@ -30,6 +30,16 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
+    if ARCH == "qwen3":
+        from transformers import Qwen3Config
+        # Qwen3 DENSE (Qwen3-4B/8B): the RoPE family + QK-norm (per-head RMSNorm on q/k) — exercises the optional
+        # q_norm/k_norm path added to the `rope` arch.
+        return Qwen3Config(
+            vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=4,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=8, rms_norm_eps=1e-6,
+            tie_word_embeddings=False, max_position_embeddings=256,
+            attn_implementation="eager", torch_dtype=torch.float32,
+        )
     if ARCH == "minimax":
         from transformers import MiniMaxM2Config
         return MiniMaxM2Config(
@@ -169,7 +179,8 @@ def build():
     torch.manual_seed(SEED)
     cfg = make_config()
     tf = __import__("transformers")
-    Cls = (tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
+    Cls = (tf.Qwen3ForCausalLM if ARCH == "qwen3"
+           else tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
            else tf.DeepseekV3ForCausalLM if ARCH.startswith("mla")
            else tf.Qwen3MoeForCausalLM if ARCH.startswith("qwen3moe")
            else tf.Gemma4ForCausalLM if ARCH.startswith("gemma4")
@@ -182,7 +193,7 @@ def build():
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
-                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH == "mlayarn" else 0.0))
+                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3") else 0.0))
             # Identity-init router scales (Gemma-4 MoE): mean-1 so the `*scale`/`*per_expert_scale` terms become
             # discriminating — at the ones() default a bug in either is invisible.
             elif name.endswith(("router.scale", "router.per_expert_scale")):
@@ -221,7 +232,8 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = ("MiniMaxM2ForCausalLM" if ARCH == "minimax"
+    cls = ("Qwen3ForCausalLM" if ARCH == "qwen3"
+           else "MiniMaxM2ForCausalLM" if ARCH == "minimax"
            else "DeepseekV3ForCausalLM" if ARCH.startswith("mla")
            else "Qwen3MoeForCausalLM" if ARCH.startswith("qwen3moe")
            else "Gemma4ForCausalLM" if ARCH.startswith("gemma4") else "Gemma3ForCausalLM")
