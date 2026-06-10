@@ -33,28 +33,33 @@ diverges without explaining why.
   for usable *dense* large-model speed on CPU; the pure-Rust column-block path is the default + faithful reference
   (int8 always uses `i8dot`). `mm_routed_down` (Tier C), and the row-wise embed helpers.
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
-  (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). GPT-2/RoPE/Gemma-2/Gemma-3 each have a KV-cache `generate`
-  (+ int8-KV) and `explain`. `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1 pattern, no soft-capping. `gemma4.rs`
-  adds (dense text path) value-norm, scaling=1, per-layer-type head_dim, partial-rotary global RoPE, and the PLE
-  gated-residual block; norms use the weight directly (no (1+w)); `moe_branch` adds the MoE-FFN (router + experts,
-  dense||expert sum). gemma4 `generate` falls back to naive recompute and `explain` is TBD (forward correctness is the gate).
+  (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). **Every arch now has a KV-cache `generate`/`generate_stream`
+  (+ int8-KV) and `explain`** — the KV-cache decode is byte-identical to the naive full-recompute path (the f32
+  generation gate, checked per arch by `scripts/validate_all.sh`). `gemma3.rs` adds QK-norm, dual-base RoPE, the 5:1
+  pattern, no soft-capping. `gemma4.rs` adds value-norm, scaling=1, per-layer-type head_dim, partial-rotary global
+  RoPE, and the PLE gated-residual block; norms use the weight directly (no (1+w)); `moe_branch` adds the MoE-FFN
+  (router + experts, dense||expert sum). Its KV cache is per-layer-width (local/global head_dim differ); the PLE block
+  is per-token so it recomputes for new rows only.
 - `src/bundle.rs` — also the **MoE expert-offload**: the blob is mmap'd; dense arrays parse into RAM (the resident set),
   but expert weights stay on disk and `expert_f32`/`expert_mm` read+dequant them on demand (per token only the active
   top-k fault in; the OS page cache holds the hot working set). Non-MoE models: no expert arrays, footprint unchanged.
 - `src/qwen3moe.rs` — Qwen3-MoE: the RoPE backbone + QK-norm (per-head RMSNorm on q/k) + per-layer MoE-or-dense
   (plain-gate router: softmax → top-k → optional renorm; SwiGLU experts read from the mmap) + optional **sliding
   window** (`use_sliding_window`: ONE window on every layer — no per-layer pattern, unlike Gemma 3). No new attention
-  kernel — reuses the MoE-FFN + expert-offload. predict only (generate=naive / explain TBD).
+  kernel — reuses the MoE-FFN + expert-offload. KV-cache `generate` (+ int8-KV) and `explain` wired; on a MoE layer the
+  explain feature is the dominant expert's promoted neuron.
 - `src/mla.rs` — DeepSeek-V3/R1 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
   split, v_head_dim ≠ qk_head_dim) + DeepSeek MoE (group-limited sigmoid routing with bias-corrected *choice* and
   sigmoid *weight*, an always-on shared expert, first-k-dense layers). **YaRN** rope scaling (every real
   DeepSeek-V3/R1/Kimi config ships it): the inv_freq ramp, the mscale attention factor on cos/sin, and the mscale²
   softmax-scale correction. **Interleaved rotary** (`rope_interleave`, the DeepSeek default) is de-interleaved at
   convert time (the permutation is baked into the q_b/q + kv_a rotary rows), so the kernel keeps split-half rope and
-  matches exactly. Experts paged from the mmap. predict only.
+  matches exactly. Experts paged from the mmap. KV-cache `generate` (+ int8-KV) caches the *assembled* per-head K/V
+  (byte-identical to naive) and `explain` reads heads + the shared-expert/dense FFN features.
 - `src/minimax.rs` — MiniMax-M2: RoPE backbone + FULL-WIDTH q/k-norm (RMSNorm over the whole nh·hd / nkv·hd, not
   per-head) + all-MoE with a sigmoid router (+bias for the choice, sigmoid renormed for the weight; no group, no shared
-  expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. predict only.
+  expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. KV-cache
+  `generate` (+ int8-KV) and `explain` (dominant-expert feature) wired.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
   archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax`), `--dtype int8|f16|f32` (f32 = bit-exact, for the
   faithfulness gate). `-o` defaults to `bundles/<name>/<name>` (grouped, not loose in cwd); copies `tokenizer.json` next
@@ -104,11 +109,11 @@ Still open, with the honest catch on each (none are quick wins — they need har
   uncertain (the gather read can cost as much as the dense pass).
 - **KV-cache quant** (TurboQuant-style): a *memory* win (4× smaller cache) that only manifests at long context, which
   these short-context demos don't exercise — validatable by token-identity but not demonstrable as a real saving here.
-- **Gemma-4 remaining pieces** (dense text + MoE + expert-offload all landed, 60/60). Each its own validated increment:
-  **attention_k_eq_v** (global layers reuse k as v, with `num_global_key_value_heads`); **KV-sharing**
-  (`num_kv_shared_layers` — later layers reuse an earlier layer's K/V); a **KV-cache `generate` + `explain`** for gemma4
-  (currently naive recompute / TBD); and an **explicit LRU + prefetch** over the page cache (perf, not correctness — the
-  current path leans on the OS page cache, the chosen "no extra bookkeeping" strategy).
+- **Gemma-4 remaining pieces** (dense text + MoE + expert-offload + KV-cache `generate`/`explain` all landed, 60/60).
+  Each its own validated increment: **attention_k_eq_v** (global layers reuse k as v, with `num_global_key_value_heads`);
+  **KV-sharing** (`num_kv_shared_layers` — later layers reuse an earlier layer's K/V); and an **explicit LRU + prefetch**
+  over the page cache (perf, not correctness — the current path leans on the OS page cache, the chosen "no extra
+  bookkeeping" strategy).
 - **Frontier-MoE roadmap.** **Qwen3-MoE (incl. sliding window) and MLA (DeepSeek-V3/R1/Kimi-K2, incl. YaRN +
   interleaved rotary) are done** (60/60 each, with dedicated discriminating columns in `validate_all.sh`) — both
   carried by the MoE-FFN + expert-offload; MLA is the last new attention *class* among the *supported* set.
@@ -116,8 +121,9 @@ Still open, with the honest catch on each (none are quick wins — they need har
   attention — compressors, a lightning indexer, grouped o_proj, sliding-window shared-KV MQA), *not* "V3 plus
   deltas"; it would be its own kernel, and `convert` now refuses `model_type=deepseek_v4` explicitly instead of
   mis-routing it to `mla`. Remaining tails: **DeepSeek-V4 (HCA/CSA) as a new arch**; **MiniMax-M2 done** (60/60);
-  **MiniMax-M3** (newer, weights/class not out yet — validate when they land); and **KV-cache `generate` + `explain`**
-  for the newer archs (currently naive recompute). Beyond kernels the binding constraint is **memory** — these are
+  **MiniMax-M3** (newer, weights/class not out yet — validate when they land). **KV-cache `generate`/`generate_stream`
+  (+ int8-KV) and `explain` are now wired for every arch** (gemma4, qwen3moe, mla, minimax included) — KV==naive
+  byte-identity gated in `validate_all.sh`. Beyond kernels the binding constraint is **memory** — these are
   100B–1T-param models; expert-offload is the lever (resident = shared layers + hot experts), but the shared layers +
   a usable working set still want a bigger box + fast disk. Every kernel is tiny-instance-validatable
   (`scripts/validate_all.sh`); full weights are the hardware ask.

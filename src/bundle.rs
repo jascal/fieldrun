@@ -176,6 +176,19 @@ impl Bundle {
         x.dot(&wv)
     }
 
+    /// Logical row `r` of an offloaded expert weight (stored (in, out) row-major) as f32 — the analogue of
+    /// `weight_row` for the mmap'd MoE experts, so explain can name a MoE neuron's promoted tokens (its down-row
+    /// projected to the unembed). One expert is paged in per call; explain touches one neuron per layer, so this is
+    /// cheap. Falls back to `weight_row` if `name` is actually a dense (non-offloaded) array.
+    pub fn expert_row(&self, name: &str, r: usize) -> Vec<f32> {
+        if !self.experts.contains_key(name) {
+            return self.weight_row(name, r);
+        }
+        let (shape, w) = self.expert_f32(name);
+        let out = shape[1];
+        w[r * out..(r + 1) * out].to_vec()
+    }
+
     /// Tier C — routed MLP down-projection. For each row keep only the top `frac` neurons by |activation| and sum just
     /// their down-rows (a sparse axpy), skipping the rest entirely: real conditional compute, ~`frac` of the work.
     /// Numerically identical to zeroing the bottom (1-frac) neurons then a dense down-proj (the pylm `--route-frac`).
