@@ -15,6 +15,7 @@ mod bundle;
 mod composition;
 mod convert;
 mod device;
+mod dsv4;
 mod explain;
 #[cfg(feature = "gpu")]
 mod gpu_gpt2;
@@ -50,6 +51,7 @@ use blas_src as _;
 
 use bundle::Bundle;
 use composition::Gpt2;
+use dsv4::Dsv4;
 use gemma::Gemma;
 use gemma3::Gemma3;
 use gemma4::Gemma4;
@@ -119,7 +121,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax"];
+        const ARCHS: &[&str] = &["gpt2", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
@@ -300,7 +302,8 @@ fn main() {
             "qwen3moe" => Box::new(Qwen3Moe::new(bundle, route, kv_int8)),
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
+            "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).

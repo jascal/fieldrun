@@ -215,14 +215,12 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
             ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
             ("mla", &["deepseek", "deepseek_v3", "kimi"]),
             ("minimax", &["minimax"]),
+            // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with a new attention class (shared-KV MQA + sink +
+            // undo-RoPE + grouped o_proj, mHC residual, sqrtsoftplus MoE, and CSA/HCA compressors). Longest-prefix-wins
+            // routes "deepseek_v4" here (11 chars) over `mla`'s "deepseek" (8). convert_dsv4 handles the sliding subset
+            // and refuses checkpoints that actually use the CSA/HCA compressors (a later stage).
+            ("dsv4", &["deepseek_v4"]),
         ];
-        // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with hierarchical/compressed-sparse attention
-        // (compressors, an indexer, grouped o_proj, sliding-window shared-KV MQA) — a different attention class.
-        // Refuse loudly rather than mis-route it to `mla` and convert garbage.
-        if model_type == "deepseek_v4" {
-            panic!("convert: model_type \"deepseek_v4\" uses HCA/CSA attention — a different attention class from \
-                    V3's MLA, not yet supported. The `mla` arch covers DeepSeek-V3/R1 and Kimi-K2 (incl. YaRN).");
-        }
         let best = table
             .iter()
             .filter_map(|(a, toks)| {
@@ -254,6 +252,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, out_stem)?,
         "mla" => convert_mla(&cfg, &m, dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, out_stem)?,
+        "dsv4" => convert_dsv4(&cfg, &m, dtype, out_stem)?,
         other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
     };
     // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
@@ -878,6 +877,132 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
         }
     }
     Ok(())
+}
+
+/// DeepSeek-V4 (Stage 1: the sliding-only backbone). Refuses checkpoints that actually use the CSA/HCA compressors or
+/// hash-routed MoE layers (later stages). Weights: q-LoRA (q_a/q_b + q_a_norm), shared-KV MQA (kv_proj/kv_norm), the
+/// grouped o_proj written as one block per group, per-head attention sinks, the two mHC HyperConnections + the final
+/// HyperHead (fn/base/scale params), the sqrtsoftplus router (+ e_score_correction_bias) over packed experts, and the
+/// always-on shared expert. config packs the dims; config_f the rope-theta/eps/clamp/scale scalars.
+fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+    let nl = geti(c, "num_hidden_layers").unwrap();
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let hd = geti(c, "head_dim").unwrap();
+    let d = geti(c, "hidden_size").unwrap();
+    let q_lora = geti(c, "q_lora_rank").unwrap();
+    // partial_rotary_factor (a fraction) → rope_head_dim = round(head_dim * factor); falls back to default_partial.
+    let prf = getf(c, "partial_rotary_factor").or_else(|| getf(c, "default_partial_rotary_factor")).unwrap_or(64.0 / 512.0);
+    let rd = (hd as f64 * prf).round() as usize;
+    let n_exp = geti(c, "n_routed_experts").or_else(|| geti(c, "num_local_experts")).unwrap();
+    let top_k = geti(c, "num_experts_per_tok").unwrap();
+    let o_groups = geti(c, "o_groups").unwrap();
+    let o_lora = geti(c, "o_lora_rank").unwrap();
+    let moe_inter = geti(c, "moe_intermediate_size").or_else(|| geti(c, "intermediate_size")).unwrap();
+    let vocab = geti(c, "vocab_size").unwrap();
+    let hc = geti(c, "hc_mult").unwrap_or(4);
+    let sinkhorn = geti(c, "hc_sinkhorn_iters").unwrap_or(20);
+    let window = geti(c, "sliding_window").unwrap();
+    // V4 declares _tied_weights_keys(lm_head→embed): a checkpoint that omits lm_head.weight is tied (reload re-ties it),
+    // so treat a missing lm_head as tied regardless of the config flag.
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false) || !m.has("lm_head.weight");
+    let theta = getf(c, "rope_theta").unwrap_or(10000.0);
+    let eps = getf(c, "rms_norm_eps").unwrap_or(1e-6);
+    let limit = getf(c, "swiglu_limit").unwrap_or(10.0);
+    let rscale = getf(c, "routed_scaling_factor").unwrap_or(1.5);
+    let hc_eps = getf(c, "hc_eps").unwrap_or(1e-6);
+    // Stage 1 covers the sliding-only / all-`moe` subset. Refuse the compressor + hash-routed regimes loudly.
+    let lt = c.get("layer_types").and_then(|v| v.as_array());
+    if let Some(a) = lt {
+        for (l, v) in a.iter().enumerate() {
+            let t = v.as_str().unwrap_or("");
+            assert_eq!(t, "sliding_attention",
+                "dsv4: layer {l} is {t:?} (CSA/HCA compressor) — not yet supported (Stage 1 is sliding-only).");
+        }
+    }
+    if let Some(a) = c.get("mlp_layer_types").and_then(|v| v.as_array()) {
+        for (l, v) in a.iter().enumerate() {
+            assert_eq!(v.as_str().unwrap_or("moe"), "moe",
+                "dsv4: layer {l} uses hash routing — not yet supported (Stage 1 is moe-only).");
+        }
+    }
+
+    let config: Vec<usize> = vec![nl, nh, hd, q_lora, rd, d, n_exp, top_k, o_groups, o_lora, moe_inter, vocab, hc, sinkhorn, window, tie as usize];
+    let config_f: Vec<f64> = vec![theta, eps, limit, rscale, hc_eps];
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "dsv4",
+        "config": config, "config_f": config_f });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf); // (out, in)
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    // embeddings stay low-precision; lm_head raw (vocab, d) for rowdot_f32 when untied.
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_small("embed", &ed, &es, dtype)?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight");
+        w.put_small("lm_head", &dt, &s, dtype)?;
+    }
+    norm(&mut w, "norm", "model.norm.weight")?;
+    // HyperHead (final stream collapse)
+    lin(&mut w, "hc_head.hc_fn", "model.hc_head.hc_fn")?;
+    {
+        let (s, dt) = m.read("model.hc_head.hc_base");
+        w.put_small("hc_head.hc_base", &dt, &s, dtype)?;
+        let (s2, dt2) = m.read("model.hc_head.hc_scale");
+        w.put_small("hc_head.hc_scale", &dt2, &s2, dtype)?;
+    }
+    let gin = nh * hd / o_groups; // grouped o_proj input-per-group
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        norm(&mut w, &format!("l{l}.input_layernorm"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.post_attention_layernorm"), &format!("{p}post_attention_layernorm.weight"))?;
+        // attention
+        norm(&mut w, &format!("l{l}.self_attn.q_a_norm"), &format!("{p}self_attn.q_a_norm.weight"))?;
+        norm(&mut w, &format!("l{l}.self_attn.kv_norm"), &format!("{p}self_attn.kv_norm.weight"))?;
+        lin(&mut w, &format!("l{l}.self_attn.q_a_proj"), &format!("{p}self_attn.q_a_proj.weight"))?;
+        lin(&mut w, &format!("l{l}.self_attn.q_b_proj"), &format!("{p}self_attn.q_b_proj.weight"))?;
+        lin(&mut w, &format!("l{l}.self_attn.kv_proj"), &format!("{p}self_attn.kv_proj.weight"))?;
+        lin(&mut w, &format!("l{l}.self_attn.o_b_proj"), &format!("{p}self_attn.o_b_proj.weight"))?;
+        // grouped o_a_proj: HF weight (o_groups*o_lora, gin); write one block per group (o_lora, gin).
+        let (oas, oad) = m.read(&format!("{p}self_attn.o_a_proj.weight"));
+        assert_eq!(oas, vec![o_groups * o_lora, gin], "dsv4 o_a_proj shape");
+        for g in 0..o_groups {
+            let blk = &oad[g * o_lora * gin..(g + 1) * o_lora * gin];
+            w.put_lin(&format!("l{l}.self_attn.o_a_proj.{g}"), blk, o_lora, gin, dtype)?;
+        }
+        let (sks, skd) = m.read(&format!("{p}self_attn.sinks"));
+        w.put_small(&format!("l{l}.self_attn.sinks"), &skd, &sks, dtype)?;
+        // mHC HyperConnections (attn + ffn sites)
+        for hcn in ["attn_hc", "ffn_hc"] {
+            lin(&mut w, &format!("l{l}.{hcn}.fn"), &format!("{p}{hcn}.fn"))?;
+            let (bs, bd) = m.read(&format!("{p}{hcn}.base"));
+            w.put_small(&format!("l{l}.{hcn}.base"), &bd, &bs, dtype)?;
+            let (ss, sd) = m.read(&format!("{p}{hcn}.scale"));
+            w.put_small(&format!("l{l}.{hcn}.scale"), &sd, &ss, dtype)?;
+        }
+        // MoE router + bias
+        lin(&mut w, &format!("l{l}.mlp.gate"), &format!("{p}mlp.gate.weight"))?;
+        let (bs, bd) = m.read(&format!("{p}mlp.gate.e_score_correction_bias"));
+        w.put_small(&format!("l{l}.mlp.e_score_correction_bias"), &bd, &bs, dtype)?;
+        // routed experts — saved UNPACKED per expert (Mixtral convention): w1=gate, w3=up, w2=down. One (in,out) array each.
+        for e in 0..n_exp {
+            lin(&mut w, &format!("l{l}.experts.{e}.gate"), &format!("{p}mlp.experts.{e}.w1.weight"))?;
+            lin(&mut w, &format!("l{l}.experts.{e}.up"), &format!("{p}mlp.experts.{e}.w3.weight"))?;
+            lin(&mut w, &format!("l{l}.experts.{e}.down"), &format!("{p}mlp.experts.{e}.w2.weight"))?;
+        }
+        // shared expert (SwiGLU)
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            lin(&mut w, &format!("l{l}.mlp.shared_experts.{proj}"), &format!("{p}mlp.shared_experts.{proj}.weight"))?;
+        }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
 }
 
 #[cfg(test)]
