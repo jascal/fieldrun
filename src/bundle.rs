@@ -171,6 +171,21 @@ impl Bundle {
         self.experts.contains_key(name)
     }
 
+    /// Hint the kernel to read-ahead a routed expert's mmap pages (`MADV_WILLNEED`) so the page-in overlaps with compute
+    /// on the previously-selected experts. Pure performance hint: a no-op for correctness, for unknown names, and on
+    /// non-unix targets. The MoE forward calls this for every active top-k expert up front, so the kernel pages experts
+    /// 2..k in while expert 1 is being computed — turning k serial page-fault stalls (the decode bottleneck under expert
+    /// offload) into one overlapped readahead. Does not change the resident set: these are exactly the experts this
+    /// forward will touch anyway.
+    #[cfg(unix)]
+    pub fn prefetch(&self, name: &str) {
+        if let Some(e) = self.experts.get(name) {
+            let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, e.offset, e.bytes);
+        }
+    }
+    #[cfg(not(unix))]
+    pub fn prefetch(&self, _name: &str) {}
+
     /// Read one MoE expert weight on demand from the mmap and dequantise to f32 (i8 via its per-column `__scale`
     /// sibling, which is resident). Cold experts fault in from disk; hot ones stay in the OS page cache. Returns
     /// (shape, data) with the same (in, out) row-major layout `mm` expects.

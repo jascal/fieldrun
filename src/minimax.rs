@@ -103,6 +103,13 @@ impl MiniMax {
             }
         }
         let mut out = Array2::<f32>::zeros((seq, a2.ncols()));
+        // Prefetch every active expert's weights up front (MADV_WILLNEED) so the OS pages experts 2..k from the mmap
+        // while expert 1 is computed — overlapping the per-token page-in stalls that bound MoE decode under offload.
+        for &e in assign.keys() {
+            self.b.prefetch(&format!("{p}experts.{e}.gate"));
+            self.b.prefetch(&format!("{p}experts.{e}.up"));
+            self.b.prefetch(&format!("{p}experts.{e}.down"));
+        }
         for (e, toks) in &assign {
             let mut rows = Array2::<f32>::zeros((toks.len(), a2.ncols()));
             for (i, &(t, _)) in toks.iter().enumerate() { rows.row_mut(i).assign(&a2.row(t)); }
