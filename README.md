@@ -31,8 +31,9 @@ budget (default 24 GB; exploits Apple unified memory), CPU default + fallback. A
 is the optimization pass: on-GPU attention, persistent buffers, tiled/fp16 matmul, and a bigger model). The default
 build stays pure-CPU with no GPU dependency.
 
-Plus: **KV-cache generation** (all archs, tokens identical to naive), **fp16/int8 bundles for all four archs** (embeddings
-stay fp16, linear weights int8; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
+Plus: **KV-cache generation** (all archs, tokens identical to naive, with an optional int8 KV cache in both the one-shot
+and the streaming/serve decode loop), **fp16/int8/int4 bundles for every arch** (embeddings stay fp16, linear weights
+int8 or group-wise int4; GPT-2 164 MB, Qwen 631 MB, Gemma-2-2b 3.2 GB / fits 8 GB) with **outlier-aware**
 activation quant (GPT-2 int8 = fp32 accuracy, 99% per-position). The int8 dot is vectorised on aarch64 (Apple Silicon /
 ARM) with **stable NEON** intrinsics (`vmull_s8` → `vpadalq_s16`, 16 lanes/iter) and a portable scalar fallback
 everywhere else — all on stable Rust, no feature flag or nightly. (Activations are quantised to *signed* int8; this is

@@ -134,6 +134,12 @@ impl Gemma4 {
         let h2_in = self.norm(x_pre, &format!("{p}pre_feedforward_layernorm_2"));
         let mut h2 = Array2::<f32>::zeros((seq, self.d));
         let mi = self.moe_inter;
+        // Prefetch every active expert's weights up front (MADV_WILLNEED) so the OS pages experts 2..k from the mmap
+        // while expert 1 is computed — overlapping the per-token page-in stalls that bound MoE decode under offload.
+        for &e in assign.keys() {
+            self.b.prefetch(&format!("{p}experts.{e}.gate_up"));
+            self.b.prefetch(&format!("{p}experts.{e}.down"));
+        }
         for (e, toks) in &assign {
             let mut rows = Array2::<f32>::zeros((toks.len(), self.d));
             for (i, &(t, _)) in toks.iter().enumerate() { rows.row_mut(i).assign(&h2_in.row(t)); }
