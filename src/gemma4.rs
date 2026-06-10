@@ -637,6 +637,31 @@ impl Model for Gemma4 {
 
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let total = prompt.len() + max_tokens;
+        if self.kv_int8 {
+            let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|l| vec![0i8; total * self.nkv * self.hd_of(l)]).collect();
+            let mut vc = kc.clone();
+            let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+            let mut vs = ks.clone();
+            let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+            let xb = self.forward_block_q(prompt, &emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+            let mut next = self.head_argmax(&xb);
+            let mut out = Vec::new();
+            let mut pos = prompt.len();
+            loop {
+                if eos.contains(&next) {
+                    break;
+                }
+                out.push(next);
+                if !emit(next) || out.len() == max_tokens {
+                    break;
+                }
+                emb = self.b.rows_f32("embed", &[next]) * self.escale;
+                let xb = self.forward_block_q(&[next], &emb, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+                next = self.head_argmax(&xb);
+                pos += 1;
+            }
+            return out;
+        }
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
         let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|l| Array2::zeros((total, self.nkv * self.hd_of(l)))).collect();
         let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
