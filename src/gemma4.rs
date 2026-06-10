@@ -12,9 +12,11 @@
 //!     each decoder layer; read from the checkpoint into config_f so a non-1.0 value runs faithfully.
 //!   - **attention_k_eq_v**: GLOBAL (full) layers carry no v_proj — V is the k_proj output (value-normed, NOT RoPE'd) —
 //!     and use `num_global_key_value_heads` KV heads; sliding layers are unaffected (per-layer `nkv_of(l)`).
+//!   - **KV-sharing** (`num_kv_shared_layers`): the last N layers carry no k_proj/v_proj/k_norm — they keep their own
+//!     q_proj/q_norm but borrow the assembled K/V of the LAST non-shared layer of their own type (`kv_src[l]`).
 //! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate), dense and MoE. Incremental
 //! KV-cache `generate`/`generate_stream` (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and
-//! `explain` are wired. KV-sharing (num_kv_shared_layers) is the remaining tail (the convert asserts it's off).
+//! `explain` are wired.
 
 use std::collections::HashMap;
 
@@ -30,6 +32,8 @@ pub struct Gemma4 {
     nkv: usize,
     nkv_g: usize,     // KV heads on GLOBAL layers under attention_k_eq_v (else == nkv)
     k_eq_v: bool,     // attention_k_eq_v: global layers reuse K as V (no v_proj), with nkv_g KV heads
+    kv_src: Vec<usize>,   // per layer: which layer's K/V to use (== l normally; an earlier same-type layer if KV-shared)
+    stores_kv: Vec<bool>, // per layer: is this the K/V source a later shared layer reuses (the uncached path stashes it)
     hd_local: usize,
     hd_global: usize,
     d: usize,
@@ -82,6 +86,21 @@ impl Gemma4 {
         let sliding: Vec<bool> = (0..n_layer).map(|l| c[16 + l] != 0).collect();
         // attention_k_eq_v flag packed right after the sliding flags (c[16+nl]); absent (older bundles) → off.
         let k_eq_v = c.len() > 16 + n_layer && c[16 + n_layer] != 0;
+        // KV-sharing: the last `n_kv_shared` layers borrow the assembled K/V of the LAST non-shared layer of their own
+        // type (sliding vs full). Packed at c[17+nl]; absent → 0 (off). kv_src[l] points at that source (== l if not
+        // shared); stores_kv[l] marks a source layer (the uncached forward stashes it for the shared layers to reuse).
+        let n_kv_shared = if c.len() > 17 + n_layer { c[17 + n_layer] as usize } else { 0 };
+        let first_shared = n_layer.saturating_sub(n_kv_shared);
+        let (mut src_sliding, mut src_global): (Option<usize>, Option<usize>) = (None, None);
+        for l in 0..first_shared {
+            if sliding[l] { src_sliding = Some(l); } else { src_global = Some(l); }
+        }
+        let kv_src: Vec<usize> = (0..n_layer)
+            .map(|l| if l >= first_shared {
+                if sliding[l] { src_sliding.unwrap_or(l) } else { src_global.unwrap_or(l) }
+            } else { l })
+            .collect();
+        let stores_kv: Vec<bool> = (0..n_layer).map(|l| n_kv_shared > 0 && (Some(l) == src_sliding || Some(l) == src_global)).collect();
         // config_f: [theta_local, theta_global, eps, partial_rotary_factor, <nl layer_scalar>]
         let (theta_local, theta_global, eps, prf) =
             (b.config_f[0] as f32, b.config_f[1] as f32, b.config_f[2] as f32, b.config_f[3] as f32);
@@ -97,7 +116,7 @@ impl Gemma4 {
             .map(|j| if j < angles { 1.0 / theta_global.powf(2.0 * j as f32 / hd_global as f32) } else { 0.0 })
             .collect();
         Gemma4 {
-            b, n_layer, h, nkv, nkv_g, k_eq_v, hd_local, hd_global, d, ple, eps,
+            b, n_layer, h, nkv, nkv_g, k_eq_v, kv_src, stores_kv, hd_local, hd_global, d, ple, eps,
             escale: (d as f32).sqrt(), ple_escale: (ple as f32).sqrt(), proj_scale: (d as f32).powf(-0.5),
             inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter, layer_scalar, kv_int8,
         }
@@ -266,18 +285,26 @@ impl Gemma4 {
             .collect()
     }
 
-    /// Project + per-head-norm + RoPE the q/k/v for layer `l` at absolute position `pos` — the derivation shared by all
-    /// four forward paths (full `hidden`, `explanation`, KV-cache f32 `forward_block`, int8-KV `forward_block_q`).
-    /// Returns post-norm, post-RoPE (q, k, v): q has `h` heads, k/v have `nkv` heads, all of width `hd_of(l)`.
-    fn derive_qkv(&self, l: usize, a: &Array2<f32>, pos: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+    /// Project + q-norm + RoPE the queries for layer `l` at absolute position `pos`. Always present — KV-shared layers
+    /// keep their own q_proj/q_norm and only borrow K/V from an earlier same-type layer. q has `h` heads of width hd_of(l).
+    fn derive_q(&self, l: usize, a: &Array2<f32>, pos: usize) -> Array2<f32> {
+        let p = format!("l{l}.");
+        let hd = self.hd_of(l);
+        let mut q = self.b.mm(a, &format!("{p}self_attn.q_proj"));
+        self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), self.h, hd);
+        self.rope(&mut q, self.h, hd, pos, self.inv_for(l));
+        q
+    }
+
+    /// Project + per-head-norm + RoPE the K/V for layer `l` at absolute position `pos`. Skipped on KV-shared layers
+    /// (they reuse an earlier same-type layer's assembled K/V). Returns post-norm, post-RoPE (k, v) with `nkv_of(l)`
+    /// heads of width hd_of(l). Under attention_k_eq_v a global layer has NO v_proj — V is the k_proj OUTPUT
+    /// (value-normed, NOT RoPE'd), captured before k_norm/RoPE mutate `k`. v-norm is RMS-only (no weight).
+    fn derive_kv(&self, l: usize, a: &Array2<f32>, pos: usize) -> (Array2<f32>, Array2<f32>) {
         let p = format!("l{l}.");
         let (hd, nkv) = (self.hd_of(l), self.nkv_of(l));
         let inv = self.inv_for(l);
-        let mut q = self.b.mm(a, &format!("{p}self_attn.q_proj"));
         let mut k = self.b.mm(a, &format!("{p}self_attn.k_proj"));
-        self.head_norm(&mut q, Some(&format!("{p}self_attn.q_norm")), self.h, hd);
-        // value: under attention_k_eq_v a global layer has NO v_proj — V is the k_proj OUTPUT (value-normed, NOT RoPE'd),
-        // captured here before k_norm/RoPE mutate `k`. Otherwise the usual v_proj. v-norm is RMS-only (no weight).
         let mut v = if self.k_eq_v && !self.sliding[l] {
             k.clone()
         } else {
@@ -285,9 +312,14 @@ impl Gemma4 {
         };
         self.head_norm(&mut k, Some(&format!("{p}self_attn.k_norm")), nkv, hd);
         self.head_norm(&mut v, None, nkv, hd);
-        self.rope(&mut q, self.h, hd, pos, inv);
         self.rope(&mut k, nkv, hd, pos, inv);
-        (q, k, v)
+        (k, v)
+    }
+
+    /// Is layer `l` a KV-shared layer (no own k/v/norms — reuses `kv_src[l]`'s assembled K/V)? `kv_src[l] == l` for a
+    /// normal layer, and points at an earlier same-type layer for a shared one.
+    fn is_shared(&self, l: usize) -> bool {
+        self.kv_src[l] != l
     }
 
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
@@ -300,6 +332,7 @@ impl Gemma4 {
         }
         let pli = self.per_layer_inputs(ids, &x);
 
+            let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
@@ -307,7 +340,16 @@ impl Gemma4 {
             let rep = h / nkv;
             // --- attention ---
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let (q, k, v) = self.derive_qkv(l, &a, 0);
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] {
+                    kv_store[l] = Some(kv.clone());
+                }
+                kv
+            };
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             for head in 0..h {
@@ -377,13 +419,23 @@ impl Gemma4 {
         let mut head_act: Vec<Vec<f32>> = Vec::new();
         let mut head_hd: Vec<usize> = Vec::new(); // per-layer head_dim (local vs global) — for head DLA
         let mut mlp_h: Vec<Vec<f32>> = Vec::new();
+            let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let hd = self.hd_of(l);
             let nkv = self.nkv_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let (q, k, v) = self.derive_qkv(l, &a, 0);
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] {
+                    kv_store[l] = Some(kv.clone());
+                }
+                kv
+            };
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
             let mut layer_att = Vec::with_capacity(h);
@@ -462,16 +514,20 @@ impl Gemma4 {
             let nkv = self.nkv_of(l);
             let rep = h / nkv;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let (q, k, v) = self.derive_qkv(l, &a, cur);
-            kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
-            vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            let q = self.derive_q(l, &a, cur);
+            if !self.is_shared(l) {
+                let (k, v) = self.derive_kv(l, &a, cur);
+                kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
+                vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            }
+            let src = self.kv_src[l]; // KV-shared layers attend over an earlier same-type layer's cache
             let sliding = self.sliding[l];
             let mut attn_out = Array2::<f32>::zeros((m, h * hd));
             for head in 0..h {
                 let kv = head / rep;
                 let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
-                let kh = kc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
-                let vh = vc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let kh = kc[src].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let vh = vc[src].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
                 let mut scores = qh.dot(&kh.t());
                 for i in 0..m {
                     let abs = cur + i;
@@ -524,18 +580,22 @@ impl Gemma4 {
             let rep = h / nkv;
             let kvdim = nkv * hd;
             let a = self.norm(&x, &format!("{p}input_layernorm"));
-            let (q, k, v) = self.derive_qkv(l, &a, cur);
-            for i in 0..m {
-                let pos = cur + i;
-                for kh in 0..nkv {
-                    let base = kh * hd;
-                    let sck = ((0..hd).fold(0f32, |mx, c| mx.max(k[[i, base + c]].abs())) / 127.0).max(1e-8);
-                    let scv = ((0..hd).fold(0f32, |mx, c| mx.max(v[[i, base + c]].abs())) / 127.0).max(1e-8);
-                    ks[l][pos * nkv + kh] = sck;
-                    vs[l][pos * nkv + kh] = scv;
-                    for c in 0..hd {
-                        kc[l][pos * kvdim + base + c] = q8(k[[i, base + c]], sck);
-                        vc[l][pos * kvdim + base + c] = q8(v[[i, base + c]], scv);
+            let q = self.derive_q(l, &a, cur);
+            let src = self.kv_src[l]; // KV-shared layers attend over an earlier same-type layer's cache
+            if !self.is_shared(l) {
+                let (k, v) = self.derive_kv(l, &a, cur);
+                for i in 0..m {
+                    let pos = cur + i;
+                    for kh in 0..nkv {
+                        let base = kh * hd;
+                        let sck = ((0..hd).fold(0f32, |mx, c| mx.max(k[[i, base + c]].abs())) / 127.0).max(1e-8);
+                        let scv = ((0..hd).fold(0f32, |mx, c| mx.max(v[[i, base + c]].abs())) / 127.0).max(1e-8);
+                        ks[src][pos * nkv + kh] = sck;
+                        vs[src][pos * nkv + kh] = scv;
+                        for c in 0..hd {
+                            kc[src][pos * kvdim + base + c] = q8(k[[i, base + c]], sck);
+                            vc[src][pos * kvdim + base + c] = q8(v[[i, base + c]], scv);
+                        }
                     }
                 }
             }
@@ -546,10 +606,10 @@ impl Gemma4 {
                 let mut kh_a = Array2::<f32>::zeros((klen, hd));
                 let mut vh_a = Array2::<f32>::zeros((klen, hd));
                 for pos in 0..klen {
-                    let (sck, scv) = (ks[l][pos * nkv + kv], vs[l][pos * nkv + kv]);
+                    let (sck, scv) = (ks[src][pos * nkv + kv], vs[src][pos * nkv + kv]);
                     for c in 0..hd {
-                        kh_a[[pos, c]] = kc[l][pos * kvdim + kv * hd + c] as f32 * sck;
-                        vh_a[[pos, c]] = vc[l][pos * kvdim + kv * hd + c] as f32 * scv;
+                        kh_a[[pos, c]] = kc[src][pos * kvdim + kv * hd + c] as f32 * sck;
+                        vh_a[[pos, c]] = vc[src][pos * kvdim + kv * hd + c] as f32 * scv;
                     }
                 }
                 let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
