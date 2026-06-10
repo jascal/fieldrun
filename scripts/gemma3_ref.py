@@ -30,6 +30,24 @@ def make_config():
     """A tiny config that exercises every path the real model uses."""
     import torch
 
+    if ARCH == "dsv4":
+        from transformers import DeepseekV4Config
+        # DeepSeek-V4 Stage 1: the SLIDING-ONLY backbone (no CSA/HCA compressors, no hash routing) — exercises the new
+        # attention class (q-LoRA shared-KV MQA + sink + undo-RoPE + grouped o_proj + partial interleaved RoPE), the mHC
+        # 4-stream Sinkhorn residual, and the sqrtsoftplus MoE + shared expert.
+        return DeepseekV4Config(
+            vocab_size=64, hidden_size=32, moe_intermediate_size=16, intermediate_size=16,
+            num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=1, head_dim=16,
+            q_lora_rank=24, partial_rotary_factor=8 / 16,   # 8 of 16 head dims rotate
+            num_experts_per_tok=2, n_routed_experts=8, n_shared_experts=1,
+            max_position_embeddings=256, sliding_window=8, o_groups=2, o_lora_rank=12,
+            layer_types=["sliding_attention"] * 3, mlp_layer_types=["moe"] * 3,
+            hc_mult=4, hc_sinkhorn_iters=20, rms_norm_eps=1e-6,
+            # V4 declares _tied_weights_keys(lm_head→embed); save_pretrained drops lm_head and a reload ties it, so the
+            # checkpoint is effectively tied. Make that explicit so the torch reference uses embed as the unembed too.
+            tie_word_embeddings=True,
+            attn_implementation="eager", torch_dtype=torch.float32,
+        )
     if ARCH == "qwen3":
         from transformers import Qwen3Config
         # Qwen3 DENSE (Qwen3-4B/8B): the RoPE family + QK-norm (per-head RMSNorm on q/k) — exercises the optional
@@ -189,6 +207,7 @@ def build():
     cfg = make_config()
     tf = __import__("transformers")
     Cls = (tf.Qwen3ForCausalLM if ARCH == "qwen3"
+           else tf.DeepseekV4ForCausalLM if ARCH == "dsv4"
            else tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
            else tf.DeepseekV3ForCausalLM if ARCH.startswith("mla")
            else tf.Qwen3MoeForCausalLM if ARCH.startswith("qwen3moe")
@@ -202,10 +221,19 @@ def build():
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
-                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv", "gemma4kvshare") else 0.0))
+                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv", "gemma4kvshare", "dsv4") else 0.0))
             # Identity-init router scales (Gemma-4 MoE): mean-1 so the `*scale`/`*per_expert_scale` terms become
             # discriminating — at the ones() default a bug in either is invisible.
             elif name.endswith(("router.scale", "router.per_expert_scale")):
+                p.copy_(torch.randn_like(p) * 0.1 + 1.0)
+            # DeepSeek-V4 identity-init PARAMETERS the kernel must read (else the gate is blind to those code paths):
+            #   self_attn.sinks (per-head attention sink, init 0 — a zero sink is NOT a no-op in the softmax);
+            #   attn_hc/ffn_hc/hc_head base (HC additive gates, init 0) + scale (HC multiplicative, init 1).
+            elif ARCH == "dsv4" and name.endswith("self_attn.sinks"):
+                p.copy_(torch.randn_like(p) * 0.5)
+            elif ARCH == "dsv4" and name.endswith(("attn_hc.base", "ffn_hc.base", "hc_base")):
+                p.copy_(torch.randn_like(p) * 0.3)
+            elif ARCH == "dsv4" and name.endswith(("attn_hc.scale", "ffn_hc.scale", "hc_scale")):
                 p.copy_(torch.randn_like(p) * 0.1 + 1.0)
         # Identity-init BUFFERS that the kernels read from the checkpoint but that init to a no-op value, so the
         # 60/60 gate can't otherwise discriminate the code paths that consume them:
@@ -242,6 +270,7 @@ def compare(dump_path):
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
     cls = ("Qwen3ForCausalLM" if ARCH == "qwen3"
+           else "DeepseekV4ForCausalLM" if ARCH == "dsv4"
            else "MiniMaxM2ForCausalLM" if ARCH == "minimax"
            else "DeepseekV3ForCausalLM" if ARCH.startswith("mla")
            else "Qwen3MoeForCausalLM" if ARCH.startswith("qwen3moe")
