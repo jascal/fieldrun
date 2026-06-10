@@ -28,10 +28,16 @@ A bundle is two files that share a stem:
 }
 ```
 
-- **`offset`/`bytes`** index into the blob; `bytes == prod(shape) * sizeof(dtype)`.
-- **`dtype`** is `"f32"` in v1 (little-endian IEEE-754). `"f16"`/`"i8"` are reserved for the in-RAM-precision path: an
-  `i8` array carries a sibling `"<name>__scale"` `f32` array (per-output-column dequant), so the runtime keeps weights
-  low-precision in RAM and dequantises per matmul.
+- **`offset`/`bytes`** index into the blob; `bytes == prod(shape) * sizeof(dtype)` — except `i4`, which is bit-packed
+  (`bytes == shape[0] * ceil(shape[1]/2)`).
+- **`dtype`** is `"f32"` in v1 (little-endian IEEE-754). `"f16"`/`"i8"`/`"i4"` are the in-RAM/on-disk-precision path; each
+  quantised array carries a sibling `"<name>__scale"` `f16` array, and the runtime keeps weights low-precision and
+  dequantises per matmul:
+  - **`i8`** — per-output-column symmetric int8, stored `(in, out)` row-major; `__scale` shape `[out]`.
+  - **`i4`** — group-wise symmetric int4 (default group 32), stored `(out, in)` output-column-major with two
+    two's-complement nibbles per byte along `in`; `__scale` shape `[out, ceil(in/group)]`, and the array carries an
+    extra `"group"` field. Half the bytes of `i8`; dequantised to f32 on read. For MoE this halves the bytes paged in
+    per token (the expert-offload lever).
 - Array **names and shapes** match the pylm numpy kernels exactly (`numpy_lm.py` / `numpy_rope.py` / `numpy_gemma.py`),
   so a bundle is just those weights relaid; the Rust kernel mirrors the numpy one.
 

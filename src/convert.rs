@@ -11,6 +11,9 @@ use std::io::Write;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
+/// int4 group size (weights along the input dim share one fp16 scale per group). 32 is the GGUF/AWQ default.
+const I4_GROUP: usize = 32;
+
 /// A model's weights, possibly sharded. mmaps each file (address space, not RAM); tensors are read on demand.
 struct Model {
     mmaps: Vec<Mmap>,
@@ -78,6 +81,13 @@ impl BundleWriter {
         self.offset += bytes;
     }
 
+    // Like `entry` but records the int4 group size (the on-disk bytes are packed, so they aren't prod(shape)*sizeof).
+    fn entry_g(&mut self, name: &str, dtype: &str, shape: &[usize], bytes: usize, group: usize) {
+        self.arrays.push(serde_json::json!({ "name": name, "dtype": dtype, "shape": shape, "offset": self.offset,
+                                             "bytes": bytes, "group": group }));
+        self.offset += bytes;
+    }
+
     fn put_f16(&mut self, name: &str, data: &[f32], shape: &[usize]) -> std::io::Result<()> {
         let mut buf = Vec::with_capacity(data.len() * 2);
         for &v in data {
@@ -107,9 +117,43 @@ impl BundleWriter {
     /// A weight linear from an (out, in) source: int8 (transposed, per-column), or f32/f16 transposed to (in, out).
     fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
         if dtype == "int8" { return self.put_i8(name, data, out, inp, true); }
+        if dtype == "int4" { return self.put_i4(name, data, out, inp, true); }
         let mut t = vec![0f32; inp * out];
         for o in 0..out { for i in 0..inp { t[i * out + o] = data[o * inp + i]; } }
         self.put_small(name, &t, &[inp, out], dtype)
+    }
+
+    /// Group-wise symmetric **int4** from an (out, in) source (nn.Linear, `transpose=true`) or an (in, out) source
+    /// (GPT-2 Conv1D, `false`). Stored OUTPUT-COLUMN-MAJOR `(out, in)` with two 4-bit values per byte along `in`, and an
+    /// fp16 scale per (output-column, group-of-`in`) — half the bytes of int8, dequantised to f32 on read. Symmetric
+    /// `[-7, 7]`, two's-complement nibble. For MoE experts this halves the bytes paged in per token (the offload lever).
+    fn put_i4(&mut self, name: &str, data: &[f32], rows: usize, cols: usize, transpose: bool) -> std::io::Result<()> {
+        let (out, inp) = if transpose { (rows, cols) } else { (cols, rows) };
+        let at = |i: usize, j: usize| if transpose { data[j * inp + i] } else { data[i * out + j] }; // logical W[in=i, out=j]
+        let g = I4_GROUP.min(inp.max(1));
+        let ng = inp.div_ceil(g);
+        let mut scale = vec![0f32; out * ng];
+        for j in 0..out {
+            for gi in 0..ng {
+                let (lo, hi) = (gi * g, ((gi + 1) * g).min(inp));
+                let amax = (lo..hi).fold(0f32, |m, i| m.max(at(i, j).abs()));
+                scale[j * ng + gi] = (amax / 7.0).max(1e-8);
+            }
+        }
+        let row_bytes = inp.div_ceil(2);
+        let mut packed = vec![0u8; out * row_bytes];
+        for j in 0..out {
+            for i in 0..inp {
+                let s = scale[j * ng + i / g];
+                let q = (at(i, j) / s).round_ties_even().clamp(-7.0, 7.0) as i8;
+                let nib = (q as u8) & 0x0F;
+                let b = &mut packed[j * row_bytes + i / 2];
+                if i % 2 == 0 { *b |= nib; } else { *b |= nib << 4; }
+            }
+        }
+        self.bin.write_all(&packed)?;
+        self.entry_g(name, "i4", &[out, inp], packed.len(), g);
+        self.put_f16(&format!("{name}__scale"), &scale, &[out, ng])
     }
 
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
@@ -254,7 +298,9 @@ fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
         sml(&mut w, &format!("h{l}.ln_2.bias"), &format!("{p}ln_2.bias"))?;
         for (fr, hf) in [("attn.c_attn", "attn.c_attn"), ("attn.c_proj", "attn.c_proj"), ("mlp.c_fc", "mlp.c_fc"), ("mlp.c_proj", "mlp.c_proj")] {
             let (s, dt) = m.read(&format!("{p}{hf}.weight"));
-            if i8 { w.put_i8(&format!("h{l}.{fr}.weight"), &dt, s[0], s[1], false)?; } else { w.put_small(&format!("h{l}.{fr}.weight"), &dt, &s, dtype)?; }
+            if i8 { w.put_i8(&format!("h{l}.{fr}.weight"), &dt, s[0], s[1], false)?; }
+            else if dtype == "int4" { w.put_i4(&format!("h{l}.{fr}.weight"), &dt, s[0], s[1], false)?; }
+            else { w.put_small(&format!("h{l}.{fr}.weight"), &dt, &s, dtype)?; }
             sml(&mut w, &format!("h{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
         }
     }
@@ -800,6 +846,13 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
             if m.has(&format!("{p}{proj}.bias")) {
                 let (s, dt) = m.read(&format!("{p}{proj}.bias"));
                 w.put_small(&format!("l{l}.{proj}.bias"), &dt, &s, dtype)?;
+            }
+        }
+        // Qwen3-dense QK-norm: per-head RMSNorm on q/k, present only on Qwen3 (not Llama/Qwen2.5). Standard RMSNorm
+        // (no (1+w) bake), so it rides the same `norm` path; skip if this arch already wrote it via `norms` (gemma3).
+        for nm in ["self_attn.q_norm", "self_attn.k_norm"] {
+            if m.has(&format!("{p}{nm}.weight")) && !norms.iter().any(|(_, h)| *h == nm) {
+                norm(w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
             }
         }
     }

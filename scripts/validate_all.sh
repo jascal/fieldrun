@@ -12,14 +12,14 @@ REF=scripts/gemma3_ref.py
 # FEATURES lets you validate a non-default build (e.g. the Apple Accelerate / OpenBLAS matmul) with the same sweep.
 cargo build --release ${FEATURES:+--features "$FEATURES"} >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 
-printf "\n%-12s %-14s %-8s %-8s %-8s\n" arch ref f32 f16 int8
+printf "\n%-12s %-14s %-8s %-8s %-8s %-8s\n" arch ref f32 f16 int8 int4
 printf '%.0s-' {1..54}; echo
 # arch | bundle --arch flag | torch reference class
-for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "qwen3moe:qwen3moe:Qwen3-MoE" "qwen3moeswa:qwen3moe:Qwen3-MoE-SWA" "mla:mla:DeepSeek-V3" "mlayarn:mla:DeepSeek-YaRN" "minimax:minimax:MiniMax-M2"; do
+for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "qwen3:rope:Qwen3-dense" "qwen3moe:qwen3moe:Qwen3-MoE" "qwen3moeswa:qwen3moe:Qwen3-MoE-SWA" "mla:mla:DeepSeek-V3" "mlayarn:mla:DeepSeek-YaRN" "minimax:minimax:MiniMax-M2"; do
   tag="${spec%%:*}"; rest="${spec#*:}"; arch="${rest%%:*}"; ref="${rest##*:}"
   $PY $REF build "$tag" >/dev/null 2>&1 || { printf "%-12s BUILD FAILED\n" "$tag"; continue; }
   row=""
-  for dt in f32 f16 int8; do
+  for dt in f32 f16 int8 int4; do
     # --force: build() reseeds the tiny model every run, so a bundle left over from a previous run would have been
     # converted from DIFFERENT random weights than this run's torch reference — reusing it compares apples to oranges
     # (silent 1/60 garbage). CI's /tmp is clean so it never hit this; a repeated local run did.

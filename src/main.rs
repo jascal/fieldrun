@@ -124,8 +124,8 @@ fn main() {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
         }
-        if !["int8", "f16", "f32"].contains(&dtype) {
-            eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int8, f16, f32)");
+        if !["int4", "int8", "f16", "f32"].contains(&dtype) {
+            eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, int8, f16, f32)");
             std::process::exit(2);
         }
         // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the
@@ -518,7 +518,7 @@ USAGE\n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
   --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
-  --dtype <D>     int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
+  --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
   --force         re-convert even if the bundle already exists (default: skip)\n\
