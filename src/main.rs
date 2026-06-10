@@ -393,6 +393,30 @@ fn main() {
             println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
             return;
         }
+
+        // --gen-prefix N: prefix-KV reuse gate. Warm a cache from `prompt` (leaving its full K/V resident), then
+        // generate an EXTENDED prompt that shares that prefix two ways — reusing the warm cache (partial prefill of
+        // only the new suffix) vs a cold cache (full prefill) — and against the naive recompute. Reuse must be
+        // byte-identical: the chunked forward at the reuse boundary attends to the copied prefix rows exactly as a
+        // fresh prefill would. Runs on the tiny no-tokenizer instances (it speaks raw ids), so validate_all.sh gates it.
+        if let Some(n) = flag(&args, "--gen-prefix").and_then(|s| s.parse::<usize>().ok()) {
+            use crate::model::PrefixKv;
+            let prompt = &ids[..ctx_window.min(ids.len())];
+            let mut warm = PrefixKv::default();
+            let seed = lm.generate_stream_prefix(prompt, n, &[], &mut |_| true, &mut warm); // warm.ids = prompt ++ seed
+            // an extended prompt that shares a non-trivial prefix with the warm cache
+            let mut ext = prompt.to_vec();
+            ext.extend_from_slice(&seed[..seed.len() / 2]);
+            let reuse_l = warm.reuse_len(&ext);
+            let reuse = lm.generate_stream_prefix(&ext, n, &[], &mut |_| true, &mut warm);
+            let fresh = lm.generate_stream_prefix(&ext, n, &[], &mut |_| true, &mut PrefixKv::default());
+            let naive = lm.generate_stream(&ext, n, &[], &mut |_| true);
+            println!("[fieldrun] gen-prefix · {arch} · prompt {} → ext {} (reused {reuse_l} prefix tokens, {} new)",
+                     prompt.len(), ext.len(), ext.len() - reuse_l);
+            println!("[fieldrun]   reuse==fresh: {}  ·  reuse==naive: {}  ·  identical: {}",
+                     reuse == fresh, reuse == naive, reuse == fresh && reuse == naive);
+            return;
+        }
         let t0 = std::time::Instant::now();
         let preds: Vec<i64> = (ctx_window..end).into_par_iter().map(|i| lm.predict(ctx(i))).collect();
         let secs = t0.elapsed().as_secs_f64();

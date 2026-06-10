@@ -34,18 +34,20 @@ echo
 
 # Generate + explain gate: incremental KV-cache decode must be BYTE-IDENTICAL to the naive full-recompute path (the f32
 # correctness gate for generation — naive is itself top-1-validated vs torch above, so KV==naive ⇒ KV==torch), for both
-# the f32 and int8-KV caches; and `explain` (the runtime circuit/feature readout) must run on every arch. Reuses the f32
-# bundles + holdouts built above.
-printf "%-12s %-22s %-12s %s\n" arch "generate f32(KV==naive)" "int8-KV" explain
-printf '%.0s-' {1..56}; echo
-for spec in gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mla:mla mlayarn:mla minimax:minimax; do
+# the f32 and int8-KV caches. `prefix` gates prefix-KV reuse (the chat/serve cross-turn cache): generating an extended
+# prompt by REUSING the prior turn's cached prefix must be byte-identical to a cold full prefill (and to naive). And
+# `explain` (the runtime circuit/feature readout) must run on every arch. Reuses the f32 bundles + holdouts built above.
+printf "%-12s %-22s %-9s %-9s %s\n" arch "generate f32(KV==naive)" "int8-KV" "prefix" explain
+printf '%.0s-' {1..62}; echo
+for spec in qwen3:rope gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mla:mla mlayarn:mla minimax:minimax; do
   tag="${spec%%:*}"; b=/tmp/${tag}_f32; ids=/tmp/${tag}_holdout.json
   [ -f "$b.fieldrun.json" ] || { printf "%-12s (no f32 bundle — built above?)\n" "$tag"; continue; }
   idn=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
   id8=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 --kv-int8 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  idp=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --gen-prefix 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
   ex=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --explain 2>/dev/null | grep -c 'model predicts')
   exl=$([ "${ex:-0}" -ge 1 ] && echo ok || echo MISSING)
-  printf "%-12s %-22s %-12s %s\n" "$tag" "${idn:-ERR}" "${id8:-ERR}" "$exl"
+  printf "%-12s %-22s %-9s %-9s %s\n" "$tag" "${idn:-ERR}" "${id8:-ERR}" "${idp:-ERR}" "$exl"
 done
 echo
 
@@ -58,4 +60,7 @@ if [ -n "${GPT2:-}" ] && [ -f ../lm-sae/pylm/holdout_gpt2.json ]; then
     t=$($BIN --bundle /tmp/gpt2_$dt --ids ../lm-sae/pylm/holdout_gpt2.json --ctx 64 --n-eval 200 2>/dev/null | grep -oE 'top-1: [0-9.]+%')
     printf "  %-5s %s\n" "$dt" "$t"
   done
+  # gpt2 (composition arch) prefix-KV reuse on real weights: reuse must be byte-identical to a cold prefill + naive.
+  gp=$($BIN --bundle /tmp/gpt2_f32 --ids ../lm-sae/pylm/holdout_gpt2.json --ctx 64 --gen-prefix 24 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  printf "  gpt2 prefix-KV reuse == fresh+naive: %s\n" "${gp:-ERR}"
 fi

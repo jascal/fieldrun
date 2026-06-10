@@ -378,4 +378,23 @@ impl Model for Gpt2 {
         }
         out
     }
+
+    fn generate_stream_prefix(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool, cache: &mut crate::model::PrefixKv) -> Vec<i64> {
+        if self.kv_int8 {
+            cache.clear();
+            return self.generate_stream(prompt, max_tokens, eos, emit);
+        }
+        let (d, n_layer) = (self.d, self.n_layer);
+        let alloc = |total: usize| {
+            let kc: Vec<Array2<f32>> = (0..n_layer).map(|_| Array2::zeros((total, d))).collect();
+            let vc = kc.clone();
+            (kc, vc)
+        };
+        let mut fwd = |ids: &[i64], cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]| {
+            let ppos: Vec<i64> = (cur..cur + ids.len()).map(|i| i as i64).collect();
+            let emb = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &ppos);
+            self.forward_block(&emb, cur, kc, vc)
+        };
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb))
+    }
 }
