@@ -8,6 +8,8 @@
 //!     rest are zero-padded → identity), local layers full-rotate at the lower base;
 //!   - the **Per-Layer-Embedding (PLE) gated-residual block** per layer: a token-identity aux embedding + a context
 //!     projection of the input embedding, gated by the post-FFN hidden and added back.
+//!   - a per-layer **`layer_scalar`** (a persistent buffer, default 1.0) multiplied into the residual as the LAST op of
+//!     each decoder layer; read from the checkpoint into config_f so a non-1.0 value runs faithfully.
 //! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate), dense and MoE. Incremental
 //! KV-cache `generate`/`generate_stream` (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and
 //! `explain` are wired. attention_k_eq_v / KV-sharing are not yet implemented (the convert asserts they're off).
@@ -41,6 +43,7 @@ pub struct Gemma4 {
     n_exp: usize,
     topk: usize,
     moe_inter: usize,
+    layer_scalar: Vec<f32>, // per-layer output multiplier applied as the LAST op of each layer (default 1.0)
     kv_int8: bool,    // store the KV cache (per-layer GQA width) as int8 with a per-kv-head scale during generate
 }
 
@@ -73,9 +76,13 @@ impl Gemma4 {
         let ple = c[11] as usize;
         let (moe, n_exp, topk, moe_inter) = (c[12] != 0, c[13] as usize, c[14] as usize, c[15] as usize);
         let sliding: Vec<bool> = (0..n_layer).map(|l| c[16 + l] != 0).collect();
-        // config_f: [theta_local, theta_global, eps, partial_rotary_factor]
+        // config_f: [theta_local, theta_global, eps, partial_rotary_factor, <nl layer_scalar>]
         let (theta_local, theta_global, eps, prf) =
             (b.config_f[0] as f32, b.config_f[1] as f32, b.config_f[2] as f32, b.config_f[3] as f32);
+        // per-layer output scalar; default 1.0 for older bundles that didn't record it.
+        let layer_scalar: Vec<f32> = (0..n_layer)
+            .map(|l| if b.config_f.len() > 4 + l { b.config_f[4 + l] as f32 } else { 1.0 })
+            .collect();
         // local: full rotation at the low base over hd_local
         let inv_local = (0..hd_local / 2).map(|j| 1.0 / theta_local.powf(2.0 * j as f32 / hd_local as f32)).collect();
         // global: "proportional" partial rotary — first `angles` pairs at the high base, the rest zero (un-rotated)
@@ -86,7 +93,7 @@ impl Gemma4 {
         Gemma4 {
             b, n_layer, h, nkv, hd_local, hd_global, d, ple, eps,
             escale: (d as f32).sqrt(), ple_escale: (ple as f32).sqrt(), proj_scale: (d as f32).powf(-0.5),
-            inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter, kv_int8,
+            inv_local, inv_global, window, sliding, tied, moe, n_exp, topk, moe_inter, layer_scalar, kv_int8,
         }
     }
 
@@ -312,6 +319,7 @@ impl Gemma4 {
             g = &g * &pli[l]; // gate by the per-layer embedding
             let proj = self.b.mm(&g, &format!("{p}per_layer_projection")); // (seq, d)
             x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
     }
@@ -391,6 +399,7 @@ impl Gemma4 {
             g = &g * &pli[l];
             let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
             x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         let xf = self.norm(&x, "norm");
         let un = self.unembed();
@@ -473,6 +482,7 @@ impl Gemma4 {
             g = &g * &pli[l];
             let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
             x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
     }
@@ -560,6 +570,7 @@ impl Gemma4 {
             g = &g * &pli[l];
             let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
             x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
     }

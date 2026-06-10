@@ -183,6 +183,20 @@ def build():
         for name, p in model.named_parameters():
             if "norm" in name:
                 p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH == "mlayarn" else 0.0))
+            # Identity-init router scales (Gemma-4 MoE): mean-1 so the `*scale`/`*per_expert_scale` terms become
+            # discriminating — at the ones() default a bug in either is invisible.
+            elif name.endswith(("router.scale", "router.per_expert_scale")):
+                p.copy_(torch.randn_like(p) * 0.1 + 1.0)
+        # Identity-init BUFFERS that the kernels read from the checkpoint but that init to a no-op value, so the
+        # 60/60 gate can't otherwise discriminate the code paths that consume them:
+        #   layer_scalar (Gemma-4, per-layer ×scalar, inits 1.0) and e_score_correction_bias (DeepSeek/MiniMax
+        #   sigmoid-router CHOICE bias, inits 0.0). NB: do NOT touch rotary inv_freq buffers — the kernels recompute
+        #   those from theta, so randomising them would (correctly) diverge.
+        for name, buf in model.named_buffers():
+            if name.endswith("layer_scalar"):
+                buf.copy_(torch.randn_like(buf) * 0.1 + 1.0)          # mean-1 ×scalar per layer
+            elif name.endswith("e_score_correction_bias"):
+                buf.copy_(torch.randn_like(buf) * 0.2)               # mean-0 bias — shifts the top-k CHOICE
     model.save_pretrained(OUT_DIR, safe_serialization=True)
 
     g = torch.Generator().manual_seed(1000 + SEED)

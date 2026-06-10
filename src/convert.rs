@@ -391,11 +391,20 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
         .map(|s| s == "full_attention").unwrap_or((l + 1) % pattern == 0);
     // Gemma 4 forces the last layer to full_attention.
     let is_full = |l: usize| full_of(l) || l + 1 == nl;
+    // Per-layer output scalar (`layer_scalar`, a persistent buffer applied as the LAST op of each decoder layer in
+    // `Gemma4ForCausalLM`; default 1.0). Read it per layer so a checkpoint that ships a non-1.0 value runs faithfully
+    // instead of silently diverging; appended to config_f after the 4 rope/eps scalars.
+    let layer_scalar: Vec<f64> = (0..nl).map(|l| {
+        let k = format!("model.layers.{l}.layer_scalar");
+        if m.has(&k) { m.read(&k).1.first().copied().unwrap_or(1.0) as f64 } else { 1.0 }
+    }).collect();
     let mut config: Vec<usize> = vec![nl, nh, nkv, nkv_g, hd, hd_g, d, ffn, vocab, tie as usize, window, ple,
                                       moe as usize, n_exp, topk, moe_inter];
     for l in 0..nl { config.push(if is_full(l) { 0 } else { 1 }); } // sliding flags start at config[16]
+    let mut config_f: Vec<f64> = vec![theta_local, theta_global, eps, prf];
+    config_f.extend(&layer_scalar); // config_f[4..4+nl] = per-layer layer_scalar
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gemma4",
-        "config": config, "config_f": [theta_local, theta_global, eps, prf] });
+        "config": config, "config_f": config_f });
 
     let mut w = BundleWriter::new(stem)?;
     let i8 = dtype == "int8";
