@@ -332,6 +332,29 @@ impl Model for Gpt2 {
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let d = self.d;
         let total = prompt.len() + max_tokens;
+        if self.kv_int8 {
+            // int8 KV cache for chat/serve — 4x smaller cache (longer context in the same budget); lossy by design.
+            let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * d]).collect();
+            let mut vc = kc.clone();
+            let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.n_head]).collect();
+            let mut vs = ks.clone();
+            let ppos: Vec<i64> = (0..prompt.len() as i64).collect();
+            let emb = &self.b.rows_f32("wte", prompt) + &self.b.rows_f32("wpe", &ppos);
+            let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+            let mut next = self.head_argmax(&xb);
+            let mut out = Vec::new();
+            let mut pos = prompt.len();
+            loop {
+                if eos.contains(&next) { break; }
+                out.push(next);
+                if !emit(next) || out.len() == max_tokens { break; }
+                let e = &self.b.rows_f32("wte", &[next]) + &self.b.rows_f32("wpe", &[pos as i64]);
+                let xb = self.forward_block_q(&e, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+                next = self.head_argmax(&xb);
+                pos += 1;
+            }
+            return out;
+        }
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, d))).collect();
         let mut vc = kc.clone();
         let ppos: Vec<i64> = (0..prompt.len() as i64).collect();

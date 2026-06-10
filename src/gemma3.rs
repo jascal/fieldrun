@@ -465,6 +465,28 @@ impl Model for Gemma3 {
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let total = prompt.len() + max_tokens;
         let kvdim = self.nkv * self.hd;
+        if self.kv_int8 {
+            // int8 KV cache for chat/serve — 4x smaller cache (longer context in the same budget); lossy by design.
+            let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * kvdim]).collect();
+            let mut vc = kc.clone();
+            let mut ks: Vec<Vec<f32>> = (0..self.n_layer).map(|_| vec![0f32; total * self.nkv]).collect();
+            let mut vs = ks.clone();
+            let mut emb = self.b.rows_f32("embed", prompt) * self.escale;
+            let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+            let mut next = self.head_argmax(&xb);
+            let mut out = Vec::new();
+            let mut pos = prompt.len();
+            loop {
+                if eos.contains(&next) { break; }
+                out.push(next);
+                if !emit(next) || out.len() == max_tokens { break; }
+                emb = self.b.rows_f32("embed", &[next]) * self.escale;
+                let xb = self.forward_block_q(&emb, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+                next = self.head_argmax(&xb);
+                pos += 1;
+            }
+            return out;
+        }
         let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((total, kvdim))).collect();
         let mut vc = kc.clone();
         let mut emb = self.b.rows_f32("embed", prompt) * self.escale;

@@ -565,6 +565,31 @@ impl Model for Mla {
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let total = prompt.len() + max_tokens;
         let (kdim, vdim) = (self.nh * self.qkh, self.nh * self.v_head);
+        if self.kv_int8 {
+            let mut kc: Vec<Vec<i8>> = (0..self.nl).map(|_| vec![0i8; total * kdim]).collect();
+            let mut vc: Vec<Vec<i8>> = (0..self.nl).map(|_| vec![0i8; total * vdim]).collect();
+            let mut ks: Vec<Vec<f32>> = (0..self.nl).map(|_| vec![0f32; total * self.nh]).collect();
+            let mut vs = ks.clone();
+            let emb = self.b.rows_f32("embed", prompt);
+            let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
+            let mut next = self.head_argmax(&xb);
+            let mut out = Vec::new();
+            let mut pos = prompt.len();
+            loop {
+                if eos.contains(&next) {
+                    break;
+                }
+                out.push(next);
+                if !emit(next) || out.len() == max_tokens {
+                    break;
+                }
+                let e = self.b.rows_f32("embed", &[next]);
+                let xb = self.forward_block_q(&e, pos, &mut kc, &mut ks, &mut vc, &mut vs);
+                next = self.head_argmax(&xb);
+                pos += 1;
+            }
+            return out;
+        }
         let mut kc: Vec<Array2<f32>> = (0..self.nl).map(|_| Array2::zeros((total, kdim))).collect();
         let mut vc: Vec<Array2<f32>> = (0..self.nl).map(|_| Array2::zeros((total, vdim))).collect();
         let emb = self.b.rows_f32("embed", prompt);
