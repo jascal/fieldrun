@@ -34,20 +34,22 @@ echo
 
 # Generate + explain gate: incremental KV-cache decode must be BYTE-IDENTICAL to the naive full-recompute path (the f32
 # correctness gate for generation — naive is itself top-1-validated vs torch above, so KV==naive ⇒ KV==torch), for both
-# the f32 and int8-KV caches. `prefix` gates prefix-KV reuse (the chat/serve cross-turn cache): generating an extended
-# prompt by REUSING the prior turn's cached prefix must be byte-identical to a cold full prefill (and to naive). And
-# `explain` (the runtime circuit/feature readout) must run on every arch. Reuses the f32 bundles + holdouts built above.
-printf "%-12s %-22s %-9s %-9s %s\n" arch "generate f32(KV==naive)" "int8-KV" "prefix" explain
-printf '%.0s-' {1..62}; echo
+# the f32 and int8-KV caches. `prefix`/`prefix-q` gate prefix-KV reuse (the chat/serve cross-turn cache) on the f32 and
+# the int8 cache respectively: generating an extended prompt by REUSING the prior turn's cached prefix must be
+# byte-identical to a cold full prefill (and to naive). And `explain` (the runtime circuit/feature readout) must run on
+# every arch. Reuses the f32 bundles + holdouts built above.
+printf "%-12s %-22s %-9s %-9s %-9s %s\n" arch "generate f32(KV==naive)" "int8-KV" "prefix" "prefix-q" explain
+printf '%.0s-' {1..70}; echo
 for spec in qwen3:rope gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 gemma4keqv:gemma4 gemma4kvshare:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mla:mla mlayarn:mla minimax:minimax; do
   tag="${spec%%:*}"; b=/tmp/${tag}_f32; ids=/tmp/${tag}_holdout.json
   [ -f "$b.fieldrun.json" ] || { printf "%-12s (no f32 bundle — built above?)\n" "$tag"; continue; }
   idn=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
   id8=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 --kv-int8 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
   idp=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --gen-prefix 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  idpq=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --gen-prefix 16 --kv-int8 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
   ex=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --explain 2>/dev/null | grep -c 'model predicts')
   exl=$([ "${ex:-0}" -ge 1 ] && echo ok || echo MISSING)
-  printf "%-12s %-22s %-9s %-9s %s\n" "$tag" "${idn:-ERR}" "${id8:-ERR}" "${idp:-ERR}" "$exl"
+  printf "%-12s %-22s %-9s %-9s %-9s %s\n" "$tag" "${idn:-ERR}" "${id8:-ERR}" "${idp:-ERR}" "${idpq:-ERR}" "$exl"
 done
 echo
 
