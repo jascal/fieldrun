@@ -458,9 +458,7 @@ impl Bundle {
                         let mut buf = vec![0f32; k * bw];
                         for kk in 0..k {
                             let wrow = &v[kk * n + c0..kk * n + c0 + bw];
-                            for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
-                                *b = w.to_f32();
-                            }
+                            f16_to_f32(wrow, &mut buf[kk * bw..kk * bw + bw]);
                         }
                         let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
                         out.slice_mut(s![.., c0..c0 + bw]).assign(&a.dot(&wblock));
@@ -480,9 +478,7 @@ impl Bundle {
                             let mut buf = vec![0f32; k * bw];
                             for kk in 0..k {
                                 let wrow = &v[kk * n + c0..kk * n + c0 + bw];
-                                for (b, w) in buf[kk * bw..kk * bw + bw].iter_mut().zip(wrow) {
-                                    *b = w.to_f32();
-                                }
+                                f16_to_f32(wrow, &mut buf[kk * bw..kk * bw + bw]);
                             }
                             let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
                             (c0, a.dot(&wblock))
@@ -549,18 +545,30 @@ impl Bundle {
     }
 }
 
-/// Dot product of signed-int8 activations with signed-int8 weights, accumulating in i32. On aarch64 (Apple Silicon /
-/// ARM) it vectorises with **stable** NEON intrinsics — `vmull_s8` (s8×s8 → s16) then `vpadalq_s16` (pairwise-add into
-/// an i32 accumulator), 16 lanes/iteration. (We deliberately avoid the one-instruction `sdot`/`vdotq_s32`: it's gated
-/// behind the still-unstable `stdarch_neon_dotprod` feature, so it would need nightly — exactly the trap the x86
-/// AVX-512 VNNI path fell into. `vmull`/`vpadal` are stable since the base NEON intrinsics, so this builds on stable
-/// 1.82.) Other targets use a portable scalar dot, which autovectorises well. NEON is baseline on aarch64, so the
-/// runtime check always passes there; the scalar fallback keeps any non-aarch64 CPU correct.
+/// Dot product of signed-int8 activations with signed-int8 weights, accumulating in i32. Hand-vectorised per target
+/// with **stable** intrinsics, runtime-dispatched; every path is **bit-exact** to the scalar fallback (i8×i8 products
+/// fit in i16 and the i32 sum never overflows for our row widths, so reordering the adds is exact — it cannot move an
+/// argmax, so the faithfulness gate is unaffected):
+///  - **aarch64**: `vmull_s8` (s8×s8 → s16) then `vpadalq_s16` (pairwise-add into i32), 16 lanes/iter. (We avoid the
+///    one-instruction `sdot`/`vdotq_s32` — it's gated behind the unstable `stdarch_neon_dotprod` feature = nightly.)
+///  - **x86-64**: sign-extend i8→i16 (`cvtepi8_epi16`) then `madd_epi16` (i16×i16 → i32 pairwise) into an i32 vector
+///    accumulator. AVX-512-BW does 32 lanes/iter, AVX2 16 lanes/iter. AVX-512 intrinsics are stable since Rust 1.89
+///    (the project MSRV), AVX2 since 1.27 — no nightly. This replaces the old scalar-only x86 path.
+/// NEON is baseline on aarch64 so its check always passes; the scalar fallback keeps any other CPU correct.
 fn i8dot(a: &[i8], w: &[i8]) -> i32 {
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             return unsafe { sdot_neon(a, w) };
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "_scalar_i8_bench")))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512bw") && std::arch::is_x86_feature_detected!("avx512f") {
+            return unsafe { i8dot_avx512bw(a, w) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { i8dot_avx2(a, w) };
         }
     }
     a.iter().zip(w).map(|(&x, &y)| x as i32 * y as i32).sum()
@@ -587,6 +595,94 @@ unsafe fn sdot_neon(a: &[i8], w: &[i8]) -> i32 {
         sum += a[k] as i32 * w[k] as i32; // tail (k not a multiple of 16)
     }
     sum
+}
+
+/// AVX2 signed-int8 dot: sign-extend 16 i8 → 16 i16 (`cvtepi8_epi16`), `madd_epi16` to 8 i32 pairwise products,
+/// accumulate, horizontal-sum, scalar tail. Bit-exact to scalar (integer, no overflow for our widths).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn i8dot_avx2(a: &[i8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let chunks = len / 16;
+    let mut acc = _mm256_setzero_si256();
+    for c in 0..chunks {
+        let av = _mm_loadu_si128(a.as_ptr().add(c * 16) as *const __m128i); // 16 i8
+        let wv = _mm_loadu_si128(w.as_ptr().add(c * 16) as *const __m128i);
+        let a16 = _mm256_cvtepi8_epi16(av); // 16 i16 (sign-extended)
+        let w16 = _mm256_cvtepi8_epi16(wv);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16, w16)); // 8 i32 pairwise products
+    }
+    // horizontal sum of the 8 i32 lanes
+    let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+    let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+    let mut sum = _mm_cvtsi128_si32(s32);
+    for k in (chunks * 16)..len {
+        sum += a[k] as i32 * w[k] as i32; // tail (k not a multiple of 16)
+    }
+    sum
+}
+
+/// AVX-512-BW signed-int8 dot: same shape as AVX2 at 32 lanes/iter (`_mm512_cvtepi8_epi16` → `_mm512_madd_epi16` →
+/// `_mm512_reduce_add_epi32`). Stable since Rust 1.89 (the MSRV). Bit-exact to scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512f")]
+unsafe fn i8dot_avx512bw(a: &[i8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let chunks = len / 32;
+    let mut acc = _mm512_setzero_si512();
+    for c in 0..chunks {
+        let av = _mm256_loadu_si256(a.as_ptr().add(c * 32) as *const __m256i); // 32 i8
+        let wv = _mm256_loadu_si256(w.as_ptr().add(c * 32) as *const __m256i);
+        let a16 = _mm512_cvtepi8_epi16(av); // 32 i16 (sign-extended)
+        let w16 = _mm512_cvtepi8_epi16(wv);
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(a16, w16)); // 16 i32 pairwise products
+    }
+    let mut sum = _mm512_reduce_add_epi32(acc);
+    for k in (chunks * 32)..len {
+        sum += a[k] as i32 * w[k] as i32; // tail (k not a multiple of 32)
+    }
+    sum
+}
+
+/// Convert a contiguous f16 slice to f32 into `dst`. Uses F16C hardware conversion (`_mm256_cvtph_ps`, 8 lanes/instr)
+/// on x86 when available, else the scalar `half` path. IEEE f16→f32 is exact (every f16 is representable in f32), so
+/// this is **bit-identical** to the scalar loop — it just does the upcast 8-wide instead of one `to_f32` call at a
+/// time. `half::f16` is `repr(transparent)` over `u16`, so the slice reinterprets without a copy.
+#[inline]
+fn f16_to_f32(src: &[half::f16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx") {
+            unsafe {
+                f16_to_f32_f16c(src, dst);
+            }
+            return;
+        }
+    }
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = s.to_f32();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx")]
+unsafe fn f16_to_f32_f16c(src: &[half::f16], dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let len = src.len();
+    let chunks = len / 8;
+    let sp = src.as_ptr() as *const u16; // f16 is repr(transparent) over u16
+    let dp = dst.as_mut_ptr();
+    for c in 0..chunks {
+        let h = _mm_loadu_si128(sp.add(c * 8) as *const __m128i); // 8 f16 (128 bits)
+        _mm256_storeu_ps(dp.add(c * 8), _mm256_cvtph_ps(h)); // -> 8 f32
+    }
+    for i in (chunks * 8)..len {
+        *dp.add(i) = (*src.get_unchecked(i)).to_f32(); // tail (len not a multiple of 8)
+    }
 }
 
 #[cfg(test)]
@@ -662,5 +758,46 @@ mod tests {
         let w: Vec<i8> = vec![-1, 2, -3, 4, 5, -6, 7, 8, -9, 10, -11, 12, 13, -14, 15, 16, 17, -18];
         let want: i32 = a.iter().zip(&w).map(|(&x, &y)| x as i32 * y as i32).sum();
         assert_eq!(i8dot(&a, &w), want);
+    }
+
+    /// The SIMD i8dot (NEON / AVX2 / AVX-512, whichever the host dispatches to) must be **bit-exact** to the scalar
+    /// reference across many lengths — including non-multiples of 16/32 (tail), all-extreme values (overflow headroom),
+    /// and the longest realistic row width. Bit-exactness is what lets the SIMD path ship without touching the gate.
+    #[test]
+    fn i8dot_simd_vs_scalar() {
+        let scalar = |a: &[i8], w: &[i8]| -> i32 { a.iter().zip(w).map(|(&x, &y)| x as i32 * y as i32).sum() };
+        // a cheap deterministic PRNG so we don't pull in a dep; covers lengths that stress every lane count + tail.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as i8 // full i8 range incl. -128
+        };
+        for &len in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 100, 255, 896, 4864] {
+            let a: Vec<i8> = (0..len).map(|_| next()).collect();
+            let w: Vec<i8> = (0..len).map(|_| next()).collect();
+            assert_eq!(i8dot(&a, &w), scalar(&a, &w), "len {len}");
+        }
+        // worst-case magnitude (all ±127) at the widest row — confirms the i32 accumulator never overflows.
+        let a = vec![127i8; 4864];
+        let w = vec![-128i8; 4864];
+        assert_eq!(i8dot(&a, &w), scalar(&a, &w));
+    }
+
+    /// The F16C upcast must be bit-identical to `half::to_f32` for EVERY f16 bit pattern (subnormals, inf, nan, ±max)
+    /// — IEEE f16→f32 is exact, so the SIMD path can't perturb a weight. Also covers non-multiple-of-8 tail lengths.
+    #[test]
+    fn f16_to_f32_simd_vs_scalar() {
+        let all: Vec<half::f16> = (0u16..=u16::MAX).map(half::f16::from_bits).collect();
+        for &len in &[0usize, 1, 7, 8, 9, 15, 16, 17, all.len()] {
+            let src = &all[..len];
+            let mut got = vec![0f32; len];
+            f16_to_f32(src, &mut got);
+            for (g, s) in got.iter().zip(src) {
+                let want = s.to_f32();
+                assert!(g.to_bits() == want.to_bits() || (g.is_nan() && want.is_nan()), "f16 {:#06x}", s.to_bits());
+            }
+        }
     }
 }
