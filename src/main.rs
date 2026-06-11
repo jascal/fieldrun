@@ -196,6 +196,68 @@ fn main() {
         return;
     }
 
+    // `fieldrun eval <prog.dl> [--semiring max|log]` — run an emitted `export --logic` program with the built-in
+    // semiring evaluator (no Soufflé needed). Parses candidate/contrib facts, accumulates logit(T)=Σ contrib (⊗=+),
+    // then applies the cross-candidate ⊕: max-product (default) → decide(T)=argmax (the greedy decode, T=0); log-
+    // semiring → the softmax distribution (T=1). ONE program, two semirings — LE-T5 + the two-temperature claim, run.
+    if matches!(args.get(1).map(String::as_str), Some("eval")) {
+        let path = match args.iter().skip(2).find(|a| !a.starts_with('-')).cloned().or_else(|| flag(&args, "--in").map(String::from)) {
+            Some(p) => p,
+            None => {
+                eprintln!("[fieldrun] eval: give an emitted program — fieldrun eval prog.dl [--semiring max|log]");
+                std::process::exit(2);
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("[fieldrun] eval: cannot read {path}: {e}"); std::process::exit(1); }
+        };
+        let semiring = flag(&args, "--semiring").unwrap_or("max");
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut cands: Vec<i64> = Vec::new();
+        let mut logit: BTreeMap<i64, f64> = BTreeMap::new();
+        let mut blocks: BTreeSet<String> = BTreeSet::new();
+        for line in text.lines() {
+            let l = line.trim();
+            if let Some(rest) = l.strip_prefix("candidate(") {
+                if let Some(Ok(id)) = rest.split(')').next().map(|s| s.trim().parse::<i64>()) {
+                    if !cands.contains(&id) { cands.push(id); logit.entry(id).or_insert(0.0); }
+                }
+            } else if let Some(rest) = l.strip_prefix("contrib(") {
+                let inner = rest.split(')').next().unwrap_or("");
+                let parts: Vec<&str> = inner.splitn(3, ',').collect();
+                if parts.len() == 3 {
+                    if let (Ok(id), Ok(w)) = (parts[1].trim().parse::<i64>(), parts[2].trim().parse::<f64>()) {
+                        *logit.entry(id).or_insert(0.0) += w;
+                        blocks.insert(parts[0].trim().trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            eprintln!("[fieldrun] eval: no candidate/contrib facts in {path} (is it an `export --logic` program?)");
+            std::process::exit(1);
+        }
+        eprintln!("[fieldrun] eval {path}: {} candidates · {} blocks · semiring={semiring}", cands.len(), blocks.len());
+        let mut scored: Vec<(i64, f64)> = cands.iter().map(|&t| (t, *logit.get(&t).unwrap_or(&0.0))).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if semiring == "log" {
+            let mx = scored[0].1;
+            let z: f64 = scored.iter().map(|(_, s)| (s - mx).exp()).sum();
+            println!("% distribution over candidates (log-semiring / sum-product, T=1):");
+            for (t, s) in scored.iter().take(12) {
+                println!("  P {:>6.3}   logit {:>8.3}   token {t}", (s - mx).exp() / z, s);
+            }
+        } else {
+            let (t, s) = scored[0];
+            println!("decide({t}).   % logit {s:.4}  (max-product / argmax, T=0)");
+            if scored.len() > 1 {
+                println!("% runner-up token {} logit {:.4}  margin {:+.4}", scored[1].0, scored[1].1, s - scored[1].1);
+            }
+        }
+        return;
+    }
+
     let store_explicit = flag(&args, "--store");
     let store_path = store_explicit.unwrap_or("../lm-sae/pylm/store_gpt2.json");
     let ids_path = flag(&args, "--ids").unwrap_or("../lm-sae/pylm/holdout_gpt2.json");

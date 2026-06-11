@@ -177,8 +177,11 @@ as provenance structure vs intervention diffuseness.
   (`|W|≥0.1` shown, dense remainder folded into block `"rest"` = the forge tax), and the decode as
   `decide(T) :- logit(T,S), S = max … : { logit(_,S2) }` (max-product / `T=0`). Verified: `Σ contrib == logit` to
   floating point and the `(max,+)` decode `== the model's token` (LE-T5 round-trip self-check, "FAITHFUL ✓", both
-  Qwen2.5-0.5B). *Remaining:* (a) a built-in evaluator or Soufflé harness to run it without fieldrun; (b) the
-  whole-model (not per-context) emit; (c) the sparse-`(max,+)`-matmul performance face of §1.5.
+  Qwen2.5-0.5B). **A built-in evaluator runs it without Soufflé:** `fieldrun eval prog.dl --semiring max|log` parses the
+  candidate/contrib facts and applies the cross-candidate `⊕` — `max` → `decide(T)` (greedy decode), `log` → the
+  softmax distribution. Verified: `eval --semiring max` on the emitted program returns the model's token; `--semiring
+  log` returns the distribution — **one program, two semirings, two temperatures, run.** *Remaining:* (a) the
+  whole-model (not per-context) emit; (b) the sparse-`(max,+)`-matmul performance face of §1.5.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the
