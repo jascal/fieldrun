@@ -50,6 +50,30 @@ pub struct Explanation {
     pub mlp_features: Vec<MlpFeature>,
 }
 
+/// How much of the explain trace to render — modelled on a database `EXPLAIN`'s option levels, because the deeper
+/// facets cost the reader attention AND real compute (the circuit facet re-runs the faithful forward, the `ANALYZE`
+/// analogue). `Route` is free (the route label is computed from the generated token + the KB, no extra forward);
+/// `Circuits` adds the DLA circuit breakdown but ONLY on COMPOSED tokens (the attribution drives the verbosity — you
+/// pay the explain-forward exactly where the model actually composed); `All` shows the circuits for every token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExplainMode {
+    Route,
+    Circuits,
+    All,
+}
+
+impl ExplainMode {
+    /// Parse a mode name (case-insensitive). `on`/`true`/`1` alias `Route` (the cheap default); unknown → None.
+    pub fn parse(s: &str) -> Option<ExplainMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "route" | "routes" | "on" | "true" | "1" => Some(ExplainMode::Route),
+            "circuits" | "circuit" | "dla" => Some(ExplainMode::Circuits),
+            "all" | "full" | "verbose" => Some(ExplainMode::All),
+            _ => None,
+        }
+    }
+}
+
 /// Name an attention head's behaviour at the predicting position from its attention row (length seq), using the
 /// `idiom_library` signatures: where the last token attends tells us the circuit it runs.
 pub fn classify_head(row: &[f32], ctx: &[i64]) -> (&'static str, usize, f32) {
@@ -327,6 +351,15 @@ pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String, max_ctx: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explain_mode_parses_levels() {
+        assert_eq!(ExplainMode::parse("route"), Some(ExplainMode::Route));
+        assert_eq!(ExplainMode::parse("on"), Some(ExplainMode::Route)); // alias for the cheap default
+        assert_eq!(ExplainMode::parse("CIRCUITS"), Some(ExplainMode::Circuits)); // case-insensitive
+        assert_eq!(ExplainMode::parse("all"), Some(ExplainMode::All));
+        assert_eq!(ExplainMode::parse("--raw"), None); // a following flag isn't a mode → caller defaults to Route
+    }
 
     #[test]
     fn top_promoted_picks_largest_signed() {

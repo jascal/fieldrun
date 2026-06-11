@@ -515,9 +515,14 @@ fn main() {
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
             .and_then(|s| s.parse::<u16>().ok());
-        // --explain: in the chat REPL it turns ON per-reply explanations (toggle live with /explain). With --ids it's
-        // the standalone "explain this prediction" mode. (It used to force standalone mode and panic without --ids.)
-        let explain = has_flag(&args, "--explain");
+        // --explain[=MODE]: in the chat REPL it turns ON per-reply explanations (toggle live with /explain). MODE is the
+        // EXPLAIN level — `route` (default, free: per-token RETRIEVED/SELECTED/COMPOSED), `circuits` (route + DLA
+        // breakdown only on COMPOSED tokens), `all` (DLA on every token). `--explain` alone = route.
+        let explain: Option<explain::ExplainMode> = if has_flag(&args, "--explain") {
+            Some(flag(&args, "--explain").and_then(explain::ExplainMode::parse).unwrap_or(explain::ExplainMode::Route))
+        } else {
+            None
+        };
 
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
         // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare
@@ -531,7 +536,11 @@ fn main() {
                 // default reply cap depends on the model (reasoning models get a bigger budget); --max-tokens overrides.
                 Some(tg) => {
                     let max_tokens = want.unwrap_or_else(|| tg.default_max_tokens());
-                    api::chat(lm, tg, max_tokens, explain, has_flag(&args, "--raw"), &arch);
+                    // --store loads the KB rules so explain can attribute each token to an idiom (RETRIEVED/SELECTED);
+                    // without it, routing is induction-only. The candidate set bounds the SELECTED-vs-COMPOSED line.
+                    let kb = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+                    let cand = retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch);
                 }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
@@ -547,7 +556,7 @@ fn main() {
 
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).
         if let Some(port) = serve_port {
-            if explain {
+            if explain.is_some() {
                 eprintln!("[fieldrun] note: --explain toggles per-reply explanations in the chat REPL. The API server \
                            ignores it — POST /explain for the structured form, or pass \"explain\":true to the chat \
                            endpoints. (Use --chat --explain for an explained REPL.)");
@@ -562,7 +571,7 @@ fn main() {
 
         // --explain WITH --ids: standalone "explain the prediction at the end of the first --ctx tokens" (circuits +
         // features). Without ids we'd have already gone to chat above; guard anyway so an empty stream can't index out.
-        if explain {
+        if explain.is_some() {
             if ids.is_empty() {
                 eprintln!("[fieldrun] --explain standalone mode needs --ids <token stream>. For explained chat replies, \
                            run with --chat --explain (or just --explain) and toggle /explain in the REPL.");
