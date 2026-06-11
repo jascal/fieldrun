@@ -409,6 +409,11 @@ impl Model for Rope {
         Some(self.explanation(ids))
     }
 
+    fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        let xf = self.hidden(ids); // post-final-norm residual; row(last) is the exact vector the unembedding dots
+        Some(xf.row(ids.len() - 1).to_vec())
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);

@@ -706,6 +706,68 @@ fn main() {
             return;
         }
 
+        // --probe-facet (tighten Q1): the token cells in r-space ARE the Laguerre power diagram of {U_v} (weights
+        // ‖U_v‖²+2b_v). Compute the EXACT nearest facet argmin_{v≠t}(L_t−L_v)/‖U_t−U_v‖ (not the logit-runner-up proxy)
+        // and (a) how often the nearest facet == the logit runner-up, (b) the killer check: for COMPOSED, is the token
+        // across the nearest facet the KB's own top-1? If yes, composition = r(x) having crossed the facet out of the
+        // KB's cell. Needs an arch exposing final_residual (rope).
+        if has_flag(&args, "--probe-facet") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-facet needs --store"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, _d) = b2.dims(un);
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() {
+                eprintln!("[fieldrun] --probe-facet: arch {arch} doesn't expose final_residual (rope only)");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-facet: precomputing ‖U_v‖² for {vocab} unembed rows…");
+            let unorm: Vec<f32> = (0..vocab).into_par_iter().map(|v| b2.weight_row(un, v).iter().map(|x| x * x).sum()).collect();
+            let cap = (end - ctx_window).min(n_eval).min(300);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-facet: {} positions — full logits + nearest-facet over {vocab} tokens…", positions.len());
+            struct F { route: u8, dx: f32, vstar_is_ru: bool, vstar_is_kb: bool }
+            let recs: Vec<F> = positions.par_iter().filter_map(|c| {
+                let r = lm.final_residual(c)?;
+                let l = b2.rowdot_f32(un, &r); // full logits L_v = ⟨U_v, r⟩
+                let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
+                let ut = b2.weight_row(un, t);
+                let g = b2.rowdot_f32(un, &ut); // ⟨U_v, U_t⟩ for all v → ‖U_t−U_v‖² = ‖U_t‖²+‖U_v‖²−2⟨U_v,U_t⟩
+                let (mut best_d, mut vstar) = (f32::INFINITY, t);
+                let (mut best_l, mut ru) = (f32::NEG_INFINITY, t);
+                for v in 0..vocab {
+                    if v == t { continue; }
+                    if l[v] > best_l { best_l = l[v]; ru = v; }
+                    let dvv2 = unorm[t] + unorm[v] - 2.0 * g[v];
+                    if dvv2 > 1e-4 {
+                        let dv = (l[t] - l[v]) / dvv2.sqrt(); // exact Euclidean distance to the t–v bisector facet
+                        if dv < best_d { best_d = dv; vstar = v; }
+                    }
+                }
+                let kb = store.predict(c).0 as usize;
+                let covered = store.candidates(c, &cfg).contains(&(t as i64));
+                let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
+                Some(F { route, dx: best_d, vstar_is_ru: vstar == ru, vstar_is_kb: vstar == kb })
+            }).collect();
+            let pct = |g: &[&F], f: &dyn Fn(&F) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
+            let meanf = |g: &[&F], f: &dyn Fn(&F) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== (Q1 tight) exact power-diagram nearest facet ({} positions, {vocab} tokens) ===", recs.len());
+            println!("{:<12}{:>6}{:>18}{:>22}{:>24}", "route", "n", "nearest-facet dist", "v*==logit-runner-up", "v*==KB-top1 (killer)");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&F> = recs.iter().filter(|x| x.route == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                println!("{lbl:<12}{:>6}{:>18.3}{:>21.0}%{:>23.0}%", g.len(), meanf(&g, &|x| x.dx), pct(&g, &|x| x.vstar_is_ru), pct(&g, &|x| x.vstar_is_kb));
+            }
+            let all: Vec<&F> = recs.iter().collect();
+            println!("(nearest facet == logit runner-up overall: {:.0}%  ⇒ how often the runner-up proxy IS the nearest facet)", pct(&all, &|x| x.vstar_is_ru));
+            println!("(killer) COMPOSED v*==KB-top1 = r(x) sits on the bisector with the KB's prediction = composition crossed out of the KB cell.");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
