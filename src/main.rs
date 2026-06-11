@@ -806,7 +806,9 @@ fn main() {
             // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
             // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
             // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
-            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32 }
+            const KS: [usize; 4] = [1, 2, 3, 5]; // coalition sizes for the additivity test
+            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32,
+                       sk: [f32; 4], flipk: [bool; 4] } // sk[i] = ΣD_j(top KS[i]) − Δ ; flipk[i] = forward flip ablating those
             let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
@@ -827,9 +829,23 @@ fn main() {
                 let talign = top.4 == Some(t); // is the single circuit we ablate itself a t-supporter (isolated argmax == t)?
                 let dj = top.0 - top.5;        // D_j of the ablated top circuit (logit units): linear flip ⟺ margin < D_j
                 let rho = lm.unembed_cos(t as usize, ex.runner_up as usize).unwrap_or(0.0); // coherence cos(U_t, U_v*)
-                let (heads, neurons) = if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
-                let flip = lm.predict_ablated(c, &heads, &neurons) != Some(t);
-                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign, dj, rho })
+                let margin = ex.predicted_logit - ex.runner_up_logit;
+                // coalition additivity: ablate the top-k circuits JOINTLY. ΣD_j over them is the LINEAR margin shift
+                // (DLA is additive), so the coalition linear identity is flip ⟺ Δ < ΣD_j. As k grows we strip more
+                // pivotality AND leave the forward pass less headroom to rescue — tests additivity + cushion-exhaustion.
+                let (mut sk, mut flipk) = ([0f32; 4], [false; 4]);
+                for (ki, &k) in KS.iter().enumerate() {
+                    let kk = k.min(circ.len());
+                    let (mut hs, mut ns, mut sumdj) = (Vec::new(), Vec::new(), 0f32);
+                    for cc in &circ[..kk] {
+                        sumdj += cc.0 - cc.5; // this circuit's D_j
+                        if cc.1 { hs.push((cc.2, cc.3)); } else { ns.push((cc.2, cc.3)); }
+                    }
+                    sk[ki] = sumdj - margin;
+                    flipk[ki] = lm.predict_ablated(c, &hs, &ns) != Some(t);
+                }
+                let flip = flipk[0]; // k=1 single-circuit flip (reused by every earlier table)
+                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk })
             }).collect();
             let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
             let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
@@ -987,6 +1003,25 @@ fn main() {
                     100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n as f32,
                     g.iter().map(|x| x.margin).sum::<f32>() / n as f32, g.iter().map(|y| s_of(y)).sum::<f32>() / n as f32);
             }
+            // (coalition additivity) ablate the top-k JOINTLY; the linear coalition identity is flip ⟺ Δ < ΣD_j, i.e.
+            // sk = ΣD_j − Δ > 0. Per k: flip%, linear-identity accuracy (sign(sk) vs forward flip), and the rescue rate
+            // among sk>0 (forward keeps t). Predictions: identity stays a good NECESSARY condition; rescue rate FALLS as
+            // k grows (more pivotality stripped ⇒ less downstream headroom = cushion exhaustion); the residual (fp) is
+            // indirect-effect + new-winner≠v* (grows with k as other facets enter).
+            let nrec = recs.len() as f32;
+            println!("\n  (coalition additivity) ablate top-k JOINTLY; linear identity flip ⟺ Δ < ΣD_j (sk=ΣD_j−Δ):");
+            println!("  {:>4}{:>10}{:>12}{:>16}{:>16}", "k", "flip%", "mean sk", "ident-acc[fp fn]", "sk>0: n rescue%");
+            for (ki, &k) in KS.iter().enumerate() {
+                let flippct = 100.0 * recs.iter().filter(|x| x.flipk[ki]).count() as f32 / nrec;
+                let msk = recs.iter().map(|x| x.sk[ki]).sum::<f32>() / nrec;
+                let (mut tp, mut tn, mut fp, mut fnn) = (0u32, 0u32, 0u32, 0u32);
+                for x in &recs { match (x.sk[ki] > 0.0, x.flipk[ki]) { (true, true) => tp += 1, (true, false) => fp += 1, (false, true) => fnn += 1, (false, false) => tn += 1 } }
+                let acc = 100.0 * (tp + tn) as f32 / nrec;
+                let sp = recs.iter().filter(|x| x.sk[ki] > 0.0).count();
+                let resc = if sp == 0 { f32::NAN } else { 100.0 * recs.iter().filter(|x| x.sk[ki] > 0.0 && !x.flipk[ki]).count() as f32 / sp as f32 };
+                println!("  {k:>4}{flippct:>9.0}%{msk:>12.2}{acc:>11.0}% [{fp:>2} {fnn:>2}]{sp:>10} {resc:>5.0}%", );
+            }
+            println!("  ⇒ additivity holds if ident-acc stays high; cushion exhausts if rescue% falls with k; fp rising with k = new-winner≠v* (other facets).");
             return;
         }
 

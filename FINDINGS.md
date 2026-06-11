@@ -204,6 +204,20 @@ natural-text holdout, matched-vocab store.
     forward pass trivially compensates. So near-synonyms are hard to edit because D_j is small, **not** because rescue
     starves. (`Model::unembed_cos`, rope; explain-only.)
 
+- **(coalition additivity) ΣD_j predicts joint ablation; the cushion is finite; a new-winner channel opens at large k.**
+  Ablating the top-k circuits *jointly* (k=1,2,3,5), the coalition linear identity flip ⟺ Δ < ΣD_j (sk = ΣD_j − Δ):
+  - **(1) additivity holds** — sign(sk) vs forward-flip accuracy stays flat at ~75–83% across k on both models. The
+    *individually*-measured D_j's **add**; indirect effects don't corrupt the sum (I'd predicted additivity would break
+    — it didn't).
+  - **(2) cushion exhausts** — rescue rate among sk>0 falls monotonically with k (coder 35→25→16→16%, instruct
+    31→22→17→11%): stripping more pivotality leaves the forward pass less headroom to rescue, so larger coalitions are
+    more reliably destructive (Grok's "coalition exceeding the cushion", confirmed).
+  - **(3) a new-winner channel opens** — fn (flip despite sk<0) rises with k (coder 3→17, instruct 17→32) while fp
+    falls: at large k the post-ablation argmax becomes a *third* token the t-vs-v\* identity doesn't model (the global
+    power-diagram "surprise", made measurable).
+  ⇒ the editing-budget rule is **ΣD_j > Δ + cushion(Δ,ρ)**, with the cushion exhausting as the coalition grows, plus a
+  multi-facet correction at large k.
+
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
   intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
