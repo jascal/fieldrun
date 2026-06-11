@@ -130,6 +130,13 @@ fn main() {
             eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, q4a, int8, f16, f32)");
             std::process::exit(2);
         }
+        // per-tensor-role policy: --embed-dtype quantises the embed/tied-unembed (the largest tensor for a big vocab)
+        // independently of the linear --dtype. Default "" keeps it f16 (so the f32/int8 faithfulness gates are intact).
+        let embed_dtype = flag(&args, "--embed-dtype").unwrap_or("");
+        if !["", "int8"].contains(&embed_dtype) {
+            eprintln!("[fieldrun] convert: unknown --embed-dtype {embed_dtype:?} (have: int8; default keeps embed f16); only the `rope` arch supports it so far");
+            std::process::exit(2);
+        }
         // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the
         // cwd — so converting from a dev checkout doesn't litter it. <name> = the model's last path segment minus @rev.
         let out: String = match flag(&args, "-o").or_else(|| flag(&args, "--out")) {
@@ -166,7 +173,7 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        if let Err(e) = convert::convert(&model_dir, arch, dtype, &out) {
+        if let Err(e) = convert::convert(&model_dir, arch, dtype, embed_dtype, &out) {
             eprintln!("[fieldrun] convert failed: {e}");
             std::process::exit(1);
         }

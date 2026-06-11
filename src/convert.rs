@@ -206,6 +206,35 @@ impl BundleWriter {
         self.put_f16(&format!("{name}__min"), &mins, &[out, ng])
     }
 
+    /// ROW-MAJOR per-row int8 for the embed/unembed `(vocab, d)`: each vocab row gets one fp16 scale (`amax/127`),
+    /// stored row-major so it matches the row-contiguous access in `rows_f32`/`rowdot_f32`. Halves the largest tensor
+    /// (a big-vocab lm_head) vs f16. Sibling `__scale` (vocab,). Dtype tag `rowi8`.
+    fn put_embed_i8(&mut self, name: &str, data: &[f32], vocab: usize, d: usize) -> std::io::Result<()> {
+        let mut scale = vec![0f32; vocab];
+        let mut q = vec![0u8; vocab * d];
+        for r in 0..vocab {
+            let amax = (0..d).fold(0f32, |m, c| m.max(data[r * d + c].abs()));
+            let s = (amax / 127.0).max(1e-8);
+            scale[r] = s;
+            for c in 0..d {
+                q[r * d + c] = ((data[r * d + c] / s).round_ties_even().clamp(-127.0, 127.0) as i8) as u8;
+            }
+        }
+        self.bin.write_all(&q)?;
+        self.entry(name, "rowi8", &[vocab, d], q.len());
+        self.put_f16(&format!("{name}__scale"), &scale, &[vocab])
+    }
+
+    /// Write the embed/unembed under the per-tensor-role policy: `embed_dtype=="int8"` → row-major quant (the largest
+    /// tensor for a big-vocab model — the highest-leverage memory lever); anything else falls back to the normal small
+    /// path keyed on the linear `dtype` (f16/f32). Opt-in: default keeps the embed f16 so the f32/int8 gates are intact.
+    fn put_embed(&mut self, name: &str, data: &[f32], shape: &[usize], embed_dtype: &str, dtype: &str) -> std::io::Result<()> {
+        match embed_dtype {
+            "int8" if shape.len() == 2 => self.put_embed_i8(name, data, shape[0], shape[1]),
+            _ => self.put_small(name, data, shape, dtype),
+        }
+    }
+
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
     /// store (in, out); else source is already (in, out) (GPT-2 Conv1D) → store as-is.
     fn put_i8(&mut self, name: &str, data: &[f32], rows: usize, cols: usize, transpose: bool) -> std::io::Result<()> {
@@ -247,7 +276,7 @@ fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
     }
 }
 
-pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std::io::Result<()> {
+pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
     // Pre-flight: catch the common "wrong --arch for this model" mistake with a clear message instead of a deep
     // missing-config-key panic. Map the HF config's model_type to the fieldrun arch family and only error on a
@@ -295,7 +324,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
     }
     let n = match arch {
         "gpt2" => convert_gpt2(&cfg, &m, dtype, out_stem)?,
-        "rope" => convert_rope(&cfg, &m, dtype, out_stem)?,
+        "rope" => convert_rope(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma" => convert_gemma(&cfg, &m, dtype, out_stem)?,
         "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
@@ -367,7 +396,7 @@ fn rope_theta_eps(c: &serde_json::Value) -> (f64, f64) {
 
 // shared: write the linear/embed/bias arrays for a Llama/Qwen/Gemma layer stack. `norm_offset` adds 1.0 to norm
 // weights (Gemma's x·(1+w)). `norms` lists the (fieldrun, hf) RMSNorm names per layer.
-fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -378,7 +407,7 @@ fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "rope",
         "config": [nl, nh, nkv, hd, d, ffn, vocab, tie as usize], "config_f": [theta, eps] });
     let mut w = BundleWriter::new(stem)?;
-    write_layers(&mut w, c, m, dtype, nl, tie, &[("in_ln", "input_layernorm"), ("post_ln", "post_attention_layernorm")], false)?;
+    write_layers(&mut w, c, m, dtype, edt, nl, tie, &[("in_ln", "input_layernorm"), ("post_ln", "post_attention_layernorm")], false)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
@@ -401,7 +430,7 @@ fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> s
     let mut w = BundleWriter::new(stem)?;
     let norms = [("input_layernorm", "input_layernorm"), ("post_attention_layernorm", "post_attention_layernorm"),
                  ("pre_feedforward_layernorm", "pre_feedforward_layernorm"), ("post_feedforward_layernorm", "post_feedforward_layernorm")];
-    write_layers(&mut w, c, m, dtype, nl, tie, &norms, true)?;
+    write_layers(&mut w, c, m, dtype, "", nl, tie, &norms, true)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
@@ -439,7 +468,7 @@ fn convert_gemma3(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
     let norms = [("input_layernorm", "input_layernorm"), ("post_attention_layernorm", "post_attention_layernorm"),
                  ("pre_feedforward_layernorm", "pre_feedforward_layernorm"), ("post_feedforward_layernorm", "post_feedforward_layernorm"),
                  ("self_attn.q_norm", "self_attn.q_norm"), ("self_attn.k_norm", "self_attn.k_norm")];
-    write_layers(&mut w, c, m, dtype, nl, tie, &norms, true)?;
+    write_layers(&mut w, c, m, dtype, "", nl, tie, &norms, true)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
@@ -882,7 +911,7 @@ fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) ->
 
 /// Shared Llama/Qwen/Gemma writer: embed (f16) + final norm + per-layer norms (with optional +1 bake) + the
 /// q/k/v/o/gate/up/down Linears (transposed, int8 or f16) + optional q/k/v bias.
-fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, nl: usize, tie: bool,
+fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, nl: usize, tie: bool,
                 norms: &[(&str, &str)], bake1: bool) -> std::io::Result<()> {
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, mut dt) = m.read(hf);
@@ -893,13 +922,14 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
         let (s, dt) = m.read(hf); // (out, in)
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
+    // embed (and the tied unembed) honour the per-role `edt` policy — quantising the largest tensor (opt-in).
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     norm(w, "norm", "model.norm.weight")?;
     if !tie {
         // unembed is read row-wise by rowdot_f32 as (vocab, d) → store raw (NOT transposed), low-precision like embed
         let (s, dt) = m.read("lm_head.weight"); // (vocab, d)
-        w.put_small("lm_head", &dt, &s, dtype)?;
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     let _ = c;
     for l in 0..nl {
@@ -1126,5 +1156,27 @@ mod tests {
         };
         let (e_i4, e_q4a) = (mse("wi4"), mse("wq4a"));
         assert!(e_q4a < e_i4 * 0.5, "q4a MSE {e_q4a} should be << int4 MSE {e_i4} on offset data");
+    }
+
+    /// Row-major int8 embed (Phase 4b): rows_f32 must reconstruct each vocab row within the per-row int8 step, and
+    /// rowdot_f32 / weight_row (the tied-unembed + explain paths) must agree with the dequantised row.
+    #[test]
+    fn rowi8_embed_roundtrip() {
+        let data: Vec<f32> = vec![0.1, -0.2, 0.3, -0.4, 1.0, -2.0, 0.5, 0.25, -0.7, 0.8, -0.9, 0.6]; // (vocab=3, d=4)
+        let dir = std::env::temp_dir().join(format!("fr_rowi8_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut w = BundleWriter::new(&stem).unwrap();
+        w.put_embed_i8("embed", &data, 3, 4).unwrap();
+        w.finish(&stem, json!({"format": "fieldrun-bundle", "version": 1, "arch": "test", "config": []})).unwrap();
+        let b = crate::bundle::Bundle::load(&stem).unwrap();
+        let rows = b.rows_f32("embed", &[1]); // row 1 = [1.0,-2.0,0.5,0.25]; amax 2.0 -> step ~0.0157
+        for (g, &want) in rows.row(0).iter().zip(&data[4..8]) {
+            assert!((g - want).abs() < 0.02, "rows_f32 got {g} want {want}");
+        }
+        let wr = b.weight_row("embed", 1); // explain path must match rows_f32
+        assert!(wr.iter().zip(rows.row(0)).all(|(a, b)| (a - b).abs() < 1e-6), "weight_row != rows_f32");
+        let dots = b.rowdot_f32("embed", &[1.0, 1.0, 1.0, 1.0]); // dot with ones = sum of the dequantised row
+        assert!((dots[1] - rows.row(0).sum()).abs() < 1e-4, "rowdot {} vs {}", dots[1], rows.row(0).sum());
     }
 }

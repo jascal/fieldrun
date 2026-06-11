@@ -35,6 +35,7 @@ enum Arr {
     I8(I8w), // per-output-column symmetric int8 (scale in sibling "<name>__scale"), repacked for the int8-dot path
     I4(I4w), // group-wise symmetric int4 (2 nibbles/byte, scale per out-col×group), dequantised to f32 on read
     Q4A(Q4Aw), // group-wise AFFINE int4 (unsigned nibble; scale+min per out-col×group): x = scale*q + min
+    RowI8(RowI8w), // ROW-MAJOR per-row int8 for the embed/unembed (vocab, d): row r = data[r*d..] * scale[r]
 }
 
 /// An int8 weight prepared for the int8 matmul: stored transposed to (out, in) so each output column's contiguous `k`
@@ -79,6 +80,15 @@ struct Q4Aw {
 fn u4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> f32 {
     let byte = packed[j * row_bytes + i / 2];
     (if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32
+}
+
+/// A ROW-MAJOR per-row int8 weight for the **embed / tied unembed**: stored `(vocab, d)` row-major with one fp16 scale
+/// per row (vocab token) in the sibling `<name>__scale`; row r dequantises to `data[r*d + c] * scale[r]`. Unlike the
+/// column-major `I8w` (for linears via the int8 dot), this matches the embed's row-contiguous access in
+/// `rows_f32`/`rowdot_f32` — the lever for the largest tensor (the lm_head over a big vocab).
+struct RowI8w {
+    data: Vec<i8>, // (vocab, d) row-major
+    d: usize,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +187,10 @@ impl Bundle {
                         // affine int4: same packed layout as i4; dequant uses the __scale + __min siblings per mm.
                         let (n, k) = (a.shape[0], a.shape[1]); // (out, in)
                         Arr::Q4A(Q4Aw { packed: raw.to_vec(), k, n, g: a.group.unwrap_or(64) })
+                    }
+                    "rowi8" => {
+                        // row-major per-row int8 embed (vocab, d); scale per row in the __scale sibling.
+                        Arr::RowI8(RowI8w { data: raw.iter().map(|&b| b as i8).collect(), d: a.shape[1] })
                     }
                     d => panic!("unsupported array dtype {d:?} in bundle"),
                 };
@@ -289,7 +303,7 @@ impl Bundle {
     /// Numerically identical to zeroing the bottom (1-frac) neurons then a dense down-proj (the pylm `--route-frac`).
     pub fn mm_routed_down(&self, h: &Array2<f32>, name: &str, frac: f32) -> Array2<f32> {
         let (shape, arr) = self.get(name); // down: (ffn, d)
-        if matches!(arr, Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_)) {
+        if matches!(arr, Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) | Arr::RowI8(_)) {
             return self.mm(h, name); // int8/int4 down is quantised → routing falls back to a dense mm for now
         }
         let (ffn, d) = (shape[0], shape[1]);
@@ -308,7 +322,7 @@ impl Bundle {
                 match arr {
                     Arr::F32(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, &w)| *a += hk * w),
                     Arr::F16(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, w)| *a += hk * w.to_f32()),
-                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => unreachable!(),
+                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) | Arr::RowI8(_) => unreachable!(),
                 }
             }
             out.row_mut(i).assign(&ArrayView1::from(acc.as_slice()));
@@ -353,6 +367,12 @@ impl Bundle {
                         scale[gi] * u4_nibble(&w4.packed, row_bytes, j, r) + mins[gi]
                     })
                     .collect()
+            }
+            Arr::RowI8(w) => {
+                // row-major embed: logical row r is contiguous (data[r*d..]) × the per-row scale. Used by explain when
+                // the tied unembed is rowi8.
+                let s = self.arr1o(&format!("{name}__scale"))[r];
+                w.data[r * w.d..(r + 1) * w.d].iter().map(|&q| q as f32 * s).collect()
             }
         }
     }
@@ -573,6 +593,8 @@ impl Bundle {
                     out
                 }
             }
+            // rowi8 is the row-major embed/unembed format, accessed via rows_f32/rowdot_f32 — never a linear operand.
+            Arr::RowI8(_) => panic!("rowi8 is the row-major embed format; not a linear weight (use rows_f32/rowdot_f32)"),
         }
     }
 
@@ -585,7 +607,7 @@ impl Bundle {
         match arr {
             Arr::F32(v) => v.clone(),
             Arr::F16(v) => v.iter().map(|h| h.to_f32()).collect(),
-            Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("upcast: quantised weight needs its scale; go through mm()"),
+            Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) | Arr::RowI8(_) => panic!("upcast: quantised weight needs its scale; go through mm()"),
         }
     }
 
@@ -594,13 +616,19 @@ impl Bundle {
     pub fn rows_f32(&self, name: &str, ids: &[i64]) -> Array2<f32> {
         let (shape, arr) = self.get(name);
         let d = shape[1];
+        // row-major int8 embed: fetch the per-row scale array once.
+        let rscale = if matches!(arr, Arr::RowI8(_)) { Some(self.arr1o(&format!("{name}__scale"))) } else { None };
         let mut out = Array2::<f32>::zeros((ids.len(), d));
         for (t, &id) in ids.iter().enumerate() {
             let base = id as usize * d;
             match arr {
                 Arr::F32(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, &s)| *o = s),
                 Arr::F16(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, s)| *o = s.to_f32()),
-                Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rows_f32: quantised embed unsupported (embed stays f16)"),
+                Arr::RowI8(w) => {
+                    let s = rscale.as_ref().unwrap()[id as usize];
+                    out.row_mut(t).iter_mut().zip(&w.data[base..base + d]).for_each(|(o, &q)| *o = q as f32 * s);
+                }
+                Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rows_f32: column-major quant embed unsupported (use rowi8)"),
             }
         }
         out
@@ -611,6 +639,7 @@ impl Bundle {
     pub fn rowdot_f32(&self, name: &str, x: &[f32]) -> Vec<f32> {
         let (shape, arr) = self.get(name);
         let (rows, d) = (shape[0], shape[1]);
+        let rscale = if matches!(arr, Arr::RowI8(_)) { Some(self.arr1o(&format!("{name}__scale"))) } else { None };
         // The tied unembed over a 256k vocab is ~the biggest per-token cost; rows are independent → fan out over cores.
         (0..rows)
             .into_par_iter()
@@ -619,7 +648,12 @@ impl Bundle {
                 match arr {
                     Arr::F32(v) => v[base..base + d].iter().zip(x).map(|(&w, &xi)| w * xi).sum(),
                     Arr::F16(v) => v[base..base + d].iter().zip(x).map(|(w, &xi)| w.to_f32() * xi).sum(),
-                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rowdot_f32: quantised unembed unsupported (embed stays f16)"),
+                    Arr::RowI8(w) => {
+                        // scale*Σ q·x — pull the per-row scale out of the dot (W8A_f32, like the i4 path).
+                        let s = rscale.as_ref().unwrap()[r];
+                        s * w.data[base..base + d].iter().zip(x).map(|(&q, &xi)| q as f32 * xi).sum::<f32>()
+                    }
+                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rowdot_f32: column-major quant unembed unsupported (use rowi8)"),
                 }
             })
             .collect()
