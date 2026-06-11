@@ -653,16 +653,16 @@ fn tool_result_text(content: Option<&serde_json::Value>) -> String {
 /// (no KB rule covers it — the forge tax). With no `store`, falls back to context-only candidates (recent + induction
 /// copy): a covered token is SELECTED, the strict in-context-copy target is RETRIEVED, else COMPOSED.
 #[cfg(feature = "api")]
-fn token_route(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg) -> (&'static str, String) {
+fn token_route(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg) -> (&'static str, String, Option<i64>) {
     match store {
         Some(s) => {
             let (kb, idiom) = s.predict(ctx);
             if kb == predicted {
-                ("RETRIEVED", idiom)
+                ("RETRIEVED", idiom, None)
             } else if s.candidates(ctx, cfg).contains(&predicted) {
-                ("SELECTED", idiom)
+                ("SELECTED", idiom, Some(kb)) // the KB's own top-1 — the pick the model overrode by choosing `predicted`
             } else {
-                ("COMPOSED", String::new())
+                ("COMPOSED", String::new(), None)
             }
         }
         None => {
@@ -670,11 +670,12 @@ fn token_route(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg
             let mut ind = Vec::new();
             context_candidates(ctx, 0, 1, &mut ind);
             if ind.first() == Some(&predicted) {
-                ("RETRIEVED", "induction".to_string())
+                ("RETRIEVED", "induction".to_string(), None)
             } else {
                 let mut c = Vec::new();
                 context_candidates(ctx, cfg.recent, cfg.induction, &mut c);
-                if c.contains(&predicted) { ("SELECTED", "context".to_string()) } else { ("COMPOSED", String::new()) }
+                // the strict induction copy-target (if any) is the context's "top-1" the model passed over.
+                if c.contains(&predicted) { ("SELECTED", "context".to_string(), ind.first().copied()) } else { ("COMPOSED", String::new(), None) }
             }
         }
     }
@@ -730,11 +731,16 @@ fn render_typed_trace(
     let circ_bounded = head_tail > 0 && n > 2 * head_tail && !matches!(mode, ExplainMode::Route);
     let show_circuits = |k: usize| !circ_bounded || k < head_tail || k >= n - head_tail;
     let note = if circ_bounded { format!("; DLA circuits on first/last {head_tail} only — /explain tokens 0 for all") } else { String::new() };
-    let mut out = vec![format!("explain trace [{legend}{note}] — one frame per token, routed to a KB rule or to composition:")];
+    let mut out = vec![
+        format!("explain trace [{legend}{note}] — one frame per token, routed to a KB rule or to composition:"),
+        "  RETRIEVED = the knowledge-base rule's top-1 IS the token (pure lookup)".to_string(),
+        "  SELECTED  = the token was a KB candidate but not the rule's top-1 — the model chose it over the rule's pick".to_string(),
+        "  COMPOSED  = no KB rule covers it; the network computed it (the \"forge tax\")".to_string(),
+    ];
     let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
     let mut ctx = prompt_ids.to_vec();
     for (k, &t) in gen_ids.iter().enumerate() {
-        let (route, idiom) = token_route(store, &ctx, t, cand);
+        let (route, idiom, kb_top1) = token_route(store, &ctx, t, cand);
         match route { "RETRIEVED" => retr += 1, "SELECTED" => sel += 1, _ => comp += 1 }
         // route + rule line — ALWAYS (cheap). The rule that explains THIS token (key → successors); its idiom names the
         // route when present. RETRIEVED/SELECTED get a production-rule line (needs --store); COMPOSED has no rule.
@@ -746,7 +752,13 @@ fn render_typed_trace(
             _ => idiom,
         };
         let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
-        out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
+        // For SELECTED, name the KB's own top-1 — the prediction the model passed over — so the route is legible
+        // (otherwise SELECTED reads just like RETRIEVED, since both can show an induction copy line below).
+        let overrode = match kb_top1 {
+            Some(top1) if route == "SELECTED" && top1 != t => format!("  (KB top-1 was {} — model overrode)", dec(top1)),
+            _ => String::new(),
+        };
+        out.push(format!("\n┌─ #{k} {} ← {route}{via}{overrode}", dec(t)));
         if let Some(rh) = &rule {
             out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
         }
@@ -805,7 +817,7 @@ fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], o
     let mut ctx = prompt_ids.to_vec();
     let mut arr = Vec::with_capacity(gen_ids.len());
     for &t in gen_ids {
-        let (route, idiom) = token_route(opts.store.as_ref(), &ctx, t, &opts.cand);
+        let (route, idiom, kb_top1) = token_route(opts.store.as_ref(), &ctx, t, &opts.cand);
         let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
         let explanation = if want_circuits {
             lm.explain(&ctx).and_then(|ex| serde_json::to_value(ex).ok()).unwrap_or(serde_json::Value::Null)
@@ -820,7 +832,7 @@ fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], o
             _ => idiom,
         };
         let rule_detail = rule.and_then(|rh| serde_json::to_value(rh).ok()).unwrap_or(serde_json::Value::Null);
-        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "explanation": explanation }));
+        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "kb_top1": kb_top1, "explanation": explanation }));
         ctx.push(t);
     }
     serde_json::Value::Array(arr)
