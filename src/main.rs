@@ -405,6 +405,30 @@ fn main() {
                     best = Some((mean, sample));
                 }
             }
+            // Conditional analysis (needs a store): does the KB's CONFIDENCE (which idiom fired) predict coverage? If a
+            // high-confidence idiom (induction/quad) covers the argmax far more often than the unigram floor, a gate that
+            // prunes ONLY when that idiom fires is high-precision. The KB-top-1==argmax column is the Phase-6 signal: when
+            // it's high, you can emit the KB token and skip the WHOLE forward (not just the head).
+            if let Some(s) = store.as_ref() {
+                let gen = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+                let mut by: std::collections::HashMap<String, [usize; 3]> = std::collections::HashMap::new(); // idiom -> [count, kb_top1==argmax, argmax∈cands]
+                for (c, &t) in positions.iter().zip(&truth) {
+                    let (kb, idiom) = s.predict(c);
+                    let e = by.entry(idiom).or_default();
+                    e[0] += 1;
+                    if kb == t { e[1] += 1; }
+                    if s.candidates(c, &gen).contains(&t) { e[2] += 1; }
+                }
+                let mut rows: Vec<(String, [usize; 3])> = by.into_iter().collect();
+                rows.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+                println!("\nper-idiom (KB confidence signal) — does a fired idiom predict coverage / standalone correctness?");
+                println!("{:<14} {:>6} {:>14} {:>12}", "idiom", "n", "KB top1=argmax", "cov(gen)");
+                for (idiom, e) in &rows {
+                    let (n, acc, cov) = (e[0], e[1], e[2]);
+                    println!("{idiom:<14} {n:>6} {:>13.1}% {:>11.1}%", 100.0 * acc as f64 / n as f64, 100.0 * cov as f64 / n as f64);
+                }
+            }
+
             // Head speedup: time the full-vocab unembed vs the subset unembed for a representative candidate set.
             let (mean_c, cand) = best.unwrap_or((1.0, vec![0]));
             let mut s: u64 = 0x243F6A8885A308D3;
