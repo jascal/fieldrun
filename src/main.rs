@@ -36,6 +36,7 @@ mod hub;
 mod minimax;
 mod mla;
 mod model;
+mod neox;
 mod qwen3moe;
 mod retrieval;
 mod rope;
@@ -60,6 +61,7 @@ use gemma3::Gemma3;
 use gemma4::Gemma4;
 use minimax::MiniMax;
 use mla::Mla;
+use neox::Neox;
 // mdfmt (Markdown→ANSI for the chat REPL) is only used by the api `chat`; module declared below under cfg(api).
 use model::Model;
 use qwen3moe::Qwen3Moe;
@@ -133,7 +135,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
@@ -319,6 +321,7 @@ fn main() {
         let kv_int8 = has_flag(&args, "--kv-int8");
         let mut lm: Box<dyn Model> = match arch.as_str() {
             "gpt2" => Box::new(Gpt2::new(bundle, route, kv_int8)),
+            "neox" => Box::new(Neox::new(bundle, route, kv_int8)),
             "rope" => Box::new(Rope::new(bundle, route, kv_int8)),
             "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
@@ -327,7 +330,7 @@ fn main() {
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
         // --pruned-head: margin-gated retrieval-pruned output head on the DECODE loops (serve/chat/stream). The KB
@@ -1172,7 +1175,7 @@ USAGE\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
-  --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
+  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
   --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
