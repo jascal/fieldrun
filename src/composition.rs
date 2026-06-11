@@ -143,17 +143,21 @@ impl Gpt2 {
         let xf = layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"));
         let lg = self.b.rowdot_f32("wte", &xf.row(seq - 1).to_vec());
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
-        let gain = self.b.arr1("ln_f.weight").to_vec(); // final LayerNorm gain — for head direct-logit attribution (center=true)
+        let gain = self.b.arr1("ln_f.weight").to_vec(); // final LayerNorm gain — for direct-logit attribution (center=true)
+        let u_pred = self.b.weight_row("wte", model_predicts as usize); // predicted token's unembed row
         assemble(
             ids,
             &att_last,
+            &head_act,
             &mlp_h,
+            &lg,
             model_predicts,
-            |l, n, act| {
-                let w_out = self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n); // neuron n's write direction (any dtype)
-                top_promoted(&self.b.rowdot_f32("wte", &w_out), act, 5)
-            },
-            |l, head| head_dla(&self.b, &format!("h{l}.attn.c_proj.weight"), "wte", &head_act[l], head, hd, &gain, true, 5),
+            &gain,
+            true,
+            &u_pred,
+            |l, n| self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n), // neuron n's write direction (any dtype)
+            |l, head| head_raw_contrib(&self.b, &format!("h{l}.attn.c_proj.weight"), &head_act[l], head, hd),
+            |c| self.b.rowdot_f32("wte", c),
         )
     }
 

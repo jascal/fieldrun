@@ -359,16 +359,23 @@ impl Mla {
         let gain = self.b.arr1("norm").to_vec();
         let (first_k, nl) = (self.first_k, self.nl);
         let _ = nl;
+        let u_pred = self.b.weight_row(un, model_predicts as usize);
         assemble(
             ids,
             &att_last,
+            &head_act,
             &mlp_h,
+            &lg,
             model_predicts,
-            |l, n, act| {
+            &gain,
+            false,
+            &u_pred,
+            |l, n| {
                 let name = if l < first_k { format!("l{l}.mlp.down_proj") } else { format!("l{l}.shared.down") };
-                top_promoted(&self.b.rowdot_f32(un, &self.b.weight_row(&name, n)), act, 5)
+                self.b.weight_row(&name, n)
             },
-            |l, head| head_dla(&self.b, &format!("l{l}.o_proj"), un, &head_act[l], head, vh, &gain, false, 5),
+            |l, head| head_raw_contrib(&self.b, &format!("l{l}.o_proj"), &head_act[l], head, vh),
+            |c| self.b.rowdot_f32(un, c),
         )
     }
 

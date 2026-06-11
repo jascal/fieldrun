@@ -222,17 +222,21 @@ impl Rope {
         let lg = self.b.rowdot_f32(self.unembed_name(), &xf.row(seq - 1).to_vec());
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
         let un = self.unembed_name();
-        let gain = self.b.arr1("norm").to_vec(); // final RMSNorm gain — for head direct-logit attribution
+        let gain = self.b.arr1("norm").to_vec(); // final RMSNorm gain — for direct-logit attribution
+        let u_pred = self.b.weight_row(un, model_predicts as usize);
         assemble(
             ids,
             &att_last,
+            &head_act,
             &mlp_h,
+            &lg,
             model_predicts,
-            |l, n, act| {
-                let w_out = self.b.weight_row(&format!("l{l}.mlp.down_proj"), n);
-                top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
-            },
-            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), un, &head_act[l], head, hd, &gain, false, 5),
+            &gain,
+            false,
+            &u_pred,
+            |l, n| self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
+            |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),
+            |c| self.b.rowdot_f32(un, c),
         )
     }
 
