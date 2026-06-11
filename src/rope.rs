@@ -163,6 +163,65 @@ impl Rope {
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }
 
+    /// Causal-ablation copy of `hidden`: re-run the forward with the given attention heads `ah` (layer, head) and MLP
+    /// neurons `an` (layer, neuron) ZEROED out of the residual stream (so downstream layers recompute without them).
+    /// A separate copy keeps the faithfulness-gated `hidden` pristine. Research tool (`--probe-ablate`), not gated.
+    fn hidden_ab(&self, ids: &[i64], ah: &[(usize, usize)], an: &[(usize, usize)]) -> Array2<f32> {
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            for &(al, hh) in ah {
+                if al == l {
+                    attn_out.slice_mut(s![.., hh * hd..(hh + 1) * hd]).fill(0.0); // ablate head: zero its value-output
+                }
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hid = gate;
+            for (hv, uv) in hid.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            for &(al, nn) in an {
+                if al == l {
+                    hid.slice_mut(s![.., nn..nn + 1]).fill(0.0); // ablate neuron: zero its post-SwiGLU activation
+                }
+            }
+            x = &x + &self.down(&hid, &format!("{p}mlp.down_proj"));
+        }
+        rmsnorm(&x, self.b.arr1("norm"), self.eps)
+    }
+
     fn unembed_name(&self) -> &'static str {
         if self.b.config[7] != 0 { "embed" } else { "lm_head" } // tied embed, else a separate (fp16) head
     }
@@ -412,6 +471,12 @@ impl Model for Rope {
     fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
         let xf = self.hidden(ids); // post-final-norm residual; row(last) is the exact vector the unembedding dots
         Some(xf.row(ids.len() - 1).to_vec())
+    }
+
+    fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
+        let xf = self.hidden_ab(ids, heads, neurons);
+        let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
+        Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
