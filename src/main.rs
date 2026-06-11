@@ -12,6 +12,8 @@
 
 mod api;
 mod bundle;
+#[cfg(feature = "jit")]
+mod jit;
 mod composition;
 mod convert;
 mod device;
@@ -97,6 +99,15 @@ fn main() {
     // help: explicit --help/-h, or a bare invocation (the dev-only default store/ids paths would just panic otherwise).
     if args.len() == 1 || has_flag(&args, "--help") || has_flag(&args, "-h") {
         print_help();
+        return;
+    }
+
+    // RESEARCH SPIKE (only built with `--features jit`): bench a `(k,g)`-specialised JIT int4 dot vs the hand AVX2
+    // kernel. `--jit-bench [k] [g] [iters]` (positional after the flag; defaults k=4864 g=32 iters=200000).
+    #[cfg(feature = "jit")]
+    if let Some(i) = args.iter().position(|a| a == "--jit-bench") {
+        let p = |n: usize, d: usize| args.get(i + 1 + n).and_then(|s| s.parse().ok()).unwrap_or(d);
+        jit::bench_i4_dot(p(0, 4864), p(1, 32), p(2, 200_000));
         return;
     }
 

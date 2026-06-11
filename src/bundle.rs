@@ -87,7 +87,7 @@ fn u4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> f32 {
 /// GEMM path, whose ~8× materialisation made int4 decode pathological). `prow` is the column's `ceil(k/2)` packed
 /// bytes; `scale` its `ng` group scales. Auto-vectorises over the group inner loop.
 #[inline]
-fn i4_dot(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
+pub(crate) fn i4_dot(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
