@@ -28,7 +28,7 @@ use crate::retrieval::{CandCfg, Store}; // ExplainOpts (held by serve in both bu
 #[cfg(feature = "api")]
 use crate::explain::ExplainMode;
 #[cfg(feature = "api")]
-use crate::retrieval::{context_candidates, RuleHit};
+use crate::retrieval::{context_candidates, induction_rule, RuleHit};
 
 #[derive(Deserialize)]
 struct PredictReq {
@@ -724,42 +724,38 @@ fn render_typed_trace(
         ExplainMode::All => "route + DLA circuits on every token",
     };
     let n = gen_ids.len();
-    let windowed = head_tail > 0 && n > 2 * head_tail;
-    let show = |k: usize| !windowed || k < head_tail || k >= n - head_tail;
-    let win = if windowed { format!(" (showing first/last {head_tail})") } else { String::new() };
-    let mut out = vec![format!("explain trace [{legend}]{win} — one frame per token, routed to a KB rule or to composition:")];
+    // head_tail bounds ONLY the expensive + verbose CIRCUIT breakdown (one faithful forward each) — the route + rule
+    // lines are cheap (KB lookups, no forward) and ARE the per-token attribution the trace exists for, so they show
+    // for EVERY token. So `circuits N` deep-dives only the first/last N; the routing+rules stay complete.
+    let circ_bounded = head_tail > 0 && n > 2 * head_tail && !matches!(mode, ExplainMode::Route);
+    let show_circuits = |k: usize| !circ_bounded || k < head_tail || k >= n - head_tail;
+    let note = if circ_bounded { format!("; DLA circuits on first/last {head_tail} only — /explain tokens 0 for all") } else { String::new() };
+    let mut out = vec![format!("explain trace [{legend}{note}] — one frame per token, routed to a KB rule or to composition:")];
     let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
-    let mut elided: [usize; 3] = [0, 0, 0]; // RETRIEVED/SELECTED/COMPOSED counts of the elided middle run
     let mut ctx = prompt_ids.to_vec();
     for (k, &t) in gen_ids.iter().enumerate() {
         let (route, idiom) = token_route(store, &ctx, t, cand);
-        let ri = match route { "RETRIEVED" => 0, "SELECTED" => 1, _ => 2 };
-        match ri { 0 => retr += 1, 1 => sel += 1, _ => comp += 1 }
-        if show(k) {
-            if elided.iter().sum::<usize>() > 0 {
-                out.push(format!("\n┊  … {} tokens elided — RETRIEVED {} · SELECTED {} · COMPOSED {} …", elided.iter().sum::<usize>(), elided[0], elided[1], elided[2]));
-                elided = [0, 0, 0];
+        match route { "RETRIEVED" => retr += 1, "SELECTED" => sel += 1, _ => comp += 1 }
+        // route + rule line — ALWAYS (cheap). The rule that explains THIS token (key → successors); its idiom names the
+        // route when present. RETRIEVED/SELECTED get a production-rule line (needs --store); COMPOSED has no rule.
+        // n-gram/grammar rules need the KB (--store); induction is pure context, so it shows even store-less.
+        let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)).or_else(|| induction_rule(&ctx, t)) } else { None };
+        let via_name = match (&rule, route) {
+            (Some(rh), _) => rh.idiom.clone(),
+            (None, "SELECTED") => "candidate-set".to_string(),
+            _ => idiom,
+        };
+        let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
+        out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
+        if let Some(rh) = &rule {
+            out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
+        }
+        // circuit breakdown — the expensive half — only on the first/last head_tail tokens.
+        let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
+        if want_circuits && show_circuits(k) {
+            if let Some(ex) = lm.explain(&ctx) {
+                out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
             }
-            // the rule that explains THIS token (key → successors); its idiom names the route when present.
-            let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)) } else { None };
-            let via_name = match (&rule, route) {
-                (Some(rh), _) => rh.idiom.clone(),
-                (None, "SELECTED") => "candidate-set".to_string(),
-                _ => idiom,
-            };
-            let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
-            out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
-            if let Some(rh) = &rule {
-                out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
-            }
-            let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
-            if want_circuits {
-                if let Some(ex) = lm.explain(&ctx) {
-                    out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
-                }
-            }
-        } else {
-            elided[ri] += 1;
         }
         ctx.push(t);
     }
