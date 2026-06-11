@@ -246,6 +246,29 @@ natural-text holdout, matched-vocab store.
   regime; whether a clean multi-ablation removing **all** t-supporters surfaces protection — and whether decoupling
   **breaks** for near-synonym runner-ups, where the incoherence assumption fails — is the open follow-on, §6 Q4b.)*
 
+## 5d. Per-block logit reconstruction — the export is faithful (LE-T5), the decision is block-sparse but circuit-dense
+
+`--probe-reconstruct` (`Model::residual_decomp`, rope) decomposes the predicting-position logit into its **per-block
+residual-stream writes** — embedding + each layer's attention + each layer's MLP (49 blocks for a 24-layer model) — and
+checks `Σ_blocks == logit`. This is the empirical face of the logic-export soundness theorem (`LOGIC_EXPORT.md` LE-T5).
+
+- **Reconstruction is EXACT.** `|Σ_blocks − logit|` mean **5.9e-6 / 7.2e-6**, max **2.1e-5 / 3.2e-5** (coder/instruct) —
+  floating-point. Residual-stream additivity holds, so the additive (static) decomposition reconstructs every logit
+  exactly. **The semiring-Datalog export is faithful by LE-T5, confirmed numerically** (no missing components, no
+  nonlinearity in the *static* decode — the only nonlinearity is the per-position final-norm scalar, which folds in).
+- **The decision is block-SPARSE** (margin t-vs-v* over the 49 blocks): effective supporting blocks (block-PR) ≈
+  **8–10 of 49**, top-block share **23–29%**, and σ (top blocks to drop to flip) ≈ **1.1–1.6** — the margin is thin
+  enough that removing the single top (usually late) block flips it. So a decision attributes to a *few* blocks: good
+  for navigating the exported program.
+- **But it is circuit-DENSE within a block** — and **PIC's O2 (composed → *larger* support) does NOT hold at block
+  granularity; it mildly reverses.** COMPOSED is slightly *more* block-concentrated than RETRIEVED (PR 8.2/8.5 < 9.9/8.8,
+  σ 1.2/1.1 < 1.6/1.5, top-block 27/29% > 23/26%) — because composed = thin margin = block-fragile. The "composed is
+  distributed" story is *within-block* (high PR ≈ 45 over a block's ~14 heads / ~4864 neurons; §5c), **not across
+  blocks**. ⇒ **the decision is block-sparse but circuit-dense**: a handful of (mostly late) blocks, each an internally
+  dense sum. For the logic export this means the readable fragment is compact at *block* granularity but **bottoms out
+  there for composed tokens** — below the block it is the dense forge-tax sum (T4 / LE-T2). The source-level O2 σ is the
+  circuit-coalition question (§5c), not this block-level one.
+
 ## 6. Open math questions (with empirical status)
 
 - **Q1 (tropical/Boolean boundary).** The retrieval/composition boundary as alignment between the U
@@ -288,7 +311,11 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-dla -
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-facet
 # causal: ablate the top DLA circuit → flip; Grok μ_t-falsifier (flip split by μ_t WITHIN matched margin bins,
 # + per-cell PR and t→ which-circuit control) → decoupling confirmed (§5c; rope arch — needs predict_ablated)
+# (add --head-sweep for the per-module 1/PR lemma test; heavy: ~nh forwards/rescue)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 300
+# per-block logit reconstruction: Σ_blocks == logit (LE-T5 exact) + block-level decision support by route
+# (§5d; rope arch — needs residual_decomp; the LOGIC_EXPORT LE-T5/LO2 brick)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-reconstruct --n-eval 300
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).

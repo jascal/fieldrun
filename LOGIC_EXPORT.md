@@ -163,8 +163,14 @@ as provenance structure vs intervention diffuseness.
 
 - **LO1** Define the non-scalar (geometry-valued) provenance semiring that carries `G` faithfully (LE-T2);
   prove it reduces to the scalar log/tropical semiring on diagonal `G`.
-- **LO2** `--probe-reconstruct`: measure `Σ_j c_j^v` (export accumulation) vs the true logit — the static
-  residual (decompiler completeness, LE-T5 exact) and its growth under intervention (forge tax, LE-T4).
+- **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
+  **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
+  **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
+  emitted readable fragment is compact at *block* granularity and bottoms out there for composed tokens (below = the
+  dense forge-tax sum). NB the source-level support number (PIC O2 / `σ(t) ∼ PR`) is *not* this block-level σ — at block
+  granularity it mildly reverses (composed slightly more concentrated, being thin-margin); O2 is the circuit-coalition
+  question. *Remaining:* the interventional residual (forge-tax growth under ablation) = the D_j-regression's indirect
+  gap (FINDINGS §5c), already measured.
 - **LO3** Compile the retrievable fragment to an executable semiring-Datalog engine; benchmark
   sparse-(max,+)-matmul decode vs the dense forward (the performance face of §1.5).
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to

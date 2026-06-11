@@ -784,6 +784,65 @@ fn main() {
             return;
         }
 
+        // --probe-reconstruct (LE-T5 / LOGIC_EXPORT LO2): decompose the predicted-token logit into per-block residual
+        // writes (embed + each layer's attn + mlp). Σ_blocks == logit EXACTLY (residual-stream additivity) ⇒ the
+        // reconstruction residual measures decompiler completeness (LE-T5 exact); the per-block concentration of the
+        // t-vs-v* margin is the decision's block-level support number (PIC O2: small=retrieved, large=composed). Rope-only.
+        if has_flag(&args, "--probe-reconstruct") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            if lm.residual_decomp(&ids[..ctx_window.min(ids.len())], &[0]).is_none() {
+                eprintln!("[fieldrun] --probe-reconstruct: arch {arch} has no residual_decomp (rope only)");
+                return;
+            }
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-reconstruct: {} positions — block decomposition…", positions.len());
+            struct R { route: u8, err: f32, block_pr: f32, top1: f32, sigma: usize }
+            let mut nblocks = 0usize;
+            let recs: Vec<R> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain(c)?;
+                let (t, v) = (ex.model_predicts, ex.runner_up);
+                let (_lab, contrib) = lm.residual_decomp(c, &[t, v])?;
+                let lt: f32 = contrib.iter().map(|b| b[0]).sum();
+                let err = (lt - ex.predicted_logit).abs(); // LE-T5: should be ~0 (additive reconstruction is exact)
+                let mut db: Vec<f32> = contrib.iter().map(|b| b[0] - b[1]).collect(); // per-block t-vs-v* pivotality
+                let margin = db.iter().sum::<f32>(); // == Δ (the decision margin)
+                let pos: Vec<f32> = db.iter().copied().filter(|&x| x > 0.0).collect();
+                let (s, sq): (f32, f32) = (pos.iter().sum(), pos.iter().map(|x| x * x).sum());
+                let block_pr = if sq > 0.0 { s * s / sq } else { 1.0 };          // effective # of supporting blocks
+                let top1 = if s > 0.0 { pos.iter().cloned().fold(0.0, f32::max) / s } else { 0.0 }; // top-block share
+                db.sort_by(|a, b| b.partial_cmp(a).unwrap()); // σ = #top blocks to REMOVE to flip (Σ removed > Δ)
+                let (mut acc, mut sigma) = (0.0f32, 0usize);
+                for &x in &db { if acc > margin { break; } acc += x; sigma += 1; }
+                let route = if let Some(st) = &store {
+                    let (kb, _) = st.predict(c);
+                    if kb == t { 0u8 } else if st.candidates(c, &cfg).contains(&t) { 1 } else { 2 }
+                } else { 3 };
+                Some(R { route, err, block_pr, top1, sigma })
+            }).collect();
+            if let Some((lab, _)) = lm.residual_decomp(positions[0], &[0]) { nblocks = lab.len(); }
+            let n = recs.len().max(1) as f32;
+            let (mean_err, max_err) = (recs.iter().map(|r| r.err).sum::<f32>() / n, recs.iter().map(|r| r.err).fold(0.0, f32::max));
+            println!("\n=== (LE-T5) per-block logit reconstruction over {} blocks (embed + {}×{{attn,mlp}}) ===", nblocks, (nblocks - 1) / 2);
+            println!("reconstruction |Σ_blocks − logit|: mean {mean_err:.2e}  max {max_err:.2e}  ⇒ {}",
+                if max_err < 1e-2 { "EXACT (residual-stream additivity holds; the export is faithful by LE-T5)" } else { "NON-zero (missing components / numerical)" });
+            println!("\n=== block-level decision support (margin t-vs-v* across {} blocks) ===", nblocks);
+            println!("{:<12}{:>6}{:>12}{:>14}{:>16}", "route", "n", "block-PR", "top-block %", "σ (drop→flip)");
+            let groups: &[(&str, u8)] = if store.is_some() { &[("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2)] } else { &[("ALL", 3)] };
+            for (lbl, r) in groups {
+                let g: Vec<&R> = recs.iter().filter(|x| x.route == *r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                let m = g.len() as f32;
+                println!("{lbl:<12}{:>6}{:>12.1}{:>13.0}%{:>16.1}", g.len(),
+                    g.iter().map(|x| x.block_pr).sum::<f32>() / m, 100.0 * g.iter().map(|x| x.top1).sum::<f32>() / m,
+                    g.iter().map(|x| x.sigma as f32).sum::<f32>() / m);
+            }
+            println!("⇒ block-PR / σ = the decision's block-level support number (PIC O2): small ⇒ retrieved-concentrated, large ⇒ composed-distributed. This bounds how compact the emitted retrievable Datalog fragment can be (LOGIC_EXPORT LO3).");
+            return;
+        }
+
         // --probe-ablate (CAUSAL test of the μ_t redundancy claim): knock out the top-k DLA circuits in the FORWARD
         // PASS (re-run with them zeroed) and ask whether the prediction flips. Redundancy prediction: COVERED tokens
         // (many individually-sufficient circuits, μ_t≫1) survive (low flip); COMPOSED tokens (emergent, μ_t≈0) collapse
@@ -801,7 +860,9 @@ fn main() {
             }
             let cap = (end - ctx_window).min(n_eval); // k=1: 1 explain + 1 ablated forward / position (cheap → use all n_eval)
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
-            eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…", positions.len());
+            let head_sweep = has_flag(&args, "--head-sweep"); // per-module O(1/PR) lemma test (expensive: nh forwards/rescue)
+            eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…{}", positions.len(),
+                if head_sweep { " (+per-head sweep)" } else { "" });
             // Grok's decisive falsifier: ablate the SINGLE top circuit (k=1), record margin + PR + μ_t per position,
             // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
             // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
@@ -809,8 +870,10 @@ fn main() {
             const KS: [usize; 4] = [1, 2, 3, 5]; // coalition sizes for the additivity test
             struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32,
                        sk: [f32; 4], flipk: [bool; 4], // sk[i] = ΣD_j(top KS[i]) − Δ ; flipk[i] = forward flip ablating those
-                       l_top: usize, sweep: Vec<(usize, bool)> } // L_top = ablated circuit's layer; sweep = (downstream
-                       // layer ℓ, does ablating {top + all of ℓ's attention} un-rescue?) — only filled for k=1 rescues
+                       l_top: usize, sweep: Vec<(usize, bool, bool)>, // L_top = ablated circuit's layer; sweep =
+                       // (downstream layer ℓ, un-rescue via ℓ's ATTN block?, un-rescue via ℓ's MLP block?) — k=1 rescues only
+                       head_tried: usize, head_unresc: usize, pr_at: f32 } // per-MODULE (single downstream head) un-rescue
+                       // counts (--head-sweep): tests Grok's lemma P(single-module un-rescue) ≈ 1/PR. pr_at = PR at this rescue
             let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
@@ -851,19 +914,33 @@ fn main() {
                 // {top circuit + a whole downstream layer ℓ's attention} for each ℓ > L_top and see which ℓ un-rescues
                 // (flips). Concentration at small ℓ-L_top ⇒ local rescue just downstream; spread ⇒ diffuse/deep.
                 let l_top = top.2;
-                let mut sweep: Vec<(usize, bool)> = Vec::new();
+                let mut sweep: Vec<(usize, bool, bool)> = Vec::new();
+                let (mut head_tried, mut head_unresc) = (0usize, 0usize);
                 if sk[0] > 0.0 && !flipk[0] {
                     if let Some((nl, nh)) = lm.dims() {
-                        let base_n: Vec<(usize, usize)> = if top.1 { vec![] } else { vec![(top.2, top.3)] };
+                        let (hh, nnn): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
+                            if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
                         for l2 in (l_top + 1)..nl {
-                            let mut hs: Vec<(usize, usize)> = if top.1 { vec![(top.2, top.3)] } else { vec![] };
-                            hs.extend((0..nh).map(|h| (l2, h)));
-                            let unresc = lm.predict_ablated(c, &hs, &base_n) != Some(t);
-                            sweep.push((l2, unresc));
+                            // ablate {top circuit + whole ATTN block of ℓ} and {top + whole MLP block of ℓ} separately
+                            let un_attn = lm.predict_ablated_blocks(c, &hh, &nnn, &[l2], &[]) != Some(t);
+                            let un_mlp = lm.predict_ablated_blocks(c, &hh, &nnn, &[], &[l2]) != Some(t);
+                            sweep.push((l2, un_attn, un_mlp));
+                        }
+                        // --head-sweep: per-MODULE test of Grok's lemma — ablate {top + a SINGLE downstream head} for
+                        // every downstream head; P(single-module un-rescue) should ≈ 1/PR (≈2%) in the high-PR regime.
+                        if head_sweep {
+                            for l2 in (l_top + 1)..nl {
+                                for h in 0..nh {
+                                    let mut hs = hh.clone();
+                                    hs.push((l2, h));
+                                    head_tried += 1;
+                                    if lm.predict_ablated(c, &hs, &nnn) != Some(t) { head_unresc += 1; }
+                                }
+                            }
                         }
                     }
                 }
-                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk, l_top, sweep })
+                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk, l_top, sweep, head_tried, head_unresc, pr_at: pr })
             }).collect();
             let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
             let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
@@ -1053,18 +1130,34 @@ fn main() {
                 println!("  {lbl:<8}{:>8}{:>12.1}{:>9.0}%", g.len(), g.iter().map(|x| x.l_top as f32).sum::<f32>() / n,
                     100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n);
             }
-            println!("  layer sweep over k=1 rescues: ablate {{top + downstream layer ℓ's attn}} → un-rescue% by relative depth (ℓ−L_top):");
+            println!("  layer sweep over k=1 rescues: ablate {{top + downstream layer ℓ's ATTN | MLP}} → un-rescue% by relative depth (ℓ−L_top):");
+            println!("  {:<10}{:>6}{:>14}{:>14}", "Δdepth", "n", "attn un-resc%", "MLP un-resc%");
             let maxd = recs.iter().flat_map(|x| x.sweep.iter().map(|s| s.0 - x.l_top)).max().unwrap_or(0);
             for d in 1..=maxd.min(10) {
-                let (mut tot, mut un) = (0usize, 0usize);
-                for x in &recs { for &(l2, u) in &x.sweep { if l2 - x.l_top == d { tot += 1; if u { un += 1; } } } }
+                let (mut tot, mut una, mut unm) = (0usize, 0usize, 0usize);
+                for x in &recs { for &(l2, ua, um) in &x.sweep { if l2 - x.l_top == d { tot += 1; if ua { una += 1; } if um { unm += 1; } } } }
                 if tot == 0 { continue; }
-                println!("  Δdepth {d:>2}:  n {:>4}  un-rescue {:>4.0}%", tot, 100.0 * un as f32 / tot as f32);
+                println!("  Δdepth {d:>2}{:>8}{:>13.0}%{:>13.0}%", tot, 100.0 * una as f32 / tot as f32, 100.0 * unm as f32 / tot as f32);
             }
-            let nresc = recs.iter().filter(|x| !x.sweep.is_empty()).count();
-            let breakable = recs.iter().filter(|x| x.sweep.iter().any(|&(_, u)| u)).count();
-            println!("  of {nresc} k=1 rescues, {breakable} ({:.0}%) un-rescued by ablating SOME single downstream layer's attention (else the rescue is diffuse / lives in MLP).",
-                100.0 * breakable as f32 / nresc.max(1) as f32);
+            let nresc = recs.iter().filter(|x| !x.sweep.is_empty()).count().max(1);
+            let brk_a = recs.iter().filter(|x| x.sweep.iter().any(|&(_, ua, _)| ua)).count();
+            let brk_m = recs.iter().filter(|x| x.sweep.iter().any(|&(_, _, um)| um)).count();
+            let brk_e = recs.iter().filter(|x| x.sweep.iter().any(|&(_, ua, um)| ua || um)).count();
+            println!("  of {nresc} k=1 rescues, breakable by SOME single downstream block: attn {brk_a} ({:.0}%) · MLP {brk_m} ({:.0}%) · either {brk_e} ({:.0}%)  [residual = diffuse across layers].",
+                100.0 * brk_a as f32 / nresc as f32, 100.0 * brk_m as f32 / nresc as f32, 100.0 * brk_e as f32 / nresc as f32);
+            if head_sweep {
+                // Grok's PR→localizability lemma: P(single-MODULE un-rescue) ≈ 1/PR. Per-head un-rescue rate, pooled over
+                // all downstream single-head ablations of all rescues, vs the measured mean 1/PR at those rescues.
+                let tried: usize = recs.iter().map(|x| x.head_tried).sum();
+                let unre: usize = recs.iter().map(|x| x.head_unresc).sum();
+                let prr: Vec<f32> = recs.iter().filter(|x| x.head_tried > 0).map(|x| x.pr_at).collect();
+                let mean_pr = if prr.is_empty() { f32::NAN } else { prr.iter().sum::<f32>() / prr.len() as f32 };
+                let perhead = if tried == 0 { f32::NAN } else { 100.0 * unre as f32 / tried as f32 };
+                println!("\n  (Grok lemma) per-MODULE un-rescue: ablate {{top + a SINGLE downstream head}} over ALL such heads:");
+                println!("    {unre}/{tried} single-head ablations un-rescue = {perhead:.1}% per head   vs   1/PR = {:.1}% (mean PR {mean_pr:.0} at rescues)",
+                    100.0 / mean_pr);
+                println!("  ⇒ lemma predicts per-module un-rescue ≈ 1/PR; match ⇒ repair diffuse in a high-PR substrate (no surgical head).");
+            }
             return;
         }
 
