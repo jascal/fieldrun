@@ -157,14 +157,27 @@ impl TextGen {
     ) -> GenOut {
         let ids = self.encode(prompt, add_special);
         let mut acc: Vec<i64> = Vec::new();
+        // WINDOWED incremental decode: decode only `acc[start..]` each step and emit the byte-prefix delta — vs
+        // re-decoding the WHOLE accumulator every token (O(n)/token → O(n²) over a generation). `start` is re-anchored
+        // forward once the window grows past CAP, by ADV tokens, so the per-token decode stays O(window) not O(n). The
+        // re-anchor moves the start far BEHIND the emission tail (≥ CAP-ADV tokens), so BPE/UTF-8 boundary effects at
+        // the new start can't reach the bytes we emit, and the baseline `prev` is re-decoded from the SAME start as the
+        // following tokens, so any decoder-specific leading quirk cancels in the delta. `prev` = decoded text of the
+        // current window. Robust to BPE multi-byte/merge tokens (the `starts_with` guard skips a non-extending update).
+        const CAP: usize = 64;
+        const ADV: usize = 32;
+        let mut start = 0usize;
         let mut prev = String::new();
         // Reuse the K/V of the prefix this prompt shares with the previous turn (uncontended lock; recover a poisoned
-        // mutex rather than cascade a panic). decode the full accumulator each step and emit the byte-prefix delta —
-        // robust to BPE multi-byte/merge tokens.
+        // mutex rather than cascade a panic).
         let mut cache = self.prefix.lock().unwrap_or_else(|e| e.into_inner());
         let out = lm.generate_stream_prefix(&ids, max_tokens, &self.eos, &mut |t| {
             acc.push(t);
-            let text = self.decode(&acc);
+            if acc.len() - start > CAP {
+                start += ADV;
+                prev = self.decode(&acc[start..acc.len() - 1]); // re-baseline to the window WITHOUT this token, so its bytes still emit below
+            }
+            let text = self.decode(&acc[start..]);
             if text.starts_with(&prev) {
                 let delta = &text[prev.len()..];
                 if !delta.is_empty() {
@@ -175,7 +188,9 @@ impl TextGen {
             true
         }, &mut cache);
         let hit_eos = out.len() < max_tokens;
-        GenOut { text: prev, prompt_tokens: ids.len(), completion_tokens: out.len(), hit_eos, prompt_ids: ids, gen_ids: out }
+        // authoritative full reply for the stored text (chat history / non-streaming response) — one O(n) decode, not per token.
+        let text = self.decode(&acc);
+        GenOut { text, prompt_tokens: ids.len(), completion_tokens: out.len(), hit_eos, prompt_ids: ids, gen_ids: out }
     }
 }
 
