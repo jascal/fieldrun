@@ -14,6 +14,11 @@ use safetensors::{Dtype, SafeTensors};
 /// int4 group size (weights along the input dim share one fp16 scale per group). 32 is the GGUF/AWQ default.
 const I4_GROUP: usize = 32;
 
+/// q4a (affine group-int4) group size. 64 (vs int4's 32) keeps the bytes equal — int4 carries one fp16 scale/group
+/// (4 + 16/32 = 4.5 bpw), q4a carries an fp16 scale AND min/group (4 + (16+16)/64 = 4.5 bpw) — so a bench A/B isolates
+/// the *affine* (min-offset) quality win at the SAME bundle size. See the affine quant in `put_q4a`.
+const Q4A_GROUP: usize = 32;
+
 /// A model's weights, possibly sharded. mmaps each file (address space, not RAM); tensors are read on demand.
 struct Model {
     mmaps: Vec<Mmap>,
@@ -118,6 +123,7 @@ impl BundleWriter {
     fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
         if dtype == "int8" { return self.put_i8(name, data, out, inp, true); }
         if dtype == "int4" { return self.put_i4(name, data, out, inp, true); }
+        if dtype == "q4a" { return self.put_q4a(name, data, out, inp, true); }
         let mut t = vec![0f32; inp * out];
         for o in 0..out { for i in 0..inp { t[i * out + o] = data[o * inp + i]; } }
         self.put_small(name, &t, &[inp, out], dtype)
@@ -154,6 +160,79 @@ impl BundleWriter {
         self.bin.write_all(&packed)?;
         self.entry_g(name, "i4", &[out, inp], packed.len(), g);
         self.put_f16(&format!("{name}__scale"), &scale, &[out, ng])
+    }
+
+    /// Affine (asymmetric) group **q4a** from an (out, in) source (`transpose=true`) or (in, out) (`false`). Unsigned
+    /// 4-bit `q ∈ [0,15]` with a per-group fp16 `scale` AND `min`; dequant `x = scale*q + min`. The min offset (vs
+    /// symmetric int4) fits a group whose values aren't zero-centred far better — the same idea as GGUF Q4_1/Q4_K. With
+    /// group 64 the bytes match int4's 4.5 bpw, so the only variable vs int4 is the affine reconstruction. Stored
+    /// output-column-major `(out, in)`, 2 nibbles/byte along `in`; siblings `__scale` and `__min`, each fp16 (out, ng).
+    fn put_q4a(&mut self, name: &str, data: &[f32], rows: usize, cols: usize, transpose: bool) -> std::io::Result<()> {
+        let (out, inp) = if transpose { (rows, cols) } else { (cols, rows) };
+        let at = |i: usize, j: usize| if transpose { data[j * inp + i] } else { data[i * out + j] }; // logical W[in=i, out=j]
+        let g = Q4A_GROUP.min(inp.max(1));
+        let ng = inp.div_ceil(g);
+        let (mut scale, mut mins) = (vec![0f32; out * ng], vec![0f32; out * ng]);
+        for j in 0..out {
+            for gi in 0..ng {
+                let (lo, hi) = (gi * g, ((gi + 1) * g).min(inp));
+                let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                for i in lo..hi {
+                    let v = at(i, j);
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+                scale[j * ng + gi] = ((mx - mn) / 15.0).max(1e-8); // 15 levels for unsigned 4-bit
+                mins[j * ng + gi] = mn;
+            }
+        }
+        let row_bytes = inp.div_ceil(2);
+        let mut packed = vec![0u8; out * row_bytes];
+        for j in 0..out {
+            for i in 0..inp {
+                let gi = j * ng + i / g;
+                let q = (((at(i, j) - mins[gi]) / scale[gi]).round_ties_even()).clamp(0.0, 15.0) as u8; // unsigned [0,15]
+                let b = &mut packed[j * row_bytes + i / 2];
+                if i % 2 == 0 {
+                    *b |= q;
+                } else {
+                    *b |= q << 4;
+                }
+            }
+        }
+        self.bin.write_all(&packed)?;
+        self.entry_g(name, "q4a", &[out, inp], packed.len(), g);
+        self.put_f16(&format!("{name}__scale"), &scale, &[out, ng])?;
+        self.put_f16(&format!("{name}__min"), &mins, &[out, ng])
+    }
+
+    /// ROW-MAJOR per-row int8 for the embed/unembed `(vocab, d)`: each vocab row gets one fp16 scale (`amax/127`),
+    /// stored row-major so it matches the row-contiguous access in `rows_f32`/`rowdot_f32`. Halves the largest tensor
+    /// (a big-vocab lm_head) vs f16. Sibling `__scale` (vocab,). Dtype tag `rowi8`.
+    fn put_embed_i8(&mut self, name: &str, data: &[f32], vocab: usize, d: usize) -> std::io::Result<()> {
+        let mut scale = vec![0f32; vocab];
+        let mut q = vec![0u8; vocab * d];
+        for r in 0..vocab {
+            let amax = (0..d).fold(0f32, |m, c| m.max(data[r * d + c].abs()));
+            let s = (amax / 127.0).max(1e-8);
+            scale[r] = s;
+            for c in 0..d {
+                q[r * d + c] = ((data[r * d + c] / s).round_ties_even().clamp(-127.0, 127.0) as i8) as u8;
+            }
+        }
+        self.bin.write_all(&q)?;
+        self.entry(name, "rowi8", &[vocab, d], q.len());
+        self.put_f16(&format!("{name}__scale"), &scale, &[vocab])
+    }
+
+    /// Write the embed/unembed under the per-tensor-role policy: `embed_dtype=="int8"` → row-major quant (the largest
+    /// tensor for a big-vocab model — the highest-leverage memory lever); anything else falls back to the normal small
+    /// path keyed on the linear `dtype` (f16/f32). Opt-in: default keeps the embed f16 so the f32/int8 gates are intact.
+    fn put_embed(&mut self, name: &str, data: &[f32], shape: &[usize], embed_dtype: &str, dtype: &str) -> std::io::Result<()> {
+        match embed_dtype {
+            "int8" if shape.len() == 2 => self.put_embed_i8(name, data, shape[0], shape[1]),
+            _ => self.put_small(name, data, shape, dtype),
+        }
     }
 
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
@@ -197,7 +276,7 @@ fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
     }
 }
 
-pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std::io::Result<()> {
+pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
     // Pre-flight: catch the common "wrong --arch for this model" mistake with a clear message instead of a deep
     // missing-config-key panic. Map the HF config's model_type to the fieldrun arch family and only error on a
@@ -244,15 +323,15 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
         }
     }
     let n = match arch {
-        "gpt2" => convert_gpt2(&cfg, &m, dtype, out_stem)?,
-        "rope" => convert_rope(&cfg, &m, dtype, out_stem)?,
-        "gemma" => convert_gemma(&cfg, &m, dtype, out_stem)?,
-        "gemma3" => convert_gemma3(&cfg, &m, dtype, out_stem)?,
-        "gemma4" => convert_gemma4(&cfg, &m, dtype, out_stem)?,
-        "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, out_stem)?,
-        "mla" => convert_mla(&cfg, &m, dtype, out_stem)?,
-        "minimax" => convert_minimax(&cfg, &m, dtype, out_stem)?,
-        "dsv4" => convert_dsv4(&cfg, &m, dtype, out_stem)?,
+        "gpt2" => convert_gpt2(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "rope" => convert_rope(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "gemma" => convert_gemma(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "gemma3" => convert_gemma3(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "gemma4" => convert_gemma4(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
         other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
     };
     // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
@@ -272,7 +351,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, out_stem: &str) -> std:
     Ok(())
 }
 
-fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let (nl, nh, d) = (geti(c, "n_layer").unwrap(), geti(c, "n_head").unwrap(), geti(c, "n_embd").unwrap());
     let (npos, vocab) = (geti(c, "n_positions").unwrap(), geti(c, "vocab_size").unwrap());
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gpt2",
@@ -284,8 +363,11 @@ fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
         let (s, dt) = m.read(hf);
         w.put_small(name, &dt, &s, dtype)
     };
-    // wte/wpe/ln_f small (f16 or f32); Conv1D weights (already (in,out)) int8 without transpose, else small as-is
-    sml(&mut w, "wte", &format!("{pre}wte.weight"))?;
+    // wte (tied embed/unembed) honours the per-role embed policy; wpe/ln_f stay small (f16 or f32)
+    {
+        let (s, dt) = m.read(&format!("{pre}wte.weight"));
+        w.put_embed("wte", &dt, &s, edt, dtype)?;
+    }
     sml(&mut w, "wpe", &format!("{pre}wpe.weight"))?;
     sml(&mut w, "ln_f.weight", &format!("{pre}ln_f.weight"))?;
     sml(&mut w, "ln_f.bias", &format!("{pre}ln_f.bias"))?;
@@ -317,7 +399,7 @@ fn rope_theta_eps(c: &serde_json::Value) -> (f64, f64) {
 
 // shared: write the linear/embed/bias arrays for a Llama/Qwen/Gemma layer stack. `norm_offset` adds 1.0 to norm
 // weights (Gemma's x·(1+w)). `norms` lists the (fieldrun, hf) RMSNorm names per layer.
-fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -328,13 +410,13 @@ fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "rope",
         "config": [nl, nh, nkv, hd, d, ffn, vocab, tie as usize], "config_f": [theta, eps] });
     let mut w = BundleWriter::new(stem)?;
-    write_layers(&mut w, c, m, dtype, nl, tie, &[("in_ln", "input_layernorm"), ("post_ln", "post_attention_layernorm")], false)?;
+    write_layers(&mut w, c, m, dtype, edt, nl, tie, &[("in_ln", "input_layernorm"), ("post_ln", "post_attention_layernorm")], false)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
 }
 
-fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -351,7 +433,7 @@ fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> s
     let mut w = BundleWriter::new(stem)?;
     let norms = [("input_layernorm", "input_layernorm"), ("post_attention_layernorm", "post_attention_layernorm"),
                  ("pre_feedforward_layernorm", "pre_feedforward_layernorm"), ("post_feedforward_layernorm", "post_feedforward_layernorm")];
-    write_layers(&mut w, c, m, dtype, nl, tie, &norms, true)?;
+    write_layers(&mut w, c, m, dtype, edt, nl, tie, &norms, true)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
@@ -361,7 +443,7 @@ fn convert_gemma(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> s
 /// global θ for full layers), a 5:1 sliding:full layer pattern, and NO logit soft-capping. head_dim is shared across
 /// layer types (unlike Gemma 4). Per-layer sliding flags (from `layer_types`) are packed into `config` so the kernel
 /// needn't re-derive the pattern. `config_f` carries both RoPE bases.
-fn convert_gemma3(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_gemma3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -389,7 +471,7 @@ fn convert_gemma3(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
     let norms = [("input_layernorm", "input_layernorm"), ("post_attention_layernorm", "post_attention_layernorm"),
                  ("pre_feedforward_layernorm", "pre_feedforward_layernorm"), ("post_feedforward_layernorm", "post_feedforward_layernorm"),
                  ("self_attn.q_norm", "self_attn.q_norm"), ("self_attn.k_norm", "self_attn.k_norm")];
-    write_layers(&mut w, c, m, dtype, nl, tie, &norms, true)?;
+    write_layers(&mut w, c, m, dtype, edt, nl, tie, &norms, true)?;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
@@ -410,7 +492,7 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
 /// RoPE on global layers (handled in the kernel by zero-padding inv_freq), and the Per-Layer-Embedding gated-residual
 /// block. attention_k_eq_v (global layers drop v_proj) and KV-sharing (the last num_kv_shared_layers drop k/v/k_norm) are
 /// both supported.
-fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     // attention_k_eq_v: GLOBAL layers carry no v_proj — V is the k_proj output (value-normed) — and use
     // num_global_key_value_heads KV heads. We record the flag and skip the absent v_proj weights below.
     let k_eq_v = c.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -473,7 +555,7 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
     };
     // main + PLE embeddings (both f16/f32, never int8 — embed stays low-precision)
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     let (es2, ed2) = m.read("model.embed_tokens_per_layer.weight"); // (vocab_per_layer, nl*ple)
     w.put_small("embed_per_layer", &ed2, &es2, dtype)?;
     norm(&mut w, "norm", "model.norm.weight")?;
@@ -488,7 +570,7 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
     }
     if !tie {
         let (s, dt) = m.read("lm_head.weight"); // (vocab, d) — raw for rowdot_f32, low-precision
-        w.put_small("lm_head", &dt, &s, dtype)?;
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     for l in 0..nl {
         let p = format!("model.layers.{l}.");
@@ -550,7 +632,7 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> 
 /// Experts are written one int8 array each (offload), so this reaches Qwen3-MoE on a ≤24 GB box. No attention bias
 /// (Qwen3 dropped it), no embed scale, no soft-capping. Sliding window (`use_sliding_window`) applies ONE window to
 /// every layer (no per-layer pattern; the window is appended to `config` after the MoE flags, 0 = full attention).
-fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let swa = c.get("use_sliding_window").and_then(|v| v.as_bool()).unwrap_or(false);
     let window = if swa { geti(c, "sliding_window").unwrap_or(4096) } else { 0 };
     let nh = geti(c, "num_attention_heads").unwrap();
@@ -584,11 +666,11 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     norm(&mut w, "norm", "model.norm.weight")?;
     if !tie {
         let (s, dt) = m.read("lm_head.weight"); // (vocab, d) — raw for rowdot_f32, low-precision
-        w.put_small("lm_head", &dt, &s, dtype)?;
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     for l in 0..nl {
         let p = format!("model.layers.{l}.");
@@ -626,7 +708,7 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -
 /// is passed through in `config_f`. Interleaved rotary weights (`rope_interleave`, the DeepSeek default) are
 /// de-interleaved here — the permutation is baked into the q_b/q and kv_a rotary rows so the runtime's split-half
 /// rope matches the torch interleave path exactly.
-fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nl = geti(c, "num_hidden_layers").unwrap();
     let nh = geti(c, "num_attention_heads").unwrap();
     let d = geti(c, "hidden_size").unwrap();
@@ -704,10 +786,10 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
     let qkh = qk_nope + qk_rope;
     let q_rot_starts: Vec<usize> = (0..nh).map(|h| h * qkh + qk_nope).collect();
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     norm(&mut w, "norm", "model.norm.weight")?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight"); w.put_small("lm_head", &dt, &s, dtype)?;
+        let (s, dt) = m.read("lm_head.weight"); w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     // experts ship either packed (experts.gate_up_proj/down_proj 3D) or per-expert Linears — write per-expert gate/up/down either way.
     let write_experts = |w: &mut BundleWriter, p: &str, l: usize| -> std::io::Result<()> {
@@ -774,7 +856,7 @@ fn convert_mla(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std
 /// MiniMax-M2 — the RoPE backbone + FULL-WIDTH q/k-norm (RMSNorm over the whole nh·hd / nkv·hd projection, not
 /// per-head) + an all-MoE FFN with a sigmoid router (sigmoid scores + bias for the choice, sigmoid scores renormed for
 /// the weight; no group limiting, no shared expert). Experts written one int8 array each (offload).
-fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -798,10 +880,10 @@ fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) ->
         let (s, dt) = m.read(hf); w.put_lin(name, &dt, s[0], s[1], dtype)
     };
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     norm(&mut w, "norm", "model.norm.weight")?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight"); w.put_small("lm_head", &dt, &s, dtype)?;
+        let (s, dt) = m.read("lm_head.weight"); w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     // MiniMax-M2 uses Mixtral-style MoE naming: block_sparse_moe.{gate, e_score_correction_bias,
     // experts.{e}.w1/w2/w3} where w1=gate_proj, w2=down_proj, w3=up_proj.
@@ -832,7 +914,7 @@ fn convert_minimax(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) ->
 
 /// Shared Llama/Qwen/Gemma writer: embed (f16) + final norm + per-layer norms (with optional +1 bake) + the
 /// q/k/v/o/gate/up/down Linears (transposed, int8 or f16) + optional q/k/v bias.
-fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, nl: usize, tie: bool,
+fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, nl: usize, tie: bool,
                 norms: &[(&str, &str)], bake1: bool) -> std::io::Result<()> {
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
         let (s, mut dt) = m.read(hf);
@@ -843,13 +925,14 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
         let (s, dt) = m.read(hf); // (out, in)
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
+    // embed (and the tied unembed) honour the per-role `edt` policy — quantising the largest tensor (opt-in).
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     norm(w, "norm", "model.norm.weight")?;
     if !tie {
         // unembed is read row-wise by rowdot_f32 as (vocab, d) → store raw (NOT transposed), low-precision like embed
         let (s, dt) = m.read("lm_head.weight"); // (vocab, d)
-        w.put_small("lm_head", &dt, &s, dtype)?;
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     let _ = c;
     for l in 0..nl {
@@ -884,7 +967,7 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
 /// grouped o_proj written as one block per group, per-head attention sinks, the two mHC HyperConnections + the final
 /// HyperHead (fn/base/scale params), the sqrtsoftplus router (+ e_score_correction_bias) over packed experts, and the
 /// always-on shared expert. config packs the dims; config_f the rope-theta/eps/clamp/scale scalars.
-fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nl = geti(c, "num_hidden_layers").unwrap();
     let nh = geti(c, "num_attention_heads").unwrap();
     let hd = geti(c, "head_dim").unwrap();
@@ -942,10 +1025,10 @@ fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, stem: &str) -> st
     };
     // embeddings stay low-precision; lm_head raw (vocab, d) for rowdot_f32 when untied.
     let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_small("embed", &ed, &es, dtype)?;
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
     if !tie {
         let (s, dt) = m.read("lm_head.weight");
-        w.put_small("lm_head", &dt, &s, dtype)?;
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     norm(&mut w, "norm", "model.norm.weight")?;
     // HyperHead (final stream collapse)
@@ -1046,5 +1129,57 @@ mod tests {
         let (r0, r1) = (b.weight_row("m", 0), b.weight_row("m", 1));
         assert!((r0[0] - 1.0).abs() < 0.05 && (r0[1] - 2.0).abs() < 0.05, "{r0:?}");
         assert!((r1[0] - 3.0).abs() < 0.05 && (r1[1] - 4.0).abs() < 0.05, "{r1:?}");
+    }
+
+    /// The point of q4a: on a non-zero-centred weight (values clustered around +0.5), symmetric int4 wastes range on
+    /// the unused negative half, while q4a's per-group `min` captures the offset — so at equal bytes q4a's
+    /// reconstruction error must be far lower. Exercises the real convert→load→weight_row path for both dtypes.
+    #[test]
+    fn q4a_beats_int4_on_offset_data() {
+        let (inp, out) = (128usize, 4usize);
+        let data: Vec<f32> = (0..inp * out).map(|t| 0.5 + 0.18 * ((t % 37) as f32 / 37.0 - 0.5)).collect(); // ~[0.41, 0.59]
+        let dir = std::env::temp_dir().join(format!("fr_q4a_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut w = BundleWriter::new(&stem).unwrap();
+        w.put_i4("wi4", &data, inp, out, false).unwrap();
+        w.put_q4a("wq4a", &data, inp, out, false).unwrap();
+        w.finish(&stem, json!({"format": "fieldrun-bundle", "version": 1, "arch": "test", "config": []})).unwrap();
+        let b = crate::bundle::Bundle::load(&stem).unwrap();
+        let mse = |name: &str| -> f32 {
+            let mut e = 0.0f32;
+            for r in 0..inp {
+                let row = b.weight_row(name, r);
+                for j in 0..out {
+                    let d = row[j] - data[r * out + j];
+                    e += d * d;
+                }
+            }
+            e / (inp * out) as f32
+        };
+        let (e_i4, e_q4a) = (mse("wi4"), mse("wq4a"));
+        assert!(e_q4a < e_i4 * 0.5, "q4a MSE {e_q4a} should be << int4 MSE {e_i4} on offset data");
+    }
+
+    /// Row-major int8 embed (Phase 4b): rows_f32 must reconstruct each vocab row within the per-row int8 step, and
+    /// rowdot_f32 / weight_row (the tied-unembed + explain paths) must agree with the dequantised row.
+    #[test]
+    fn rowi8_embed_roundtrip() {
+        let data: Vec<f32> = vec![0.1, -0.2, 0.3, -0.4, 1.0, -2.0, 0.5, 0.25, -0.7, 0.8, -0.9, 0.6]; // (vocab=3, d=4)
+        let dir = std::env::temp_dir().join(format!("fr_rowi8_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut w = BundleWriter::new(&stem).unwrap();
+        w.put_embed_i8("embed", &data, 3, 4).unwrap();
+        w.finish(&stem, json!({"format": "fieldrun-bundle", "version": 1, "arch": "test", "config": []})).unwrap();
+        let b = crate::bundle::Bundle::load(&stem).unwrap();
+        let rows = b.rows_f32("embed", &[1]); // row 1 = [1.0,-2.0,0.5,0.25]; amax 2.0 -> step ~0.0157
+        for (g, &want) in rows.row(0).iter().zip(&data[4..8]) {
+            assert!((g - want).abs() < 0.02, "rows_f32 got {g} want {want}");
+        }
+        let wr = b.weight_row("embed", 1); // explain path must match rows_f32
+        assert!(wr.iter().zip(rows.row(0)).all(|(a, b)| (a - b).abs() < 1e-6), "weight_row != rows_f32");
+        let dots = b.rowdot_f32("embed", &[1.0, 1.0, 1.0, 1.0]); // dot with ones = sum of the dequantised row
+        assert!((dots[1] - rows.row(0).sum()).abs() < 1e-4, "rowdot {} vs {}", dots[1], rows.row(0).sum());
     }
 }

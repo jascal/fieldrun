@@ -13,9 +13,13 @@
 //!    reasonable generic default — not necessarily the model's exact trained template). Not the model's real
 //!    tokenizer? then text endpoints 400; the native endpoints still work. `"stream": true` streams tokens as SSE.
 //!    Tool/function calling: pass `tools` (OpenAI `{type:"function",function:{…}}` or Anthropic `{name,input_schema}`)
-//!    and fieldrun declares them in the prompt and returns structured `tool_calls` / `tool_use` (see `tools.rs`; tool
-//!    requests are answered non-streaming). fieldrun extension: `"explain": true` attaches the structured Explanation
-//!    under a `fieldrun_explanation` field (non-streaming; clients ignore the unknown field; canonical: POST /explain).
+//!    and fieldrun declares them in the prompt and returns structured `tool_calls` / `tool_use` (see `tools.rs`). When
+//!    `stream:true`, tool calls are emitted as SSE deltas (OpenAI `chat.completion.chunk` `tool_calls` / Anthropic
+//!    `tool_use` content blocks) — fieldrun buffers the generation to parse the calls, then streams the parsed result,
+//!    so a streaming client (e.g. opencode via the AI SDK) always gets a `text/event-stream`, never a bare JSON body.
+//!    fieldrun extension: `"explain": true` attaches the structured Explanation under a `fieldrun_explanation` field
+//!    (non-streaming response; clients ignore the unknown field) and, under `--serve`, also prints it to the server
+//!    console; canonical structured route: POST /explain.
 
 use serde::Deserialize;
 
@@ -40,6 +44,18 @@ fn default_n() -> usize {
 #[derive(Deserialize)]
 struct ExplainReq {
     ids: Vec<i64>,
+}
+
+/// The result of one `TextGen::gen` call. Beyond the text + token counts, it carries the prompt and generated token
+/// ids so callers can run `explain_steps` — an explanation per generated token (every forward pass of the reply).
+#[cfg(feature = "api")]
+pub struct GenOut {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub hit_eos: bool,
+    pub prompt_ids: Vec<i64>,
+    pub gen_ids: Vec<i64>,
 }
 
 /// Text generation over a bundled tokenizer (the OpenAI/Anthropic + `--chat` layer). Only built with `--features api`.
@@ -81,6 +97,18 @@ impl TextGen {
         self.tok.decode(&u, true).unwrap_or_default()
     }
 
+    /// A display label for a token id, used in explain output: its decoded text quoted (`" lunch" [54809]`), or for a
+    /// special token that decodes to "" its vocab name (`<|im_start|> [151644]`), with the id appended.
+    fn token_label(&self, id: i64) -> String {
+        let s = self.decode(&[id]);
+        let meaning = if !s.is_empty() { format!("{s:?}") } else { self.id_to_token(id).unwrap_or_default() };
+        if meaning.is_empty() {
+            format!("[{id}]")
+        } else {
+            format!("{meaning} [{id}]")
+        }
+    }
+
     /// Sensible default reply cap when the caller/CLI doesn't set one. Token budget tracks *thinking*, not model size:
     /// a reasoning model (a tokenizer that knows a `<think>`-style token) spends hundreds-to-thousands of tokens before
     /// the answer, so 256 would truncate mid-thought — give those 2048; everything else 512. Always overridable
@@ -117,7 +145,8 @@ impl TextGen {
 
     /// Generate from a text prompt with **early-stop at EOS** (no compute past the natural end). `on_text` receives
     /// each newly-decoded text chunk *as it is produced* — used for live chat + SSE streaming. Returns
-    /// (full_text, prompt_tokens, completion_tokens, hit_eos).
+    /// (full_text, prompt_tokens, completion_tokens, hit_eos, prompt_ids, generated_ids). The two id vectors let the
+    /// caller explain *every* forward pass of the reply (one per generated token), not just the end-of-prompt one.
     pub fn gen(
         &self,
         lm: &dyn Model,
@@ -125,7 +154,7 @@ impl TextGen {
         max_tokens: usize,
         add_special: bool,
         on_text: &mut dyn FnMut(&str),
-    ) -> (String, usize, usize, bool) {
+    ) -> GenOut {
         let ids = self.encode(prompt, add_special);
         let mut acc: Vec<i64> = Vec::new();
         let mut prev = String::new();
@@ -145,7 +174,8 @@ impl TextGen {
             prev = text;
             true
         }, &mut cache);
-        (prev, ids.len(), out.len(), out.len() < max_tokens)
+        let hit_eos = out.len() < max_tokens;
+        GenOut { text: prev, prompt_tokens: ids.len(), completion_tokens: out.len(), hit_eos, prompt_ids: ids, gen_ids: out }
     }
 }
 
@@ -168,18 +198,21 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
     };
     eprintln!("[fieldrun] serving {arch} on http://0.0.0.0:{port}  (POST /predict /generate /explain · GET /health{openai})");
     for mut req in server.incoming_requests() {
+        let method = req.method().to_string();
         let url = req.url().to_string();
         #[cfg(feature = "api")]
         let route = url.split('?').next().unwrap_or(&url).to_string();
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);
-        // SSE streaming for the text endpoints when the client asks for `"stream": true`.
+        // one log line per request so `--serve` shows activity (route + stream/tools/explain flags), not just silence.
+        log_request(&method, url.split('?').next().unwrap_or(&url), &body);
+        // SSE streaming for the text endpoints when the client asks for `"stream": true` — INCLUDING tool requests
+        // (serve_stream buffers the generation, parses the calls, then emits them as SSE; the old code answered tool
+        // requests with a non-streaming JSON body even when the client asked to stream, which an SSE client can't read).
         #[cfg(feature = "api")]
         if let Some(tg) = textgen.as_ref() {
             let streamable = matches!(route.as_str(), "/v1/chat/completions" | "/v1/completions" | "/v1/messages");
-            // tool requests don't stream — we need the whole output to parse calls out of it, so they go to handle().
-            let has_tools = !crate::tools::parse_tools(&serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)).is_empty();
-            if streamable && !has_tools && wants_stream(&body) {
+            if streamable && wants_stream(&body) {
                 serve_stream(req, &route, &body, lm.as_ref(), arch, tg);
                 continue;
             }
@@ -188,6 +221,27 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
         let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
         let _ = req.respond(tiny_http::Response::from_string(json).with_header(header));
     }
+}
+
+/// One concise console line per request under `--serve`, summarising the route and the request flags that matter for
+/// debugging a client integration (streaming on/off, how many tools were offered, whether the explain extension is set).
+fn log_request(method: &str, route: &str, body: &str) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let b = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let n_arr = |k: &str| v.get(k).and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+    let n_tools = n_arr("tools") + n_arr("functions");
+    let mut flags: Vec<String> = Vec::new();
+    if b("stream") {
+        flags.push("stream".into());
+    }
+    if n_tools > 0 {
+        flags.push(format!("tools={n_tools}"));
+    }
+    if b("explain") {
+        flags.push("explain".into());
+    }
+    let suffix = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
+    eprintln!("[fieldrun] {method} {route}{suffix}");
 }
 
 #[cfg(feature = "api")]
@@ -231,8 +285,14 @@ impl std::io::Read for SseReader {
     }
 }
 
-/// Stream a chat/completion as Server-Sent Events. Generation runs on a scoped thread (borrowing the model — `Model:
-/// Sync` makes `&dyn Model` Send) and pushes SSE frames into a channel that the response reader drains.
+/// Stream a chat/completion as Server-Sent Events.
+///
+/// Two paths share one transport (`text/event-stream`):
+///  - **no tools** — generation runs on a scoped thread (borrowing the model — `Model: Sync` makes `&dyn Model` Send)
+///    and pushes SSE frames into a channel as each token is produced, so the client sees text live.
+///  - **tools offered** — we must see the *whole* output to parse `<tool_call>` blocks out of it, so we generate fully
+///    (buffered), parse, and then emit the parsed result as SSE frames (tool-call deltas, or the plain text if the
+///    model just answered). The client still gets a stream — just delivered after generation rather than token-by-token.
 #[cfg(feature = "api")]
 fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen) {
     #[derive(serde::Deserialize)]
@@ -245,17 +305,53 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
         system: String,
         #[serde(default)]
         max_tokens: Option<usize>,
+        #[serde(default)]
+        explain: bool,
     }
-    let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None });
+    let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None, explain: false });
     let max_tokens = r.max_tokens.unwrap_or_else(|| tg.default_max_tokens()).clamp(1, 16384);
-    // tool calls don't stream (we parse the whole output) — serve() routes tool requests to the non-streaming handler,
-    // so here messages carry at most prior tool calls/results, which render_chat renders into the prompt.
+    let bv: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let tools = crate::tools::parse_tools(&bv);
+    // Build the prompt exactly as the non-streaming handler does, so streamed and buffered responses are identical:
+    // a tool preamble + top-level system are merged ahead of render_chat (which also renders prior tool round-trips).
     let (prompt, add_special) = if route == "/v1/completions" {
         (r.prompt.clone(), true)
     } else {
-        let sys = if r.system.is_empty() { None } else { Some(r.system.as_str()) };
-        (render_chat(sys, &r.messages), false)
+        let mut sys_extra = String::new();
+        if !tools.is_empty() {
+            sys_extra.push_str(&crate::tools::preamble(&tools));
+        }
+        if !r.system.is_empty() {
+            if !sys_extra.is_empty() {
+                sys_extra.push_str("\n\n");
+            }
+            sys_extra.push_str(&r.system);
+        }
+        (render_chat(if sys_extra.is_empty() { None } else { Some(&sys_extra) }, &r.messages), false)
     };
+    // Completions don't carry tools in the OpenAI schema; tools only apply to the chat/messages routes.
+    let want_tools = route != "/v1/completions" && !tools.is_empty() && !crate::tools::choice_none(&bv);
+
+    if want_tools {
+        // Buffered tool-aware path: generate the whole reply, (optionally) log the explanation, parse calls, emit SSE.
+        let g = tg.gen(lm, &prompt, max_tokens, add_special, &mut |_| {});
+        if r.explain {
+            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
+        }
+        let calls = crate::tools::parse_calls(&g.text);
+        let id = now();
+        let frames = if route == "/v1/messages" {
+            anthropic_tool_frames(arch, id, &g.text, &calls, g.hit_eos)
+        } else {
+            openai_tool_frames(arch, id, &g.text, &calls, g.completion_tokens, g.hit_eos)
+        };
+        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).unwrap();
+        let len = frames.len();
+        let resp = tiny_http::Response::new(200.into(), vec![header], std::io::Cursor::new(frames), Some(len), None);
+        let _ = req.respond(resp);
+        return;
+    }
+
     let route = route.to_string();
     let arch = arch.to_string();
     std::thread::scope(|s| {
@@ -269,14 +365,116 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
             let mut on_text = |chunk: &str| {
                 let _ = tx.send(sse_delta(&route, &arch, id, chunk));
             };
-            tg.gen(lm, &prompt, max_tokens, add_special, &mut on_text);
+            let g = tg.gen(lm, &prompt, max_tokens, add_special, &mut on_text);
             let _ = tx.send(sse_close(&route, &arch, id));
+            if r.explain {
+                // print the full explain trace (one frame per generated token) to the server console post-stream
+                log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
+            }
             // tx dropped here -> channel closes -> reader EOFs
         });
         let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).unwrap();
         let resp = tiny_http::Response::new(200.into(), vec![header], SseReader { rx, buf: Vec::new(), pos: 0 }, None, None);
         let _ = req.respond(resp);
     });
+}
+
+/// OpenAI streaming tool-call frames: a `role` chunk, then either the answer text (model didn't call a tool) or one
+/// `tool_calls` delta per parsed call (each carries `index`, `id`, `type`, and the full `function.name`+`arguments`
+/// string in a single fragment — the AI SDK assembles them by `index`), then a terminal `finish_reason` chunk + `[DONE]`.
+#[cfg(feature = "api")]
+fn openai_tool_frames(arch: &str, id: u64, text: &str, calls: &[crate::tools::ToolCall], ct: usize, eos: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut push = |delta: serde_json::Value, finish: Option<&str>| {
+        let j = serde_json::json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","model":arch,
+            "choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        out.extend_from_slice(format!("data: {j}\n\n").as_bytes());
+    };
+    push(serde_json::json!({"role":"assistant"}), None);
+    if calls.is_empty() {
+        if !text.is_empty() {
+            push(serde_json::json!({"content": text}), None);
+        }
+        push(serde_json::json!({}), Some(if eos { "stop" } else { "length" }));
+    } else {
+        let lead = crate::tools::leading_text(text);
+        if !lead.is_empty() {
+            push(serde_json::json!({"content": lead}), None);
+        }
+        for (i, c) in calls.iter().enumerate() {
+            let args = serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into());
+            push(serde_json::json!({"tool_calls":[{"index":i,"id":format!("call_{id}_{i}"),"type":"function",
+                "function":{"name":c.name,"arguments":args}}]}), None);
+        }
+        push(serde_json::json!({}), Some("tool_calls"));
+    }
+    // final usage-only chunk (clients that set stream_options.include_usage read it; others ignore the empty choices)
+    let usage = serde_json::json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","model":arch,
+        "choices":[],"usage":{"completion_tokens":ct}});
+    out.extend_from_slice(format!("data: {usage}\n\n").as_bytes());
+    out.extend_from_slice(b"data: [DONE]\n\n");
+    out
+}
+
+/// Anthropic streaming tool-use frames: `message_start`, then a text content block (if the model produced leading prose
+/// or no call at all) and/or one `tool_use` content block per call — each a `content_block_start` carrying the tool
+/// name, an `input_json_delta` with the full arguments JSON as `partial_json`, and a `content_block_stop` — closed by
+/// `message_delta` (`stop_reason`) + `message_stop`.
+#[cfg(feature = "api")]
+fn anthropic_tool_frames(arch: &str, id: u64, text: &str, calls: &[crate::tools::ToolCall], eos: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut emit = |event: &str, data: serde_json::Value| {
+        out.extend_from_slice(format!("event: {event}\ndata: {data}\n\n").as_bytes());
+    };
+    emit("message_start", serde_json::json!({"type":"message_start","message":{"id":format!("msg_{id}"),
+        "type":"message","role":"assistant","model":arch,"content":[],"stop_reason":serde_json::Value::Null,
+        "usage":{"input_tokens":0,"output_tokens":0}}}));
+    let mut idx = 0usize;
+    let text_block = |out_emit: &mut dyn FnMut(&str, serde_json::Value), idx: usize, body: &str| {
+        out_emit("content_block_start", serde_json::json!({"type":"content_block_start","index":idx,
+            "content_block":{"type":"text","text":""}}));
+        out_emit("content_block_delta", serde_json::json!({"type":"content_block_delta","index":idx,
+            "delta":{"type":"text_delta","text":body}}));
+        out_emit("content_block_stop", serde_json::json!({"type":"content_block_stop","index":idx}));
+    };
+    if calls.is_empty() {
+        text_block(&mut emit, idx, text);
+        emit("message_delta", serde_json::json!({"type":"message_delta",
+            "delta":{"stop_reason": if eos {"end_turn"} else {"max_tokens"}},"usage":{"output_tokens":0}}));
+        emit("message_stop", serde_json::json!({"type":"message_stop"}));
+        return out;
+    }
+    let lead = crate::tools::leading_text(text);
+    if !lead.is_empty() {
+        text_block(&mut emit, idx, &lead);
+        idx += 1;
+    }
+    for (i, c) in calls.iter().enumerate() {
+        emit("content_block_start", serde_json::json!({"type":"content_block_start","index":idx,
+            "content_block":{"type":"tool_use","id":format!("toolu_{id}_{i}"),"name":c.name,"input":{}}}));
+        let args = serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into());
+        emit("content_block_delta", serde_json::json!({"type":"content_block_delta","index":idx,
+            "delta":{"type":"input_json_delta","partial_json":args}}));
+        emit("content_block_stop", serde_json::json!({"type":"content_block_stop","index":idx}));
+        idx += 1;
+    }
+    emit("message_delta", serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},
+        "usage":{"output_tokens":0}}));
+    emit("message_stop", serde_json::json!({"type":"message_stop"}));
+    out
+}
+
+/// Print the full explain TRACE (one frame per generated token) to the server console (stderr). Used under `--serve`
+/// when a request sets `"explain": true` — the streamed/JSON response can't always carry the extension field, so the
+/// operator watches the circuits + named features for every forward pass of the reply on the console.
+#[cfg(feature = "api")]
+fn log_explanation(lm: &dyn Model, tg: &TextGen, prompt_ids: &[i64], gen_ids: &[i64]) {
+    let steps = explain_steps(lm, prompt_ids, gen_ids);
+    if steps.is_empty() {
+        return;
+    }
+    let dec = |id: i64| tg.token_label(id);
+    eprintln!("[fieldrun] {}", render_explain_trace(&steps, &dec, 10));
 }
 
 #[cfg(feature = "api")]
@@ -419,20 +617,61 @@ fn tool_result_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// The structured Explanation for the model's prediction at the end of `prompt`, as a JSON value to graft onto an API
-/// response. There is no cross-vendor standard for returning interpretability data over the OpenAI/Anthropic schemas
-/// (reasoning/thinking blocks are for CoT *text*, not circuits), so fieldrun returns it in a namespaced extension field
-/// — standard clients ignore unknown fields; the canonical structured form is the native `POST /explain` route.
+/// One Explanation per generated token — the forward pass that produced each token of the reply. These models generate
+/// one token at a time ("loop and think"), so a single end-of-prompt explanation only covers the FIRST step; this
+/// walks the whole reply. Step k explains the prediction at `prompt_ids ++ gen_ids[0..k]`, whose greedy top-1 is
+/// `gen_ids[k]` (so each step's `model_predicts` == that step's token). Empty if the arch has no explain. NB: re-runs a
+/// forward pass per generated token — an opt-in interpretability/debug surface, deliberately off the hot path.
 #[cfg(feature = "api")]
-fn explanation_json(lm: &dyn Model, tg: &TextGen, prompt: &str, add_special: bool) -> serde_json::Value {
-    let pids = tg.encode(prompt, add_special);
-    if pids.is_empty() {
-        return serde_json::Value::Null;
+fn explain_steps(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64]) -> Vec<crate::explain::Explanation> {
+    let mut ctx = prompt_ids.to_vec();
+    let mut steps = Vec::new();
+    if gen_ids.is_empty() {
+        // No tokens generated (immediate EOS / max_tokens 0) — still explain what the prompt-end would predict.
+        if !ctx.is_empty() {
+            if let Some(ex) = lm.explain(&ctx) {
+                steps.push(ex);
+            }
+        }
+        return steps;
     }
-    match lm.explain(&pids) {
-        Some(ex) => serde_json::to_value(&ex).unwrap_or(serde_json::Value::Null),
-        None => serde_json::json!({ "error": "explain not supported for this arch" }),
+    for &t in gen_ids {
+        if let Some(ex) = lm.explain(&ctx) {
+            steps.push(ex);
+        }
+        ctx.push(t);
     }
+    steps
+}
+
+/// Render the explain TRACE — the per-token "debugger stack" of forward passes — for the console / text UI. Each
+/// generated token is a frame (`#k predicts <token>`) followed by that step's circuits + features. `max_ctx` trims
+/// each frame's printed context preview (0 = all). One frame == one forward pass; stepping the stack == watching the
+/// model think token-by-token.
+#[cfg(feature = "api")]
+fn render_explain_trace(steps: &[crate::explain::Explanation], dec: &dyn Fn(i64) -> String, max_ctx: usize) -> String {
+    if steps.is_empty() {
+        return "explain: not supported for this arch (or empty prompt)".to_string();
+    }
+    let mut out = vec![format!("explain trace — {} forward pass(es), one frame per generated token (debugger mode):", steps.len())];
+    for (k, ex) in steps.iter().enumerate() {
+        out.push(format!("\n┌─ #{k} predicts {}", dec(ex.model_predicts)));
+        out.push(crate::explain::render(ex, dec, max_ctx));
+    }
+    out.join("\n")
+}
+
+/// The explain trace as JSON — an array of per-token Explanations (one forward pass each) — to graft onto an API
+/// response under `fieldrun_explanation`. There is no cross-vendor standard for returning interpretability data over
+/// the OpenAI/Anthropic schemas (reasoning/thinking blocks are for CoT *text*, not circuits), so fieldrun namespaces
+/// it; standard clients ignore the unknown field. Canonical structured form: the native `POST /explain` route.
+#[cfg(feature = "api")]
+fn explanation_steps_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64]) -> serde_json::Value {
+    let steps = explain_steps(lm, prompt_ids, gen_ids);
+    if steps.is_empty() {
+        return serde_json::json!({ "error": "explain not supported for this arch" });
+    }
+    serde_json::Value::Array(steps.iter().map(|ex| serde_json::to_value(ex).unwrap_or(serde_json::Value::Null)).collect())
 }
 
 #[cfg(feature = "api")]
@@ -458,14 +697,15 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
 
     if route == "/v1/completions" {
         // OpenAI text completion — raw prompt, with the tokenizer's special tokens
-        let (text, pt, ct, eos) = tg.gen(lm, &r.prompt, max_tokens, true, &mut |_| {});
+        let g = tg.gen(lm, &r.prompt, max_tokens, true, &mut |_| {});
         let mut v = serde_json::json!({
             "id": format!("cmpl-{}", now()), "object": "text_completion", "created": now(), "model": arch,
-            "choices": [{ "text": text, "index": 0, "finish_reason": if eos {"stop"} else {"length"} }],
-            "usage": { "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct }
+            "choices": [{ "text": g.text, "index": 0, "finish_reason": if g.hit_eos {"stop"} else {"length"} }],
+            "usage": { "prompt_tokens": g.prompt_tokens, "completion_tokens": g.completion_tokens, "total_tokens": g.prompt_tokens + g.completion_tokens }
         });
         if r.explain {
-            v["fieldrun_explanation"] = explanation_json(lm, tg, &r.prompt, true);
+            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
+            v["fieldrun_explanation"] = explanation_steps_json(lm, &g.prompt_ids, &g.gen_ids);
         }
         return v.to_string();
     }
@@ -486,8 +726,12 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         sys_extra.push_str(&r.system);
     }
     let prompt = render_chat(if sys_extra.is_empty() { None } else { Some(&sys_extra) }, &r.messages);
-    let (text, pt, ct, eos) = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
-    let explanation = if r.explain { Some(explanation_json(lm, tg, &prompt, false)) } else { None };
+    let g = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
+    if r.explain {
+        log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids); // also print the full explain trace to the server console under --serve
+    }
+    let explanation = if r.explain { Some(explanation_steps_json(lm, &g.prompt_ids, &g.gen_ids)) } else { None };
+    let GenOut { text, prompt_tokens: pt, completion_tokens: ct, hit_eos: eos, .. } = g;
     let attach = |mut v: serde_json::Value| -> String {
         if let Some(ex) = explanation {
             v["fieldrun_explanation"] = ex;
@@ -807,7 +1051,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
         // looking like an editable input prompt while it's still generating. `in_code` carries an open ``` fence.
         let mut linebuf = String::new();
         let mut in_code = false;
-        let (text, _, _, finished) = tg.gen(lm.as_ref(), &prompt, max_tokens, add_special, &mut |chunk| {
+        let gen_out = tg.gen(lm.as_ref(), &prompt, max_tokens, add_special, &mut |chunk| {
             if !fmt {
                 if !started {
                     started = true;
@@ -858,47 +1102,29 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
         } else {
             println!(); // raw stream had no trailing newline
         }
-        if !finished {
+        if !gen_out.hit_eos {
             // ran into the length cap rather than stopping at EOS — say so, so a truncated reply isn't mistaken for
             // a broken model (reasoning models especially blow past a small cap mid-thought).
             eprintln!("[fieldrun] (stopped at max_tokens={max_tokens} — raise with --max-tokens N for longer replies)");
         }
-        // per-reply explanation: the circuits + features behind the model's prediction at the end of this prompt
-        // (the decision that produced the first reply token). Decoded via the bundled tokenizer. Off by default.
+        // per-reply explain TRACE: the circuits + features behind EVERY forward pass of the reply — one frame per
+        // generated token, a debugger-style stack of the model "looping and thinking" (not just the first decision).
+        // Decoded via the bundled tokenizer. Off by default (toggle with /explain).
         if explain {
-            let pids = tg.encode(&prompt, false);
-            if pids.is_empty() {
-                eprintln!("[fieldrun] (explain: empty prompt)");
+            let steps = explain_steps(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids);
+            if steps.is_empty() {
+                // no explain for this arch (the prompt is never empty here, so an empty trace means unsupported)
+                eprintln!("[fieldrun] (explain not implemented for arch {arch} — turning off; /explain on to retry)");
+                explain = false;
             } else {
-                match lm.explain(&pids) {
-                    Some(ex) => {
-                        let dec = |id: i64| {
-                            // show both the token's meaning and its id: `" lunch" [54809]`, `<|im_start|> [151644]`.
-                            let s = tg.decode(&[id]);
-                            let meaning = if !s.is_empty() {
-                                format!("{s:?}") // visible text (special tokens decode to "")
-                            } else {
-                                tg.id_to_token(id).unwrap_or_default() // special-token name, e.g. <|im_start|>
-                            };
-                            if meaning.is_empty() {
-                                format!("[{id}]")
-                            } else {
-                                format!("{meaning} [{id}]")
-                            }
-                        };
-                        eprintln!("\n[explain]\n{}", crate::explain::render(&ex, &dec, explain_ctx));
-                    }
-                    None => {
-                        eprintln!("[fieldrun] (explain not implemented for arch {arch} — turning off; /explain on to retry)");
-                        explain = false;
-                    }
-                }
+                let dec = |id: i64| tg.token_label(id);
+                eprintln!("\n[explain]\n{}", render_explain_trace(&steps, &dec, explain_ctx));
             }
         }
         if chatml {
             // only instruct models carry conversation history (base completion is stateless per turn)
             history.push(("user".into(), user.to_string()));
-            history.push(("assistant".into(), text.trim().to_string()));
+            history.push(("assistant".into(), gen_out.text.trim().to_string()));
         }
     }
 }
@@ -968,5 +1194,39 @@ mod tests {
         assert!(open.contains("message_start") && open.contains("content_block_start"));
         let d = String::from_utf8(sse_delta("/v1/messages", "rope", 1, "Hi")).unwrap();
         assert!(d.contains("content_block_delta") && d.contains("\"text\":\"Hi\""), "{d}");
+    }
+
+    #[test]
+    fn openai_tool_frames_stream_calls() {
+        // A parsed tool call must stream as an OpenAI tool_calls delta (index + id + function) and finish "tool_calls".
+        let calls = vec![crate::tools::ToolCall { name: "get_weather".into(), arguments: serde_json::json!({"city":"Paris"}) }];
+        let s = String::from_utf8(openai_tool_frames("rope", 7, "let me check", &calls, 5, true)).unwrap();
+        assert!(s.contains(r#""delta":{"role":"assistant"}"#), "{s}");
+        assert!(s.contains("\"tool_calls\":[{") && s.contains("\"index\":0") && s.contains("get_weather"), "{s}");
+        // arguments must be a JSON *string* on the wire (OpenAI), not an object
+        assert!(s.contains(r#""arguments":"{\"city\":\"Paris\"}""#), "{s}");
+        assert!(s.contains("\"finish_reason\":\"tool_calls\"") && s.trim_end().ends_with("[DONE]"), "{s}");
+        // leading prose before the call is streamed as a content delta
+        assert!(s.contains(r#""content":"let me check""#), "{s}");
+    }
+
+    #[test]
+    fn openai_tool_frames_plain_answer() {
+        // No call (model answered despite tools offered) → text streams as content + finish "stop", still an SSE stream.
+        let s = String::from_utf8(openai_tool_frames("rope", 7, "Hello there", &[], 2, true)).unwrap();
+        assert!(s.contains(r#""content":"Hello there""#) && s.contains("\"finish_reason\":\"stop\""), "{s}");
+        assert!(!s.contains("tool_calls"), "{s}");
+        assert!(s.trim_end().ends_with("[DONE]"), "{s}");
+    }
+
+    #[test]
+    fn anthropic_tool_frames_stream_calls() {
+        let calls = vec![crate::tools::ToolCall { name: "get_weather".into(), arguments: serde_json::json!({"city":"Paris"}) }];
+        let s = String::from_utf8(anthropic_tool_frames("rope", 7, "", &calls, true)).unwrap();
+        assert!(s.contains("event: message_start") && s.contains("event: message_stop"), "{s}");
+        assert!(s.contains("\"type\":\"tool_use\"") && s.contains("get_weather"), "{s}");
+        // arguments arrive as input_json_delta.partial_json (the Anthropic streaming tool-input shape)
+        assert!(s.contains("\"type\":\"input_json_delta\"") && s.contains("partial_json"), "{s}");
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "{s}");
     }
 }

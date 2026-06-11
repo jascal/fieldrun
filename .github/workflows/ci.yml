@@ -8,15 +8,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Build across the MSRV (1.82) + current stable, for every feature combination. This is the gate that catches
-  # dependency drift past Rust 1.82 (the class of bug found by testing on an Intel Mac on 1.82) — the moment a dep
-  # bumps its MSRV/edition, CI goes red here instead of a user discovering it.
+  # Build across the MSRV (1.89) + current stable, for every feature combination. This is the gate that catches
+  # dependency drift past Rust 1.89 (the class of bug found by testing on an Intel Mac on 1.82) — the moment a dep
+  # bumps its MSRV/edition, CI goes red here instead of a user discovering it. (MSRV is 1.89 since the x86 AVX-512
+  # int8/F16C decode intrinsics stabilised there.)
   build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.82.0", "stable"]
+        rust: ["1.89.0", "stable"]
         # default = hub + api; also build the lean offline binary and the gpu variant
         features: ["", "--no-default-features", "--features gpu"]
     name: build (${{ matrix.rust }}, ${{ matrix.features || 'default' }})
@@ -26,7 +27,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      # respect the committed Cargo.lock (the pins that keep us on 1.82) — never re-resolve in CI
+      # respect the committed Cargo.lock (the pins that keep us on the MSRV) — never re-resolve in CI
       - run: cargo build --release --locked ${{ matrix.features }}
 
   # Unit tests (the #[cfg(test)] modules) on stable, with the api feature so the api/tokenizer tests run too.
