@@ -545,6 +545,27 @@ impl Bundle {
                 out
             }
             Arr::F16(v) => {
+                // DECODE fast path (single-token matrix-vector, m==1): fused dequant-and-accumulate — read each f16
+                // weight ONCE (F16C) and FMA into the n-wide output, never materialising an f32 weight buffer. This
+                // kills the ~5× memory amplification of the upcast-then-GEMM path (the dominant cost of f16 decode).
+                // Input-stationary over k: out += a[kk] * W[kk, :]. NOT byte-identical to the GEMM path (FP order), so
+                // KV-decode is validated by top-1 agreement, not byte-identity. Prefill (m>1) keeps the GEMM below.
+                if a.nrows() == 1 {
+                    let arow = a.row(0);
+                    let arow = arow.as_slice().unwrap(); // (k,) contiguous
+                    // parallelise over OUTPUT-column chunks: each thread streams its column-band of the weight matrix
+                    // (so the whole matrix is read once, split across cores → aggregate bandwidth, not single-core).
+                    let block = 256.min(n.max(1));
+                    let mut out = vec![0f32; n];
+                    out.par_chunks_mut(block).enumerate().for_each(|(bi, acc)| {
+                        let c0 = bi * block;
+                        let bw = acc.len();
+                        for (kk, &av) in arow.iter().enumerate() {
+                            f16_saxpy(av, &v[kk * n + c0..kk * n + c0 + bw], acc);
+                        }
+                    });
+                    return Array2::from_shape_vec((1, n), out).unwrap();
+                }
                 // Upcast W one column-block at a time into a local f32 buffer, then GEMM the block — this keeps the
                 // vectorised matmul while bounding the f32 upcast to one block (so a multi-GB f16 weight is never
                 // fully materialised as f32). Block width 512.
@@ -800,6 +821,51 @@ unsafe fn f16_to_f32_f16c(src: &[half::f16], dst: &mut [f32]) {
     }
 }
 
+/// Fused SAXPY against an f16 weight row: `acc[j] += scal * f16_to_f32(wrow[j])` for all j. The kernel for single-token
+/// DECODE (matrix-vector): instead of upcasting the whole weight to an f32 buffer and GEMMing (which reads each weight
+/// as 2B f16 + writes 4B f32 + reads 4B f32 ≈ 5× memory traffic — the reason f16 decode is ~15× over the memory floor),
+/// this reads each f16 weight ONCE, converts 8 at a time with F16C, and FMAs into the accumulator. x86: F16C+AVX2+FMA;
+/// scalar fallback. NB: changes the FP reduction order vs the GEMM path, so a decode that uses it is NOT byte-identical
+/// to the naive (m>1) recompute — validated by top-1 agreement, not byte-identity.
+#[inline]
+fn f16_saxpy(scal: f32, wrow: &[half::f16], acc: &mut [f32]) {
+    debug_assert_eq!(wrow.len(), acc.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("f16c")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                f16_saxpy_x86(scal, wrow, acc);
+            }
+            return;
+        }
+    }
+    for (a, w) in acc.iter_mut().zip(wrow) {
+        *a += scal * w.to_f32();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx2,fma")]
+unsafe fn f16_saxpy_x86(scal: f32, wrow: &[half::f16], acc: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let len = wrow.len();
+    let chunks = len / 8;
+    let s = _mm256_set1_ps(scal);
+    let wp = wrow.as_ptr() as *const u16;
+    let ap = acc.as_mut_ptr();
+    for c in 0..chunks {
+        let wf = _mm256_cvtph_ps(_mm_loadu_si128(wp.add(c * 8) as *const __m128i)); // 8 f16 -> 8 f32
+        let cur = _mm256_loadu_ps(ap.add(c * 8));
+        _mm256_storeu_ps(ap.add(c * 8), _mm256_fmadd_ps(s, wf, cur)); // acc += scal * w
+    }
+    for i in (chunks * 8)..len {
+        *ap.add(i) += scal * (*wrow.get_unchecked(i)).to_f32();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +939,24 @@ mod tests {
         let w: Vec<i8> = vec![-1, 2, -3, 4, 5, -6, 7, 8, -9, 10, -11, 12, 13, -14, 15, 16, 17, -18];
         let want: i32 = a.iter().zip(&w).map(|(&x, &y)| x as i32 * y as i32).sum();
         assert_eq!(i8dot(&a, &w), want);
+    }
+
+    /// The fused f16 SAXPY (decode kernel) must match a scalar `acc += scal * f16->f32(w)` reference within fp
+    /// tolerance (FMA vs separate mul+add differ by ~1 ULP). Exercises accumulation into a non-zero acc + the tail.
+    #[test]
+    fn f16_saxpy_matches_scalar() {
+        let wrow: Vec<half::f16> = (0..37).map(|i| half::f16::from_f32(i as f32 * 0.1 - 1.5)).collect();
+        let init: Vec<f32> = (0..37).map(|i| i as f32 * 0.01).collect();
+        let scal = 0.7f32;
+        let mut got = init.clone();
+        f16_saxpy(scal, &wrow, &mut got);
+        let mut want = init.clone();
+        for (a, w) in want.iter_mut().zip(&wrow) {
+            *a += scal * w.to_f32();
+        }
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-4, "{g} vs {w}");
+        }
     }
 
     /// The SIMD i8dot (NEON / AVX2 / AVX-512, whichever the host dispatches to) must be **bit-exact** to the scalar
