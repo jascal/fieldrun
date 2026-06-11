@@ -700,6 +700,31 @@ fn fmt_rule(r: &RuleHit, predicted: i64, dec: &dyn Fn(i64) -> String) -> String 
     format!("     rule  {} [{key}] → {{{succ}}}{rank}", r.idiom)
 }
 
+/// Format the candidate-set route detail. A SELECTED token that no single named rule explains came from the KB's broader
+/// plausible set (recent context / closed-class / unigram floor) — `rule_for` found no n-gram/induction/grammar rule for
+/// it. Show that bounded, order-stable set (highest-value sources first) with the picked token marked and its position,
+/// so the frame says *what the model chose within* instead of a bare "candidate-set". Store-less: the context candidates.
+#[cfg(feature = "api")]
+fn fmt_candidate_set(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg, dec: &dyn Fn(i64) -> String) -> String {
+    let cands = match store {
+        Some(s) => s.candidates(ctx, cfg),
+        None => {
+            let mut c = Vec::new();
+            context_candidates(ctx, cfg.recent, cfg.induction, &mut c);
+            c
+        }
+    };
+    let total = cands.len();
+    let at = match cands.iter().position(|&t| t == predicted) {
+        Some(i) => format!("candidate #{} of {total}", i + 1),
+        None => format!("{total} candidates"),
+    };
+    const SHOW: usize = 12;
+    let preview = cands.iter().take(SHOW).map(|&t| if t == predicted { format!("{} ◀", dec(t)) } else { dec(t) }).collect::<Vec<_>>().join(", ");
+    let more = if total > SHOW { format!(", … +{}", total - SHOW) } else { String::new() };
+    format!("     candidate-set: model chose {} ({at}) — KB set {{{preview}{more}}}", dec(predicted))
+}
+
 /// Render the TYPED explain trace (the `route`/`circuits`/`all` levels). Every token gets a one-line route (RETRIEVED /
 /// SELECTED / COMPOSED, free — no forward); `Circuits` additionally re-runs the faithful forward and shows the DLA
 /// circuit breakdown ONLY on COMPOSED tokens (the attribution drives the verbosity — you pay the explain-forward
@@ -761,6 +786,9 @@ fn render_typed_trace(
         out.push(format!("\n┌─ #{k} {} ← {route}{via}{overrode}", dec(t)));
         if let Some(rh) = &rule {
             out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
+        } else if route == "SELECTED" {
+            // candidate-set route: no single named rule explains the token, so show the bounded KB set it was picked from.
+            out.push(fmt_candidate_set(store, &ctx, t, cand, dec));
         }
         // circuit breakdown — the expensive half — only on the first/last head_tail tokens.
         let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
@@ -831,8 +859,22 @@ fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], o
             (None, "SELECTED") => "candidate-set".to_string(),
             _ => idiom,
         };
+        // candidate-set position for a SELECTED token no named rule covers — its place in the KB's plausible set.
+        let candidate_set = if route == "SELECTED" && rule.is_none() {
+            let cands = match opts.store.as_ref() {
+                Some(s) => s.candidates(&ctx, &opts.cand),
+                None => {
+                    let mut c = Vec::new();
+                    context_candidates(&ctx, opts.cand.recent, opts.cand.induction, &mut c);
+                    c
+                }
+            };
+            serde_json::json!({ "position": cands.iter().position(|&x| x == t).map(|i| i + 1), "total": cands.len() })
+        } else {
+            serde_json::Value::Null
+        };
         let rule_detail = rule.and_then(|rh| serde_json::to_value(rh).ok()).unwrap_or(serde_json::Value::Null);
-        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "kb_top1": kb_top1, "explanation": explanation }));
+        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "kb_top1": kb_top1, "candidate_set": candidate_set, "explanation": explanation }));
         ctx.push(t);
     }
     serde_json::Value::Array(arr)
@@ -1327,6 +1369,21 @@ mod tests {
         assert!(!wants_stream(r#"{"stream":false}"#));
         assert!(!wants_stream(r#"{"messages":[]}"#));
         assert!(!wants_stream("not json"));
+    }
+
+    #[test]
+    fn candidate_set_frame_shows_set_and_position() {
+        // store-less: context_candidates = last `recent` tokens (most-recent first), no induction.
+        let cfg = CandCfg { recent: 3, induction: 0, quad: 0, tri: 0, bi: 0, skel: 0, uni: 0, closed: false };
+        let dec = |t: i64| format!("T{t}");
+        // ctx tail [10,20,30] → candidates [30,20,10]; predicted 20 is the 2nd, marked, of 3.
+        let line = fmt_candidate_set(None, &[40, 10, 20, 30], 20, &cfg, &dec);
+        assert!(line.contains("model chose T20"), "{line}");
+        assert!(line.contains("candidate #2 of 3"), "{line}");
+        assert!(line.contains("T20 ◀"), "{line}");
+        // a token not in the set reports the size without a position.
+        let miss = fmt_candidate_set(None, &[40, 10, 20, 30], 99, &cfg, &dec);
+        assert!(miss.contains("3 candidates"), "{miss}");
     }
 
     #[test]
