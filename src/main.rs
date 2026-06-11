@@ -459,6 +459,58 @@ fn main() {
             return;
         }
 
+        // --attribute (the explain/attribution side of Phase 8b): route EACH token of a holdout to a KB rule or to
+        // composition. Three routes — RETRIEVED (a symbolic KB rule's top-1 == the model's argmax: a pure lookup),
+        // SELECTED (the argmax is in the KB candidate set but isn't the KB top-1: composition disambiguated within a
+        // retrieved set), COMPOSED (no KB rule covers it: the irreducible forge tax). The per-token trace + the
+        // aggregate retrieved/selected/composed split make the KB-vs-composition thesis observable token by token —
+        // the retrieval half of explain (the composition half is the DLA circuit trace). Needs `--store`.
+        if has_flag(&args, "--attribute") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --attribute needs --store <store.json> (the KB rules to attribute against)"); return; }
+            };
+            let dec = load_decoder(flag(&args, "--vocab"));
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --attribute: no eval positions (need --ids > ctx_window, matching this model's vocab)");
+                return;
+            }
+            let trace_n = positions.len().min(30); // readable per-token trace; aggregate is over all positions
+            eprintln!("[fieldrun] --attribute: routing {} tokens (ctx {ctx_window}) — RETRIEVED / SELECTED / COMPOSED", positions.len());
+            // 3-way counts overall + per-idiom (idiom -> [retrieved, selected, composed]).
+            let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
+            let mut by: std::collections::HashMap<String, [usize; 3]> = std::collections::HashMap::new();
+            println!("\n=== per-token attribution (first {trace_n}) — token ← route via KB rule ===");
+            for (i, c) in positions.iter().enumerate() {
+                let truth = lm.predict(c);
+                let (kb, idiom) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&truth);
+                let (route, slot) = if kb == truth { ("RETRIEVED", 0) } else if covered { ("SELECTED ", 1) } else { ("COMPOSED ", 2) };
+                match slot { 0 => retr += 1, 1 => sel += 1, _ => comp += 1 };
+                by.entry(idiom.clone()).or_default()[slot] += 1;
+                if i < trace_n {
+                    println!("  {route} {:<22} via {idiom}", dec(truth));
+                }
+            }
+            let n = positions.len() as f64;
+            println!("\n=== decomposition of {} next-token decisions ===", positions.len());
+            println!("  RETRIEVED (KB rule alone = model)        {retr:>4}  {:>5.1}%", 100.0 * retr as f64 / n);
+            println!("  SELECTED  (in KB set, composition picks) {sel:>4}  {:>5.1}%", 100.0 * sel as f64 / n);
+            println!("  COMPOSED  (no KB rule — the forge tax)   {comp:>4}  {:>5.1}%", 100.0 * comp as f64 / n);
+            let mut rows: Vec<(String, [usize; 3])> = by.into_iter().collect();
+            rows.sort_by(|a, b| (b.1[0] + b.1[1] + b.1[2]).cmp(&(a.1[0] + a.1[1] + a.1[2])));
+            println!("\n  by KB rule that fired:   idiom            n   retr%  sel%  comp%");
+            for (idiom, e) in &rows {
+                let tot = (e[0] + e[1] + e[2]).max(1) as f64;
+                println!("    {idiom:<16} {:>4}  {:>5.0} {:>5.0} {:>5.0}", e[0] + e[1] + e[2],
+                         100.0 * e[0] as f64 / tot, 100.0 * e[1] as f64 / tot, 100.0 * e[2] as f64 / tot);
+            }
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
