@@ -618,7 +618,7 @@ fn main() {
             eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
             let b2 = Bundle::load(&stem).expect("reload bundle for U-row norms");
             let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
-            struct Rec { route: u8, pr: f32, captured: usize, margin: f32, nmargin: f32, top_hit: bool, any_hit: bool }
+            struct Rec { route: u8, pr: f32, captured: usize, margin: f32, nmargin: f32, top_hit: bool, mu_t: usize }
             let recs: Vec<Rec> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let pick = ex.model_predicts;
@@ -636,9 +636,12 @@ fn main() {
                 let (ut, uv) = (b2.weight_row(un, pick as usize), b2.weight_row(un, ex.runner_up as usize));
                 let nrm = ut.iter().zip(&uv).map(|(a, b)| { let dd = a - b; dd * dd }).sum::<f32>().sqrt();
                 let nmargin = if nrm > 0.0 { margin / nrm } else { f32::NAN };
-                // Q4: does any single circuit's ISOLATED argmax (its #1 promoted token) reproduce the model's pick?
-                let any_hit = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
-                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).any(|a| a == pick);
+                // Q4b: μ_t = single-circuit readout MULTIPLICITY = # of (shown, highest-DLA) circuits whose ISOLATED
+                // argmax (its #1 promoted token) is the model's pick. μ_t≫1 = redundant; μ_t=0 = emergent (Grok's
+                // "argmax of the sum that is the argmax of no summand"). Counted over the top-6 heads + top-6 neurons by
+                // DLA (a lower bound on the full-spectrum μ_t — those are the circuits most relevant to t's logit).
+                let mu_t = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).filter(|&a| a == pick).count();
                 let top_hit = {
                     let th = ex.head_circuits.first();
                     let tn = ex.mlp_features.first();
@@ -649,19 +652,21 @@ fn main() {
                         (None, None) => None,
                     }.copied() == Some(pick)
                 };
-                Some(Rec { route, pr, captured: d.len(), margin, nmargin, top_hit, any_hit })
+                Some(Rec { route, pr, captured: d.len(), margin, nmargin, top_hit, mu_t })
             }).collect();
 
             let pct = |g: &[&Rec], f: &dyn Fn(&Rec) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
             let meanf = |g: &[&Rec], f: &dyn Fn(&Rec) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
-            println!("\n=== (C/Q1/Q4) full-spectrum DLA + falsifiers ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.captured).unwrap_or(0));
-            println!("{:<12}{:>6}{:>11}{:>13}{:>15}{:>15}{:>13}", "route", "n", "PR (eff#)", "margin", "margin/‖ΔU‖", "top-circ=pick", "any-circ=pick");
+            println!("\n=== (C/Q1/Q4) full-spectrum DLA + μ_t multiplicity ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.captured).unwrap_or(0));
+            println!("{:<12}{:>6}{:>10}{:>13}{:>13}{:>12}{:>14}", "route", "n", "PR (eff#)", "margin/‖ΔU‖", "μ_t (mean)", "μ_t≥1", "emergent μ_t=0");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
                 let g: Vec<&Rec> = recs.iter().filter(|x| x.route == r).collect();
                 if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
-                println!("{lbl:<12}{:>6}{:>11.1}{:>13.2}{:>15.3}{:>14.0}%{:>12.0}%", g.len(),
-                    meanf(&g, &|x| x.pr), meanf(&g, &|x| x.margin), meanf(&g, &|x| x.nmargin), pct(&g, &|x| x.top_hit), pct(&g, &|x| x.any_hit));
+                println!("{lbl:<12}{:>6}{:>10.1}{:>13.2}{:>13.2}{:>11.0}%{:>13.0}%", g.len(),
+                    meanf(&g, &|x| x.pr), meanf(&g, &|x| x.nmargin), meanf(&g, &|x| x.mu_t as f32), pct(&g, &|x| x.mu_t > 0), pct(&g, &|x| x.mu_t == 0));
             }
+            println!("(Q4b) μ_t = # of top-12-by-DLA circuits whose ISOLATED argmax is the model's token. μ_t≫1 = redundantly");
+            println!("      multiply-realized (covered); μ_t=0 = EMERGENT (argmax of the sum that is the argmax of no summand).");
 
             // (Q1 disambiguation) confidence vs structure: within matched normalized-margin bins, does KB-coverage still
             // predict single-circuit redundancy? If the COVERED−COMPOSED any-circ gap persists at matched margin, the
@@ -678,9 +683,26 @@ fn main() {
                 let cov: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route != 2).collect();
                 let cmp: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route == 2).collect();
                 let mm = meanf(&recs.iter().filter(inbin).collect::<Vec<_>>(), &|x| x.nmargin);
-                println!("{lbl:<14}{mm:>10.2} {:>9} {:>5.0}%  {:>9} {:>5.0}%", cov.len(), pct(&cov, &|x| x.any_hit), cmp.len(), pct(&cmp, &|x| x.any_hit));
+                println!("{lbl:<14}{mm:>10.2} {:>9} {:>5.0}%  {:>9} {:>5.0}%", cov.len(), pct(&cov, &|x| x.mu_t > 0), cmp.len(), pct(&cmp, &|x| x.mu_t > 0));
             }
             println!("⇒ if COVERED any-circ% ≫ COMPOSED any-circ% WITHIN a margin bin, the retrieval/composition split is NOT just confidence.");
+
+            // Grok's margin-multiplicity prediction (publish-blocking falsifier): for COVERED, m(x) should be POSITIVELY
+            // correlated with μ_t(x) (deeper cells recruit more redundant alignments). ≤0 falsifies it.
+            let corr = |g: &[&Rec]| -> f32 {
+                let n = g.len() as f32;
+                if n < 2.0 { return f32::NAN; }
+                let (mx, my) = (g.iter().map(|r| r.nmargin).sum::<f32>() / n, g.iter().map(|r| r.mu_t as f32).sum::<f32>() / n);
+                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0, 0.0);
+                for r in g { let (dx, dy) = (r.nmargin - mx, r.mu_t as f32 - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+                if sxx > 0.0 && syy > 0.0 { sxy / (sxx.sqrt() * syy.sqrt()) } else { f32::NAN }
+            };
+            let fin: Vec<&Rec> = recs.iter().filter(|r| r.nmargin.is_finite()).collect();
+            let cov: Vec<&Rec> = fin.iter().filter(|r| r.route != 2).copied().collect();
+            let retr: Vec<&Rec> = fin.iter().filter(|r| r.route == 0).copied().collect();
+            let sel: Vec<&Rec> = fin.iter().filter(|r| r.route == 1).copied().collect();
+            println!("\n=== (Grok prediction) corr(normalized margin, μ_t) — predicted >0 for COVERED; ≤0 falsifies ===");
+            println!("  COVERED (R+S): {:.3}    RETRIEVED: {:.3}    SELECTED: {:.3}    all: {:.3}", corr(&cov), corr(&retr), corr(&sel), corr(&fin));
             return;
         }
 
