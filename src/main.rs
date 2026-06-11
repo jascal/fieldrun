@@ -616,36 +616,55 @@ fn main() {
                 return;
             }
             eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
-            // (route, top1_share, participation_ratio, n_captured, decision_margin) over the FULL candidate DLA spectrum.
-            let recs: Vec<(u8, f32, f32, usize, f32)> = positions.par_iter().filter_map(|c| {
+            let b2 = Bundle::load(&stem).expect("reload bundle for U-row norms");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            // (route, PR, captured, raw_margin, norm_margin, single-circuit-top1-reproduces, any-circuit-reproduces)
+            let recs: Vec<(u8, f32, usize, f32, f32, bool, bool)> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let pick = ex.model_predicts;
                 let (kb, _) = store.predict(c);
                 let covered = store.candidates(c, &cfg).contains(&pick);
                 let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 };
-                // FULL spectrum: every scored circuit's DLA (~64 heads + ~384 neurons), positive contributions only.
+                // FULL spectrum participation ratio: every scored circuit's positive DLA (~64 heads + ~384 neurons).
                 let mut d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
                 if d.is_empty() { return None; }
                 d.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                let sum: f32 = d.iter().sum();
-                let sumsq: f32 = d.iter().map(|x| x * x).sum();
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
                 let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
-                let margin = ex.predicted_logit - ex.runner_up_logit; // distance to the nearest U-power-diagram facet (Q1)
-                Some((route, d[0] / sum, pr, d.len(), margin))
+                let raw_margin = ex.predicted_logit - ex.runner_up_logit;
+                // Q1 normalization fix: true facet distance = (L_t − L_v) / ‖U_t − U_v‖.
+                let (ut, uv) = (b2.weight_row(un, pick as usize), b2.weight_row(un, ex.runner_up as usize));
+                let nrm = ut.iter().zip(&uv).map(|(a, b)| { let dd = a - b; dd * dd }).sum::<f32>().sqrt();
+                let norm_margin = if nrm > 0.0 { raw_margin / nrm } else { f32::NAN };
+                // Q4 falsifier: does any single circuit's ISOLATED argmax (its #1 promoted token) reproduce the model's pick?
+                let argmaxes: Vec<i64> = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).collect();
+                let any_hit = argmaxes.contains(&pick);
+                let top_circuit_argmax = {
+                    let th = ex.head_circuits.first();
+                    let tn = ex.mlp_features.first();
+                    match (th, tn) {
+                        (Some(h), Some(n)) => if h.dla >= n.dla { h.promotes.first().copied() } else { n.promotes.first().copied() },
+                        (Some(h), None) => h.promotes.first().copied(),
+                        (None, Some(n)) => n.promotes.first().copied(),
+                        (None, None) => None,
+                    }
+                };
+                Some((route, pr, d.len(), raw_margin, norm_margin, top_circuit_argmax == Some(pick), any_hit))
             }).collect();
 
-            println!("\n=== (C) combine vs select — DLA concentration on the predicted token (FULL spectrum: ~64 heads + ~384 neurons) ===");
-            println!("{:<12}{:>7}{:>11}{:>13}{:>15}{:>16}", "route", "n", "captured", "top1-share", "PR (eff #)", "margin (Q1)");
+            println!("\n=== (C/Q1/Q4) full-spectrum DLA + Grok's falsifiers ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.2).unwrap_or(0));
+            println!("{:<12}{:>6}{:>11}{:>13}{:>15}{:>15}{:>13}", "route", "n", "PR (eff#)", "margin", "margin/‖ΔU‖", "top-circ=pick", "any-circ=pick");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
-                let g: Vec<&(u8, f32, f32, usize, f32)> = recs.iter().filter(|x| x.0 == r).collect();
-                if g.is_empty() { println!("{lbl:<12}{:>7}", 0); continue; }
+                let g: Vec<&(u8, f32, usize, f32, f32, bool, bool)> = recs.iter().filter(|x| x.0 == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
                 let n = g.len() as f32;
-                let mean = |f: &dyn Fn(&(u8, f32, f32, usize, f32)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
-                println!("{lbl:<12}{:>7}{:>11.0}{:>13.3}{:>14.1}{:>16.2}", g.len(), mean(&|x| x.3 as f32), mean(&|x| x.1), mean(&|x| x.2), mean(&|x| x.4));
+                let mean = |f: &dyn Fn(&(u8, f32, usize, f32, f32, bool, bool)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
+                let pct = |f: &dyn Fn(&(u8, f32, usize, f32, f32, bool, bool)) -> bool| 100.0 * g.iter().filter(|x| f(x)).count() as f64 / g.len() as f64;
+                println!("{lbl:<12}{:>6}{:>11.1}{:>13.2}{:>15.3}{:>14.0}%{:>12.0}%", g.len(), mean(&|x| x.1), mean(&|x| x.3), mean(&|x| x.4), pct(&|x| x.5), pct(&|x| x.6));
             }
-            println!("(C) one circuit dominates → top1-share→1, PR→1 = selection;  spread → PR high = superposition/combination.");
-            println!("(Q1) decision margin = L_t − runner-up = distance to the nearest unembedding power-diagram facet;");
-            println!("     RETRIEVED deeper-in-cell (large margin) vs COMPOSED on-a-fine-facet (small margin) ⇒ the polyhedral-alignment picture.");
+            println!("(Q1) margin/‖ΔU‖ = true facet distance (normalised). Ordering RETRIEVED>SELECTED>COMPOSED surviving normalisation ⇒ not a U-row-norm artifact.");
+            println!("(Q4) top-circ/any-circ=pick = does the single best / any shown circuit's ISOLATED argmax reproduce the model's token? Low ⇒ no circuit compiles to the rule (Grok's falsifier — high would refute Q4).");
             return;
         }
 
