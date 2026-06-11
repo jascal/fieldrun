@@ -20,6 +20,7 @@ pub struct Rope {
     route: f32,    // Tier C: fraction of MLP neurons to compute per token (0 = off)
     kv_int8: bool, // store the KV cache (GQA width) as int8 with a per-kv-head scale
     qk_norm: bool, // Qwen3-dense: per-head RMSNorm on q/k after projection, before RoPE (absent on Llama/Qwen2.5)
+    gate: Option<std::sync::Arc<crate::headgate::HeadGate>>, // --pruned-head: margin-gated pruned unembed on decode
 }
 
 fn rmsnorm(x: &Array2<f32>, w: Array1<f32>, eps: f32) -> Array2<f32> {
@@ -59,7 +60,7 @@ impl Rope {
         let eps = b.config_f[1] as f32;
         let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
         let qk_norm = b.has("l0.self_attn.q_norm"); // Qwen3-dense ships it; Llama/Qwen2.5/Mistral/Phi don't
-        Rope { b, n_layer, h, nkv, hd, eps, inv, route, kv_int8, qk_norm }
+        Rope { b, n_layer, h, nkv, hd, eps, inv, route, kv_int8, qk_norm, gate: None }
     }
 
     /// Per-head RMSNorm over head_dim (Qwen3 QK-norm), weight applied directly — on the q/k projection output
@@ -455,6 +456,21 @@ impl Rope {
         let logits = self.b.rowdot_f32(self.unembed_name(), &xfn.row(xfn.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
+
+    /// `head_argmax` behind the margin gate (`--pruned-head`): score only the KB's candidate rows; accept the in-set
+    /// argmax iff the in-set normalized margin (exact facet distance, FINDINGS §5b) clears the gate's threshold, else
+    /// run the full head. `ctx` = prompt + emitted-so-far (the KB keys its candidate set on it). With no gate
+    /// installed this IS `head_argmax`.
+    fn head_argmax_gated(&self, xfn: &Array2<f32>, ctx: &[i64]) -> i64 {
+        if let Some(g) = &self.gate {
+            let r = xfn.row(xfn.nrows() - 1).to_vec();
+            let un = self.unembed_name();
+            if let Some(t) = g.try_pruned(ctx, &|c| self.b.rowdot_f32_subset(un, &r, c), &|v| self.b.weight_row(un, v)) {
+                return t;
+            }
+        }
+        self.head_argmax(xfn)
+    }
 }
 
 impl Model for Rope {
@@ -477,6 +493,15 @@ impl Model for Rope {
         let xf = self.hidden_ab(ids, heads, neurons);
         let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn set_head_gate(&mut self, gate: std::sync::Arc<crate::headgate::HeadGate>) -> bool {
+        self.gate = Some(gate);
+        true
+    }
+
+    fn head_gate_stats(&self) -> Option<(u64, u64)> {
+        self.gate.as_ref().map(|g| g.stats())
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
@@ -509,6 +534,7 @@ impl Model for Rope {
     fn generate_stream(&self, prompt: &[i64], max_tokens: usize, eos: &[i64], emit: &mut dyn FnMut(i64) -> bool) -> Vec<i64> {
         let total = prompt.len() + max_tokens;
         let kvdim = self.nkv * self.hd;
+        let mut ctx: Vec<i64> = prompt.to_vec(); // running context for the gated head's KB lookup
         if self.kv_int8 {
             // int8 KV cache for chat/serve — 4x smaller cache (longer context in the same budget); lossy by design.
             let mut kc: Vec<Vec<i8>> = (0..self.n_layer).map(|_| vec![0i8; total * kvdim]).collect();
@@ -517,16 +543,17 @@ impl Model for Rope {
             let mut vs = ks.clone();
             let emb = self.b.rows_f32("embed", prompt);
             let xb = self.forward_block_q(&emb, 0, &mut kc, &mut ks, &mut vc, &mut vs);
-            let mut next = self.head_argmax(&xb);
+            let mut next = self.head_argmax_gated(&xb, &ctx);
             let mut out = Vec::new();
             let mut pos = prompt.len();
             loop {
                 if eos.contains(&next) { break; }
                 out.push(next);
                 if !emit(next) || out.len() == max_tokens { break; }
+                ctx.push(next);
                 let e = self.b.rows_f32("embed", &[next]);
                 let xb = self.forward_block_q(&e, pos, &mut kc, &mut ks, &mut vc, &mut vs);
-                next = self.head_argmax(&xb);
+                next = self.head_argmax_gated(&xb, &ctx);
                 pos += 1;
             }
             return out;
@@ -535,7 +562,7 @@ impl Model for Rope {
         let mut vc = kc.clone();
         let emb = self.b.rows_f32("embed", prompt);
         let xb = self.forward_block(&emb, 0, &mut kc, &mut vc);
-        let mut next = self.head_argmax(&xb);
+        let mut next = self.head_argmax_gated(&xb, &ctx);
         let mut out = Vec::new();
         let mut pos = prompt.len();
         loop {
@@ -546,9 +573,10 @@ impl Model for Rope {
             if !emit(next) || out.len() == max_tokens {
                 break;
             }
+            ctx.push(next);
             let e = self.b.rows_f32("embed", &[next]);
             let xb = self.forward_block(&e, pos, &mut kc, &mut vc);
-            next = self.head_argmax(&xb);
+            next = self.head_argmax_gated(&xb, &ctx);
             pos += 1;
         }
         out
@@ -568,7 +596,7 @@ impl Model for Rope {
                 let emb = self.b.rows_f32("embed", ids);
                 self.forward_block_q(&emb, cur, kc, ks, vc, vs)
             };
-            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb));
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, ctx| self.head_argmax_gated(xb, ctx));
         }
         let (kvdim, n_layer) = (self.nkv * self.hd, self.n_layer);
         let alloc = |total: usize| {
@@ -580,6 +608,6 @@ impl Model for Rope {
             let emb = self.b.rows_f32("embed", ids);
             self.forward_block(&emb, cur, kc, vc)
         };
-        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb))
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, ctx| self.head_argmax_gated(xb, ctx))
     }
 }

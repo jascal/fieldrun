@@ -781,7 +781,7 @@ impl Model for Gemma4 {
                 let emb = self.b.rows_f32("embed", ids) * self.escale;
                 self.forward_block_q(ids, &emb, cur, kc, ks, vc, vs)
             };
-            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb));
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb));
         }
         let n_layer = self.n_layer;
         // per-layer GQA width: local and global layers have different head_dim, so kc[l] width = nkv * hd_of(l)
@@ -794,6 +794,6 @@ impl Model for Gemma4 {
             let emb = self.b.rows_f32("embed", ids) * self.escale;
             self.forward_block(ids, &emb, cur, kc, vc)
         };
-        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb))
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb))
     }
 }

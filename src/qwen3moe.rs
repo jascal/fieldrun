@@ -546,7 +546,7 @@ impl Model for Qwen3Moe {
                 let emb = self.b.rows_f32("embed", ids);
                 self.forward_block_q(&emb, cur, kc, ks, vc, vs)
             };
-            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.unembed_argmax(xb));
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.unembed_argmax(xb));
         }
         let (kvdim, n_layer) = (self.nkv * self.hd, self.n_layer);
         let alloc = |total: usize| {
@@ -558,6 +558,6 @@ impl Model for Qwen3Moe {
             let emb = self.b.rows_f32("embed", ids);
             self.forward_block(&emb, cur, kc, vc)
         };
-        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.unembed_argmax(xb))
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.unembed_argmax(xb))
     }
 }

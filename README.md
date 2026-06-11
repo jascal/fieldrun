@@ -42,6 +42,14 @@ everywhere else — all on stable Rust, no feature flag or nightly. (Activations
 bit-exact to the scalar dot, so the faithfulness numbers are unchanged. We avoid the one-instruction `sdot`/`vdotq_s32`
 on purpose — it's still behind an unstable feature and would force nightly.)
 
+Also: a **margin-gated retrieval-pruned output head** on the serve/chat decode loops (`--pruned-head`, needs `--store`;
+rope arch). Per decode step the KB proposes ~540 candidate tokens and the unembed scores only those rows; the pick is
+accepted iff the in-set normalized margin `(L_t − L_v)/‖U_t − U_v‖` (the exact distance to the nearest candidate
+power-diagram facet — see [`FINDINGS.md`](FINDINGS.md) §5b) clears `--pruned-margin` (default 2.0), else the full
+(vocab × d) head runs. Opt-in and deliberately lossy (an accuracy-vs-speed knob like `--route-frac`): measure it with
+`--gate-check N`, which generates N tokens through the gated decode vs the ungated full head and reports the identical
+prefix + accept rate. At threshold +∞ every step falls back and the output is byte-identical to the full head.
+
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.
 **Runtime is pure Rust, no framework.**

@@ -404,7 +404,7 @@ impl Model for Gpt2 {
                 let emb = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &ppos);
                 self.forward_block_q(&emb, cur, kc, ks, vc, vs)
             };
-            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb));
+            return crate::model::prefix_generate_q(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb));
         }
         let (d, n_layer) = (self.d, self.n_layer);
         let alloc = |total: usize| {
@@ -417,6 +417,6 @@ impl Model for Gpt2 {
             let emb = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &ppos);
             self.forward_block(&emb, cur, kc, vc)
         };
-        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb| self.head_argmax(xb))
+        crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb))
     }
 }
