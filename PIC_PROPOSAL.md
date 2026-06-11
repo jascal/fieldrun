@@ -183,9 +183,14 @@ residual is the forge tax).
 
 ## 7. Related work
 
-- **Incidence calculus** (Bundy 1985): the truth-functional-incidence / non-truth-functional-
-  probability split. PIC is its signed-measure, inner-product generalization; the diagonal-`G` limit
-  recovers it.
+- **Incidence calculus** — Bundy, A. (1985), *"Incidence Calculus: A Mechanism for Probabilistic
+  Reasoning,"* Journal of Automated Reasoning 1(3), 263–283. The direct ancestor. Bundy's load-bearing
+  insight — *probability is not truth-functional, but incidence is, so track incidence sets and recover
+  probability by measure* — is the whole reason PIC exists. PIC changes exactly two things Bundy left
+  Boolean: incidences become **signed measures in an inner-product space**, and ∩/∪ become **weighted
+  threshold**. Everything else, including "probability = proportion of worlds," is kept verbatim, and the
+  **diagonal-`G` limit recovers classical incidence calculus exactly** (T2). PIC is, in the precise
+  sense of T2, incidence calculus with the orthogonality assumption removed.
 - **Log-linear / energy-based models & Markov logic networks**: PIC's additive core *is* a log-linear
   model; PIC adds the inner-product (frame-Gram) coupling and the retrievable/computed split.
 - **Random-utility / discrete choice (GEV, nested logit, probit; McFadden)**: §6.2's interpretive lens;
@@ -214,11 +219,19 @@ separates the additive (retrievable) logic from the diffuse (computed) remainder
 
 ---
 
-## 9. Provenance
+## 9. Acknowledgment & provenance
 
-This proposal is the product of a theory–experiment loop: the fieldrun `--probe-ablate` program
-supplied the measured desiderata (D1–D5); a collaborator (Grok) contributed the product-of-experts T5
-recovery and the correlated discrete-choice framing; the structural-frame-Gram resolution of §6.2 and
-the static/interventional (T5/T4) delimitation are refinements from that exchange. Every quantitative
-claim traces to a probe in [`FINDINGS.md`](./FINDINGS.md) §5; nothing here is posited that the probes
-do not constrain.
+**This work is, before anything else, a tip of the hat to Alan Bundy's incidence calculus (1985).**
+The central realization here — that the transformer core's non-truth-functionality is carried by the
+Gram kernel `G`, and that you recover its output probabilities by *measuring incidences* — is Bundy's
+idea, forty years on, meeting a substrate he could not have had. We have only removed his orthogonality
+assumption (Boolean ∩/∪ → weighted threshold; set incidences → signed measures) and shown the original
+calculus sits inside PIC as the diagonal-`G` limit. The name "projective incidence calculus" is chosen
+to keep the lineage in plain sight.
+
+Provenance: the fieldrun `--probe-ablate` program supplied the measured desiderata (D1–D5); a
+collaborator (Grok) contributed the product-of-experts T5 recovery and the correlated discrete-choice
+framing; the structural-frame-Gram resolution of §6.2 and the static/interventional (T5/T4)
+delimitation are refinements from that exchange. Every quantitative claim traces to a probe in
+[`FINDINGS.md`](./FINDINGS.md) §5; nothing here is posited that the probes do not constrain. The
+geometric/algebraic dual is developed in [`TROPICAL_PROPOSAL.md`](./TROPICAL_PROPOSAL.md).
