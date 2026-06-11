@@ -82,6 +82,54 @@ fn u4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> f32 {
     (if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32
 }
 
+/// Fused symmetric-int4 × f32 dot for ONE output column (decode m==1): `Σ_kk a[kk] * (nibble_kk * groupscale)`, the
+/// nibbles unpacked inline from the column's contiguous packed row — NO f32 weight buffer (vs the dequant-to-buffer +
+/// GEMM path, whose ~8× materialisation made int4 decode pathological). `prow` is the column's `ceil(k/2)` packed
+/// bytes; `scale` its `ng` group scales. Auto-vectorises over the group inner loop.
+#[inline]
+fn i4_dot(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
+    let mut sum = 0.0f32;
+    let mut gi = 0;
+    let mut kk = 0;
+    while kk < k {
+        let hi = (kk + g).min(k);
+        let mut gsum = 0.0f32;
+        while kk < hi {
+            let byte = prow[kk / 2];
+            let nib = if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            gsum += a[kk] * ((((nib << 4) as i8) >> 4) as f32); // sign-extend signed 4-bit
+            kk += 1;
+        }
+        sum += scale[gi] * gsum;
+        gi += 1;
+    }
+    sum
+}
+
+/// Fused affine-int4 (q4a) × f32 dot for ONE output column (decode m==1): with `w = scale*q + min`, the per-group
+/// contribution is `scale_g * Σ a*q + min_g * Σ a` — so we accumulate the q-weighted and plain activation sums per
+/// group. Unsigned nibble; no f32 buffer.
+#[inline]
+fn q4a_dot(prow: &[u8], a: &[f32], scale: &[f32], mins: &[f32], g: usize, k: usize) -> f32 {
+    let mut sum = 0.0f32;
+    let mut gi = 0;
+    let mut kk = 0;
+    while kk < k {
+        let hi = (kk + g).min(k);
+        let (mut qsum, mut asum) = (0.0f32, 0.0f32);
+        while kk < hi {
+            let byte = prow[kk / 2];
+            let q = (if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32;
+            qsum += a[kk] * q;
+            asum += a[kk];
+            kk += 1;
+        }
+        sum += scale[gi] * qsum + mins[gi] * asum;
+        gi += 1;
+    }
+    sum
+}
+
 /// A ROW-MAJOR per-row int8 weight for the **embed / tied unembed**: stored `(vocab, d)` row-major with one fp16 scale
 /// per row (vocab token) in the sibling `<name>__scale`; row r dequantises to `data[r*d + c] * scale[r]`. Unlike the
 /// column-major `I8w` (for linears via the int8 dot), this matches the embed's row-contiguous access in
@@ -489,6 +537,18 @@ impl Bundle {
                 let (k, nn, g) = (w4.k, w4.n, w4.g);
                 let (ng, row_bytes) = (k.div_ceil(g), k.div_ceil(2));
                 let packed = &w4.packed;
+                // DECODE fast path (m==1): fused unpack-and-dot per output column — no f32 weight buffer (the
+                // dequant-to-buffer + GEMM path made int4 decode ~18× too slow). Output-stationary; par over columns.
+                if a.nrows() == 1 {
+                    let arow = a.row(0);
+                    let arow = arow.as_slice().unwrap();
+                    let scale = scale.as_slice().unwrap();
+                    let out: Vec<f32> = (0..nn)
+                        .into_par_iter()
+                        .map(|j| i4_dot(&packed[j * row_bytes..(j + 1) * row_bytes], arow, &scale[j * ng..(j + 1) * ng], g, k))
+                        .collect();
+                    return Array2::from_shape_vec((1, nn), out).unwrap();
+                }
                 let block = 512.min(nn.max(1));
                 let mut blocks: Vec<(usize, Array2<f32>)> = (0..nn.div_ceil(block))
                     .into_par_iter()
@@ -520,6 +580,20 @@ impl Bundle {
                 let (k, nn, g) = (w4.k, w4.n, w4.g);
                 let (ng, row_bytes) = (k.div_ceil(g), k.div_ceil(2));
                 let packed = &w4.packed;
+                // DECODE fast path (m==1): fused affine unpack-and-dot per output column — no f32 weight buffer.
+                if a.nrows() == 1 {
+                    let arow = a.row(0);
+                    let arow = arow.as_slice().unwrap();
+                    let (scale, mins) = (scale.as_slice().unwrap(), mins.as_slice().unwrap());
+                    let out: Vec<f32> = (0..nn)
+                        .into_par_iter()
+                        .map(|j| {
+                            let (sl, mn) = (&scale[j * ng..(j + 1) * ng], &mins[j * ng..(j + 1) * ng]);
+                            q4a_dot(&packed[j * row_bytes..(j + 1) * row_bytes], arow, sl, mn, g, k)
+                        })
+                        .collect();
+                    return Array2::from_shape_vec((1, nn), out).unwrap();
+                }
                 let block = 512.min(nn.max(1));
                 let mut blocks: Vec<(usize, Array2<f32>)> = (0..nn.div_ceil(block))
                     .into_par_iter()
@@ -939,6 +1013,16 @@ mod tests {
         let w: Vec<i8> = vec![-1, 2, -3, 4, 5, -6, 7, 8, -9, 10, -11, 12, 13, -14, 15, 16, 17, -18];
         let want: i32 = a.iter().zip(&w).map(|(&x, &y)| x as i32 * y as i32).sum();
         assert_eq!(i8dot(&a, &w), want);
+    }
+
+    /// The fused int4/q4a decode dots must equal a manual dequant-and-dot (one output column, one group).
+    #[test]
+    fn i4_q4a_dot_matches_manual() {
+        let prow = vec![0xE1u8, 0xF3u8]; // signed nibbles [1, -2, 3, -1] / unsigned [1, 14, 3, 15]
+        let a = vec![1.0f32; 4];
+        assert_eq!(i4_dot(&prow, &a, &[1.0], 4, 4), 1.0); // 1 - 2 + 3 - 1
+        // q4a affine: w = 0.5*q - 1.0 → Σ a·w = 0.5*(1+14+3+15) - 1*4 = 12.5
+        assert!((q4a_dot(&prow, &a, &[0.5], &[-1.0], 4, 4) - 12.5).abs() < 1e-5);
     }
 
     /// The fused f16 SAXPY (decode kernel) must match a scalar `acc += scal * f16->f32(w)` reference within fp
