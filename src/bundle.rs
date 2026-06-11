@@ -88,6 +88,12 @@ fn u4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> f32 {
 /// bytes; `scale` its `ng` group scales. Auto-vectorises over the group inner loop.
 #[inline]
 fn i4_dot(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+            return unsafe { i4_dot_avx2(prow, a, scale, g, k) };
+        }
+    }
     let mut sum = 0.0f32;
     let mut gi = 0;
     let mut kk = 0;
@@ -111,6 +117,12 @@ fn i4_dot(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
 /// group. Unsigned nibble; no f32 buffer.
 #[inline]
 fn q4a_dot(prow: &[u8], a: &[f32], scale: &[f32], mins: &[f32], g: usize, k: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+            return unsafe { q4a_dot_avx2(prow, a, scale, mins, g, k) };
+        }
+    }
     let mut sum = 0.0f32;
     let mut gi = 0;
     let mut kk = 0;
@@ -122,6 +134,96 @@ fn q4a_dot(prow: &[u8], a: &[f32], scale: &[f32], mins: &[f32], g: usize, k: usi
             let q = (if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32;
             qsum += a[kk] * q;
             asum += a[kk];
+            kk += 1;
+        }
+        sum += scale[gi] * qsum + mins[gi] * asum;
+        gi += 1;
+    }
+    sum
+}
+
+/// Horizontal sum of the 8 f32 lanes of an AVX vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let q = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1)); // 4 lanes
+    let d = _mm_add_ps(q, _mm_movehl_ps(q, q)); // 2 lanes
+    _mm_cvtss_f32(_mm_add_ss(d, _mm_shuffle_ps(d, d, 1)))
+}
+
+/// Unpack 8 packed nibbles (4 bytes at `prow[byte..]`) into kk-order: load 4 bytes, mask the low nibbles and the
+/// per-byte high nibbles (`srli_epi16(.,4) & 0x0F` extracts each byte's high nibble — the cross-byte carry lands in
+/// bits 4-7 which the mask drops), then `unpacklo_epi8` interleaves them to [lo0,hi0,lo1,hi1,…] = nibble(kk=0..7).
+/// Result holds the 8 nibbles (values 0-15) in its low 8 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack8_nibbles(prow: *const u8, byte: usize) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let bytes = _mm_cvtsi32_si128(std::ptr::read_unaligned(prow.add(byte) as *const i32));
+    let lomask = _mm_set1_epi8(0x0F);
+    let lo = _mm_and_si128(bytes, lomask);
+    let hn = _mm_and_si128(_mm_srli_epi16(bytes, 4), lomask);
+    _mm_unpacklo_epi8(lo, hn)
+}
+
+/// AVX2 `i4_dot`: vectorise the group inner loop 8 nibbles/iter — unpack → sign-extend 4-bit (XOR 8, sub 8) →
+/// widen to f32 → FMA with the activations; scalar tail per group. ~the memory floor instead of scalar-unpack-bound.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn i4_dot_avx2(prow: &[u8], a: &[f32], scale: &[f32], g: usize, k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let (pp, ap) = (prow.as_ptr(), a.as_ptr());
+    let eight = _mm_set1_epi8(8);
+    let (mut sum, mut gi, mut kk) = (0.0f32, 0usize, 0usize);
+    while kk < k {
+        let hi = (kk + g).min(k);
+        let mut gacc = _mm256_setzero_ps();
+        while kk + 8 <= hi {
+            let nib = unpack8_nibbles(pp, kk / 2);
+            let signed = _mm_sub_epi8(_mm_xor_si128(nib, eight), eight); // 4-bit sign-extend
+            let wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(signed)); // low 8 i8 -> 8 i32 -> 8 f32
+            gacc = _mm256_fmadd_ps(wf, _mm256_loadu_ps(ap.add(kk)), gacc);
+            kk += 8;
+        }
+        let mut gsum = hsum256(gacc);
+        while kk < hi {
+            let byte = *pp.add(kk / 2);
+            let n = if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            gsum += *ap.add(kk) * ((((n << 4) as i8) >> 4) as f32);
+            kk += 1;
+        }
+        sum += scale[gi] * gsum;
+        gi += 1;
+    }
+    sum
+}
+
+/// AVX2 `q4a_dot`: like `i4_dot_avx2` but unsigned nibbles (0-15, so the widen is a no-op sign-wise) and it accumulates
+/// BOTH `Σ a·q` and `Σ a` per group, combined as `scale·Σaq + min·Σa`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4a_dot_avx2(prow: &[u8], a: &[f32], scale: &[f32], mins: &[f32], g: usize, k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let (pp, ap) = (prow.as_ptr(), a.as_ptr());
+    let (mut sum, mut gi, mut kk) = (0.0f32, 0usize, 0usize);
+    while kk < k {
+        let hi = (kk + g).min(k);
+        let (mut qacc, mut aacc) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+        while kk + 8 <= hi {
+            let nib = unpack8_nibbles(pp, kk / 2);
+            let qf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(nib)); // unsigned 0-15 -> 8 f32
+            let af = _mm256_loadu_ps(ap.add(kk));
+            qacc = _mm256_fmadd_ps(qf, af, qacc);
+            aacc = _mm256_add_ps(aacc, af);
+            kk += 8;
+        }
+        let (mut qsum, mut asum) = (hsum256(qacc), hsum256(aacc));
+        while kk < hi {
+            let byte = *pp.add(kk / 2);
+            let q = (if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32;
+            qsum += *ap.add(kk) * q;
+            asum += *ap.add(kk);
             kk += 1;
         }
         sum += scale[gi] * qsum + mins[gi] * asum;
@@ -1023,6 +1125,31 @@ mod tests {
         assert_eq!(i4_dot(&prow, &a, &[1.0], 4, 4), 1.0); // 1 - 2 + 3 - 1
         // q4a affine: w = 0.5*q - 1.0 → Σ a·w = 0.5*(1+14+3+15) - 1*4 = 12.5
         assert!((q4a_dot(&prow, &a, &[0.5], &[-1.0], 4, 4) - 12.5).abs() < 1e-5);
+    }
+
+    /// The SIMD (AVX2) i4_dot/q4a_dot must match a scalar dequant-and-dot reference. k=37, g=16 exercises the 8-nibble
+    /// SIMD chunks + the per-group scalar tail + multiple groups.
+    #[test]
+    fn i4_q4a_dot_simd_vs_reference() {
+        let (k, g) = (37usize, 16usize);
+        let ng = k.div_ceil(g);
+        let nibs: Vec<i8> = (0..k).map(|i| ((i * 7 + 3) % 16) as i8 - 8).collect(); // signed [-8,7]
+        let mut prow = vec![0u8; k.div_ceil(2)];
+        for kk in 0..k {
+            let q = (nibs[kk] as u8) & 0x0F;
+            if kk % 2 == 0 {
+                prow[kk / 2] |= q;
+            } else {
+                prow[kk / 2] |= q << 4;
+            }
+        }
+        let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.13 - 2.0).sin()).collect();
+        let scale: Vec<f32> = (0..ng).map(|gi| 0.1 + gi as f32 * 0.05).collect();
+        let want_i4: f32 = (0..k).map(|kk| a[kk] * nibs[kk] as f32 * scale[kk / g]).sum();
+        assert!((i4_dot(&prow, &a, &scale, g, k) - want_i4).abs() < 1e-3, "i4 simd vs ref");
+        let mins: Vec<f32> = (0..ng).map(|gi| -0.3 + gi as f32 * 0.1).collect();
+        let want_q: f32 = (0..k).map(|kk| a[kk] * (scale[kk / g] * ((nibs[kk] as u8 & 0x0F) as f32) + mins[kk / g])).sum();
+        assert!((q4a_dot(&prow, &a, &scale, &mins, g, k) - want_q).abs() < 1e-3, "q4a simd vs ref");
     }
 
     /// The fused f16 SAXPY (decode kernel) must match a scalar `acc += scal * f16->f32(w)` reference within fp
