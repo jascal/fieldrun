@@ -329,13 +329,373 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
+        // --prune-head (Phase 8b): measure the retrieval-pruned output head. The KB proposes a small candidate set per
+        // position; the full-vocab unembed collapses to scoring only those. Because the pruned head scores the SAME
+        // unembed rows, pruned-argmax == full-argmax exactly when the candidate set contains the full head's argmax — so
+        // top-1 fidelity == candidate-set COVERAGE of the full argmax. Reports the coverage-vs-size curve (sweeping
+        // candidate configs) + the head speedup (full vs subset unembed) + the unembed's share of per-token compute.
+        // Context-only by default (recent + induction, needs no store); pass `--store <store.json>` to add KB n-grams.
+        if has_flag(&args, "--prune-head") {
+            use retrieval::{context_candidates, CandCfg};
+            let store: Option<Store> = flag(&args, "--store").and_then(|p| match Store::load(p) {
+                Ok(s) => Some(s),
+                Err(e) => { eprintln!("[fieldrun] --store {p:?}: {e} (continuing context-only)"); None }
+            });
+            let b2 = Bundle::load(&stem).expect("reload bundle for unembed microbench");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, d) = b2.dims(un);
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --prune-head: no eval positions (need --ids with > ctx_window tokens, matching this model's vocab)");
+                return;
+            }
+            eprintln!("[fieldrun] --prune-head: {} positions (ctx {ctx_window}), unembed {un} ({vocab}×{d}), store: {}",
+                      positions.len(), if store.is_some() { "n-gram KB" } else { "context-only" });
+            // Ground truth: the FULL head's argmax per position (what the pruned head must reproduce). Parallel forwards.
+            let t_truth = std::time::Instant::now();
+            let truth: Vec<i64> = positions.par_iter().map(|c| lm.predict(c)).collect();
+            let predict_ms = t_truth.elapsed().as_secs_f64() * 1e3 / positions.len() as f64;
+
+            let build = |c: &[i64], cfg: &CandCfg| -> Vec<i64> {
+                match store.as_ref() {
+                    Some(s) => s.candidates(c, cfg),
+                    None => {
+                        let mut o = Vec::new();
+                        context_candidates(c, cfg.recent, cfg.induction, &mut o);
+                        let mut seen = std::collections::HashSet::new();
+                        o.retain(|&t| seen.insert(t));
+                        o
+                    }
+                }
+            };
+            let z = CandCfg { recent: 0, induction: 0, quad: 0, tri: 0, bi: 0, skel: 0, uni: 0, closed: false };
+            // sweep: context-only (recent+induction; work with no store) then KB-augmented (n-gram/grammar/unigram —
+            // these add tokens ONLY when a --store is loaded). Spans |C| from a few to a few hundred → the coverage knee.
+            let cfgs: Vec<(&str, CandCfg)> = vec![
+                ("recent8",          CandCfg { recent: 8,  ..z }),
+                ("recent32+ind3",    CandCfg { recent: 32, induction: 3, ..z }),
+                ("recent64+ind4",    CandCfg { recent: 64, induction: 4, ..z }),
+                ("recent128+ind4",   CandCfg { recent: 128, induction: 4, ..z }),
+                ("ngram16",          CandCfg { recent: 16, induction: 3, quad: 6, tri: 6, bi: 6, ..z }),
+                ("ngram+grammar",    CandCfg { recent: 16, induction: 3, quad: 6, tri: 6, bi: 6, skel: 6, closed: true, ..z }),
+                ("generous~256",     CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true }),
+                ("generous~512",     CandCfg { recent: 128, induction: 4, quad: 16, tri: 16, bi: 16, skel: 16, uni: 256, closed: true }),
+            ];
+            println!("\n=== retrieval-pruned head — coverage sweep ({} positions) ===", positions.len());
+            println!("{:<18} {:>9} {:>8} {:>14}", "config", "mean|C|", "cov%", "V/|C| (head×)");
+            let mut best: Option<(f64, Vec<i64>)> = None; // (mean|C|, a representative candidate set) for the balanced config
+            for (name, cfg) in &cfgs {
+                let mut tot = 0usize;
+                let mut cov = 0usize;
+                let mut sample: Vec<i64> = Vec::new();
+                for (c, &t) in positions.iter().zip(&truth) {
+                    let cands = build(c, cfg);
+                    tot += cands.len();
+                    if cands.contains(&t) {
+                        cov += 1;
+                    }
+                    if sample.is_empty() {
+                        sample = cands;
+                    }
+                }
+                let mean = tot as f64 / positions.len() as f64;
+                let covp = 100.0 * cov as f64 / positions.len() as f64;
+                println!("{name:<18} {mean:>9.1} {covp:>7.1}% {:>13.1}×", vocab as f64 / mean.max(1.0));
+                if *name == "generous~256" {
+                    best = Some((mean, sample));
+                }
+            }
+            // Conditional analysis (needs a store): does the KB's CONFIDENCE (which idiom fired) predict coverage? If a
+            // high-confidence idiom (induction/quad) covers the argmax far more often than the unigram floor, a gate that
+            // prunes ONLY when that idiom fires is high-precision. The KB-top-1==argmax column is the Phase-6 signal: when
+            // it's high, you can emit the KB token and skip the WHOLE forward (not just the head).
+            if let Some(s) = store.as_ref() {
+                let gen = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+                let mut by: std::collections::HashMap<String, [usize; 3]> = std::collections::HashMap::new(); // idiom -> [count, kb_top1==argmax, argmax∈cands]
+                for (c, &t) in positions.iter().zip(&truth) {
+                    let (kb, idiom) = s.predict(c);
+                    let e = by.entry(idiom).or_default();
+                    e[0] += 1;
+                    if kb == t { e[1] += 1; }
+                    if s.candidates(c, &gen).contains(&t) { e[2] += 1; }
+                }
+                let mut rows: Vec<(String, [usize; 3])> = by.into_iter().collect();
+                rows.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+                println!("\nper-idiom (KB confidence signal) — does a fired idiom predict coverage / standalone correctness?");
+                println!("{:<14} {:>6} {:>14} {:>12}", "idiom", "n", "KB top1=argmax", "cov(gen)");
+                for (idiom, e) in &rows {
+                    let (n, acc, cov) = (e[0], e[1], e[2]);
+                    println!("{idiom:<14} {n:>6} {:>13.1}% {:>11.1}%", 100.0 * acc as f64 / n as f64, 100.0 * cov as f64 / n as f64);
+                }
+            }
+
+            // Head speedup: time the full-vocab unembed vs the subset unembed for a representative candidate set.
+            let (mean_c, cand) = best.unwrap_or((1.0, vec![0]));
+            let mut s: u64 = 0x243F6A8885A308D3;
+            let mut x: Vec<f32> = (0..d).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 33) as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
+            x.truncate(d);
+            let iters = 200usize;
+            let t = std::time::Instant::now();
+            let mut sink = 0.0f32;
+            for _ in 0..iters { sink += b2.rowdot_f32(un, &x).iter().cloned().fold(f32::MIN, f32::max); }
+            let full_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..iters { sink += b2.rowdot_f32_subset(un, &x, &cand).iter().cloned().fold(f32::MIN, f32::max); }
+            let sub_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("\nunembed head (|C|={:.0}):  full {full_us:.1} µs/tok   subset {sub_us:.1} µs/tok   head speedup {:.1}×", mean_c, full_us / sub_us);
+            // End-to-end framing must use a single-token DECODE step (where pruning matters), NOT predict() on a 64-token
+            // context (a prefill — there the unembed is a tiny share). Time a real KV-cached decode: generate from a short
+            // prompt and per-token ≈ elapsed/N (the short-prompt prefill is negligible vs N decode steps).
+            let short: Vec<i64> = positions[0].iter().take(8).copied().collect();
+            let ndec = 24usize;
+            let t = std::time::Instant::now();
+            let g = lm.generate(&short, ndec);
+            let decode_ms = t.elapsed().as_secs_f64() * 1e3 / g.len().max(1) as f64;
+            let tok_pruned_ms = (decode_ms - full_us / 1e3 + sub_us / 1e3).max(0.0);
+            println!("(64-ctx prefill {predict_ms:.1} ms/pos — for reference)");
+            println!("decode token (forward+full-head) ≈ {decode_ms:.2} ms; unembed share of DECODE ≈ {:.0}%", 100.0 * (full_us / 1e3) / decode_ms.max(1e-6));
+            println!("end-to-end pruned-head decode token ≈ {tok_pruned_ms:.2} ms  ⇒  {:.2}× decode tok/s (IF the candidate set covers the argmax)", decode_ms / tok_pruned_ms.max(1e-6));
+            println!("(coverage = top-1 agreement with the full head; sink={sink:.3})");
+            return;
+        }
+
+        // --attribute (the explain/attribution side of Phase 8b): route EACH token of a holdout to a KB rule or to
+        // composition. Three routes — RETRIEVED (a symbolic KB rule's top-1 == the model's argmax: a pure lookup),
+        // SELECTED (the argmax is in the KB candidate set but isn't the KB top-1: composition disambiguated within a
+        // retrieved set), COMPOSED (no KB rule covers it: the irreducible forge tax). The per-token trace + the
+        // aggregate retrieved/selected/composed split make the KB-vs-composition thesis observable token by token —
+        // the retrieval half of explain (the composition half is the DLA circuit trace). Needs `--store`.
+        if has_flag(&args, "--attribute") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --attribute needs --store <store.json> (the KB rules to attribute against)"); return; }
+            };
+            let dec = load_decoder(flag(&args, "--vocab"));
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --attribute: no eval positions (need --ids > ctx_window, matching this model's vocab)");
+                return;
+            }
+            let trace_n = positions.len().min(30); // readable per-token trace; aggregate is over all positions
+            eprintln!("[fieldrun] --attribute: routing {} tokens (ctx {ctx_window}) — RETRIEVED / SELECTED / COMPOSED", positions.len());
+            // 3-way counts overall + per-idiom (idiom -> [retrieved, selected, composed]).
+            let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
+            let mut by: std::collections::HashMap<String, [usize; 3]> = std::collections::HashMap::new();
+            println!("\n=== per-token attribution (first {trace_n}) — token ← route via KB rule ===");
+            for (i, c) in positions.iter().enumerate() {
+                let truth = lm.predict(c);
+                let (kb, idiom) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&truth);
+                let (route, slot) = if kb == truth { ("RETRIEVED", 0) } else if covered { ("SELECTED ", 1) } else { ("COMPOSED ", 2) };
+                match slot { 0 => retr += 1, 1 => sel += 1, _ => comp += 1 };
+                by.entry(idiom.clone()).or_default()[slot] += 1;
+                if i < trace_n {
+                    println!("  {route} {:<22} via {idiom}", dec(truth));
+                }
+            }
+            let n = positions.len() as f64;
+            println!("\n=== decomposition of {} next-token decisions ===", positions.len());
+            println!("  RETRIEVED (KB rule alone = model)        {retr:>4}  {:>5.1}%", 100.0 * retr as f64 / n);
+            println!("  SELECTED  (in KB set, composition picks) {sel:>4}  {:>5.1}%", 100.0 * sel as f64 / n);
+            println!("  COMPOSED  (no KB rule — the forge tax)   {comp:>4}  {:>5.1}%", 100.0 * comp as f64 / n);
+            let mut rows: Vec<(String, [usize; 3])> = by.into_iter().collect();
+            rows.sort_by(|a, b| (b.1[0] + b.1[1] + b.1[2]).cmp(&(a.1[0] + a.1[1] + a.1[2])));
+            println!("\n  by KB rule that fired:   idiom            n   retr%  sel%  comp%");
+            for (idiom, e) in &rows {
+                let tot = (e[0] + e[1] + e[2]).max(1) as f64;
+                println!("    {idiom:<16} {:>4}  {:>5.0} {:>5.0} {:>5.0}", e[0] + e[1] + e[2],
+                         100.0 * e[0] as f64 / tot, 100.0 * e[1] as f64 / tot, 100.0 * e[2] as f64 / tot);
+            }
+            return;
+        }
+
+        // --probe (the SELECTED conflict-resolution question): is the model's pick a FUNCTION of the rule-firing state?
+        // Forward-chaining framing — the candidate set is the conflict set, SELECTED is conflict resolution. Two tests:
+        //   (A) rank of the pick within its explaining rule — rank 1 == "max-incidence" conflict resolution reproduces
+        //       it; the spread over ranks is the deviation a fixed count-ordering strategy can't capture.
+        //   (B) within-bucket pick entropy when the conflict set is held FIXED (bucket by the n-gram key). H≈0 / 100%
+        //       agreement ⇒ the pick is a function of the firing state (symbolic-representable); H>0 is the residue that
+        //       needs a finer incidence space than the rules carry. Finer key (bi→tri) = finer incidence partition.
+        if has_flag(&args, "--probe") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe needs --store <store.json>"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe: no eval positions");
+                return;
+            }
+            eprintln!("[fieldrun] --probe: {} positions (ctx {ctx_window}) — running forwards…", positions.len());
+            // record per position: (pick, route, last token, (t-2,t-1), rank-of-pick-in-its-rule | None if off-rule)
+            struct Rec { pick: i64, route: u8, bik: i64, trik: (i64, i64), rank: Option<usize> }
+            let recs: Vec<Rec> = positions.par_iter().map(|c| {
+                let pick = lm.predict(c);
+                let (kb, _) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&pick);
+                let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 }; // RETRIEVED / SELECTED / COMPOSED
+                let n = c.len();
+                Rec { pick, route, bik: c[n - 1], trik: (if n >= 2 { c[n - 2] } else { -1 }, c[n - 1]),
+                      rank: store.rule_for(c, pick).and_then(|r| r.rank) }
+            }).collect();
+
+            // (A) picked-rank distribution over SELECTED positions (does a fixed count-ordering reproduce the pick?).
+            let sel: Vec<&Rec> = recs.iter().filter(|r| r.route == 1).collect();
+            let (mut r1, mut r2, mut r3, mut r4p, mut offrule) = (0, 0, 0, 0, 0);
+            for r in &sel {
+                match r.rank {
+                    Some(1) => r1 += 1,
+                    Some(2) => r2 += 1,
+                    Some(3) => r3 += 1,
+                    Some(_) => r4p += 1,
+                    None => offrule += 1, // pick covered via recent/closed/floor, not in any named rule's successors
+                }
+            }
+            let ns = sel.len().max(1) as f64;
+            println!("\n=== (A) SELECTED picked-rank within its explaining rule ({} SELECTED positions) ===", sel.len());
+            println!("  rank 1 (== max-incidence) {r1:>4}  {:>5.1}%   ← a fixed 'pick the highest-count successor' strategy reproduces these", 100.0 * r1 as f64 / ns);
+            println!("  rank 2                    {r2:>4}  {:>5.1}%", 100.0 * r2 as f64 / ns);
+            println!("  rank 3                    {r3:>4}  {:>5.1}%", 100.0 * r3 as f64 / ns);
+            println!("  rank 4+                   {r4p:>4}  {:>5.1}%", 100.0 * r4p as f64 / ns);
+            println!("  off-rule (recent/floor)   {offrule:>4}  {:>5.1}%   ← not in any named rule's RHS at all", 100.0 * offrule as f64 / ns);
+
+            // (B) within-bucket pick entropy when the conflict set is held fixed. Restrict to SELECTED.
+            let h = |picks: &[i64]| -> f64 {
+                let mut cnt: HashMap<i64, usize> = HashMap::new();
+                for &p in picks { *cnt.entry(p).or_default() += 1; }
+                let n = picks.len() as f64;
+                cnt.values().map(|&c| { let p = c as f64 / n; -p * p.log2() }).sum()
+            };
+            let bucket_stats = |buckets: Vec<Vec<i64>>| -> (usize, usize, f64, f64) {
+                let nz: Vec<Vec<i64>> = buckets.into_iter().filter(|b| b.len() >= 2).collect();
+                let total: usize = nz.iter().map(|b| b.len()).sum();
+                if total == 0 { return (0, 0, 0.0, 0.0); }
+                let wh: f64 = nz.iter().map(|b| b.len() as f64 * h(b)).sum::<f64>() / total as f64; // weighted H(pick|bucket)
+                // top-1 agreement: Σ plurality / total
+                let agree: usize = nz.iter().map(|b| {
+                    let mut cnt: HashMap<i64, usize> = HashMap::new();
+                    for &p in b { *cnt.entry(p).or_default() += 1; }
+                    *cnt.values().max().unwrap()
+                }).sum();
+                (nz.len(), total, wh, 100.0 * agree as f64 / total as f64)
+            };
+            let by_bi = { let mut m: HashMap<i64, Vec<i64>> = HashMap::new(); for r in &sel { m.entry(r.bik).or_default().push(r.pick); } bucket_stats(m.into_values().collect()) };
+            let by_tri = { let mut m: HashMap<(i64, i64), Vec<i64>> = HashMap::new(); for r in &sel { m.entry(r.trik).or_default().push(r.pick); } bucket_stats(m.into_values().collect()) };
+            let h0 = h(&sel.iter().map(|r| r.pick).collect::<Vec<_>>()); // baseline marginal entropy of the SELECTED pick
+            println!("\n=== (B) is the SELECTED pick a function of the conflict set? bucket by the n-gram key, hold the conflict set fixed ===");
+            println!("  baseline H(pick) over all SELECTED = {h0:.2} bits (no conditioning)");
+            println!("  {:<26}{:>10}{:>10}{:>14}{:>13}", "signature (incidence)", "buckets≥2", "positions", "H(pick|sig)", "top-1 agree");
+            println!("  {:<26}{:>10}{:>10}{:>13.2}{:>12.1}%", "bigram-key  (last token)", by_bi.0, by_bi.1, by_bi.2, by_bi.3);
+            println!("  {:<26}{:>10}{:>10}{:>13.2}{:>12.1}%", "trigram-key (last 2 tok)", by_tri.0, by_tri.1, by_tri.2, by_tri.3);
+            println!("  (H→0 / agree→100% as the key tightens ⇒ the pick IS a function of the firing state = conflict resolution;");
+            println!("   a plateau below that is the residue needing a finer incidence space than the rules carry.)");
+            return;
+        }
+
+        // --probe-dla (combine vs select): for each pick, is the logit DOMINATED by one circuit (disguised selection)
+        // or SPREAD over many (genuine superposition/combination)? Per position, take the per-circuit DLA contributions
+        // to the predicted token (heads + neurons, from the faithful explain forward) and measure concentration —
+        // top-1 share (max DLA / Σ captured DLA), participation ratio PR = (Σd)²/Σd² (effective # of circuits, 1 =
+        // one dominates), and the top circuit's share of the TRUE predicted logit — bucketed by route. Prediction:
+        // RETRIEVED concentrates (one rule writes it), COMPOSED spreads, SELECTED in between = partial superposition.
+        if has_flag(&args, "--probe-dla") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-dla needs --store"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap = (end - ctx_window).min(n_eval); // explain is the expensive faithful forward
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe-dla: no eval positions");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
+            let b2 = Bundle::load(&stem).expect("reload bundle for U-row norms");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            struct Rec { route: u8, pr: f32, captured: usize, margin: f32, nmargin: f32, top_hit: bool, any_hit: bool }
+            let recs: Vec<Rec> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain(c)?;
+                let pick = ex.model_predicts;
+                let (kb, _) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&pick);
+                let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 };
+                // FULL spectrum participation ratio: every scored circuit's positive DLA (~64 heads + ~384 neurons).
+                let mut d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                if d.is_empty() { return None; }
+                d.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                let margin = ex.predicted_logit - ex.runner_up_logit;
+                // Q1 normalization: true facet distance = (L_t − L_v) / ‖U_t − U_v‖.
+                let (ut, uv) = (b2.weight_row(un, pick as usize), b2.weight_row(un, ex.runner_up as usize));
+                let nrm = ut.iter().zip(&uv).map(|(a, b)| { let dd = a - b; dd * dd }).sum::<f32>().sqrt();
+                let nmargin = if nrm > 0.0 { margin / nrm } else { f32::NAN };
+                // Q4: does any single circuit's ISOLATED argmax (its #1 promoted token) reproduce the model's pick?
+                let any_hit = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).any(|a| a == pick);
+                let top_hit = {
+                    let th = ex.head_circuits.first();
+                    let tn = ex.mlp_features.first();
+                    match (th, tn) {
+                        (Some(h), Some(n)) => if h.dla >= n.dla { h.promotes.first() } else { n.promotes.first() },
+                        (Some(h), None) => h.promotes.first(),
+                        (None, Some(n)) => n.promotes.first(),
+                        (None, None) => None,
+                    }.copied() == Some(pick)
+                };
+                Some(Rec { route, pr, captured: d.len(), margin, nmargin, top_hit, any_hit })
+            }).collect();
+
+            let pct = |g: &[&Rec], f: &dyn Fn(&Rec) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
+            let meanf = |g: &[&Rec], f: &dyn Fn(&Rec) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== (C/Q1/Q4) full-spectrum DLA + falsifiers ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.captured).unwrap_or(0));
+            println!("{:<12}{:>6}{:>11}{:>13}{:>15}{:>15}{:>13}", "route", "n", "PR (eff#)", "margin", "margin/‖ΔU‖", "top-circ=pick", "any-circ=pick");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&Rec> = recs.iter().filter(|x| x.route == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                println!("{lbl:<12}{:>6}{:>11.1}{:>13.2}{:>15.3}{:>14.0}%{:>12.0}%", g.len(),
+                    meanf(&g, &|x| x.pr), meanf(&g, &|x| x.margin), meanf(&g, &|x| x.nmargin), pct(&g, &|x| x.top_hit), pct(&g, &|x| x.any_hit));
+            }
+
+            // (Q1 disambiguation) confidence vs structure: within matched normalized-margin bins, does KB-coverage still
+            // predict single-circuit redundancy? If the COVERED−COMPOSED any-circ gap persists at matched margin, the
+            // retrieval/composition split carries information BEYOND confidence (margin alone).
+            let mut nms: Vec<f32> = recs.iter().map(|r| r.nmargin).filter(|x| x.is_finite()).collect();
+            nms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: f32| if nms.is_empty() { 0.0 } else { nms[(((nms.len() - 1) as f32) * p) as usize] };
+            let (t1, t2) = (q(0.333), q(0.667));
+            println!("\n=== (Q1 disambig) within matched normalized-margin bins — does coverage predict redundancy beyond confidence? ===");
+            println!("{:<14}{:>14}{:>22}{:>22}", "margin bin", "", "COVERED (R+S)", "COMPOSED");
+            println!("{:<14}{:>10}{:>12}{:>12}{:>12}", "", "mean m/‖ΔU‖", "n  any-circ%", "n", "any-circ%");
+            for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
+                let inbin = |r: &&Rec| r.nmargin.is_finite() && r.nmargin >= lo && r.nmargin < hi;
+                let cov: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route != 2).collect();
+                let cmp: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route == 2).collect();
+                let mm = meanf(&recs.iter().filter(inbin).collect::<Vec<_>>(), &|x| x.nmargin);
+                println!("{lbl:<14}{mm:>10.2} {:>9} {:>5.0}%  {:>9} {:>5.0}%", cov.len(), pct(&cov, &|x| x.any_hit), cmp.len(), pct(&cmp, &|x| x.any_hit));
+            }
+            println!("⇒ if COVERED any-circ% ≫ COMPOSED any-circ% WITHIN a margin bin, the retrieval/composition split is NOT just confidence.");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
             .and_then(|s| s.parse::<u16>().ok());
-        // --explain: in the chat REPL it turns ON per-reply explanations (toggle live with /explain). With --ids it's
-        // the standalone "explain this prediction" mode. (It used to force standalone mode and panic without --ids.)
-        let explain = has_flag(&args, "--explain");
+        // --explain[=MODE]: in the chat REPL it turns ON per-reply explanations (toggle live with /explain). MODE is the
+        // EXPLAIN level — `route` (default, free: per-token RETRIEVED/SELECTED/COMPOSED), `circuits` (route + DLA
+        // breakdown only on COMPOSED tokens), `all` (DLA on every token). `--explain` alone = route.
+        let explain: Option<explain::ExplainMode> = if has_flag(&args, "--explain") {
+            Some(flag(&args, "--explain").and_then(explain::ExplainMode::parse).unwrap_or(explain::ExplainMode::Route))
+        } else {
+            None
+        };
 
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
         // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare
@@ -349,7 +709,11 @@ fn main() {
                 // default reply cap depends on the model (reasoning models get a bigger budget); --max-tokens overrides.
                 Some(tg) => {
                     let max_tokens = want.unwrap_or_else(|| tg.default_max_tokens());
-                    api::chat(lm, tg, max_tokens, explain, has_flag(&args, "--raw"), &arch);
+                    // --store loads the KB rules so explain can attribute each token to an idiom (RETRIEVED/SELECTED);
+                    // without it, routing is induction-only. The candidate set bounds the SELECTED-vs-COMPOSED line.
+                    let kb = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+                    let cand = retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch);
                 }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
@@ -365,7 +729,7 @@ fn main() {
 
         // --serve PORT: start the HTTP API over this loaded model (no ids needed).
         if let Some(port) = serve_port {
-            if explain {
+            if explain.is_some() {
                 eprintln!("[fieldrun] note: --explain toggles per-reply explanations in the chat REPL. The API server \
                            ignores it — POST /explain for the structured form, or pass \"explain\":true to the chat \
                            endpoints. (Use --chat --explain for an explained REPL.)");
@@ -374,13 +738,19 @@ fn main() {
             let textgen = api::TextGen::load(&stem, eos);
             #[cfg(not(feature = "api"))]
             let textgen: Option<api::TextGen> = None;
-            api::serve(lm, &arch, port, textgen);
+            // KB rules for the typed `"explain"` field (route/circuits/all): --store enables full RETRIEVED/SELECTED
+            // attribution; without it, the route is induction-only. The candidate set bounds SELECTED-vs-COMPOSED.
+            let explain_opts = api::ExplainOpts {
+                store: flag(&args, "--store").and_then(|p| Store::load(p).ok()),
+                cand: retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true },
+            };
+            api::serve(lm, &arch, port, textgen, explain_opts);
             return;
         }
 
         // --explain WITH --ids: standalone "explain the prediction at the end of the first --ctx tokens" (circuits +
         // features). Without ids we'd have already gone to chat above; guard anyway so an empty stream can't index out.
-        if explain {
+        if explain.is_some() {
             if ids.is_empty() {
                 eprintln!("[fieldrun] --explain standalone mode needs --ids <token stream>. For explained chat replies, \
                            run with --chat --explain (or just --explain) and toggle /explain in the REPL.");

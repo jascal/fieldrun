@@ -24,6 +24,11 @@
 use serde::Deserialize;
 
 use crate::model::Model;
+use crate::retrieval::{CandCfg, Store}; // ExplainOpts (held by serve in both builds) carries these
+#[cfg(feature = "api")]
+use crate::explain::ExplainMode;
+#[cfg(feature = "api")]
+use crate::retrieval::{context_candidates, RuleHit};
 
 #[derive(Deserialize)]
 struct PredictReq {
@@ -197,7 +202,7 @@ impl TextGen {
 #[cfg(not(feature = "api"))]
 pub struct TextGen;
 
-pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>) {
+pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>, explain: ExplainOpts) {
     let server = match tiny_http::Server::http(("0.0.0.0", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -228,11 +233,11 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
         if let Some(tg) = textgen.as_ref() {
             let streamable = matches!(route.as_str(), "/v1/chat/completions" | "/v1/completions" | "/v1/messages");
             if streamable && wants_stream(&body) {
-                serve_stream(req, &route, &body, lm.as_ref(), arch, tg);
+                serve_stream(req, &route, &body, lm.as_ref(), arch, tg, &explain);
                 continue;
             }
         }
-        let json = handle(&url, &body, lm.as_ref(), arch, textgen.as_ref());
+        let json = handle(&url, &body, lm.as_ref(), arch, textgen.as_ref(), &explain);
         let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
         let _ = req.respond(tiny_http::Response::from_string(json).with_header(header));
     }
@@ -252,8 +257,13 @@ fn log_request(method: &str, route: &str, body: &str) {
     if n_tools > 0 {
         flags.push(format!("tools={n_tools}"));
     }
-    if b("explain") {
-        flags.push("explain".into());
+    // explain is bool OR a level string ("route"/"circuits"/"all"); show the level when present and not off/false.
+    match v.get("explain") {
+        Some(serde_json::Value::Bool(true)) => flags.push("explain".into()),
+        Some(serde_json::Value::String(s)) if !matches!(s.to_ascii_lowercase().as_str(), "off" | "false" | "none" | "no" | "0") => {
+            flags.push(format!("explain={s}"))
+        }
+        _ => {}
     }
     let suffix = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
     eprintln!("[fieldrun] {method} {route}{suffix}");
@@ -309,7 +319,7 @@ impl std::io::Read for SseReader {
 ///    (buffered), parse, and then emit the parsed result as SSE frames (tool-call deltas, or the plain text if the
 ///    model just answered). The client still gets a stream — just delivered after generation rather than token-by-token.
 #[cfg(feature = "api")]
-fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen) {
+fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen, explain: &ExplainOpts) {
     #[derive(serde::Deserialize)]
     struct Req {
         #[serde(default)]
@@ -320,10 +330,10 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
         system: String,
         #[serde(default)]
         max_tokens: Option<usize>,
-        #[serde(default)]
-        explain: bool,
+        #[serde(default, deserialize_with = "de_explain")]
+        explain: Option<ExplainMode>,
     }
-    let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None, explain: false });
+    let r: Req = serde_json::from_str(body).unwrap_or(Req { messages: vec![], prompt: String::new(), system: String::new(), max_tokens: None, explain: None });
     let max_tokens = r.max_tokens.unwrap_or_else(|| tg.default_max_tokens()).clamp(1, 16384);
     let bv: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     let tools = crate::tools::parse_tools(&bv);
@@ -350,8 +360,8 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
     if want_tools {
         // Buffered tool-aware path: generate the whole reply, (optionally) log the explanation, parse calls, emit SSE.
         let g = tg.gen(lm, &prompt, max_tokens, add_special, &mut |_| {});
-        if r.explain {
-            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
+        if let Some(mode) = r.explain {
+            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids, explain, mode);
         }
         let calls = crate::tools::parse_calls(&g.text);
         let id = now();
@@ -382,9 +392,9 @@ fn serve_stream(req: tiny_http::Request, route: &str, body: &str, lm: &dyn Model
             };
             let g = tg.gen(lm, &prompt, max_tokens, add_special, &mut on_text);
             let _ = tx.send(sse_close(&route, &arch, id));
-            if r.explain {
+            if let Some(mode) = r.explain {
                 // print the full explain trace (one frame per generated token) to the server console post-stream
-                log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
+                log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids, explain, mode);
             }
             // tx dropped here -> channel closes -> reader EOFs
         });
@@ -483,13 +493,12 @@ fn anthropic_tool_frames(arch: &str, id: u64, text: &str, calls: &[crate::tools:
 /// when a request sets `"explain": true` — the streamed/JSON response can't always carry the extension field, so the
 /// operator watches the circuits + named features for every forward pass of the reply on the console.
 #[cfg(feature = "api")]
-fn log_explanation(lm: &dyn Model, tg: &TextGen, prompt_ids: &[i64], gen_ids: &[i64]) {
-    let steps = explain_steps(lm, prompt_ids, gen_ids);
-    if steps.is_empty() {
+fn log_explanation(lm: &dyn Model, tg: &TextGen, prompt_ids: &[i64], gen_ids: &[i64], opts: &ExplainOpts, mode: ExplainMode) {
+    if gen_ids.is_empty() {
         return;
     }
     let dec = |id: i64| tg.token_label(id);
-    eprintln!("[fieldrun] {}", render_explain_trace(&steps, &dec, 10));
+    eprintln!("[fieldrun] {}", render_typed_trace(lm, prompt_ids, gen_ids, opts.store.as_ref(), &opts.cand, mode, &dec, 10));
 }
 
 #[cfg(feature = "api")]
@@ -536,9 +545,9 @@ fn sse_close(route: &str, arch: &str, id: u64) -> Vec<u8> {
     }
 }
 
-fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen>) -> String {
+fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen>, explain: &ExplainOpts) -> String {
     #[cfg(not(feature = "api"))]
-    let _ = &tg; // only used by the OpenAI/Anthropic routes (feature `api`)
+    let _ = (&tg, explain); // only used by the OpenAI/Anthropic routes (feature `api`)
     let route = url.split('?').next().unwrap_or(url);
     match route {
         "/health" => "{\"ok\":true}".to_string(),
@@ -561,7 +570,7 @@ fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen
             "data": [{ "id": arch, "object": "model", "owned_by": "fieldrun" }] }).to_string(),
         #[cfg(feature = "api")]
         "/v1/chat/completions" | "/v1/completions" | "/v1/messages" => match tg {
-            Some(tg) => openai_anthropic(route, body, lm, arch, tg),
+            Some(tg) => openai_anthropic(route, body, lm, arch, tg, explain),
             None => err("no tokenizer for this bundle — re-run `convert` so it copies tokenizer.json next to the bundle"),
         },
         #[cfg(not(feature = "api"))]
@@ -632,65 +641,179 @@ fn tool_result_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// One Explanation per generated token — the forward pass that produced each token of the reply. These models generate
-/// one token at a time ("loop and think"), so a single end-of-prompt explanation only covers the FIRST step; this
-/// walks the whole reply. Step k explains the prediction at `prompt_ids ++ gen_ids[0..k]`, whose greedy top-1 is
-/// `gen_ids[k]` (so each step's `model_predicts` == that step's token). Empty if the arch has no explain. NB: re-runs a
-/// forward pass per generated token — an opt-in interpretability/debug surface, deliberately off the hot path.
+/// Route ONE token (predicted after `ctx`) to a KB rule or to composition — the retrieval half of explain. Returns
+/// `(route, rule)`: RETRIEVED (a KB idiom's top-1 == the token, a pure lookup — `rule` names the idiom), SELECTED (the
+/// token is in the KB candidate set but isn't the idiom top-1, so composition picked within a retrieved set), COMPOSED
+/// (no KB rule covers it — the forge tax). With no `store`, falls back to context-only candidates (recent + induction
+/// copy): a covered token is SELECTED, the strict in-context-copy target is RETRIEVED, else COMPOSED.
 #[cfg(feature = "api")]
-fn explain_steps(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64]) -> Vec<crate::explain::Explanation> {
-    let mut ctx = prompt_ids.to_vec();
-    let mut steps = Vec::new();
-    if gen_ids.is_empty() {
-        // No tokens generated (immediate EOS / max_tokens 0) — still explain what the prompt-end would predict.
-        if !ctx.is_empty() {
-            if let Some(ex) = lm.explain(&ctx) {
-                steps.push(ex);
+fn token_route(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg) -> (&'static str, String) {
+    match store {
+        Some(s) => {
+            let (kb, idiom) = s.predict(ctx);
+            if kb == predicted {
+                ("RETRIEVED", idiom)
+            } else if s.candidates(ctx, cfg).contains(&predicted) {
+                ("SELECTED", idiom)
+            } else {
+                ("COMPOSED", String::new())
             }
         }
-        return steps;
+        None => {
+            // storeless: induction-only attribution. The strict in-context-copy target (induction) is RETRIEVED.
+            let mut ind = Vec::new();
+            context_candidates(ctx, 0, 1, &mut ind);
+            if ind.first() == Some(&predicted) {
+                ("RETRIEVED", "induction".to_string())
+            } else {
+                let mut c = Vec::new();
+                context_candidates(ctx, cfg.recent, cfg.induction, &mut c);
+                if c.contains(&predicted) { ("SELECTED", "context".to_string()) } else { ("COMPOSED", String::new()) }
+            }
+        }
     }
-    for &t in gen_ids {
-        if let Some(ex) = lm.explain(&ctx) {
-            steps.push(ex);
+}
+
+/// Format a fired KB rule as a human line: the production rule made legible — its key (LHS) → ranked successors (RHS)
+/// with the picked token marked, or, for induction, the copy-source position. `dec` decodes ids to display strings.
+#[cfg(feature = "api")]
+fn fmt_rule(r: &RuleHit, predicted: i64, dec: &dyn Fn(i64) -> String) -> String {
+    let key = r.key.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(" ");
+    if let Some(src) = r.source {
+        return format!("     rule  {}: copies {} from position {src} (tail [{key}] recurs there)", r.idiom, dec(predicted));
+    }
+    let succ = r
+        .successors
+        .iter()
+        .take(6)
+        .map(|&t| if t == predicted { format!("{} ◀", dec(t)) } else { dec(t) })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rank = r.rank.map(|rk| format!("  picked rank {rk}/{}", r.successors.len())).unwrap_or_default();
+    format!("     rule  {} [{key}] → {{{succ}}}{rank}", r.idiom)
+}
+
+/// Render the TYPED explain trace (the `route`/`circuits`/`all` levels). Every token gets a one-line route (RETRIEVED /
+/// SELECTED / COMPOSED, free — no forward); `Circuits` additionally re-runs the faithful forward and shows the DLA
+/// circuit breakdown ONLY on COMPOSED tokens (the attribution drives the verbosity — you pay the explain-forward
+/// exactly where the model composed); `All` shows the circuit breakdown for every token. `cand` bounds the KB set used
+/// to decide SELECTED-vs-COMPOSED. Returns the rendered trace; cheap modes never call `lm.explain`.
+#[cfg(feature = "api")]
+fn render_typed_trace(
+    lm: &dyn Model,
+    prompt_ids: &[i64],
+    gen_ids: &[i64],
+    store: Option<&Store>,
+    cand: &CandCfg,
+    mode: ExplainMode,
+    dec: &dyn Fn(i64) -> String,
+    max_ctx: usize,
+) -> String {
+    let legend = match mode {
+        ExplainMode::Route => "route only (free — no extra forward)",
+        ExplainMode::Circuits => "route + DLA circuits on COMPOSED tokens (the forge tax)",
+        ExplainMode::All => "route + DLA circuits on every token",
+    };
+    let mut out = vec![format!("explain trace [{legend}] — one frame per generated token, routed to a KB rule or to composition:")];
+    let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
+    let mut ctx = prompt_ids.to_vec();
+    for (k, &t) in gen_ids.iter().enumerate() {
+        let (route, idiom) = token_route(store, &ctx, t, cand);
+        match route {
+            "RETRIEVED" => retr += 1,
+            "SELECTED" => sel += 1,
+            _ => comp += 1,
+        }
+        // the rule that explains THIS token (key → successors); its idiom names the route when present, so the label
+        // and the rule line agree. A SELECTED token with no rule came in via the recent/closed/unigram floor.
+        let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)) } else { None };
+        let via_name = match (&rule, route) {
+            (Some(rh), _) => rh.idiom.clone(),
+            (None, "SELECTED") => "candidate-set".to_string(),
+            _ => idiom,
+        };
+        let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
+        out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
+        if let Some(rh) = &rule {
+            out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
+        }
+        let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
+        if want_circuits {
+            if let Some(ex) = lm.explain(&ctx) {
+                out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
+            }
         }
         ctx.push(t);
     }
-    steps
-}
-
-/// Render the explain TRACE — the per-token "debugger stack" of forward passes — for the console / text UI. Each
-/// generated token is a frame (`#k predicts <token>`) followed by that step's circuits + features. `max_ctx` trims
-/// each frame's printed context preview (0 = all). One frame == one forward pass; stepping the stack == watching the
-/// model think token-by-token.
-#[cfg(feature = "api")]
-fn render_explain_trace(steps: &[crate::explain::Explanation], dec: &dyn Fn(i64) -> String, max_ctx: usize) -> String {
-    if steps.is_empty() {
-        return "explain: not supported for this arch (or empty prompt)".to_string();
-    }
-    let mut out = vec![format!("explain trace — {} forward pass(es), one frame per generated token (debugger mode):", steps.len())];
-    for (k, ex) in steps.iter().enumerate() {
-        out.push(format!("\n┌─ #{k} predicts {}", dec(ex.model_predicts)));
-        out.push(crate::explain::render(ex, dec, max_ctx));
-    }
+    let n = gen_ids.len().max(1);
+    out.push(format!(
+        "\nrouted {} tokens — RETRIEVED {} ({:.0}%) · SELECTED {} ({:.0}%) · COMPOSED {} ({:.0}%)",
+        gen_ids.len(), retr, 100.0 * retr as f64 / n as f64, sel, 100.0 * sel as f64 / n as f64, comp, 100.0 * comp as f64 / n as f64
+    ));
     out.join("\n")
 }
 
-/// The explain trace as JSON — an array of per-token Explanations (one forward pass each) — to graft onto an API
-/// response under `fieldrun_explanation`. There is no cross-vendor standard for returning interpretability data over
-/// the OpenAI/Anthropic schemas (reasoning/thinking blocks are for CoT *text*, not circuits), so fieldrun namespaces
-/// it; standard clients ignore the unknown field. Canonical structured form: the native `POST /explain` route.
+/// The KB attribution + circuit context carried by the server for the typed explain (`--store` + the candidate-set
+/// config). Held for the server's lifetime and passed to the request handlers. Not feature-gated — `serve`/`handle`
+/// compile in the token-id-only build too, so they thread this even when the text-explain handlers are absent.
+pub struct ExplainOpts {
+    pub store: Option<Store>,
+    pub cand: CandCfg,
+}
+
+/// Deserialize the request's `explain` field as EITHER a bool (`true` → the free `route` level) OR a level name
+/// (`"route"`/`"circuits"`/`"all"`; `"off"`/`false` → none). Unknown strings fall back to `route` (explain on).
 #[cfg(feature = "api")]
-fn explanation_steps_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64]) -> serde_json::Value {
-    let steps = explain_steps(lm, prompt_ids, gen_ids);
-    if steps.is_empty() {
-        return serde_json::json!({ "error": "explain not supported for this arch" });
+fn de_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ExplainMode>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum E {
+        Bool(bool),
+        Str(String),
     }
-    serde_json::Value::Array(steps.iter().map(|ex| serde_json::to_value(ex).unwrap_or(serde_json::Value::Null)).collect())
+    Ok(match Option::<E>::deserialize(d)? {
+        None | Some(E::Bool(false)) => None,
+        Some(E::Bool(true)) => Some(ExplainMode::Route),
+        Some(E::Str(s)) => match s.to_ascii_lowercase().as_str() {
+            "off" | "false" | "none" | "no" | "0" => None,
+            other => ExplainMode::parse(other).or(Some(ExplainMode::Route)),
+        },
+    })
+}
+
+/// Typed structured explain for the API response (`fieldrun_explanation`). One object per generated token —
+/// `{i, token, route, rule, explanation}` — where `route` is RETRIEVED/SELECTED/COMPOSED and `explanation` is the full
+/// DLA `Explanation` (only on COMPOSED tokens for `Circuits`, on every token for `All`, and always null for `Route`).
+/// Mirrors the console trace's attribution-driven verbosity: the expensive per-token forward runs only where the mode
+/// asks for circuits.
+#[cfg(feature = "api")]
+fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], opts: &ExplainOpts, mode: ExplainMode) -> serde_json::Value {
+    let mut ctx = prompt_ids.to_vec();
+    let mut arr = Vec::with_capacity(gen_ids.len());
+    for &t in gen_ids {
+        let (route, idiom) = token_route(opts.store.as_ref(), &ctx, t, &opts.cand);
+        let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
+        let explanation = if want_circuits {
+            lm.explain(&ctx).and_then(|ex| serde_json::to_value(ex).ok()).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+        // the fired production rule (key → ranked successors, picked rank, induction source), when one explains the token.
+        let rule = if route != "COMPOSED" { opts.store.as_ref().and_then(|s| s.rule_for(&ctx, t)) } else { None };
+        let rule_name = match (&rule, route) {
+            (Some(rh), _) => rh.idiom.clone(),
+            (None, "SELECTED") => "candidate-set".to_string(),
+            _ => idiom,
+        };
+        let rule_detail = rule.and_then(|rh| serde_json::to_value(rh).ok()).unwrap_or(serde_json::Value::Null);
+        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "explanation": explanation }));
+        ctx.push(t);
+    }
+    serde_json::Value::Array(arr)
 }
 
 #[cfg(feature = "api")]
-fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen) -> String {
+fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &TextGen, explain: &ExplainOpts) -> String {
     #[derive(serde::Deserialize)]
     struct Req {
         #[serde(default)]
@@ -701,8 +824,10 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
         system: String,
         #[serde(default)]
         max_tokens: Option<usize>,
-        #[serde(default)]
-        explain: bool, // fieldrun extension: attach the structured explanation under "fieldrun_explanation"
+        // fieldrun extension: `true`/`"route"`/`"circuits"`/`"all"` attach the typed explanation under
+        // "fieldrun_explanation" (and log the trace to the server console).
+        #[serde(default, deserialize_with = "de_explain")]
+        explain: Option<ExplainMode>,
     }
     let r: Req = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -718,9 +843,9 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
             "choices": [{ "text": g.text, "index": 0, "finish_reason": if g.hit_eos {"stop"} else {"length"} }],
             "usage": { "prompt_tokens": g.prompt_tokens, "completion_tokens": g.completion_tokens, "total_tokens": g.prompt_tokens + g.completion_tokens }
         });
-        if r.explain {
-            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids);
-            v["fieldrun_explanation"] = explanation_steps_json(lm, &g.prompt_ids, &g.gen_ids);
+        if let Some(mode) = r.explain {
+            log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids, explain, mode);
+            v["fieldrun_explanation"] = typed_explanation_json(lm, &g.prompt_ids, &g.gen_ids, explain, mode);
         }
         return v.to_string();
     }
@@ -742,10 +867,10 @@ fn openai_anthropic(route: &str, body: &str, lm: &dyn Model, arch: &str, tg: &Te
     }
     let prompt = render_chat(if sys_extra.is_empty() { None } else { Some(&sys_extra) }, &r.messages);
     let g = tg.gen(lm, &prompt, max_tokens, false, &mut |_| {});
-    if r.explain {
-        log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids); // also print the full explain trace to the server console under --serve
+    if let Some(mode) = r.explain {
+        log_explanation(lm, tg, &g.prompt_ids, &g.gen_ids, explain, mode); // also print the full explain trace to the server console under --serve
     }
-    let explanation = if r.explain { Some(explanation_steps_json(lm, &g.prompt_ids, &g.gen_ids)) } else { None };
+    let explanation = r.explain.map(|mode| typed_explanation_json(lm, &g.prompt_ids, &g.gen_ids, explain, mode));
     let GenOut { text, prompt_tokens: pt, completion_tokens: ct, hit_eos: eos, .. } = g;
     let attach = |mut v: serde_json::Value| -> String {
         if let Some(ex) = explanation {
@@ -930,14 +1055,21 @@ impl rustyline::Helper for SlashHelper {}
 /// `explain` starts per-reply explanation output on (toggle live with `/explain`); `raw` disables Markdown rendering;
 /// `arch` names the model for messages.
 #[cfg(feature = "api")]
-pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: bool, raw: bool, arch: &str) {
+#[allow(clippy::too_many_arguments)]
+pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Option<ExplainMode>, store: Option<Store>, cand: CandCfg, raw: bool, arch: &str) {
     use std::io::{IsTerminal, Write};
     // render Markdown→ANSI only when writing to a real terminal (piped output stays raw, for scripts) and not --raw.
     let mut fmt = std::io::stdout().is_terminal() && !raw;
     eprintln!("[fieldrun] chat — type a message; /help for commands, Tab completes them, ↑/↓ history, /exit or Ctrl-D \
                to quit. (greedy, max_tokens={max_tokens}; generic ChatML template)");
     eprintln!("[fieldrun] markdown rendering {} (/format to toggle){}", if fmt { "ON" } else { "OFF" },
-              if explain { "; explain ON (/explain off to stop)" } else { "" });
+              match explain {
+                  Some(m) => format!("; explain {m:?} (/explain off|route|circuits|all)"),
+                  None => String::new(),
+              });
+    if explain.is_some() && store.is_none() {
+        eprintln!("[fieldrun] explain: no --store loaded → routing is induction-only (RETRIEVED/COMPOSED); pass --store <store.json> for full KB-rule attribution.");
+    }
     if !tg.knows_chatml() {
         eprintln!("[fieldrun] heads-up: this tokenizer has no ChatML template (<|im_start|>) — it looks like a BASE \
                    model (e.g. GPT-2), not an instruct model, so chat will just CONTINUE your text and won't stop \
@@ -993,13 +1125,17 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                     eprintln!("[fieldrun] (conversation reset)");
                 }
                 "explain" => match parts.next() {
-                    Some("on") | Some("1") | Some("true") => {
-                        explain = true;
-                        eprintln!("[fieldrun] explain ON");
-                    }
                     Some("off") | Some("0") | Some("false") => {
-                        explain = false;
+                        explain = None;
                         eprintln!("[fieldrun] explain OFF");
+                    }
+                    Some(m) if ExplainMode::parse(m).is_some() => {
+                        explain = ExplainMode::parse(m);
+                        eprintln!("[fieldrun] explain {:?}  (route=free · circuits=DLA on composed · all=DLA on every token)", explain.unwrap());
+                    }
+                    None => {
+                        explain = Some(ExplainMode::Route);
+                        eprintln!("[fieldrun] explain Route (free); /explain circuits|all for the composition breakdown");
                     }
                     Some("context") | Some("ctx") => {
                         explain_ctx = match parts.next() {
@@ -1010,9 +1146,8 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
                         eprintln!("[fieldrun] explain context window = {}",
                                   if explain_ctx == 0 { "all".to_string() } else { explain_ctx.to_string() });
                     }
-                    _ => {
-                        explain = !explain; // bare /explain toggles
-                        eprintln!("[fieldrun] explain {}", if explain { "ON" } else { "OFF" });
+                    Some(other) => {
+                        eprintln!("[fieldrun] /explain {other}? use: off | route (free) | circuits (DLA on composed) | all | context N");
                     }
                 },
                 "format" | "md" | "markdown" => {
@@ -1125,16 +1260,14 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: boo
         // per-reply explain TRACE: the circuits + features behind EVERY forward pass of the reply — one frame per
         // generated token, a debugger-style stack of the model "looping and thinking" (not just the first decision).
         // Decoded via the bundled tokenizer. Off by default (toggle with /explain).
-        if explain {
-            let steps = explain_steps(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids);
-            if steps.is_empty() {
-                // no explain for this arch (the prompt is never empty here, so an empty trace means unsupported)
-                eprintln!("[fieldrun] (explain not implemented for arch {arch} — turning off; /explain on to retry)");
-                explain = false;
-            } else {
-                let dec = |id: i64| tg.token_label(id);
-                eprintln!("\n[explain]\n{}", render_explain_trace(&steps, &dec, explain_ctx));
+        if let Some(mode) = explain {
+            // Route is free (no forward); Circuits/All re-run the faithful forward (only on COMPOSED tokens for Circuits).
+            // For a circuit mode on an arch with no explain support, the route still renders; only the breakdown is empty.
+            if matches!(mode, ExplainMode::Circuits | ExplainMode::All) && lm.explain(&gen_out.prompt_ids).is_none() {
+                eprintln!("[fieldrun] (no circuit explain for arch {arch} — showing route only; /explain route to silence)");
             }
+            let dec = |id: i64| tg.token_label(id);
+            eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx));
         }
         if chatml {
             // only instruct models carry conversation history (base completion is stateless per turn)

@@ -48,6 +48,34 @@ pub struct Explanation {
     pub head_circuits: Vec<HeadCircuit>,
     pub sink_heads: usize,
     pub mlp_features: Vec<MlpFeature>,
+    /// Every scored circuit's DLA to the predicted token (all ~64 head + ~384 neuron candidates, not just the shown
+    /// top-6+6) — for concentration/participation-ratio analysis (`--probe-dla`). Not serialized (a probe aid).
+    #[serde(skip)]
+    pub all_dla: Vec<f32>,
+}
+
+/// How much of the explain trace to render — modelled on a database `EXPLAIN`'s option levels, because the deeper
+/// facets cost the reader attention AND real compute (the circuit facet re-runs the faithful forward, the `ANALYZE`
+/// analogue). `Route` is free (the route label is computed from the generated token + the KB, no extra forward);
+/// `Circuits` adds the DLA circuit breakdown but ONLY on COMPOSED tokens (the attribution drives the verbosity — you
+/// pay the explain-forward exactly where the model actually composed); `All` shows the circuits for every token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExplainMode {
+    Route,
+    Circuits,
+    All,
+}
+
+impl ExplainMode {
+    /// Parse a mode name (case-insensitive). `on`/`true`/`1` alias `Route` (the cheap default); unknown → None.
+    pub fn parse(s: &str) -> Option<ExplainMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "route" | "routes" | "on" | "true" | "1" => Some(ExplainMode::Route),
+            "circuits" | "circuit" | "dla" => Some(ExplainMode::Circuits),
+            "all" | "full" | "verbose" => Some(ExplainMode::All),
+            _ => None,
+        }
+    }
 }
 
 /// Name an attention head's behaviour at the predicting position from its attention row (length seq), using the
@@ -232,6 +260,8 @@ where
         })
         .collect();
     head_circuits.sort_by(|a, b| b.dla.total_cmp(&a.dla));
+    // capture every candidate head's DLA before truncating to the shown few (full-spectrum concentration analysis).
+    let mut all_dla: Vec<f32> = head_circuits.iter().map(|h| h.dla).collect();
     head_circuits.truncate(HEAD_SHOW);
     // Recompute the post-norm contribution for the few shown heads to fill in their "promotes" (a full-vocab projection,
     // so it's done for HEAD_SHOW heads, not all candidates). The head_raw re-read is intentional: caching every
@@ -270,6 +300,7 @@ where
         })
         .collect();
     mlp_features.sort_by(|a, b| b.dla.total_cmp(&a.dla));
+    all_dla.extend(mlp_features.iter().map(|f| f.dla)); // + every candidate neuron's DLA
     mlp_features.truncate(MLP_SHOW);
     for f in mlp_features.iter_mut() {
         let mut w = neuron_write(f.layer, f.neuron);
@@ -289,6 +320,7 @@ where
         head_circuits,
         sink_heads,
         mlp_features,
+        all_dla,
     }
 }
 
@@ -327,6 +359,15 @@ pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String, max_ctx: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explain_mode_parses_levels() {
+        assert_eq!(ExplainMode::parse("route"), Some(ExplainMode::Route));
+        assert_eq!(ExplainMode::parse("on"), Some(ExplainMode::Route)); // alias for the cheap default
+        assert_eq!(ExplainMode::parse("CIRCUITS"), Some(ExplainMode::Circuits)); // case-insensitive
+        assert_eq!(ExplainMode::parse("all"), Some(ExplainMode::All));
+        assert_eq!(ExplainMode::parse("--raw"), None); // a following flag isn't a mode → caller defaults to Route
+    }
 
     #[test]
     fn top_promoted_picks_largest_signed() {
