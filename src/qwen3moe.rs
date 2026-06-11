@@ -283,23 +283,32 @@ impl Qwen3Moe {
             x = &x + &mlp;
         }
         let xf = self.norm(&x, "norm");
+        let x_last = x.row(seq - 1).to_vec(); // residual either side of the final norm — recovers its frozen scale
+        let xf_last = xf.row(seq - 1).to_vec();
         let un = self.unembed();
-        let lg = self.b.rowdot_f32(un, &xf.row(seq - 1).to_vec());
+        let lg = self.b.rowdot_f32(un, &xf_last);
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
         let gain = self.b.arr1("norm").to_vec();
+        let u_pred = self.b.weight_row(un, model_predicts as usize);
         assemble(
             ids,
             &att_last,
+            &head_act,
             &mlp_h,
+            &lg,
             model_predicts,
-            |l, n, act| {
-                let w_out = match feat_src[l] {
-                    Some(e) => self.b.expert_row(&format!("l{l}.experts.{e}.down"), n),
-                    None => self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
-                };
-                top_promoted(&self.b.rowdot_f32(un, &w_out), act, 5)
+            &gain,
+            false,
+            &[],
+            &x_last,
+            &xf_last,
+            &u_pred,
+            |l, n| match feat_src[l] {
+                Some(e) => self.b.expert_row(&format!("l{l}.experts.{e}.down"), n),
+                None => self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
             },
-            |l, head| head_dla(&self.b, &format!("l{l}.self_attn.o_proj"), un, &head_act[l], head, hd, &gain, false, 5),
+            |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),
+            |c| self.b.rowdot_f32(un, c),
         )
     }
 
