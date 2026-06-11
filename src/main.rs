@@ -130,11 +130,16 @@ fn main() {
             eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, q4a, int8, f16, f32)");
             std::process::exit(2);
         }
-        // per-tensor-role policy: --embed-dtype quantises the embed/tied-unembed (the largest tensor for a big vocab)
-        // independently of the linear --dtype. Default "" keeps it f16 (so the f32/int8 faithfulness gates are intact).
-        let embed_dtype = flag(&args, "--embed-dtype").unwrap_or("");
-        if !["", "int8"].contains(&embed_dtype) {
-            eprintln!("[fieldrun] convert: unknown --embed-dtype {embed_dtype:?} (have: int8; default keeps embed f16); only the `rope` arch supports it so far");
+        // per-tensor-role policy: the embed/tied-unembed (the largest tensor for a big vocab) is quantised independently
+        // of the linear --dtype. DEFAULT: int8 when the linears are quantised (int8/int4/q4a) — it's ~free quality (0
+        // top-1 loss, see Phase 4b) and a big decode speedup + smaller bundle; f16/f32 keep an f16 embed (so the f32
+        // gate is intact). Override with --embed-dtype {f16|int8}. All archs read embed via rows_f32 / unembed via
+        // rowdot_f32, so the row-major int8 (rowi8) path applies everywhere.
+        let embed_dtype = flag(&args, "--embed-dtype").unwrap_or_else(|| {
+            if ["int8", "int4", "q4a"].contains(&dtype) { "int8" } else { "f16" }
+        });
+        if !["f16", "int8"].contains(&embed_dtype) {
+            eprintln!("[fieldrun] convert: unknown --embed-dtype {embed_dtype:?} (have: f16, int8)");
             std::process::exit(2);
         }
         // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the
