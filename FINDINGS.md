@@ -221,15 +221,17 @@ natural-text holdout, matched-vocab store.
 - **(rescue localization) the rescue is downstream but DIFFUSE — not a localizable lever.** Two robust facts (both
   models): (1) the top-DLA circuit is **always late** — L_top mean 20–21 of 24 layers; the highest-direct-attribution
   circuit sits near the output, so the rescue must operate within the last ~4 layers + final norm. (2) Sweeping {top +
-  a whole downstream layer's attention} per k=1 rescue, only **42%/58%** of rescues are broken by *any* single
-  downstream attention layer, and the per-relative-depth un-rescue profile **does not replicate** (coder peaks at Δdepth1
-  32%→declining; instruct flat-to-rising, Δdepth3 50%, tiny-n tail). So the rescue is *not* concentrated in a small set
-  of late heads — it's distributed across the last few layers and partly in the **MLP** (unswept). ⇒ Grok's "localize δ
-  to a few heads → a cheap hardening/editing lever" is **not supported**; there is no surgical rescue target. This
-  mirrors the rest of the thread: the repair is diffuse *for the same reason* μ_t-redundancy is causally inert and
-  PR≈45 — the whole system is **distributed-superposition, readout AND repair**. (Caveats: whole-layer attention
-  ablation is destructive = upper-bound/non-specific; MLP not swept; L_top-always-late limits depth dynamic range.
-  `Model::dims`, rope; explain-only.)
+  a whole downstream layer's **attention** *or* **MLP** block} per k=1 rescue: the MLP carries rescue comparably to
+  attention (Δdepth1 attn/MLP coder 32/36%, instruct 20/33%), and breakability by *some single* downstream block rises
+  to attn 42/58% · MLP 56/67% · **either 66/82%** — but **18–34% of rescues survive every single-block ablation**
+  (genuinely distributed across multiple blocks), with a per-depth profile that **does not replicate** across models. So
+  the rescue is *not* concentrated in a small set of late heads/blocks. ⇒ Grok's "localize δ to a few heads → a cheap
+  hardening/editing lever" is **not supported**; there is no surgical rescue target. This mirrors the rest of the thread:
+  the repair is diffuse *for the same reason* μ_t-redundancy is causally inert and PR≈45 — the whole system is
+  **distributed-superposition, readout AND repair**. Grok's **PR→localizability lemma** (P(single-module un-rescue) ≈
+  1/PR) makes this quantitative: per-head un-rescue ≈ 1/PR ≈ 2% predicts the ~25% whole-layer (≈14-head) rate via
+  1−(1−1/PR)¹⁴ — tested directly by `--head-sweep`. (Caveats: whole-block ablation is destructive = upper-bound/non-
+  specific; L_top-always-late limits depth dynamic range. `Model::dims`/`predict_ablated_blocks`, rope; explain-only.)
 
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
