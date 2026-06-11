@@ -609,7 +609,7 @@ fn main() {
                 None => { eprintln!("[fieldrun] --probe-dla needs --store"); return; }
             };
             let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
-            let cap = (end - ctx_window).min(300); // explain is the expensive faithful forward; cap the sample
+            let cap = (end - ctx_window).min(n_eval); // explain is the expensive faithful forward
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
             if positions.is_empty() {
                 eprintln!("[fieldrun] --probe-dla: no eval positions");
@@ -618,8 +618,8 @@ fn main() {
             eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
             let b2 = Bundle::load(&stem).expect("reload bundle for U-row norms");
             let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
-            // (route, PR, captured, raw_margin, norm_margin, single-circuit-top1-reproduces, any-circuit-reproduces)
-            let recs: Vec<(u8, f32, usize, f32, f32, bool, bool)> = positions.par_iter().filter_map(|c| {
+            struct Rec { route: u8, pr: f32, captured: usize, margin: f32, nmargin: f32, top_hit: bool, any_hit: bool }
+            let recs: Vec<Rec> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let pick = ex.model_predicts;
                 let (kb, _) = store.predict(c);
@@ -631,40 +631,56 @@ fn main() {
                 d.sort_by(|a, b| b.partial_cmp(a).unwrap());
                 let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
                 let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
-                let raw_margin = ex.predicted_logit - ex.runner_up_logit;
-                // Q1 normalization fix: true facet distance = (L_t − L_v) / ‖U_t − U_v‖.
+                let margin = ex.predicted_logit - ex.runner_up_logit;
+                // Q1 normalization: true facet distance = (L_t − L_v) / ‖U_t − U_v‖.
                 let (ut, uv) = (b2.weight_row(un, pick as usize), b2.weight_row(un, ex.runner_up as usize));
                 let nrm = ut.iter().zip(&uv).map(|(a, b)| { let dd = a - b; dd * dd }).sum::<f32>().sqrt();
-                let norm_margin = if nrm > 0.0 { raw_margin / nrm } else { f32::NAN };
-                // Q4 falsifier: does any single circuit's ISOLATED argmax (its #1 promoted token) reproduce the model's pick?
-                let argmaxes: Vec<i64> = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
-                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).collect();
-                let any_hit = argmaxes.contains(&pick);
-                let top_circuit_argmax = {
+                let nmargin = if nrm > 0.0 { margin / nrm } else { f32::NAN };
+                // Q4: does any single circuit's ISOLATED argmax (its #1 promoted token) reproduce the model's pick?
+                let any_hit = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).any(|a| a == pick);
+                let top_hit = {
                     let th = ex.head_circuits.first();
                     let tn = ex.mlp_features.first();
                     match (th, tn) {
-                        (Some(h), Some(n)) => if h.dla >= n.dla { h.promotes.first().copied() } else { n.promotes.first().copied() },
-                        (Some(h), None) => h.promotes.first().copied(),
-                        (None, Some(n)) => n.promotes.first().copied(),
+                        (Some(h), Some(n)) => if h.dla >= n.dla { h.promotes.first() } else { n.promotes.first() },
+                        (Some(h), None) => h.promotes.first(),
+                        (None, Some(n)) => n.promotes.first(),
                         (None, None) => None,
-                    }
+                    }.copied() == Some(pick)
                 };
-                Some((route, pr, d.len(), raw_margin, norm_margin, top_circuit_argmax == Some(pick), any_hit))
+                Some(Rec { route, pr, captured: d.len(), margin, nmargin, top_hit, any_hit })
             }).collect();
 
-            println!("\n=== (C/Q1/Q4) full-spectrum DLA + Grok's falsifiers ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.2).unwrap_or(0));
+            let pct = |g: &[&Rec], f: &dyn Fn(&Rec) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
+            let meanf = |g: &[&Rec], f: &dyn Fn(&Rec) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== (C/Q1/Q4) full-spectrum DLA + falsifiers ({} captured circuits, unembed {un}) ===", recs.first().map(|r| r.captured).unwrap_or(0));
             println!("{:<12}{:>6}{:>11}{:>13}{:>15}{:>15}{:>13}", "route", "n", "PR (eff#)", "margin", "margin/‖ΔU‖", "top-circ=pick", "any-circ=pick");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
-                let g: Vec<&(u8, f32, usize, f32, f32, bool, bool)> = recs.iter().filter(|x| x.0 == r).collect();
+                let g: Vec<&Rec> = recs.iter().filter(|x| x.route == r).collect();
                 if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
-                let n = g.len() as f32;
-                let mean = |f: &dyn Fn(&(u8, f32, usize, f32, f32, bool, bool)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
-                let pct = |f: &dyn Fn(&(u8, f32, usize, f32, f32, bool, bool)) -> bool| 100.0 * g.iter().filter(|x| f(x)).count() as f64 / g.len() as f64;
-                println!("{lbl:<12}{:>6}{:>11.1}{:>13.2}{:>15.3}{:>14.0}%{:>12.0}%", g.len(), mean(&|x| x.1), mean(&|x| x.3), mean(&|x| x.4), pct(&|x| x.5), pct(&|x| x.6));
+                println!("{lbl:<12}{:>6}{:>11.1}{:>13.2}{:>15.3}{:>14.0}%{:>12.0}%", g.len(),
+                    meanf(&g, &|x| x.pr), meanf(&g, &|x| x.margin), meanf(&g, &|x| x.nmargin), pct(&g, &|x| x.top_hit), pct(&g, &|x| x.any_hit));
             }
-            println!("(Q1) margin/‖ΔU‖ = true facet distance (normalised). Ordering RETRIEVED>SELECTED>COMPOSED surviving normalisation ⇒ not a U-row-norm artifact.");
-            println!("(Q4) top-circ/any-circ=pick = does the single best / any shown circuit's ISOLATED argmax reproduce the model's token? Low ⇒ no circuit compiles to the rule (Grok's falsifier — high would refute Q4).");
+
+            // (Q1 disambiguation) confidence vs structure: within matched normalized-margin bins, does KB-coverage still
+            // predict single-circuit redundancy? If the COVERED−COMPOSED any-circ gap persists at matched margin, the
+            // retrieval/composition split carries information BEYOND confidence (margin alone).
+            let mut nms: Vec<f32> = recs.iter().map(|r| r.nmargin).filter(|x| x.is_finite()).collect();
+            nms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: f32| if nms.is_empty() { 0.0 } else { nms[(((nms.len() - 1) as f32) * p) as usize] };
+            let (t1, t2) = (q(0.333), q(0.667));
+            println!("\n=== (Q1 disambig) within matched normalized-margin bins — does coverage predict redundancy beyond confidence? ===");
+            println!("{:<14}{:>14}{:>22}{:>22}", "margin bin", "", "COVERED (R+S)", "COMPOSED");
+            println!("{:<14}{:>10}{:>12}{:>12}{:>12}", "", "mean m/‖ΔU‖", "n  any-circ%", "n", "any-circ%");
+            for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
+                let inbin = |r: &&Rec| r.nmargin.is_finite() && r.nmargin >= lo && r.nmargin < hi;
+                let cov: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route != 2).collect();
+                let cmp: Vec<&Rec> = recs.iter().filter(|r| inbin(r) && r.route == 2).collect();
+                let mm = meanf(&recs.iter().filter(inbin).collect::<Vec<_>>(), &|x| x.nmargin);
+                println!("{lbl:<14}{mm:>10.2} {:>9} {:>5.0}%  {:>9} {:>5.0}%", cov.len(), pct(&cov, &|x| x.any_hit), cmp.len(), pct(&cmp, &|x| x.any_hit));
+            }
+            println!("⇒ if COVERED any-circ% ≫ COMPOSED any-circ% WITHIN a margin bin, the retrieval/composition split is NOT just confidence.");
             return;
         }
 
