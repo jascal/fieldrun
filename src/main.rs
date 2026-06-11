@@ -863,6 +863,22 @@ fn main() {
             }
             println!("⇒ DECOUPLING (Grok) predicts μ_t≥2 flip% ≈ μ_t=0 flip% within a bin; a large gap (high-μ_t flips less) refutes it = redundancy is causally protective.");
             println!("  (t→ = % of ablated circuits that were themselves t-supporters: if μ_t≥2's higher flip tracks higher t→, the reverse gap is the which-circuit confound, not protection failing.)");
+            // (B-clean) hold the which-circuit confound FIXED: restrict to t→=1 (we ALWAYS ablate a confirmed
+            // t-supporter), then split flip by μ_t WITHIN matched margin bins. μ_t=1 = we removed the ONLY supporter
+            // (none left); μ_t≥2 = we removed one, ≥1 backup remains. This is the airtight "do backups protect?" test —
+            // both arms ablate a genuine t-supporter, so the only difference is whether redundant backups exist.
+            // DECOUPLING predicts μ_t=1 flip% ≈ μ_t≥2 flip% (backups inert); μ_t≥2 flipping LESS = redundancy protects.
+            let md = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.margin).sum::<f32>() / g.len() as f32 };
+            let nta = recs.iter().filter(|x| x.talign).count();
+            println!("\n  (B-clean) within t→=1 ONLY (always ablate a CONFIRMED t-supporter, n={nta}): flip by μ_t in matched margin bins:");
+            println!("  {:<10}{:>22}{:>22}", "margin bin", "μ_t=1 (none left)  n Δ flip", "μ_t≥2 (backups)  n Δ flip");
+            for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
+                let one: Vec<&A> = recs.iter().filter(|x| x.talign && x.margin >= lo && x.margin < hi && x.mu_t == 1).collect();
+                let many: Vec<&A> = recs.iter().filter(|x| x.talign && x.margin >= lo && x.margin < hi && x.mu_t >= 2).collect();
+                println!("  {lbl:<10}{:>8} {:>5.2} {:>4.0}%{:>12} {:>5.2} {:>4.0}%",
+                    one.len(), md(&one), fl(&one), many.len(), md(&many), fl(&many));
+            }
+            println!("⇒ DECOUPLING predicts μ_t=1 flip% ≈ μ_t≥2 flip% (backups don't catch the loss); μ_t≥2 flipping LESS at matched Δ = redundancy is causally protective. Both arms remove a genuine t-supporter, so this isolates μ_t from the which-circuit confound.");
             return;
         }
 

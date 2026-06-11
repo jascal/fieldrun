@@ -161,6 +161,20 @@ natural-text holdout, matched-vocab store.
   cells we remove a confirmed t-supporter *and ≥2 such supporters exist*, yet flip still tracks margin alone — the
   redundant backups (PR≈40, individually < ~10% of the logit) provide essentially no cushion.
 
+- **(B-clean) the airtight backup test — redundancy is *non-compensatory*.** Restrict to `t→`=1 (we *always* ablate a
+  confirmed t-supporter), then split μ_t=1 (no backup left) vs μ_t≥2 (≥1 backup remains) at matched margin — this holds
+  the which-circuit confound fixed by construction, so the *only* difference between arms is whether redundant backups
+  exist. Pooled over both models (μ_t=1 / μ_t≥2): low-Δ 90% / 80%, mid 36% / 40%, high 4% / 21%. **Backups confer no
+  robust protection** — flat in the bulk, *anti*-protective at high Δ (small n), and only a faint non-significant ~10pp
+  protective hint at the very thinnest margin (the facet, where any cushion would matter most). ⇒ superposition
+  redundancy is **non-compensatory**: removing one t-supporter is *not* caught by the others — no error-correction
+  dynamics in the forward pass, so apparent agreement (many readers) ≠ fault tolerance. This is stronger than "μ_t
+  doesn't predict robustness": by the linear flip identity (flip ⟺ Δ < D_j = c_j^t − c_j^{v*}, j = ablated circuit),
+  μ_t is a property of circuits we *don't* touch, so it's *structurally* irrelevant to single-ablation — the real causal
+  variable is the **ablated circuit's pivotality D_j vs the margin Δ**, of which μ_t is a noisy proxy. (The high-Δ
+  anti-protective blip is almost certainly D_j selection — μ_t≥2 high-margin tokens happen to carry a more dominant top
+  circuit — itself the next thread: regress flip on D_j/Δ directly.)
+
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
   intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
