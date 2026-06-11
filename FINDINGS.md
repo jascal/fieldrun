@@ -229,9 +229,13 @@ natural-text holdout, matched-vocab store.
   hardening/editing lever" is **not supported**; there is no surgical rescue target. This mirrors the rest of the thread:
   the repair is diffuse *for the same reason* μ_t-redundancy is causally inert and PR≈45 — the whole system is
   **distributed-superposition, readout AND repair**. Grok's **PR→localizability lemma** (P(single-module un-rescue) ≈
-  1/PR) makes this quantitative: per-head un-rescue ≈ 1/PR ≈ 2% predicts the ~25% whole-layer (≈14-head) rate via
-  1−(1−1/PR)¹⁴ — tested directly by `--head-sweep`. (Caveats: whole-block ablation is destructive = upper-bound/non-
-  specific; L_top-always-late limits depth dynamic range. `Model::dims`/`predict_ablated_blocks`, rope; explain-only.)
+  1/PR) is **order-of-magnitude confirmed** (`--head-sweep`, 2198/1694 single-downstream-head ablations): per-head
+  un-rescue **4.1% / 4.0%** vs 1/PR **2.5% / 2.8%** (PR 40/35) — a ~1.4–1.6× constant above 1/PR (mild within-substrate
+  concentration; repair not *perfectly* equitable). Cross-check: the measured per-*layer* (≈14-head) rate ~32% is
+  *below* the 1−(1−0.04)¹⁴ ≈ 44% that independent heads predict ⇒ a layer's heads **share** repair (positively
+  correlated un-rescues), so the repair is diffuse *across* layers but partly *redundant within* a layer. (Caveats:
+  whole-block ablation is destructive = upper-bound/non-specific; L_top-always-late limits depth dynamic range.
+  `Model::dims`/`predict_ablated_blocks`, rope; explain-only.)
 
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under

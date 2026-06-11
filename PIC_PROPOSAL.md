@@ -115,8 +115,10 @@ Aim to *recover the measured desiderata as consequences*, not to posit them.
   expressible with the weighted-threshold connective. *[Formalizes D4 / "beyond Horn".]*
 - **T4 (diffuseness / no compact rule).** Any causal property realized as `E = Σ_m e_m` with equitable
   `e_m ∼ E/PR` has single-source influence `O(1/PR)`; hence no bounded-size PIC formula localizes it,
-  and `P(single-module intervention alters E) ≈ 1/PR`. *[Recovers D5 / the diffuse, PR-bounded repair;
-  the `--head-sweep` probe measures the `1/PR` constant directly.]*
+  and `P(single-module intervention alters E) ≈ 1/PR`. *[Recovers D5 / the diffuse, PR-bounded repair.
+  Measured (`--head-sweep`, both models): per-head un-rescue 4.0–4.1% vs 1/PR 2.5–2.8% — order-of-
+  magnitude confirmed, with a ~1.5× constant (mild within-substrate concentration). The exact constant is
+  O3.]*
 - **T5 (recovered probability).** The Gibbs measure `P(v) ∝ exp(L_v)` is recovered exactly as a PIC
   incidence frequency (§6). *[Bridge to classical "probability as proportion of worlds".]*
 
@@ -210,8 +212,10 @@ separates the additive (retrievable) logic from the diffuse (computed) remainder
 - **O1** Soundness/completeness of weighted incidence resolution (the coalition bound as inference).
 - **O2** `σ(t) ∼ PR`: is the support number (smallest sufficient circuit set) the participation ratio?
   Ties D2 (cardinality-inertness) to D4 (no small sufficient body).
-- **O3** T4 under the §6 model: prove `P(single-module repair) ≈ 1/PR` from the fixpoint closure; match
-  the `--head-sweep` constant.
+- **O3** T4 under the §6 model: derive the `~1.5×` constant in `P(single-module repair) = κ/PR`
+  (measured κ ≈ 1.4–1.6, both models) from the fixpoint closure — i.e. account for the mild within-
+  substrate concentration (un-equal `e_m`) and the within-layer correlation (a layer's heads share
+  repair: per-layer rate ~32% < the ~44% independence predicts).
 - **O4** A PIC *syntax*: compile PIC formulae directly from DLA traces (the retrievable fragment as an
   extractable program), with COMPOSED positions flagged as "no compact formula" (the forge tax).
 - **O5** Cross-architecture / cross-scale invariance of `G`'s spectrum and the retrievable/computed
