@@ -166,7 +166,9 @@ impl Rope {
     /// Causal-ablation copy of `hidden`: re-run the forward with the given attention heads `ah` (layer, head) and MLP
     /// neurons `an` (layer, neuron) ZEROED out of the residual stream (so downstream layers recompute without them).
     /// A separate copy keeps the faithfulness-gated `hidden` pristine. Research tool (`--probe-ablate`), not gated.
-    fn hidden_ab(&self, ids: &[i64], ah: &[(usize, usize)], an: &[(usize, usize)]) -> Array2<f32> {
+    /// `ablk`/`mblk` zero a *whole* attention / MLP block of the listed layers (for the rescue-localization block sweep),
+    /// on top of the per-head (`ah`) / per-neuron (`an`) ablations.
+    fn hidden_ab(&self, ids: &[i64], ah: &[(usize, usize)], an: &[(usize, usize)], ablk: &[usize], mblk: &[usize]) -> Array2<f32> {
         let seq = ids.len();
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
         let rep = h / nkv;
@@ -203,6 +205,9 @@ impl Rope {
                     attn_out.slice_mut(s![.., hh * hd..(hh + 1) * hd]).fill(0.0); // ablate head: zero its value-output
                 }
             }
+            if ablk.contains(&l) {
+                attn_out.fill(0.0); // ablate the whole attention block of this layer
+            }
             x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
 
             let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
@@ -216,6 +221,9 @@ impl Rope {
                 if al == l {
                     hid.slice_mut(s![.., nn..nn + 1]).fill(0.0); // ablate neuron: zero its post-SwiGLU activation
                 }
+            }
+            if mblk.contains(&l) {
+                hid.fill(0.0); // ablate the whole MLP block of this layer
             }
             x = &x + &self.down(&hid, &format!("{p}mlp.down_proj"));
         }
@@ -474,9 +482,101 @@ impl Model for Rope {
     }
 
     fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
-        let xf = self.hidden_ab(ids, heads, neurons);
+        let xf = self.hidden_ab(ids, heads, neurons, &[], &[]);
         let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn predict_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)], attn_layers: &[usize], mlp_layers: &[usize]) -> Option<i64> {
+        let xf = self.hidden_ab(ids, heads, neurons, attn_layers, mlp_layers);
+        let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
+        Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn dims(&self) -> Option<(usize, usize)> {
+        Some((self.b.config[0] as usize, self.b.config[1] as usize)) // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
+    }
+
+    fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        // Re-run the forward, capturing each residual-stream WRITE at the last position: the embedding, then per layer
+        // the attention block's o_proj output and the MLP block's down_proj output. These sum (linearly) to the
+        // pre-final-norm residual, so projecting each through the final RMSNorm + unembed reconstructs each token's
+        // logit exactly. (Mirrors `hidden`; the only addition is recording `.row(last)` of every write.)
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let last = seq - 1;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut writes: Vec<Vec<f32>> = vec![x.row(last).to_vec()];
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let aw = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            writes.push(aw.row(last).to_vec());
+            labels.push(format!("L{l}.attn"));
+            x = &x + &aw;
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidn = gate;
+            for (hv, uv) in hidn.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            let mw = self.down(&hidn, &format!("{p}mlp.down_proj"));
+            writes.push(mw.row(last).to_vec());
+            labels.push(format!("L{l}.mlp"));
+            x = &x + &mw;
+        }
+        // final RMSNorm geometry at the last position (no center/bias for rope): logit_v = inv_rms · Σ_d gain_d x_d U_v_d,
+        // and x = Σ_b write_b, so per-block contribution = inv_rms · Σ_d gain_d write_b_d U_v_d.
+        let xpre = x.row(last).to_vec();
+        let d = xpre.len();
+        let inv_rms = 1.0 / (xpre.iter().map(|v| v * v).sum::<f32>() / d as f32 + self.eps).sqrt();
+        let gain = self.b.arr1("norm");
+        let un = self.unembed_name();
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row(un, t as usize)).collect();
+        let contrib: Vec<Vec<f32>> = writes
+            .iter()
+            .map(|w| {
+                urows.iter()
+                    .map(|u| inv_rms * w.iter().zip(gain.iter()).zip(u.iter()).map(|((wd, gd), ud)| wd * gd * ud).sum::<f32>())
+                    .collect()
+            })
+            .collect();
+        Some((labels, contrib))
+    }
+
+    fn unembed_cos(&self, a: usize, b: usize) -> Option<f32> {
+        let un = self.unembed_name();
+        let (ua, ub) = (self.b.weight_row(un, a), self.b.weight_row(un, b));
+        let dot: f32 = ua.iter().zip(&ub).map(|(x, y)| x * y).sum();
+        let (na, nb) = (ua.iter().map(|x| x * x).sum::<f32>().sqrt(), ub.iter().map(|x| x * x).sum::<f32>().sqrt());
+        if na > 0.0 && nb > 0.0 { Some(dot / (na * nb)) } else { None }
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
