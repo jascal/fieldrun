@@ -97,23 +97,69 @@ paradox. r≈0.15 (~2% shared variance) means margin (geometry) and `μ_t` (code
 independent axes** — good for the two-axis framing, with only a weak positive coupling.
 
 **Publication status: strong preprint *direction*, not finished.** The novel core (the `μ_t` code-multiplicity
-transition + the emergence definition, de-confounded against confidence, replicated within family) is real, but
-before "publish" it needs: (1) a **causal ablation** — knock out the top circuits and show covered tokens
-survive while composed collapse (the "redundancy" claim is currently observational, not causal); (2) a
-**cross-architecture / cross-scale replication** (two Qwen-0.5B models is seed-replication, not family); plus
-the full-spectrum `μ_t` (not top-12), derivations for the asserted training-dynamics claims, and verified cites.
+transition + the emergence definition, de-confounded against confidence, replicated within family; the exact
+power-diagram geometry; the causal fragility of composed tokens) is real. The **causal ablation is now done**
+(§5c) — it *confirms* composed-is-fragile but *tempers* the redundancy claim: redundancy-beyond-margin is weak
+causally (the readout μ_t stays the strong evidence). Before "publish" it still needs: a **cross-architecture /
+cross-scale replication** (two Qwen-0.5B models is seed-replication, not family — blocked on a non-Qwen rope
+bundle + store/holdout); a bigger margin-matched ablation (several cells are n-starved); full-spectrum `μ_t`
+(not top-12); derivations for the asserted training-dynamics claims; and verified citations.
+
+## 5b. Exact power-diagram geometry — and composition is NOT a near-miss of the KB
+
+`--probe-facet` exposes the final residual `r(x)` (`Model::final_residual`) and computes, over *all* 151,936
+tokens, the **exact** nearest power-diagram facet `argmin_{v≠t} (L_t − L_v)/‖U_t − U_v‖` (the token cells in
+`r`-space are the Laguerre power diagram of `{U_v}`; the normalized margin is the *exact* Euclidean distance to
+the `t`–`v` bisector). Both models, 300 positions:
+
+- **Exact nearest-facet distance is monotone RETRIEVED ≫ SELECTED > COMPOSED** (coder 2.23/1.34/1.03; instruct
+  2.78/1.45/1.22). The runner-up proxy used elsewhere *is* the true nearest facet **89%** of the time.
+- **Killer check — refuted.** Hypothesis: "composition = `r(x)` crossing the facet *out of the KB's cell*."
+  The nearest facet is the bisector with the *KB's own prediction* only **14%/8%** of COMPOSED (15%/17% of
+  SELECTED). So for **~85% of COMPOSED the KB's prediction isn't even the nearest competitor** — composition is
+  a *non-local* divergence (KB's cell not adjacent), not a near-miss of the rule.
+- **The ~14% near-miss subclass IS one thing: function-word & morphology competition.** The `pick ⟂ KB-pred`
+  pairs are overwhelmingly closed-class glue picking *interchangeable* alternatives — `a⟂the` (×4, both models),
+  `will⟂is`, `were⟂be`, `she⟂I`, `with⟂to`, `;⟂,`, `tell⟂say`; COMPOSED adds subword suffixes `-ler⟂-ling`,
+  `-ful⟂-y`, `-quent⟂-quence`. The closed-class/grammar regime where the KB is strongest. So: RETRIEVED
+  (model=KB, deep cell) / COMPOSED-85% (genuine divergence, KB geometrically far) / near-miss-15% (function-word
+  coin-flip the rule also offered — *not* novel computation).
+
+## 5c. Causal ablation — composed is fragile, but redundancy-beyond-margin is weak
+
+`--probe-ablate` knocks out the top-k DLA circuits in the *forward pass* (`hidden_ab` re-runs with the heads/
+neurons zeroed; `Model::predict_ablated`) and asks whether the prediction flips — converting the μ_t readout
+into a causal intervention.
+
+- **Route-ordered fragility, replicated.** flip@k1 RETRIEVED 25%/25% < SELECTED 36%/52% < COMPOSED **59%/75%**
+  (coder/instruct). Knock out just the *top* circuit and COMPOSED flips ~2× as often as RETRIEVED — composed
+  tokens are *causally* fragile (emergent), retrieved ones robust.
+- **De-confound (flip@k1 within matched margin bins) is mixed/weak.** Covered flips less than composed in the
+  *low*-margin bin on both models (coder 69<86, instruct 80<100), but weak/absent in mid and n-starved in high
+  (composed n=3–5). So the flip-ordering is **largely margin** (composed near the boundary), with only a faint
+  redundancy residual.
+- **Resolution of the readout↔causal split.** The *readout* μ_t shows *strong* redundancy-beyond-margin; the
+  *causal* ablation shows it's mostly margin. Why: **redundant encoding (high μ_t) ≠ causal robustness when the
+  margin is thin.** The redundant supporters are individually *weak* (PR≈45, none > ~10% of the logit), so even
+  though *many* circuits point at `t`, removing the top few can still drop it below the runner-up if the cushion
+  is small. μ_t-redundancy and ablation-robustness are **distinct properties that decouple at thin margin** —
+  which is exactly why the readout looked strong while the causal test looked margin-dominated.
 
 ## 6. Open math questions (with empirical status)
 
 - **Q1 (tropical/Boolean boundary).** The retrieval/composition boundary as alignment between the U
   power-diagram and the KB cells; the margin = facet distance. *Status:* RETRIEVED-deep-in-cell confirmed and
-  de-confounded vs confidence. Owed: the literal pushforward-`r#μ` PCA/alignment test.
+  de-confounded vs confidence; the **exact** nearest-facet computed (§5b) — but the elegant "composition =
+  crossing the KB's facet" is **refuted** (~14% only; the rest diverge non-locally). Owed: the literal
+  pushforward-`r#μ` PCA/alignment test.
 - **Q4a (no magnitude dominance).** `PR(x) ≥ k` a.s. under a superposition/incoherence hypothesis. *Status:*
   PR~45 route-invariant, both models — supported.
 - **Q4b (code-multiplicity transition — the new object).** `μ_t ≫ 1` for coverable, `μ_t ≈ 0` for composed,
   independent of margin and PR. The reconciliation question: how is a token the argmax of *many* circuits yet
   *no* circuit dominates the magnitude (geometry of redundant weak codes)? And the emergence definition:
-  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem.
+  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. NB the
+  causal ablation (§5c) shows redundancy (μ_t) and robustness *decouple at thin margin* — they're distinct
+  properties, so a theorem must relate `μ_t`, PR, and margin jointly (not μ_t ⇒ robustness).
 - Q2 (incidence-granularity entropy rate / forge-tax as positive asymptotic residual), Q3 (continuous
   incidence calculus & failure of truth-functionality, measurable via SAE features), Q5 (rank of the
   resolution map), Q6 (MDL of the boundary / ILP-over-COMPOSED) — open, measurable on this decompile.
@@ -127,8 +173,12 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --attribute
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --prune-head
 # is SELECTED a function of the firing state? (rank dist + conflict-set entropy)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe
-# combine vs select + Grok's falsifiers (PR, normalized margin, single-circuit redundancy, margin-controlled)
+# combine vs select + Grok's falsifiers (PR, normalized margin, μ_t multiplicity, margin-controlled, margin↔μ_t corr)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-dla --n-eval 500
+# exact power-diagram nearest facet + the killer check + near-miss subclass (§5b; rope arch — needs final_residual)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-facet
+# causal: ablate top-k DLA circuits in the forward pass → flip rate by route, margin-de-confounded (§5c; rope arch)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 200
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).
