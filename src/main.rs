@@ -806,13 +806,14 @@ fn main() {
             // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
             // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
             // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
-            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool }
+            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32 }
             let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
-                // carry each circuit's isolated argmax (promotes[0]) so we can ask if the ABLATED circuit was t-aligned.
-                let mut circ: Vec<(f32, bool, usize, usize, Option<i64>)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head, h.promotes.first().copied()))
-                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron, m.promotes.first().copied()))).collect();
+                // carry isolated argmax (promotes[0]) and dla_v (contribution to the runner-up) per circuit: the ablated
+                // circuit's pivotality D_j = dla - dla_v is the LINEAR flip threshold (ablate ⇒ margin shifts by -D_j).
+                let mut circ: Vec<(f32, bool, usize, usize, Option<i64>, f32)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head, h.promotes.first().copied(), h.dla_v))
+                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron, m.promotes.first().copied(), m.dla_v))).collect();
                 circ.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
                 let top = *circ.first()?;
                 let (kb, _) = store.predict(c);
@@ -824,9 +825,10 @@ fn main() {
                 let mu_t = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
                     .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).filter(|&a| a == t).count();
                 let talign = top.4 == Some(t); // is the single circuit we ablate itself a t-supporter (isolated argmax == t)?
+                let dj = top.0 - top.5;        // D_j of the ablated top circuit (logit units): linear flip ⟺ margin < D_j
                 let (heads, neurons) = if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
                 let flip = lm.predict_ablated(c, &heads, &neurons) != Some(t);
-                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign })
+                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign, dj })
             }).collect();
             let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
             let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
@@ -879,6 +881,82 @@ fn main() {
                     one.len(), md(&one), fl(&one), many.len(), md(&many), fl(&many));
             }
             println!("⇒ DECOUPLING predicts μ_t=1 flip% ≈ μ_t≥2 flip% (backups don't catch the loss); μ_t≥2 flipping LESS at matched Δ = redundancy is causally protective. Both arms remove a genuine t-supporter, so this isolates μ_t from the which-circuit confound.");
+            // (D_j regression) the LINEAR flip identity: ablating the top circuit flips iff Δ < D_j (D_j = dla - dla_v,
+            // the circuit's pivotality = how much it shifts the t-vs-v* margin). s = D_j - Δ is the linear flip score
+            // (>0 ⇒ linear predicts flip). Three things at once: (1) does actual forward-flip rise as a step at s=0
+            // (linear identity holds causally)? (2) the confusion of sign(s) vs actual flip (the indirect-effect gap);
+            // (3) is μ_t inert once we bin on s (μ_t≥2 vs μ_t=0 flip% within s-bins should match — μ_t a noisy proxy).
+            let s_of = |x: &A| x.dj - x.margin;
+            println!("\n  (D_j regression) linear flip score s = D_j - Δ  (D_j = dla-dla_v of the ablated circuit):");
+            println!("  {:<14}{:>6}{:>10}{:>12}", "s bin", "n", "mean s", "flip%");
+            for (lbl, lo, hi) in [("s<-1   ", f32::MIN, -1.0), ("-1..-.3", -1.0, -0.3), ("-.3..0 ", -0.3, 0.0),
+                                  ("0..+.3 ", 0.0, 0.3), ("+.3..1 ", 0.3, 1.0), ("s>+1   ", 1.0, f32::MAX)] {
+                let g: Vec<&A> = recs.iter().filter(|x| { let s = s_of(x); s >= lo && s < hi }).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                println!("  {lbl:<14}{:>6}{:>10.2}{:>11.0}%", g.len(), g.iter().map(|y| s_of(y)).sum::<f32>() / n, 100.0 * g.iter().filter(|x| x.flip).count() as f32 / n);
+            }
+            let pred_flip = |x: &A| s_of(x) > 0.0; // linear identity's prediction
+            let (mut tp, mut tn, mut fp, mut fn_) = (0u32, 0u32, 0u32, 0u32);
+            for x in &recs { match (pred_flip(x), x.flip) { (true, true) => tp += 1, (true, false) => fp += 1, (false, true) => fn_ += 1, (false, false) => tn += 1 } }
+            let n = recs.len() as f32;
+            println!("  linear identity sign(s)>0 vs actual flip: acc {:.0}%  [tp {tp} tn {tn} | fp {fp} fn {fn_}]  (fp+fn = indirect-effect / new-winner≠v* gap)",
+                100.0 * (tp + tn) as f32 / n);
+            println!("  ⇒ μ_t inert once s is fixed? flip% by μ_t WITHIN |s| bins (linear-score-matched, the cleanest control):");
+            let mut ss: Vec<f32> = recs.iter().map(|y| s_of(y)).collect();
+            ss.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let sq = |p: f32| if ss.is_empty() { 0.0 } else { ss[(((ss.len() - 1) as f32) * p) as usize] };
+            let (s1, s2) = (sq(0.333), sq(0.667));
+            // per-cell mean Δ and mean D_j: the CONFOUND CHECK. μ_t≥2 flipping less at matched s is genuine indirect
+            // μ_t-protection ONLY if its Δ (and D_j) are ~equal to μ_t=0's; if μ_t≥2 has much higher Δ, the "protection"
+            // is a margin/scale effect (more total cushion), not redundancy. (s = D_j - Δ, so matched s lets Δ co-vary.)
+            let mg = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.margin).sum::<f32>() / g.len() as f32 };
+            let mdj = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.dj).sum::<f32>() / g.len() as f32 };
+            println!("  {:<8}{:>8}{:>26}{:>26}", "s bin", "mean s", "μ_t≥2  n flip Δ D_j", "μ_t=0  n flip Δ D_j");
+            for (lbl, lo, hi) in [("low s ", f32::MIN, s1), ("mid s ", s1, s2), ("high s", s2, f32::MAX)] {
+                let inb = |x: &&A| { let s = s_of(x); s >= lo && s < hi };
+                let hi_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t >= 2).collect();
+                let lo_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t == 0).collect();
+                let ms = recs.iter().filter(inb).map(|y| s_of(y)).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
+                println!("  {lbl:<8}{ms:>8.2}{:>8} {:>4.0}% {:>5.2} {:>5.2}{:>10} {:>4.0}% {:>5.2} {:>5.2}",
+                    hi_m.len(), fl(&hi_m), mg(&hi_m), mdj(&hi_m), lo_m.len(), fl(&lo_m), mg(&lo_m), mdj(&lo_m));
+            }
+            println!("  (μ_t≥2 flips less at matched s ⇒ indirect μ_t-protection IF its Δ≈μ_t=0's; if its Δ is much higher, it's a margin/scale effect, not redundancy.)");
+            // (logistic) the principled control: fit flip ~ Δ + D_j + 1[μ_t≥2]. Does μ_t add predictive power AFTER the
+            // two real causal variables? Standardize Δ,D_j (coeffs comparable); GD. The mean-log-loss penalty from
+            // DROPPING μ_t is its independent value: ≈0 ⇒ μ_t inert (proxy); large ⇒ μ_t independently causal.
+            let ys: Vec<f32> = recs.iter().map(|r| if r.flip { 1.0 } else { 0.0 }).collect();
+            let raw: Vec<[f32; 3]> = recs.iter().map(|r| [r.margin, r.dj, if r.mu_t >= 2 { 1.0 } else { 0.0 }]).collect();
+            let nn = raw.len() as f32;
+            let (mut mu, mut sd) = ([0f32; 2], [1f32; 2]);
+            for j in 0..2 {
+                mu[j] = raw.iter().map(|x| x[j]).sum::<f32>() / nn;
+                sd[j] = (raw.iter().map(|x| (x[j] - mu[j]).powi(2)).sum::<f32>() / nn).sqrt().max(1e-6);
+            }
+            let z: Vec<[f32; 3]> = raw.iter().map(|x| [(x[0] - mu[0]) / sd[0], (x[1] - mu[1]) / sd[1], x[2]]).collect();
+            let fit = |use_mu: bool| -> ([f32; 4], f32) {
+                let mut w = [0f32; 4]; // bias, Δ, D_j, μ_t≥2
+                for _ in 0..6000 {
+                    let mut g = [0f32; 4];
+                    for (zi, &y) in z.iter().zip(&ys) {
+                        let lin = w[0] + w[1] * zi[0] + w[2] * zi[1] + if use_mu { w[3] * zi[2] } else { 0.0 };
+                        let e = 1.0 / (1.0 + (-lin).exp()) - y;
+                        g[0] += e; g[1] += e * zi[0]; g[2] += e * zi[1]; if use_mu { g[3] += e * zi[2]; }
+                    }
+                    for k in 0..4 { w[k] -= 0.3 * g[k] / nn; }
+                }
+                let ll = z.iter().zip(&ys).map(|(zi, &y)| {
+                    let lin = w[0] + w[1] * zi[0] + w[2] * zi[1] + if use_mu { w[3] * zi[2] } else { 0.0 };
+                    let p = (1.0 / (1.0 + (-lin).exp())).clamp(1e-6, 1.0 - 1e-6);
+                    -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+                }).sum::<f32>() / nn;
+                (w, ll)
+            };
+            let (wf, llf) = fit(true);
+            let (_, ll0) = fit(false);
+            println!("\n  (logistic) flip ~ Δ + D_j + 1[μ_t≥2]  (Δ,D_j standardized → coeffs comparable; sign: +D_j/−Δ expected):");
+            println!("    coeffs  bias {:+.2}   Δ {:+.2}   D_j {:+.2}   μ_t≥2 {:+.2}", wf[0], wf[1], wf[2], wf[3]);
+            println!("    mean log-loss  full {llf:.3}  drop-μ_t {ll0:.3}  (Δ {:+.4} = μ_t's INDEPENDENT predictive value; ≈0 ⇒ proxy)", ll0 - llf);
             return;
         }
 

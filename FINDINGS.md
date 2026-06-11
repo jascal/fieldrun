@@ -175,6 +175,21 @@ natural-text holdout, matched-vocab store.
   anti-protective blip is almost certainly D_j selection — μ_t≥2 high-margin tokens happen to carry a more dominant top
   circuit — itself the next thread: regress flip on D_j/Δ directly.)
 
+- **(D_j regression) the causal variable is the ablated circuit's pivotality, not μ_t.** Exposed each circuit's
+  contribution to the *runner-up* (`dla_v`, explain.rs) → per-circuit pivotality **D_j = dla − dla_v** (ablating
+  circuit j shifts the t-vs-v\* margin by −D_j). The **linear flip identity** flip ⟺ Δ < D_j holds as a near-perfect
+  *necessary* condition: binning the linear flip score s = D_j − Δ, actual flip steps cleanly at s=0 (coder 0–4% below
+  → 45–80% above; instruct 11–15% → 60–78%), and sign(s) mispredicts a *non*-flip only 3/300 (coder) / 17/300 (instruct)
+  times — when D_j < Δ the token essentially never flips. It is *not sufficient* (fp 60/51): when s>0, indirect/
+  downstream recomposition **rescues** t about half the time (indirect effects are overwhelmingly protective — ~60
+  rescues vs ~3 betrayals). Matching on s, μ_t≥2 *appears* to flip less, but the per-cell Δ exposes the **margin
+  confound** — μ_t≥2 sits at higher Δ at matched s (coder mid 0.72 vs 0.41; instruct high 1.00 vs 0.32). The principled
+  control settles it: logistic `flip ~ Δ + D_j + 1[μ_t≥2]` (Δ,D_j standardized) gives Δ **−4.21/−3.11**, D_j
+  **+2.82/+1.16**, μ_t≥2 **−0.60/+0.06** (opposite signs across models = noise around 0); **dropping μ_t costs
+  +0.0035/+0.000 mean log-loss** — nothing. ⇒ **μ_t is a proxy for (Δ, D_j) position, not an independent cause**;
+  decoupling confirmed at the regression level. Aside: |w_Δ| > |w_Dj| on both ⇒ the margin protects *beyond* the linear
+  identity (the indirect-rescue channel scales with Δ) — which is *why* flip ⟺ Δ<D_j is necessary but not sufficient.
+
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
   intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
@@ -197,8 +212,11 @@ natural-text holdout, matched-vocab store.
   independent of margin and PR. The reconciliation question: how is a token the argmax of *many* circuits yet
   *no* circuit dominates the magnitude (geometry of redundant weak codes)? And the emergence definition:
   "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. The causal
-  ablation (§5c) now **confirms decoupling causally** — margin-matched + `t→`-controlled on both models, μ_t confers
-  no protection — so a theorem must relate `μ_t`, PR, and margin jointly (not μ_t ⇒ robustness). The sharp open test:
+  ablation (§5c) now **confirms decoupling causally** — margin-matched + `t→`-controlled, *and* a logistic
+  `flip ~ Δ + D_j + 1[μ_t≥2]` on both models isolates the causal variables as the margin **Δ** and the ablated
+  circuit's pivotality **D_j = c_j^t − c_j^{v\*}** (μ_t's independent log-loss value ≈ 0) — so μ_t is a *proxy*, and the
+  theorem to write is about **D_j vs Δ plus an indirect-cushion term that scales with Δ** (|w_Δ|>|w_Dj|), not μ_t. The
+  sharp open test:
   Grok's proof rests on an **incoherence assumption** (a circuit's push toward `t` is ≈ independent of its push toward
   the runner-up `v*`); it predicts decoupling should **break** — redundancy becoming protective — exactly when `v*` is
   a near-synonym of `t` (high `cos(U_t, U_{v*})`). Splitting the flip by runner-up coherence would confirm the proof
