@@ -596,6 +596,61 @@ fn main() {
             return;
         }
 
+        // --probe-dla (combine vs select): for each pick, is the logit DOMINATED by one circuit (disguised selection)
+        // or SPREAD over many (genuine superposition/combination)? Per position, take the per-circuit DLA contributions
+        // to the predicted token (heads + neurons, from the faithful explain forward) and measure concentration —
+        // top-1 share (max DLA / Σ captured DLA), participation ratio PR = (Σd)²/Σd² (effective # of circuits, 1 =
+        // one dominates), and the top circuit's share of the TRUE predicted logit — bucketed by route. Prediction:
+        // RETRIEVED concentrates (one rule writes it), COMPOSED spreads, SELECTED in between = partial superposition.
+        if has_flag(&args, "--probe-dla") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-dla needs --store"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap = (end - ctx_window).min(300); // explain is the expensive faithful forward; cap the sample
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe-dla: no eval positions");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
+            // (route, top1_share, participation_ratio, top1/logit, n_circuits_captured)
+            let recs: Vec<(u8, f32, f32, f32)> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain(c)?;
+                let pick = ex.model_predicts;
+                let (kb, _) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&pick);
+                let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 };
+                // positive DLA contributions to the predicted token, from the captured top circuits (heads + neurons).
+                let mut d: Vec<f32> = ex.head_circuits.iter().map(|h| h.dla).chain(ex.mlp_features.iter().map(|m| m.dla)).filter(|&x| x > 0.0).collect();
+                if d.is_empty() { return None; }
+                d.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let sum: f32 = d.iter().sum();
+                let sumsq: f32 = d.iter().map(|x| x * x).sum();
+                let top1 = d[0];
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                let top1_logit = if ex.predicted_logit > 0.0 { top1 / ex.predicted_logit } else { f32::NAN };
+                Some((route, top1 / sum, pr, top1_logit))
+            }).collect();
+
+            println!("\n=== (C) combine vs select — concentration of the per-circuit DLA on the predicted token ===");
+            println!("(captured = top-6 heads + top-6 neurons by DLA; top1-share/PR are AMONG those — truncated tail biases toward concentration, but the route comparison is the signal)");
+            println!("{:<12}{:>7}{:>14}{:>14}{:>16}", "route", "n", "top1-share", "PR (eff #)", "top1/logit");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&(u8, f32, f32, f32)> = recs.iter().filter(|x| x.0 == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>7}", 0); continue; }
+                let n = g.len() as f32;
+                let mean = |f: &dyn Fn(&(u8, f32, f32, f32)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
+                let logits: Vec<f32> = g.iter().map(|x| x.3).filter(|x| x.is_finite()).collect();
+                let ml = if logits.is_empty() { f32::NAN } else { logits.iter().sum::<f32>() / logits.len() as f32 };
+                println!("{lbl:<12}{:>7}{:>13.2}{:>14.2}{:>15.2}", g.len(), mean(&|x| x.1), mean(&|x| x.2), ml);
+            }
+            println!("(one circuit dominates → top1-share→1, PR→1 = selection;  spread → top1-share low, PR high = superposition/combination)");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
