@@ -855,6 +855,42 @@ impl Bundle {
             })
             .collect()
     }
+
+    /// Retrieval-pruned unembed (Phase 8b): score ONLY the candidate rows `cand` of a (rows, cols) matrix against `x`,
+    /// returning logits aligned to `cand` (`out[i] = dot(W[cand[i]], x)`). The full-vocab matmul collapses to a gather
+    /// of `cand.len()` row-dots — the KB proposes the candidates (n-gram / induction / closed-class), so the head only
+    /// scores tokens that can plausibly be next. `argmax(out)` then maps back as `cand[argmax_i]`. Identical to the
+    /// matching slice of `rowdot_f32` (same per-row dot), so when `cand` contains the full head's argmax the pruned
+    /// argmax equals the full argmax exactly. Out-of-range candidate ids are scored as `f32::NEG_INFINITY` (never picked).
+    pub fn rowdot_f32_subset(&self, name: &str, x: &[f32], cand: &[i64]) -> Vec<f32> {
+        let (shape, arr) = self.get(name);
+        let (rows, d) = (shape[0], shape[1]);
+        let rscale = if matches!(arr, Arr::RowI8(_)) { Some(self.arr1o(&format!("{name}__scale"))) } else { None };
+        cand.par_iter()
+            .map(|&c| {
+                let r = c as usize;
+                if c < 0 || r >= rows {
+                    return f32::NEG_INFINITY;
+                }
+                let base = r * d;
+                match arr {
+                    Arr::F32(v) => v[base..base + d].iter().zip(x).map(|(&w, &xi)| w * xi).sum(),
+                    Arr::F16(v) => v[base..base + d].iter().zip(x).map(|(w, &xi)| w.to_f32() * xi).sum(),
+                    Arr::RowI8(w) => {
+                        let s = rscale.as_ref().unwrap()[r];
+                        s * w.data[base..base + d].iter().zip(x).map(|(&q, &xi)| q as f32 * xi).sum::<f32>()
+                    }
+                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rowdot_f32_subset: column-major quant unembed unsupported (use rowi8)"),
+                }
+            })
+            .collect()
+    }
+
+    /// Logical (rows, cols) shape of a stored array — for callers that need the vocab/d dims without dequantising.
+    pub fn dims(&self, name: &str) -> (usize, usize) {
+        let (shape, _) = self.get(name);
+        (shape[0], shape[1])
+    }
 }
 
 /// Dot product of signed-int8 activations with signed-int8 weights, accumulating in i32. Hand-vectorised per target
@@ -1106,6 +1142,26 @@ mod tests {
         assert_eq!(b.rowdot_f32("embed", &[1.0, 1.0]), vec![1.0, 5.0, 9.0]);
         // weight_row
         assert_eq!(b.weight_row("embed", 1), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn rowdot_subset_matches_full() {
+        let stem = tmp_stem("subset");
+        // unembed (vocab=4, d=2)
+        write_bundle(&stem, "test", &[], &[("embed", "f32", vec![4, 2], vec![0., 1., 2., 3., 4., 5., 6., 7.])]);
+        let b = Bundle::load(&stem).unwrap();
+        let x = [1.0f32, 1.0];
+        let full = b.rowdot_f32("embed", &x); // [1, 5, 9, 13]
+        // a subset must equal the matching slice of the full row-dot (Phase 8b retrieval-pruned head identity).
+        let cand = [3i64, 1, 2];
+        let sub = b.rowdot_f32_subset("embed", &x, &cand);
+        assert_eq!(sub, vec![full[3], full[1], full[2]]);
+        // pruned-argmax over a set containing the full argmax (idx 3) equals the full argmax — the core fidelity claim.
+        let full_argmax = full.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as i64;
+        let pi = sub.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        assert_eq!(cand[pi], full_argmax);
+        // out-of-range candidate ids score -inf (never picked).
+        assert_eq!(b.rowdot_f32_subset("embed", &x, &[99, -1]), vec![f32::NEG_INFINITY, f32::NEG_INFINITY]);
     }
 
     #[test]

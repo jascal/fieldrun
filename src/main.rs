@@ -329,6 +329,112 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
+        // --prune-head (Phase 8b): measure the retrieval-pruned output head. The KB proposes a small candidate set per
+        // position; the full-vocab unembed collapses to scoring only those. Because the pruned head scores the SAME
+        // unembed rows, pruned-argmax == full-argmax exactly when the candidate set contains the full head's argmax — so
+        // top-1 fidelity == candidate-set COVERAGE of the full argmax. Reports the coverage-vs-size curve (sweeping
+        // candidate configs) + the head speedup (full vs subset unembed) + the unembed's share of per-token compute.
+        // Context-only by default (recent + induction, needs no store); pass `--store <store.json>` to add KB n-grams.
+        if has_flag(&args, "--prune-head") {
+            use retrieval::{context_candidates, CandCfg};
+            let store: Option<Store> = flag(&args, "--store").and_then(|p| match Store::load(p) {
+                Ok(s) => Some(s),
+                Err(e) => { eprintln!("[fieldrun] --store {p:?}: {e} (continuing context-only)"); None }
+            });
+            let b2 = Bundle::load(&stem).expect("reload bundle for unembed microbench");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, d) = b2.dims(un);
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --prune-head: no eval positions (need --ids with > ctx_window tokens, matching this model's vocab)");
+                return;
+            }
+            eprintln!("[fieldrun] --prune-head: {} positions (ctx {ctx_window}), unembed {un} ({vocab}×{d}), store: {}",
+                      positions.len(), if store.is_some() { "n-gram KB" } else { "context-only" });
+            // Ground truth: the FULL head's argmax per position (what the pruned head must reproduce). Parallel forwards.
+            let t_truth = std::time::Instant::now();
+            let truth: Vec<i64> = positions.par_iter().map(|c| lm.predict(c)).collect();
+            let predict_ms = t_truth.elapsed().as_secs_f64() * 1e3 / positions.len() as f64;
+
+            let build = |c: &[i64], cfg: &CandCfg| -> Vec<i64> {
+                match store.as_ref() {
+                    Some(s) => s.candidates(c, cfg),
+                    None => {
+                        let mut o = Vec::new();
+                        context_candidates(c, cfg.recent, cfg.induction, &mut o);
+                        let mut seen = std::collections::HashSet::new();
+                        o.retain(|&t| seen.insert(t));
+                        o
+                    }
+                }
+            };
+            let z = CandCfg { recent: 0, induction: 0, quad: 0, tri: 0, bi: 0, skel: 0, uni: 0, closed: false };
+            // sweep: context-only (recent+induction; work with no store) then KB-augmented (n-gram/grammar/unigram —
+            // these add tokens ONLY when a --store is loaded). Spans |C| from a few to a few hundred → the coverage knee.
+            let cfgs: Vec<(&str, CandCfg)> = vec![
+                ("recent8",          CandCfg { recent: 8,  ..z }),
+                ("recent32+ind3",    CandCfg { recent: 32, induction: 3, ..z }),
+                ("recent64+ind4",    CandCfg { recent: 64, induction: 4, ..z }),
+                ("recent128+ind4",   CandCfg { recent: 128, induction: 4, ..z }),
+                ("ngram16",          CandCfg { recent: 16, induction: 3, quad: 6, tri: 6, bi: 6, ..z }),
+                ("ngram+grammar",    CandCfg { recent: 16, induction: 3, quad: 6, tri: 6, bi: 6, skel: 6, closed: true, ..z }),
+                ("generous~256",     CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true }),
+                ("generous~512",     CandCfg { recent: 128, induction: 4, quad: 16, tri: 16, bi: 16, skel: 16, uni: 256, closed: true }),
+            ];
+            println!("\n=== retrieval-pruned head — coverage sweep ({} positions) ===", positions.len());
+            println!("{:<18} {:>9} {:>8} {:>14}", "config", "mean|C|", "cov%", "V/|C| (head×)");
+            let mut best: Option<(f64, Vec<i64>)> = None; // (mean|C|, a representative candidate set) for the balanced config
+            for (name, cfg) in &cfgs {
+                let mut tot = 0usize;
+                let mut cov = 0usize;
+                let mut sample: Vec<i64> = Vec::new();
+                for (c, &t) in positions.iter().zip(&truth) {
+                    let cands = build(c, cfg);
+                    tot += cands.len();
+                    if cands.contains(&t) {
+                        cov += 1;
+                    }
+                    if sample.is_empty() {
+                        sample = cands;
+                    }
+                }
+                let mean = tot as f64 / positions.len() as f64;
+                let covp = 100.0 * cov as f64 / positions.len() as f64;
+                println!("{name:<18} {mean:>9.1} {covp:>7.1}% {:>13.1}×", vocab as f64 / mean.max(1.0));
+                if *name == "generous~256" {
+                    best = Some((mean, sample));
+                }
+            }
+            // Head speedup: time the full-vocab unembed vs the subset unembed for a representative candidate set.
+            let (mean_c, cand) = best.unwrap_or((1.0, vec![0]));
+            let mut s: u64 = 0x243F6A8885A308D3;
+            let mut x: Vec<f32> = (0..d).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 33) as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
+            x.truncate(d);
+            let iters = 200usize;
+            let t = std::time::Instant::now();
+            let mut sink = 0.0f32;
+            for _ in 0..iters { sink += b2.rowdot_f32(un, &x).iter().cloned().fold(f32::MIN, f32::max); }
+            let full_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..iters { sink += b2.rowdot_f32_subset(un, &x, &cand).iter().cloned().fold(f32::MIN, f32::max); }
+            let sub_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("\nunembed head (|C|={:.0}):  full {full_us:.1} µs/tok   subset {sub_us:.1} µs/tok   head speedup {:.1}×", mean_c, full_us / sub_us);
+            // End-to-end framing must use a single-token DECODE step (where pruning matters), NOT predict() on a 64-token
+            // context (a prefill — there the unembed is a tiny share). Time a real KV-cached decode: generate from a short
+            // prompt and per-token ≈ elapsed/N (the short-prompt prefill is negligible vs N decode steps).
+            let short: Vec<i64> = positions[0].iter().take(8).copied().collect();
+            let ndec = 24usize;
+            let t = std::time::Instant::now();
+            let g = lm.generate(&short, ndec);
+            let decode_ms = t.elapsed().as_secs_f64() * 1e3 / g.len().max(1) as f64;
+            let tok_pruned_ms = (decode_ms - full_us / 1e3 + sub_us / 1e3).max(0.0);
+            println!("(64-ctx prefill {predict_ms:.1} ms/pos — for reference)");
+            println!("decode token (forward+full-head) ≈ {decode_ms:.2} ms; unembed share of DECODE ≈ {:.0}%", 100.0 * (full_us / 1e3) / decode_ms.max(1e-6));
+            println!("end-to-end pruned-head decode token ≈ {tok_pruned_ms:.2} ms  ⇒  {:.2}× decode tok/s (IF the candidate set covers the argmax)", decode_ms / tok_pruned_ms.max(1e-6));
+            println!("(coverage = top-1 agreement with the full head; sink={sink:.3})");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
