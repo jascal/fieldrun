@@ -14,6 +14,7 @@ mod api;
 mod bundle;
 #[cfg(feature = "jit")]
 mod jit;
+mod logic;
 mod composition;
 mod convert;
 mod device;
@@ -867,89 +868,20 @@ fn main() {
                 eprintln!("[fieldrun] export --logic: arch {arch} has no explain");
                 return;
             };
-            let (t, vstar) = (ex.model_predicts, ex.runner_up);
-            // candidate set: predicted + runner-up + KB-proposed, capped.
-            let mut cand: Vec<i64> = vec![t];
-            if vstar != t { cand.push(vstar); }
-            if let Some(st) = &store {
-                for x in st.candidates(c, &cfg) {
-                    if !cand.contains(&x) { cand.push(x); }
-                    if cand.len() >= cap_c { break; }
-                }
-            }
-            let Some((labels, contrib)) = lm.residual_decomp(c, &cand) else {
+            let _ = ex; // explain re-run inside logic::build; keep the early arch-support check above
+            let Some(prov) = logic::build(lm.as_ref(), c, store.as_ref(), &cfg, cap_c) else {
                 eprintln!("[fieldrun] export --logic: arch {arch} has no residual_decomp (rope only)");
                 return;
             };
             let tg = api::TextGen::load(&stem, eos.clone());
             let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
-            let mut o = String::new();
-            o.push_str("% ============================================================\n");
-            o.push_str("% fieldrun logic export — semiring-Datalog program for ONE next-token decision\n");
-            o.push_str("% Greedy decode = (max,+) provenance; swap to log-semiring for the full distribution (LOGIC_EXPORT.md).\n");
-            o.push_str("% The model SPECIALIZED to one context (a partial evaluation / decode trace). Tokens = ids; text in comments.\n");
-            o.push_str("% Soufflé-compatible. Σ over contrib/3 == the true logit (LE-T5).\n");
-            o.push_str("% ============================================================\n\n");
-            o.push_str(".decl candidate(t:number)\n.decl contrib(block:symbol, t:number, w:float)\n");
-            o.push_str(".decl logit(t:number, s:float)\n.decl decide(t:number)\n.decl retrieved(t:number)\n\n");
-            o.push_str("% context:");
-            for &id in c.iter().rev().take(16).rev() { o.push_str(&format!(" {}", lbl(id))); }
-            o.push_str(&format!("\n% model predicts: {}  (logit {:.3}, margin {:+.3} over runner-up {})\n\n",
-                lbl(t), ex.predicted_logit, ex.predicted_logit - ex.runner_up_logit, lbl(vstar)));
-            o.push_str(&format!("% ---- candidate set (predicted ∪ runner-up ∪ KB-proposed), |C| = {} ----\n", cand.len()));
-            for &id in &cand { o.push_str(&format!("candidate({}).   % {}\n", id, lbl(id))); }
-            o.push('\n');
-            o.push_str("% ---- TIER A: retrievable fragment (looked up; no composition) ----\n");
-            if retrieval::induction_rule(c, t).is_some() {
-                o.push_str(&format!("% induction (in-context copy): the predicted token {} repeats an earlier token.\n", lbl(t)));
-                o.push_str("retrieved(T) :- induction_copy(T).   % the clean recursive rule: copy the token after the matched prefix\n");
-                o.push_str(&format!("induction_copy({}).\n", t));
-            }
-            if let Some(st) = &store {
-                if let Some(h) = st.rule_for(c, t) {
-                    let key_s: Vec<String> = h.key.iter().map(|&k| lbl(k)).collect();
-                    let key_atom = h.key.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("_");
-                    o.push_str(&format!("% {} rule: key [{}] → predicted token (rank {})\n", h.idiom, key_s.join(", "),
-                        h.rank.map(|r| r.to_string()).unwrap_or_else(|| "-".into())));
-                    o.push_str(&format!("ngram_succ(\"{}\", {}).   % {} proposes the predicted token\n", key_atom, t, h.idiom));
-                }
-            }
-            o.push('\n');
-            o.push_str("% ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");
-            o.push_str("% contrib(Block, Token, Weight): block's exact contribution to Token's logit. Σ_Block = logit(Token).\n");
-            o.push_str("% |W|>=0.1 blocks shown; the dense remainder folds into block \"rest\" (the irreducible high-PR\n");
-            o.push_str("% forge-tax sum — no compact rule; LOGIC_EXPORT LE-T2/T4). 'rest' keeps the per-token sum exact.\n");
-            for (ci, &tok) in cand.iter().enumerate() {
-                let total: f32 = contrib.iter().map(|b| b[ci]).sum();
-                let mut shown = 0.0f32;
-                for (bi, w) in contrib.iter().enumerate() {
-                    if w[ci].abs() >= 0.1 {
-                        o.push_str(&format!("contrib(\"{}\", {}, {:.4}).\n", labels[bi], tok, w[ci]));
-                        shown += w[ci];
-                    }
-                }
-                o.push_str(&format!("contrib(\"rest\", {}, {:.4}).   % dense remainder for {}\n", tok, total - shown, lbl(tok)));
-            }
-            o.push('\n');
-            o.push_str("% ---- accumulation (⊗ = +) and decision (⊕ = max) — the semiring decode ----\n");
-            o.push_str("logit(T, S) :- candidate(T), S = sum W : { contrib(_, T, W) }.   % ⊗ over blocks (log-semiring +)\n");
-            o.push_str("decide(T)   :- logit(T, S), S = max S2 : { logit(_, S2) }.        % ⊕ = max (max-product, T=0)\n");
-            o.push_str(".output decide\n\n");
-            // LE-T5 round-trip self-check: argmax over candidates from the emitted contrib facts == the model's token
-            let am = (0..cand.len()).max_by(|&a, &b| {
-                let (sa, sb): (f32, f32) = (contrib.iter().map(|bl| bl[a]).sum(), contrib.iter().map(|bl| bl[b]).sum());
-                sa.partial_cmp(&sb).unwrap()
-            }).map(|i| cand[i]).unwrap_or(t);
-            let ok = am == t;
-            o.push_str(&format!("% LE-T5 round-trip: decide/1 under (max,+) == model argmax {} : {}\n",
-                lbl(t), if ok { "✓ FAITHFUL" } else { "✗ MISMATCH (candidate set missed the argmax)" }));
-            // write
-            let nblk = labels.len();
+            let o = logic::emit_dl(&prov, c, &lbl);
+            let faithful = o.contains("✓ FAITHFUL");
             match flag(&args, "--out") {
                 Some(p) => {
                     if std::fs::write(p, &o).is_ok() {
-                        eprintln!("[fieldrun] export --logic → {p}  ({} candidates, {nblk} blocks, decode {})",
-                            cand.len(), if ok { "FAITHFUL ✓" } else { "MISMATCH ✗" });
+                        eprintln!("[fieldrun] export --logic → {p}  ({} candidates, {} blocks, decode {})",
+                            prov.candidates.len(), prov.blocks.len(), if faithful { "FAITHFUL ✓" } else { "MISMATCH ✗" });
                     } else {
                         eprintln!("[fieldrun] export --logic: could not write {p}");
                     }

@@ -748,6 +748,7 @@ fn render_typed_trace(
         ExplainMode::Route => "route only (free — no extra forward)",
         ExplainMode::Circuits => "route + DLA circuits on COMPOSED tokens (the forge tax)",
         ExplainMode::All => "route + DLA circuits on every token",
+        ExplainMode::Logic => "route + logic-export provenance (per-block contributions + the decode margin; LOGIC_EXPORT.md)",
     };
     let n = gen_ids.len();
     // head_tail bounds ONLY the expensive + verbose CIRCUIT breakdown (one faithful forward each) — the route + rule
@@ -795,6 +796,13 @@ fn render_typed_trace(
         if want_circuits && show_circuits(k) {
             if let Some(ex) = lm.explain(&ctx) {
                 out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
+            }
+        }
+        // logic-export provenance — the same data the semiring-Datalog emitter renders, as a per-token line (the
+        // composition shown as per-block contributions instead of per-circuit DLA). One forward/token, so head/tail-bounded.
+        if matches!(mode, ExplainMode::Logic) && show_circuits(k) {
+            if let Some(prov) = crate::logic::build(lm, &ctx, store, cand, 32) {
+                out.push(format!("│  ⟨logic⟩ {}", crate::logic::explain_line(&prov, dec)));
             }
         }
         ctx.push(t);
@@ -874,7 +882,21 @@ fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], o
             serde_json::Value::Null
         };
         let rule_detail = rule.and_then(|rh| serde_json::to_value(rh).ok()).unwrap_or(serde_json::Value::Null);
-        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "kb_top1": kb_top1, "candidate_set": candidate_set, "explanation": explanation }));
+        // logic-export provenance (the semiring-Datalog view): per-block contributions + the decode margin. Only on Logic.
+        let logic = if matches!(mode, ExplainMode::Logic) {
+            crate::logic::build(lm, &ctx, opts.store.as_ref(), &opts.cand, 32).map(|p| {
+                let mut top: Vec<(&str, f32)> = p.blocks.iter().map(|(n, ws)| (n.as_str(), ws.first().copied().unwrap_or(0.0))).collect();
+                top.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+                serde_json::json!({
+                    "route": crate::logic::route_name(p.route), "margin": p.margin, "runner_up": p.runner_up,
+                    "candidates": p.candidates.len(),
+                    "top_blocks": top.iter().take(5).map(|(n, w)| serde_json::json!({ "block": n, "w": w })).collect::<Vec<_>>(),
+                })
+            }).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "kb_top1": kb_top1, "candidate_set": candidate_set, "explanation": explanation, "logic": logic }));
         ctx.push(t);
     }
     serde_json::Value::Array(arr)

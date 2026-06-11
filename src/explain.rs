@@ -70,6 +70,10 @@ pub enum ExplainMode {
     Route,
     Circuits,
     All,
+    /// The logic-export view: per token, the provenance the semiring-Datalog program encodes — route + fired rule +
+    /// the top contributing residual blocks + the margin (LOGIC_EXPORT.md). Faithful-by-construction (it is the
+    /// provenance of the actual decode; LE-T5). Pays one forward/token (the `residual_decomp` deopt).
+    Logic,
 }
 
 impl ExplainMode {
@@ -79,6 +83,7 @@ impl ExplainMode {
             "route" | "routes" | "on" | "true" | "1" => Some(ExplainMode::Route),
             "circuits" | "circuit" | "dla" => Some(ExplainMode::Circuits),
             "all" | "full" | "verbose" => Some(ExplainMode::All),
+            "logic" | "provenance" | "datalog" => Some(ExplainMode::Logic),
             _ => None,
         }
     }
