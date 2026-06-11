@@ -565,7 +565,13 @@ fn main() {
             let textgen = api::TextGen::load(&stem, eos);
             #[cfg(not(feature = "api"))]
             let textgen: Option<api::TextGen> = None;
-            api::serve(lm, &arch, port, textgen);
+            // KB rules for the typed `"explain"` field (route/circuits/all): --store enables full RETRIEVED/SELECTED
+            // attribution; without it, the route is induction-only. The candidate set bounds SELECTED-vs-COMPOSED.
+            let explain_opts = api::ExplainOpts {
+                store: flag(&args, "--store").and_then(|p| Store::load(p).ok()),
+                cand: retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true },
+            };
+            api::serve(lm, &arch, port, textgen, explain_opts);
             return;
         }
 
