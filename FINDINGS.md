@@ -316,6 +316,9 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablat
 # per-block logit reconstruction: Σ_blocks == logit (LE-T5 exact) + block-level decision support by route
 # (§5d; rope arch — needs residual_decomp; the LOGIC_EXPORT LE-T5/LO2 brick)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-reconstruct --n-eval 300
+# emit a runnable semiring-Datalog program for ONE decode (LOGIC_EXPORT.md LO3; retrievable clauses + per-block
+# contrib facts + (max,+) decode; self-checks Σcontrib==logit and decode==model). rope arch.
+fieldrun --bundle <qwen> --ids <ctx.json> --store <store.json> export --logic --ctx 32 --candidates 24 --out decode.dl
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).

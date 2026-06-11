@@ -171,8 +171,14 @@ as provenance structure vs intervention diffuseness.
   granularity it mildly reverses (composed slightly more concentrated, being thin-margin); O2 is the circuit-coalition
   question. *Remaining:* the interventional residual (forge-tax growth under ablation) = the D_j-regression's indirect
   gap (FINDINGS §5c), already measured.
-- **LO3** Compile the retrievable fragment to an executable semiring-Datalog engine; benchmark
-  sparse-(max,+)-matmul decode vs the dense forward (the performance face of §1.5).
+- **LO3** — **emitter DONE** (`fieldrun ... export --logic`, rope). Emits a runnable, Soufflé-compatible semiring-
+  Datalog program SPECIALIZED to one next-token decision: candidate set (facts), Tier-A retrievable fragment (induction
+  = recursive clause, n-gram = `ngram_succ` fact), Tier-B composition as `contrib(Block, Token, Weight)` per-block facts
+  (`|W|≥0.1` shown, dense remainder folded into block `"rest"` = the forge tax), and the decode as
+  `decide(T) :- logit(T,S), S = max … : { logit(_,S2) }` (max-product / `T=0`). Verified: `Σ contrib == logit` to
+  floating point and the `(max,+)` decode `== the model's token` (LE-T5 round-trip self-check, "FAITHFUL ✓", both
+  Qwen2.5-0.5B). *Remaining:* (a) a built-in evaluator or Soufflé harness to run it without fieldrun; (b) the
+  whole-model (not per-context) emit; (c) the sparse-`(max,+)`-matmul performance face of §1.5.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the
