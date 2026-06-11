@@ -64,6 +64,28 @@ pub struct CandCfg {
     pub closed: bool,  // include the whole closed-class set (function words / punct) (store)
 }
 
+/// Store-less induction rule: if `predicted` is the in-context copy of a recurring tail (the longest tail, ≥2 tokens,
+/// that recurs earlier and is followed by `predicted`), return it as a `RuleHit` with the copy-source position. Needs
+/// no store — induction is pure context — so the explain trace shows the induction production rule even without `--store`
+/// (the n-gram/grammar rules still need the KB). Mirrors `Store::rule_for`'s induction arm with the default spans.
+pub fn induction_rule(ctx: &[i64], predicted: i64) -> Option<RuleHit> {
+    let n = ctx.len();
+    for span in (2..=3usize).rev() {
+        if n > span {
+            let tail = &ctx[n - span..];
+            let mut i = n as isize - span as isize - 1;
+            while i >= 0 {
+                let iu = i as usize;
+                if &ctx[iu..iu + span] == tail && ctx[iu + span] == predicted {
+                    return Some(RuleHit { idiom: format!("induction-{span}"), key: tail.to_vec(), successors: vec![predicted], rank: Some(1), source: Some(iu + span) });
+                }
+                i -= 1;
+            }
+        }
+    }
+    None
+}
+
 /// Context-only candidate tokens — recent distinct tokens + in-context induction copy. Needs NO store, so it works for
 /// any model/tokenizer (the "the model copies from its own context" prior, which dominates real next-token coverage).
 pub fn context_candidates(ctx: &[i64], recent: usize, induction: usize, out: &mut Vec<i64>) {
