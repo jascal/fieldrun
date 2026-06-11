@@ -12,7 +12,21 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// The KB rule that explains a predicted token — a production rule made legible. `key` is the rule's left-hand side
+/// (the context tokens it keys on, or the matched tail for induction); `successors` is its ranked right-hand side (the
+/// tokens that have followed that key); `rank` is where the predicted token sits in that ranking (1 = the rule's own
+/// top choice); `source`, for induction, is the position the copy came from. Lets explain show "via bigram [' a'] →
+/// {' simple', ' Python', …}, picked ' simple' (rank 1)" instead of just the bare idiom name.
+#[derive(Serialize, Clone)]
+pub struct RuleHit {
+    pub idiom: String,
+    pub key: Vec<i64>,
+    pub successors: Vec<i64>,
+    pub rank: Option<usize>,
+    pub source: Option<usize>,
+}
 
 fn default_min_induction() -> usize { 3 }
 fn default_min_accept() -> usize { 2 }
@@ -133,6 +147,64 @@ impl Store {
         let mut seen = HashSet::with_capacity(out.len());
         out.retain(|&t| seen.insert(t));
         out
+    }
+
+    /// Find the KB rule that explains `predicted` after `ctx` — the highest-precedence idiom whose RHS contains it
+    /// (induction copy first, then quad → trigram → bigram → grammar), with the rule's key, ranked successors, and the
+    /// predicted token's rank within them. `None` if no rule contains it (then the token came from the recent/closed/
+    /// unigram floor, or is pure composition). This is the retrieval half of explain: the actual production rule, shown.
+    pub fn rule_for(&self, ctx: &[i64], predicted: i64) -> Option<RuleHit> {
+        let n = ctx.len();
+        // induction (in-context copy): the longest recurring tail whose following token is `predicted`.
+        for span in (self.min_accept..=self.min_induction).rev() {
+            if n > span {
+                let tail = &ctx[n - span..];
+                let mut i = n as isize - span as isize - 1;
+                while i >= 0 {
+                    let iu = i as usize;
+                    if &ctx[iu..iu + span] == tail && ctx[iu + span] == predicted {
+                        return Some(RuleHit { idiom: format!("induction-{span}"), key: tail.to_vec(), successors: vec![predicted], rank: Some(1), source: Some(iu + span) });
+                    }
+                    i -= 1;
+                }
+            }
+        }
+        let rank_in = |v: &[i64]| v.iter().position(|&t| t == predicted).map(|p| p + 1);
+        let top = |v: &[i64]| v.iter().take(8).copied().collect::<Vec<i64>>();
+        if n >= 3 {
+            if let Some(v) = self.quad.get(&format!("{},{},{}", ctx[n - 3], ctx[n - 2], ctx[n - 1])) {
+                if let Some(r) = rank_in(v) {
+                    return Some(RuleHit { idiom: "quad".into(), key: ctx[n - 3..].to_vec(), successors: top(v), rank: Some(r), source: None });
+                }
+            }
+        }
+        if n >= 2 {
+            if let Some(v) = self.tri.get(&format!("{},{}", ctx[n - 2], ctx[n - 1])) {
+                if let Some(r) = rank_in(v) {
+                    return Some(RuleHit { idiom: "trigram".into(), key: ctx[n - 2..].to_vec(), successors: top(v), rank: Some(r), source: None });
+                }
+            }
+        }
+        if n >= 1 {
+            if let Some(v) = self.bi.get(&ctx[n - 1].to_string()) {
+                if let Some(r) = rank_in(v) {
+                    return Some(RuleHit { idiom: "bigram".into(), key: vec![ctx[n - 1]], successors: top(v), rank: Some(r), source: None });
+                }
+            }
+        }
+        if !self.skel.is_empty() {
+            for sn in [3usize, 2usize] {
+                if n >= sn {
+                    let skel: Vec<String> = ctx[n - sn..].iter().map(|t| if self.closed.contains(t) { t.to_string() } else { "O".to_string() }).collect();
+                    if let Some(v) = self.skel.get(&format!("{}:{}", sn, skel.join("/"))) {
+                        if let Some(r) = rank_in(v) {
+                            return Some(RuleHit { idiom: format!("grammar-{sn}"), key: ctx[n - sn..].to_vec(), successors: top(v), rank: Some(r), source: None });
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Next-token prediction for a token-id context: `(top-1 id, which idiom fired)` — mirrors `lm.py predict_explain`.
@@ -258,6 +330,19 @@ mod tests {
         let mut out2 = Vec::new();
         context_candidates(&[9, 8, 7], 1, 4, &mut out2);
         assert_eq!(out2[0], 7); // most-recent first
+    }
+
+    #[test]
+    fn rule_for_names_the_explaining_rule() {
+        let s = from_json(r#"{"tri":{},"bi":{"5":[9,7,5]},"uni":[0]}"#);
+        // predicted 7 after [..,5]: the bigram rule [5] → {9,7,5} explains it at rank 2.
+        let r = s.rule_for(&[1, 5], 7).unwrap();
+        assert_eq!((r.idiom.as_str(), r.rank, r.successors.clone()), ("bigram", Some(2), vec![9, 7, 5]));
+        // a token in no rule's successors → None (it came via the recent/closed/floor, or is composed).
+        assert!(s.rule_for(&[1, 5], 42).is_none());
+        // induction: the tail "1 2" recurred at the start; predicting 3 is a copy from position 2.
+        let ri = s.rule_for(&[1, 2, 3, 1, 2], 3).unwrap();
+        assert!(ri.idiom.starts_with("induction") && ri.source == Some(2));
     }
 
     #[test]

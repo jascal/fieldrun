@@ -28,7 +28,7 @@ use crate::retrieval::{CandCfg, Store}; // ExplainOpts (held by serve in both bu
 #[cfg(feature = "api")]
 use crate::explain::ExplainMode;
 #[cfg(feature = "api")]
-use crate::retrieval::context_candidates;
+use crate::retrieval::{context_candidates, RuleHit};
 
 #[derive(Deserialize)]
 struct PredictReq {
@@ -674,6 +674,25 @@ fn token_route(store: Option<&Store>, ctx: &[i64], predicted: i64, cfg: &CandCfg
     }
 }
 
+/// Format a fired KB rule as a human line: the production rule made legible — its key (LHS) → ranked successors (RHS)
+/// with the picked token marked, or, for induction, the copy-source position. `dec` decodes ids to display strings.
+#[cfg(feature = "api")]
+fn fmt_rule(r: &RuleHit, predicted: i64, dec: &dyn Fn(i64) -> String) -> String {
+    let key = r.key.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(" ");
+    if let Some(src) = r.source {
+        return format!("     rule  {}: copies {} from position {src} (tail [{key}] recurs there)", r.idiom, dec(predicted));
+    }
+    let succ = r
+        .successors
+        .iter()
+        .take(6)
+        .map(|&t| if t == predicted { format!("{} ◀", dec(t)) } else { dec(t) })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rank = r.rank.map(|rk| format!("  picked rank {rk}/{}", r.successors.len())).unwrap_or_default();
+    format!("     rule  {} [{key}] → {{{succ}}}{rank}", r.idiom)
+}
+
 /// Render the TYPED explain trace (the `route`/`circuits`/`all` levels). Every token gets a one-line route (RETRIEVED /
 /// SELECTED / COMPOSED, free — no forward); `Circuits` additionally re-runs the faithful forward and shows the DLA
 /// circuit breakdown ONLY on COMPOSED tokens (the attribution drives the verbosity — you pay the explain-forward
@@ -699,14 +718,25 @@ fn render_typed_trace(
     let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
     let mut ctx = prompt_ids.to_vec();
     for (k, &t) in gen_ids.iter().enumerate() {
-        let (route, rule) = token_route(store, &ctx, t, cand);
+        let (route, idiom) = token_route(store, &ctx, t, cand);
         match route {
             "RETRIEVED" => retr += 1,
             "SELECTED" => sel += 1,
             _ => comp += 1,
         }
-        let via = if rule.is_empty() { String::new() } else { format!(" via {rule}") };
+        // the rule that explains THIS token (key → successors); its idiom names the route when present, so the label
+        // and the rule line agree. A SELECTED token with no rule came in via the recent/closed/unigram floor.
+        let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)) } else { None };
+        let via_name = match (&rule, route) {
+            (Some(rh), _) => rh.idiom.clone(),
+            (None, "SELECTED") => "candidate-set".to_string(),
+            _ => idiom,
+        };
+        let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
         out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
+        if let Some(rh) = &rule {
+            out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
+        }
         let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
         if want_circuits {
             if let Some(ex) = lm.explain(&ctx) {
@@ -761,14 +791,22 @@ fn typed_explanation_json(lm: &dyn Model, prompt_ids: &[i64], gen_ids: &[i64], o
     let mut ctx = prompt_ids.to_vec();
     let mut arr = Vec::with_capacity(gen_ids.len());
     for &t in gen_ids {
-        let (route, rule) = token_route(opts.store.as_ref(), &ctx, t, &opts.cand);
+        let (route, idiom) = token_route(opts.store.as_ref(), &ctx, t, &opts.cand);
         let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
         let explanation = if want_circuits {
             lm.explain(&ctx).and_then(|ex| serde_json::to_value(ex).ok()).unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null
         };
-        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule, "explanation": explanation }));
+        // the fired production rule (key → ranked successors, picked rank, induction source), when one explains the token.
+        let rule = if route != "COMPOSED" { opts.store.as_ref().and_then(|s| s.rule_for(&ctx, t)) } else { None };
+        let rule_name = match (&rule, route) {
+            (Some(rh), _) => rh.idiom.clone(),
+            (None, "SELECTED") => "candidate-set".to_string(),
+            _ => idiom,
+        };
+        let rule_detail = rule.and_then(|rh| serde_json::to_value(rh).ok()).unwrap_or(serde_json::Value::Null);
+        arr.push(serde_json::json!({ "i": arr.len(), "token": t, "route": route, "rule": rule_name, "rule_detail": rule_detail, "explanation": explanation }));
         ctx.push(t);
     }
     serde_json::Value::Array(arr)
