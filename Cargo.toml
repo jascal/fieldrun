@@ -35,6 +35,10 @@ hub = ["dep:ureq"]
 # (`tokenizers`) and `rustyline` (line editing + history + tab-completion of slash commands). On by default; build
 # `--no-default-features` for the lean token-id-only binary.
 api = ["dep:tokenizers", "dep:rustyline"]
+# RESEARCH SPIKE (opt-in, off by default): Cranelift JIT codegen — compile a kernel specialised to the loaded model
+# (shapes/group/scales baked in as constants) at load time. Pure-Rust codegen, NO LLVM/C. Cranelift carries its own
+# (newer) MSRV, which is fine because this is opt-in — the default build never compiles it, so it stays on 1.89.
+jit = ["dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-native"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -59,6 +63,12 @@ tokenizers = { version = "0.20", optional = true, default-features = false, feat
 # REPL line editing + history + tab-completion for `--chat` (only pulled by the `api` feature). default-features off to
 # skip the on-disk history file (fd-lock etc.) — in-memory history + completion are core, so this stays lean + 1.82-safe.
 rustyline = { version = "14", optional = true, default-features = false }
+# Cranelift JIT (opt-in `jit` feature) — pure-Rust codegen, no LLVM/C. Research spike for model-specialised kernels.
+cranelift-jit = { version = "0.115", optional = true }
+cranelift-module = { version = "0.115", optional = true }
+cranelift-codegen = { version = "0.115", optional = true }
+cranelift-frontend = { version = "0.115", optional = true }
+cranelift-native = { version = "0.115", optional = true }
 
 [[bin]]
 name = "fieldrun"
