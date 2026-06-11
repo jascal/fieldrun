@@ -57,11 +57,15 @@ The retrieval/composition split is **not** a magnitude distinction (uniform). It
   both models (2.4–2.9 vs ~1.0–1.5). *Not robust:* the fine SELECTED-vs-COMPOSED ordering (clean on the coder,
   within noise on the non-coder at n=500). So state it as **RETRIEVED ≫ {SELECTED, COMPOSED}**.
 
-- **Redundancy — single-circuit readout multiplicity.** Does *any* single circuit's isolated argmax reproduce
-  the model's token? **Covered (RETRIEVED+SELECTED) 51–75% vs COMPOSED 12–20%** (both models). So coverable
-  tokens are **redundantly multiply-realized** (many *individually sufficient* circuits, none necessary —
-  magnitude still distributed, PR~45), while COMPOSED tokens are **emergent**: readable from *no* single
-  circuit, present only in the ~45-way sum.
+- **Redundancy — single-circuit readout multiplicity `μ_t`.** `μ_t(x) = #{top-12-by-DLA circuits whose isolated
+  argmax is t}`. Means (coder / instruct): RETRIEVED 1.13/0.83, SELECTED **1.45/1.06**, COMPOSED 0.23/0.31.
+  Strict-emergence fraction (`μ_t = 0`): COMPOSED **84%/76%**, covered 25–52%. So coverable tokens are
+  **redundantly multiply-realized** (many *individually sufficient* circuits, none necessary — magnitude still
+  distributed, PR~45); ~80% of COMPOSED are **emergent** (readable from no single circuit, present only in the
+  ~45-way sum). Note: μ_t is *not* monotone with margin — SELECTED has the highest μ_t but RETRIEVED the highest
+  margin. The ~16–24% of COMPOSED with `μ_t ≥ 1` is a real subclass: *the model has a single-circuit rule the
+  n-gram KB lacks* (model-retrievable, not corpus-retrievable). Caveat: μ_t over the top-12 is a lower bound,
+  so the strict-emergence fraction is an upper bound.
 
 **De-confounding (is it just confidence?).** Within matched normalized-margin bins, the covered−composed
 redundancy gap **persists** (low/mid bins, where COMPOSED n is adequate): coder 65/71% vs 17/16%; non-coder
@@ -81,7 +85,23 @@ sparse to trust; "COMPOSED flat across *all* margins" is coder-specific, not est
 This is a *kind of conflict resolution with no named precedent*: redundant distributed voting shading to
 emergent combination. Ingredients have precedent (connectionist production systems / DCPS; superposition,
 Elhage et al.; product-of-experts; Bundy's incidence calculus over a continuous learned space), the fusion
-does not.
+does not. **Tropical-geometry lens (Grok):** the unembedding induces a power diagram of ℝ^d; margin = facet
+distance; high `μ_t` = many tropical monomials (circuit terms) sharing the winning term for `t`; emergence =
+"the winning term of the tropical sum that wins in no summand." A good *framing* for the discussion, not
+evidence by itself.
+
+**Margin–μ_t (Grok's prediction that deeper cells recruit more redundancy):** confirmed but WEAK — per-position
+corr(margin, μ_t) = +0.12/+0.18 (covered), up to +0.32 (SELECTED, instruct); positive on both models. The
+route-level anti-correlation (RETRIEVED high-margin/low-μ_t vs SELECTED low-margin/high-μ_t) is a Simpson's
+paradox. r≈0.15 (~2% shared variance) means margin (geometry) and `μ_t` (code-multiplicity) are **largely
+independent axes** — good for the two-axis framing, with only a weak positive coupling.
+
+**Publication status: strong preprint *direction*, not finished.** The novel core (the `μ_t` code-multiplicity
+transition + the emergence definition, de-confounded against confidence, replicated within family) is real, but
+before "publish" it needs: (1) a **causal ablation** — knock out the top circuits and show covered tokens
+survive while composed collapse (the "redundancy" claim is currently observational, not causal); (2) a
+**cross-architecture / cross-scale replication** (two Qwen-0.5B models is seed-replication, not family); plus
+the full-spectrum `μ_t` (not top-12), derivations for the asserted training-dynamics claims, and verified cites.
 
 ## 6. Open math questions (with empirical status)
 
