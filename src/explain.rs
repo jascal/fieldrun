@@ -27,7 +27,8 @@ pub struct HeadCircuit {
     pub mass: f32,
     pub dla: f32,           // direct logit attribution: this head's contribution to the predicted token's logit
     pub promotes: Vec<i64>, // the tokens the head WRITES to the logits (top of its OV→unembed projection)
-}
+    pub pred_rank: u32,     // where the predicted token sits among this head's writes (1 = its top token) — makes the Δ
+}                           // legible when the predicted token isn't in the shown top-5 (a cluster / indirect push)
 
 #[derive(Serialize)]
 pub struct MlpFeature {
@@ -36,7 +37,8 @@ pub struct MlpFeature {
     pub act: f32,
     pub dla: f32,           // direct logit attribution: this neuron's contribution to the predicted token's logit
     pub promotes: Vec<i64>,
-}
+    pub pred_rank: u32,     // where the predicted token sits among this neuron's promoted tokens (1 = top); a large rank
+}                           // with a positive Δ flags an indirect / suppressor contribution rather than a direct writer
 
 #[derive(Serialize)]
 pub struct Explanation {
@@ -158,6 +160,19 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// 1-based rank of token `tok` within a component's vocab projection (1 = the component's single most-promoted token).
+/// Lets the reader reconcile a Δ→predicted with the displayed top-5: a small rank means the predicted token really is
+/// near the top of what this component writes; a large rank means the Δ comes from a broad/indirect push, not a direct
+/// write of that token. Returns 0 if `tok` is out of range.
+fn rank_of(proj: &[f32], tok: i64) -> u32 {
+    let i = tok as usize;
+    if i >= proj.len() {
+        return 0;
+    }
+    let v = proj[i];
+    proj.iter().filter(|&&x| x > v).count() as u32 + 1
+}
+
 /// Recover the final norm's frozen 1/rms (RMSNorm) or 1/std (LayerNorm) scalar from the forward pass, so per-component Δs
 /// are reported in true logit units (and sum — over *all* components — to the predicted logit minus the LN bias term).
 /// The norm is affine in the residual: `xf = scale · gain ⊙ (x − mean) + bias`, so with `gnx = gain ⊙ (x − mean)` (i.e.
@@ -256,7 +271,7 @@ where
         .map(|&(l, h, role, j, mass, _)| {
             let c = apply_final_norm(head_raw(l, h), gain, center);
             let dla = dot(&c, u_pred) * final_scale;
-            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new() }
+            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new(), pred_rank: 0 }
         })
         .collect();
     head_circuits.sort_by(|a, b| b.dla.total_cmp(&a.dla));
@@ -267,8 +282,9 @@ where
     // so it's done for HEAD_SHOW heads, not all candidates). The head_raw re-read is intentional: caching every
     // candidate's d-vector to save HEAD_SHOW reads would cost far more memory than it saves on this off-hot-path surface.
     for hc in head_circuits.iter_mut() {
-        let c = apply_final_norm(head_raw(hc.layer, hc.head), gain, center);
-        hc.promotes = top_promoted(&project_vocab(&c), 1.0, 5);
+        let proj = project_vocab(&apply_final_norm(head_raw(hc.layer, hc.head), gain, center));
+        hc.promotes = top_promoted(&proj, 1.0, 5);
+        hc.pred_rank = rank_of(&proj, model_predicts);
         debug_assert!(hc.attends_to < ids.len(), "attends_to out of range");
     }
 
@@ -296,7 +312,7 @@ where
             let mut w = neuron_write(l, n);
             w.iter_mut().for_each(|v| *v *= act);
             let c = apply_final_norm(w, gain, center);
-            MlpFeature { layer: l, neuron: n, act, dla: dot(&c, u_pred) * final_scale, promotes: Vec::new() }
+            MlpFeature { layer: l, neuron: n, act, dla: dot(&c, u_pred) * final_scale, promotes: Vec::new(), pred_rank: 0 }
         })
         .collect();
     mlp_features.sort_by(|a, b| b.dla.total_cmp(&a.dla));
@@ -305,8 +321,9 @@ where
     for f in mlp_features.iter_mut() {
         let mut w = neuron_write(f.layer, f.neuron);
         w.iter_mut().for_each(|v| *v *= f.act);
-        let c = apply_final_norm(w, gain, center);
-        f.promotes = top_promoted(&project_vocab(&c), 1.0, 5);
+        let proj = project_vocab(&apply_final_norm(w, gain, center));
+        f.promotes = top_promoted(&proj, 1.0, 5);
+        f.pred_rank = rank_of(&proj, model_predicts);
     }
 
     // store the FULL context (it's just the input ids) — render trims the printed preview, but nothing is lost: the
@@ -335,10 +352,12 @@ pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String, max_ctx: usize) -> 
     let mut l = vec![
         format!("context {lead}{ctx}"),
         format!("model predicts {}  logit {:.2}  (margin {:+.2} vs runner-up {})", dec(ex.model_predicts), ex.predicted_logit, margin, dec(ex.runner_up)),
-        format!("  COMPOSITION  content head circuits ({} idle on sink/NO-OP) — ranked by Δlogit→predicted (reads → writes):", ex.sink_heads),
+        // Δ = this component's contribution (in logit units) to the PREDICTED token; (pred #k) = where that token ranks
+        // among the component's own writes, so a Δ whose predicted token isn't in the shown top-5 is still legible.
+        format!("  COMPOSITION  content head circuits ({} idle on sink/NO-OP) — Δ→predicted logit, (pred #k)=rank in this head's writes:", ex.sink_heads),
     ];
     for h in &ex.head_circuits {
-        let mut line = format!("    L{}.H{:<2} {:<15} Δ{:+.2}  reads {} (mass {:.3})", h.layer, h.head, h.role, h.dla, dec(h.attends_tok), h.mass);
+        let mut line = format!("    L{}.H{:<2} {:<15} Δ{:+.2} (pred #{})  reads {} (mass {:.3})", h.layer, h.head, h.role, h.dla, h.pred_rank, dec(h.attends_tok), h.mass);
         if !h.promotes.is_empty() {
             let toks = h.promotes.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(", ");
             line.push_str(&format!("  ⇒ writes {{{toks}}}"));
@@ -348,10 +367,10 @@ pub fn render(ex: &Explanation, dec: &dyn Fn(i64) -> String, max_ctx: usize) -> 
     if ex.head_circuits.is_empty() {
         l.push("    (no attention contribution above threshold — carried by MLP features below)".to_string());
     }
-    l.push("  COMPOSITION  top MLP features by Δlogit→predicted (neuron → tokens it promotes):".to_string());
+    l.push("  COMPOSITION  top MLP features by Δ→predicted logit (neuron → tokens it promotes; (pred #k)=predicted's rank):".to_string());
     for f in &ex.mlp_features {
         let toks = f.promotes.iter().map(|&t| dec(t)).collect::<Vec<_>>().join(", ");
-        l.push(format!("    L{} n{:<5} act {:<+8.2} Δ{:+.2} → {{{}}}", f.layer, f.neuron, f.act, f.dla, toks));
+        l.push(format!("    L{} n{:<5} act {:<+8.2} Δ{:+.2} (pred #{}) → {{{}}}", f.layer, f.neuron, f.act, f.dla, f.pred_rank, toks));
     }
     l.join("\n")
 }
@@ -464,9 +483,20 @@ mod tests {
         // the big-|act| neuron 0 contributes 0 to tok1; neuron 1 (small act) contributes most → it must rank first.
         assert_eq!(ex.mlp_features[0].neuron, 1, "neuron that writes toward the predicted token must rank first");
         assert!(ex.mlp_features[0].dla > ex.mlp_features[1].dla);
+        // neuron 1 writes (0,1) == tok1's unembed dir, so the predicted token is its #1 promoted token.
+        assert_eq!(ex.mlp_features[0].pred_rank, 1);
         // runner-up margin from the logits [0,9,0]: predicted tok1 logit 9, runner-up 0 → margin 9.
         assert_eq!(ex.model_predicts, 1);
         assert_eq!(ex.predicted_logit, 9.0);
         assert_eq!(ex.predicted_logit - ex.runner_up_logit, 9.0);
+    }
+
+    #[test]
+    fn rank_of_is_one_based_and_handles_ties_and_oob() {
+        let proj = [0.1f32, 5.0, -3.0, 2.0];
+        assert_eq!(rank_of(&proj, 1), 1); // 5.0 is the top
+        assert_eq!(rank_of(&proj, 3), 2); // 2.0 is second
+        assert_eq!(rank_of(&proj, 2), 4); // -3.0 is last
+        assert_eq!(rank_of(&proj, 99), 0); // out of range
     }
 }
