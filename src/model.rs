@@ -190,6 +190,12 @@ pub trait Model: Sync {
         None
     }
 
+    /// (n_layer, n_head) — for the rescue-localization layer sweep (`--probe-ablate`): ablate the top circuit + a whole
+    /// downstream layer's attention to find where the indirect rescue δ lives. Default None; rope implements it.
+    fn dims(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Cosine similarity between two unembedding rows U_a, U_b — the runner-up *coherence* ρ for the incoherence-
     /// boundary probe (`--probe-ablate`, problem A): the decoupling proof assumes a circuit's push toward `t` is ~⊥ its
     /// push toward the runner-up `v*`; that fails when U_t ≈ U_{v*} (near-synonym, high ρ), where D_j = c_j·(U_t−U_{v*})

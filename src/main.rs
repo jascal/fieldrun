@@ -808,7 +808,9 @@ fn main() {
             // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
             const KS: [usize; 4] = [1, 2, 3, 5]; // coalition sizes for the additivity test
             struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32,
-                       sk: [f32; 4], flipk: [bool; 4] } // sk[i] = ΣD_j(top KS[i]) − Δ ; flipk[i] = forward flip ablating those
+                       sk: [f32; 4], flipk: [bool; 4], // sk[i] = ΣD_j(top KS[i]) − Δ ; flipk[i] = forward flip ablating those
+                       l_top: usize, sweep: Vec<(usize, bool)> } // L_top = ablated circuit's layer; sweep = (downstream
+                       // layer ℓ, does ablating {top + all of ℓ's attention} un-rescue?) — only filled for k=1 rescues
             let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
@@ -845,7 +847,23 @@ fn main() {
                     flipk[ki] = lm.predict_ablated(c, &hs, &ns) != Some(t);
                 }
                 let flip = flipk[0]; // k=1 single-circuit flip (reused by every earlier table)
-                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk })
+                // rescue localization: for a k=1 RESCUE (s>0 but forward kept t), find WHERE the rescue lives — ablate
+                // {top circuit + a whole downstream layer ℓ's attention} for each ℓ > L_top and see which ℓ un-rescues
+                // (flips). Concentration at small ℓ-L_top ⇒ local rescue just downstream; spread ⇒ diffuse/deep.
+                let l_top = top.2;
+                let mut sweep: Vec<(usize, bool)> = Vec::new();
+                if sk[0] > 0.0 && !flipk[0] {
+                    if let Some((nl, nh)) = lm.dims() {
+                        let base_n: Vec<(usize, usize)> = if top.1 { vec![] } else { vec![(top.2, top.3)] };
+                        for l2 in (l_top + 1)..nl {
+                            let mut hs: Vec<(usize, usize)> = if top.1 { vec![(top.2, top.3)] } else { vec![] };
+                            hs.extend((0..nh).map(|h| (l2, h)));
+                            let unresc = lm.predict_ablated(c, &hs, &base_n) != Some(t);
+                            sweep.push((l2, unresc));
+                        }
+                    }
+                }
+                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk, l_top, sweep })
             }).collect();
             let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
             let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
@@ -1022,6 +1040,31 @@ fn main() {
                 println!("  {k:>4}{flippct:>9.0}%{msk:>12.2}{acc:>11.0}% [{fp:>2} {fnn:>2}]{sp:>10} {resc:>5.0}%", );
             }
             println!("  ⇒ additivity holds if ident-acc stays high; cushion exhausts if rescue% falls with k; fp rising with k = new-winner≠v* (other facets).");
+            // (rescue localization) where does the indirect rescue δ live? (1) does rescue scale with L_top depth
+            // (downstream headroom)? (2) layer sweep: ablate {top + a whole downstream layer's attention} → which ℓ
+            // un-rescues, by relative depth ℓ−L_top.
+            let nl = lm.dims().map(|d| d.0).unwrap_or(24);
+            println!("\n  (rescue localization) is the rescue DOWNSTREAM? among s>0 (k=1), rescue% by L_top depth [pred: early L_top ⇒ more headroom ⇒ more rescue]:");
+            println!("  {:<8}{:>8}{:>12}{:>10}", "L_top", "n(s>0)", "mean L_top", "rescue%");
+            for (lbl, lo, hi) in [("early ", 0usize, nl / 3), ("mid   ", nl / 3, 2 * nl / 3), ("late  ", 2 * nl / 3, nl + 1)] {
+                let g: Vec<&A> = recs.iter().filter(|x| x.sk[0] > 0.0 && x.l_top >= lo && x.l_top < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                println!("  {lbl:<8}{:>8}{:>12.1}{:>9.0}%", g.len(), g.iter().map(|x| x.l_top as f32).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n);
+            }
+            println!("  layer sweep over k=1 rescues: ablate {{top + downstream layer ℓ's attn}} → un-rescue% by relative depth (ℓ−L_top):");
+            let maxd = recs.iter().flat_map(|x| x.sweep.iter().map(|s| s.0 - x.l_top)).max().unwrap_or(0);
+            for d in 1..=maxd.min(10) {
+                let (mut tot, mut un) = (0usize, 0usize);
+                for x in &recs { for &(l2, u) in &x.sweep { if l2 - x.l_top == d { tot += 1; if u { un += 1; } } } }
+                if tot == 0 { continue; }
+                println!("  Δdepth {d:>2}:  n {:>4}  un-rescue {:>4.0}%", tot, 100.0 * un as f32 / tot as f32);
+            }
+            let nresc = recs.iter().filter(|x| !x.sweep.is_empty()).count();
+            let breakable = recs.iter().filter(|x| x.sweep.iter().any(|&(_, u)| u)).count();
+            println!("  of {nresc} k=1 rescues, {breakable} ({:.0}%) un-rescued by ablating SOME single downstream layer's attention (else the rescue is diffuse / lives in MLP).",
+                100.0 * breakable as f32 / nresc.max(1) as f32);
             return;
         }
 

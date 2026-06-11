@@ -479,6 +479,10 @@ impl Model for Rope {
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
     }
 
+    fn dims(&self) -> Option<(usize, usize)> {
+        Some((self.b.config[0] as usize, self.b.config[1] as usize)) // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
+    }
+
     fn unembed_cos(&self, a: usize, b: usize) -> Option<f32> {
         let un = self.unembed_name();
         let (ua, ub) = (self.b.weight_row(un, a), self.b.weight_row(un, b));
