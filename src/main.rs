@@ -511,6 +511,91 @@ fn main() {
             return;
         }
 
+        // --probe (the SELECTED conflict-resolution question): is the model's pick a FUNCTION of the rule-firing state?
+        // Forward-chaining framing — the candidate set is the conflict set, SELECTED is conflict resolution. Two tests:
+        //   (A) rank of the pick within its explaining rule — rank 1 == "max-incidence" conflict resolution reproduces
+        //       it; the spread over ranks is the deviation a fixed count-ordering strategy can't capture.
+        //   (B) within-bucket pick entropy when the conflict set is held FIXED (bucket by the n-gram key). H≈0 / 100%
+        //       agreement ⇒ the pick is a function of the firing state (symbolic-representable); H>0 is the residue that
+        //       needs a finer incidence space than the rules carry. Finer key (bi→tri) = finer incidence partition.
+        if has_flag(&args, "--probe") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe needs --store <store.json>"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe: no eval positions");
+                return;
+            }
+            eprintln!("[fieldrun] --probe: {} positions (ctx {ctx_window}) — running forwards…", positions.len());
+            // record per position: (pick, route, last token, (t-2,t-1), rank-of-pick-in-its-rule | None if off-rule)
+            struct Rec { pick: i64, route: u8, bik: i64, trik: (i64, i64), rank: Option<usize> }
+            let recs: Vec<Rec> = positions.par_iter().map(|c| {
+                let pick = lm.predict(c);
+                let (kb, _) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&pick);
+                let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 }; // RETRIEVED / SELECTED / COMPOSED
+                let n = c.len();
+                Rec { pick, route, bik: c[n - 1], trik: (if n >= 2 { c[n - 2] } else { -1 }, c[n - 1]),
+                      rank: store.rule_for(c, pick).and_then(|r| r.rank) }
+            }).collect();
+
+            // (A) picked-rank distribution over SELECTED positions (does a fixed count-ordering reproduce the pick?).
+            let sel: Vec<&Rec> = recs.iter().filter(|r| r.route == 1).collect();
+            let (mut r1, mut r2, mut r3, mut r4p, mut offrule) = (0, 0, 0, 0, 0);
+            for r in &sel {
+                match r.rank {
+                    Some(1) => r1 += 1,
+                    Some(2) => r2 += 1,
+                    Some(3) => r3 += 1,
+                    Some(_) => r4p += 1,
+                    None => offrule += 1, // pick covered via recent/closed/floor, not in any named rule's successors
+                }
+            }
+            let ns = sel.len().max(1) as f64;
+            println!("\n=== (A) SELECTED picked-rank within its explaining rule ({} SELECTED positions) ===", sel.len());
+            println!("  rank 1 (== max-incidence) {r1:>4}  {:>5.1}%   ← a fixed 'pick the highest-count successor' strategy reproduces these", 100.0 * r1 as f64 / ns);
+            println!("  rank 2                    {r2:>4}  {:>5.1}%", 100.0 * r2 as f64 / ns);
+            println!("  rank 3                    {r3:>4}  {:>5.1}%", 100.0 * r3 as f64 / ns);
+            println!("  rank 4+                   {r4p:>4}  {:>5.1}%", 100.0 * r4p as f64 / ns);
+            println!("  off-rule (recent/floor)   {offrule:>4}  {:>5.1}%   ← not in any named rule's RHS at all", 100.0 * offrule as f64 / ns);
+
+            // (B) within-bucket pick entropy when the conflict set is held fixed. Restrict to SELECTED.
+            let h = |picks: &[i64]| -> f64 {
+                let mut cnt: HashMap<i64, usize> = HashMap::new();
+                for &p in picks { *cnt.entry(p).or_default() += 1; }
+                let n = picks.len() as f64;
+                cnt.values().map(|&c| { let p = c as f64 / n; -p * p.log2() }).sum()
+            };
+            let bucket_stats = |buckets: Vec<Vec<i64>>| -> (usize, usize, f64, f64) {
+                let nz: Vec<Vec<i64>> = buckets.into_iter().filter(|b| b.len() >= 2).collect();
+                let total: usize = nz.iter().map(|b| b.len()).sum();
+                if total == 0 { return (0, 0, 0.0, 0.0); }
+                let wh: f64 = nz.iter().map(|b| b.len() as f64 * h(b)).sum::<f64>() / total as f64; // weighted H(pick|bucket)
+                // top-1 agreement: Σ plurality / total
+                let agree: usize = nz.iter().map(|b| {
+                    let mut cnt: HashMap<i64, usize> = HashMap::new();
+                    for &p in b { *cnt.entry(p).or_default() += 1; }
+                    *cnt.values().max().unwrap()
+                }).sum();
+                (nz.len(), total, wh, 100.0 * agree as f64 / total as f64)
+            };
+            let by_bi = { let mut m: HashMap<i64, Vec<i64>> = HashMap::new(); for r in &sel { m.entry(r.bik).or_default().push(r.pick); } bucket_stats(m.into_values().collect()) };
+            let by_tri = { let mut m: HashMap<(i64, i64), Vec<i64>> = HashMap::new(); for r in &sel { m.entry(r.trik).or_default().push(r.pick); } bucket_stats(m.into_values().collect()) };
+            let h0 = h(&sel.iter().map(|r| r.pick).collect::<Vec<_>>()); // baseline marginal entropy of the SELECTED pick
+            println!("\n=== (B) is the SELECTED pick a function of the conflict set? bucket by the n-gram key, hold the conflict set fixed ===");
+            println!("  baseline H(pick) over all SELECTED = {h0:.2} bits (no conditioning)");
+            println!("  {:<26}{:>10}{:>10}{:>14}{:>13}", "signature (incidence)", "buckets≥2", "positions", "H(pick|sig)", "top-1 agree");
+            println!("  {:<26}{:>10}{:>10}{:>13.2}{:>12.1}%", "bigram-key  (last token)", by_bi.0, by_bi.1, by_bi.2, by_bi.3);
+            println!("  {:<26}{:>10}{:>10}{:>13.2}{:>12.1}%", "trigram-key (last 2 tok)", by_tri.0, by_tri.1, by_tri.2, by_tri.3);
+            println!("  (H→0 / agree→100% as the key tightens ⇒ the pick IS a function of the firing state = conflict resolution;");
+            println!("   a plateau below that is the residue needing a finer incidence space than the rules carry.)");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
