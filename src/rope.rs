@@ -504,6 +504,10 @@ impl Model for Rope {
         self.gate.as_ref().map(|g| g.stats())
     }
 
+    fn clear_head_gate(&mut self) {
+        self.gate = None;
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);

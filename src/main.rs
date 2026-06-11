@@ -961,35 +961,50 @@ fn main() {
         }
 
         // --gate-check N: the faithfulness measurement for --pruned-head. Generate N tokens through the GATED stream
-        // decode vs the ungated full-head reference (predict() never gates), report the identical prefix + accept
-        // rate. This is how a --pruned-margin threshold is calibrated: raise it until the prefix holds at the length
-        // you serve. (Past the first divergence the contexts differ, so only the prefix is the agreement metric.)
+        // decode vs the ungated full-head stream on the same prompts, report the identical prefix + accept rate.
+        // This is how a --pruned-margin threshold is calibrated: raise it until the prefix holds at the length you
+        // serve. (Past the first divergence the contexts differ, so only the prefix is the agreement metric.) The
+        // reference is the ungated KV stream — itself gated byte-identical to the naive recompute by --gen-prefix /
+        // validate_all.sh — so the check is N decode steps, not N full-context forwards. --gate-prompts P spreads P
+        // prompts evenly across the --ids stream (closed-loop trajectories from one prompt are a sample size of 1).
         if let Some(n) = flag(&args, "--gate-check").and_then(|s| s.parse::<usize>().ok()) {
-            if ids.is_empty() {
-                eprintln!("[fieldrun] --gate-check needs --ids (a prompt to generate from)");
+            if ids.len() < ctx_window {
+                eprintln!("[fieldrun] --gate-check needs --ids with at least --ctx tokens (a prompt to generate from)");
                 return;
             }
-            let prompt = &ids[..ctx_window.min(ids.len())];
+            let p_cnt: usize = flag(&args, "--gate-prompts").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            let span = ids.len() - ctx_window;
+            let offsets: Vec<usize> = (0..p_cnt).map(|i| span * i / p_cnt).collect();
             let t0 = std::time::Instant::now();
-            let gated = lm.generate_stream(prompt, n, &[], &mut |_| true);
+            let gated: Vec<Vec<i64>> = offsets.iter().map(|&o| lm.generate_stream(&ids[o..o + ctx_window], n, &[], &mut |_| true)).collect();
             let gated_s = t0.elapsed().as_secs_f64();
+            let stats = lm.head_gate_stats(); // capture before clearing for the reference pass
+            lm.clear_head_gate();
             let t1 = std::time::Instant::now();
-            let mut c2 = prompt.to_vec();
-            let full: Vec<i64> = (0..gated.len()).map(|_| { let t = lm.predict(&c2); c2.push(t); t }).collect();
+            let full: Vec<Vec<i64>> = offsets.iter().map(|&o| lm.generate_stream(&ids[o..o + ctx_window], n, &[], &mut |_| true)).collect();
             let full_s = t1.elapsed().as_secs_f64();
-            let agree = gated.iter().zip(&full).take_while(|(a, b)| a == b).count();
-            println!("[fieldrun] gate-check · {arch} · {} tokens from a {}-token prompt", gated.len(), prompt.len());
-            println!("[fieldrun]   identical prefix: {agree}/{} {}", gated.len(),
-                     if agree == gated.len() { "(gated == full head)".to_string() } else { format!("(first divergence at token {agree})") });
-            match lm.head_gate_stats() {
+            println!("[fieldrun] gate-check · {arch} · {} prompts × {n} tokens (ctx {ctx_window})", offsets.len());
+            let (mut tok_tot, mut agree_tot, mut exact) = (0usize, 0usize, 0usize);
+            for (i, (g, f)) in gated.iter().zip(&full).enumerate() {
+                let m = g.len().min(f.len());
+                let agree = g.iter().zip(f.iter()).take_while(|(a, b)| a == b).count();
+                tok_tot += m;
+                agree_tot += agree;
+                if agree == m { exact += 1; }
+                println!("[fieldrun]   prompt@{:<6} identical prefix: {agree}/{m}{}", offsets[i],
+                         if agree == m { String::new() } else { format!("  (diverged at token {agree})") });
+            }
+            println!("[fieldrun]   exact trajectories: {exact}/{} · mean identical prefix: {:.0}%",
+                     offsets.len(), 100.0 * agree_tot as f64 / tok_tot.max(1) as f64);
+            match stats {
                 Some((acc, fb)) => {
                     let tot = (acc + fb).max(1);
                     println!("[fieldrun]   gate: {acc} pruned + {fb} full-head fallback ({:.0}% accepted)", 100.0 * acc as f64 / tot as f64);
                 }
                 None => println!("[fieldrun]   gate: none installed (pass --pruned-head --store <store.json>)"),
             }
-            println!("[fieldrun]   gated stream: {gated_s:.2}s ({:.1} tok/s) · ungated naive reference: {full_s:.2}s",
-                     gated.len() as f64 / gated_s.max(1e-9));
+            println!("[fieldrun]   gated: {gated_s:.2}s ({:.1} tok/s) · ungated full head: {full_s:.2}s ({:.1} tok/s) · {:.2}× decode",
+                     (tok_tot as f64) / gated_s.max(1e-9), (tok_tot as f64) / full_s.max(1e-9), full_s / gated_s.max(1e-9));
             return;
         }
 
@@ -1173,7 +1188,8 @@ RUN\n\
   --pruned-head   serve/chat decode: margin-gated retrieval-pruned unembed (needs --store; rope arch). Scores only\n\
   \x20               the KB's ~540 candidate rows; falls back to the full head when the in-set normalized margin is\n\
   \x20               below --pruned-margin M (default 2.0). Opt-in + lossy: calibrate with --gate-check N (generates\n\
-  \x20               N gated tokens vs the full head, reports the identical prefix + accept rate).\n\
+  \x20               N gated tokens vs the full head, reports the identical prefix + accept rate; --gate-prompts P\n\
+  \x20               spreads P prompts across the --ids stream).\n\
   --raw           chat: stream raw text, no Markdown render   --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
   --device cpu|gpu|auto   --max-vram <GB>  override the RAM-fit budget (default: detected system RAM)   GPU: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
