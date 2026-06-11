@@ -125,25 +125,50 @@ the `t`–`v` bisector). Both models, 300 positions:
   (model=KB, deep cell) / COMPOSED-85% (genuine divergence, KB geometrically far) / near-miss-15% (function-word
   coin-flip the rule also offered — *not* novel computation).
 
-## 5c. Causal ablation — composed is fragile, but redundancy-beyond-margin is weak
+## 5c. Causal ablation — composed is fragile, and μ_t-redundancy confers no causal protection (decoupling, margin-matched + confound-controlled)
 
-`--probe-ablate` knocks out the top-k DLA circuits in the *forward pass* (`hidden_ab` re-runs with the heads/
-neurons zeroed; `Model::predict_ablated`) and asks whether the prediction flips — converting the μ_t readout
-into a causal intervention.
+`--probe-ablate` knocks out the single top-DLA circuit in the *forward pass* (`hidden_ab` re-runs with the head/
+neuron zeroed; `Model::predict_ablated`) and asks whether the prediction flips — converting the μ_t readout into a
+causal intervention. k=1 (cheap → enough positions for a μ_t × margin split), n=300, both Qwen2.5-0.5B models,
+natural-text holdout, matched-vocab store.
 
-- **Route-ordered fragility, replicated.** flip@k1 RETRIEVED 25%/25% < SELECTED 36%/52% < COMPOSED **59%/75%**
-  (coder/instruct). Knock out just the *top* circuit and COMPOSED flips ~2× as often as RETRIEVED — composed
-  tokens are *causally* fragile (emergent), retrieved ones robust.
-- **De-confound (flip@k1 within matched margin bins) is mixed/weak.** Covered flips less than composed in the
-  *low*-margin bin on both models (coder 69<86, instruct 80<100), but weak/absent in mid and n-starved in high
-  (composed n=3–5). So the flip-ordering is **largely margin** (composed near the boundary), with only a faint
-  redundancy residual.
-- **Resolution of the readout↔causal split.** The *readout* μ_t shows *strong* redundancy-beyond-margin; the
-  *causal* ablation shows it's mostly margin. Why: **redundant encoding (high μ_t) ≠ causal robustness when the
-  margin is thin.** The redundant supporters are individually *weak* (PR≈45, none > ~10% of the logit), so even
-  though *many* circuits point at `t`, removing the top few can still drop it below the runner-up if the cushion
-  is small. μ_t-redundancy and ablation-robustness are **distinct properties that decouple at thin margin** —
-  which is exactly why the readout looked strong while the causal test looked margin-dominated.
+- **Route-ordered fragility, replicated.** flip@k1 RETRIEVED 22%/26% < SELECTED 40%/48% < COMPOSED **54%/61%**
+  (coder/instruct). Knock out just the *top* circuit and COMPOSED flips ~2.4× as often as RETRIEVED — composed
+  tokens are *causally* fragile (emergent), retrieved ones robust. But this tracks margin (RETRIEVED Δ≈1.4–1.6 vs
+  COMPOSED Δ≈0.7), so it must be de-confounded.
+
+- **Grok's decisive falsifier — μ_t split WITHIN matched margin bins.** Grok's incoherence-regime proof predicts the
+  flip is governed by margin Δ and PR, *not* μ_t — so at matched margin, μ_t≥2 (redundantly read) and μ_t=0 (strictly
+  emergent) should flip at the *same* rate; a protective gap (high-μ_t flips *less*) would refute decoupling =
+  redundancy is causally protective. Result — flip% | mean PR | `t→` (= % of ablated circuits that are themselves
+  t-supporters, isolated argmax == t), both models:
+
+  | bin (mean Δ) | μ_t≥2 flip / PR / t→ | μ_t=0 flip / PR / t→ | gap |
+  |---|---|---|---|
+  | coder low 0.19  | 76% / 41 / 80% | 69% / 53 / 0% | +7  |
+  | coder mid 0.65  | 41% / 40 / 91% | 27% / 52 / 0% | +14 |
+  | coder high 1.91 | 17% / 39 / 71% |  7% / 44 / 0% | +10 |
+  | instr low 0.17  | 88% / 37 / 62% | 73% / 48 / 0% | +15 |
+  | instr mid 0.68  | 46% / 37 / 54% | 40% / 46 / 0% |  +6 |
+  | instr high 2.15 | 17% / 32 / 51% |  7% / 43 / 0% | +10 |
+
+  **Margin is the governor** — flip collapses 76→41→17 (μ_t≥2) and 69→27→7 (μ_t=0) across margin terciles, *identically*
+  for both μ_t levels. The residual μ_t gap is small and in the **anti-protective** direction (+6 to +15pp; high-μ_t
+  flips *more*, not less), and the `t→` control explains it exactly: the μ_t≥2 group ablates a *confirmed* t-supporter
+  51–91% of the time vs **0%** for μ_t=0 (structural — μ_t=0 has no individually-t-aligned circuit to remove), so the
+  high-μ_t group strips more pivotal mass. PR is flat — even slightly *higher* in μ_t=0 (44–53 vs 32–41) — so PR doesn't
+  drive the gap either. ⇒ **decoupling confirmed, redundancy-protection falsified.** The deepest reading: in the μ_t≥2
+  cells we remove a confirmed t-supporter *and ≥2 such supporters exist*, yet flip still tracks margin alone — the
+  redundant backups (PR≈40, individually < ~10% of the logit) provide essentially no cushion.
+
+- **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
+  μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
+  intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
+  supporters are individually weak (PR≈40). μ_t-redundancy and ablation-robustness are **distinct properties that
+  decouple at thin margin in the incoherent regime** — which is exactly why the readout looked strong while the causal
+  test is margin-dominated. *(Hedge, per "no necessity claims": shown at matched margin in this thin-margin/incoherent
+  regime; whether a clean multi-ablation removing **all** t-supporters surfaces protection — and whether decoupling
+  **breaks** for near-synonym runner-ups, where the incoherence assumption fails — is the open follow-on, §6 Q4b.)*
 
 ## 6. Open math questions (with empirical status)
 
@@ -157,9 +182,13 @@ into a causal intervention.
 - **Q4b (code-multiplicity transition — the new object).** `μ_t ≫ 1` for coverable, `μ_t ≈ 0` for composed,
   independent of margin and PR. The reconciliation question: how is a token the argmax of *many* circuits yet
   *no* circuit dominates the magnitude (geometry of redundant weak codes)? And the emergence definition:
-  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. NB the
-  causal ablation (§5c) shows redundancy (μ_t) and robustness *decouple at thin margin* — they're distinct
-  properties, so a theorem must relate `μ_t`, PR, and margin jointly (not μ_t ⇒ robustness).
+  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. The causal
+  ablation (§5c) now **confirms decoupling causally** — margin-matched + `t→`-controlled on both models, μ_t confers
+  no protection — so a theorem must relate `μ_t`, PR, and margin jointly (not μ_t ⇒ robustness). The sharp open test:
+  Grok's proof rests on an **incoherence assumption** (a circuit's push toward `t` is ≈ independent of its push toward
+  the runner-up `v*`); it predicts decoupling should **break** — redundancy becoming protective — exactly when `v*` is
+  a near-synonym of `t` (high `cos(U_t, U_{v*})`). Splitting the flip by runner-up coherence would confirm the proof
+  *by finding its boundary*. Not yet run.
 - Q2 (incidence-granularity entropy rate / forge-tax as positive asymptotic residual), Q3 (continuous
   incidence calculus & failure of truth-functionality, measurable via SAE features), Q5 (rank of the
   resolution map), Q6 (MDL of the boundary / ILP-over-COMPOSED) — open, measurable on this decompile.
@@ -177,8 +206,9 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-dla --n-eval 500
 # exact power-diagram nearest facet + the killer check + near-miss subclass (§5b; rope arch — needs final_residual)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-facet
-# causal: ablate top-k DLA circuits in the forward pass → flip rate by route, margin-de-confounded (§5c; rope arch)
-fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 200
+# causal: ablate the top DLA circuit → flip; Grok μ_t-falsifier (flip split by μ_t WITHIN matched margin bins,
+# + per-cell PR and t→ which-circuit control) → decoupling confirmed (§5c; rope arch — needs predict_ablated)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 300
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).

@@ -799,54 +799,70 @@ fn main() {
                 eprintln!("[fieldrun] --probe-ablate: arch {arch} doesn't support ablation (rope only)");
                 return;
             }
-            let cap = (end - ctx_window).min(n_eval).min(150); // 1 explain + 3 ablated forwards / position
+            let cap = (end - ctx_window).min(n_eval); // k=1: 1 explain + 1 ablated forward / position (cheap → use all n_eval)
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
             eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…", positions.len());
-            let ks = [1usize, 2, 4];
-            // (route, margin, [flip@k1, flip@k2, flip@k4])
-            let recs: Vec<(u8, f32, [bool; 3])> = positions.par_iter().filter_map(|c| {
+            // Grok's decisive falsifier: ablate the SINGLE top circuit (k=1), record margin + PR + μ_t per position,
+            // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
+            // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
+            // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
+            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool }
+            let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
-                let mut circ: Vec<(f32, bool, usize, usize)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head))
-                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron))).collect();
+                // carry each circuit's isolated argmax (promotes[0]) so we can ask if the ABLATED circuit was t-aligned.
+                let mut circ: Vec<(f32, bool, usize, usize, Option<i64>)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head, h.promotes.first().copied()))
+                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron, m.promotes.first().copied()))).collect();
                 circ.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let top = *circ.first()?;
                 let (kb, _) = store.predict(c);
                 let covered = store.candidates(c, &cfg).contains(&t);
                 let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
-                let mut flips = [false; 3];
-                for (ki, &k) in ks.iter().enumerate() {
-                    let topk = &circ[..k.min(circ.len())];
-                    let heads: Vec<(usize, usize)> = topk.iter().filter(|c| c.1).map(|c| (c.2, c.3)).collect();
-                    let neurons: Vec<(usize, usize)> = topk.iter().filter(|c| !c.1).map(|c| (c.2, c.3)).collect();
-                    flips[ki] = lm.predict_ablated(c, &heads, &neurons) != Some(t);
-                }
-                Some((route, ex.predicted_logit - ex.runner_up_logit, flips))
+                let d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                let mu_t = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).filter(|&a| a == t).count();
+                let talign = top.4 == Some(t); // is the single circuit we ablate itself a t-supporter (isolated argmax == t)?
+                let (heads, neurons) = if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
+                let flip = lm.predict_ablated(c, &heads, &neurons) != Some(t);
+                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign })
             }).collect();
-            println!("\n=== (causal) ablate the top-k DLA circuits in the forward pass → does the prediction FLIP? ===");
-            println!("{:<12}{:>6}{:>10}{:>12}{:>12}{:>12}", "route", "n", "margin", "flip@k1", "flip@k2", "flip@k4");
+            let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
+            let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
+            let prmax = prs.iter().cloned().fold(f32::MIN, f32::max);
+            println!("\n=== (causal) ablate the single top DLA circuit → flip? by route (PR range {prmin:.0}-{prmax:.0}, ~flat) ===");
+            println!("{:<12}{:>6}{:>10}{:>10}{:>12}", "route", "n", "margin", "μ_t", "flip@k1");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
-                let g: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| x.0 == r).collect();
+                let g: Vec<&A> = recs.iter().filter(|x| x.route == r).collect();
                 if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
-                let f = |ki: usize| 100.0 * g.iter().filter(|x| x.2[ki]).count() as f32 / g.len() as f32;
-                let mm = g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32;
-                println!("{lbl:<12}{:>6}{:>10.2}{:>11.0}%{:>11.0}%{:>11.0}%", g.len(), mm, f(0), f(1), f(2));
+                let n = g.len() as f32;
+                println!("{lbl:<12}{:>6}{:>10.2}{:>10.2}{:>11.0}%", g.len(),
+                    g.iter().map(|x| x.margin).sum::<f32>() / n, g.iter().map(|x| x.mu_t as f32).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| x.flip).count() as f32 / n);
             }
-            // de-confound margin: within matched margin bins, does coverage predict robustness (lower flip@k1)?
-            let mut ms: Vec<f32> = recs.iter().map(|x| x.1).collect();
+            // Grok's falsifier: μ_t-split WITHIN matched margin bins (PR ~flat, so margin-matching ≈ (Δ,PR)-matching).
+            let mut ms: Vec<f32> = recs.iter().map(|x| x.margin).collect();
             ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let q = |p: f32| if ms.is_empty() { 0.0 } else { ms[(((ms.len() - 1) as f32) * p) as usize] };
             let (t1, t2) = (q(0.333), q(0.667));
-            println!("\n  (de-confound) flip@k1 WITHIN matched margin bins — COVERED (R+S) vs COMPOSED:");
-            println!("  {:<12}{:>12}{:>20}{:>20}", "margin bin", "mean margin", "COVERED n flip%", "COMPOSED n flip%");
+            let fl = |g: &[&A]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.flip).count() as f32 / g.len() as f32 };
+            let mpr = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.pr).sum::<f32>() / g.len() as f32 };
+            let tal = |g: &[&A]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.talign).count() as f32 / g.len() as f32 };
+            println!("\n  (Grok falsifier) flip@k1 split by μ_t WITHIN matched margin bins:");
+            println!("  {:<10}{:>8}{:>22}{:>22}", "margin bin", "mean Δ", "μ_t≥2  n flip PR t→", "μ_t=0  n flip PR t→");
             for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
-                let inb = |x: &&(u8, f32, [bool; 3])| x.1 >= lo && x.1 < hi;
-                let cov: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 != 2).collect();
-                let cmp: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 == 2).collect();
-                let fl = |g: &[&(u8, f32, [bool; 3])]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.2[0]).count() as f32 / g.len() as f32 };
-                let mm = recs.iter().filter(inb).map(|x| x.1).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
-                println!("  {lbl:<12}{mm:>12.2}{:>14} {:>4.0}%{:>14} {:>4.0}%", cov.len(), fl(&cov), cmp.len(), fl(&cmp));
+                let inb = |x: &&A| x.margin >= lo && x.margin < hi;
+                let hi_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t >= 2).collect();
+                let lo_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t == 0).collect();
+                let mm = recs.iter().filter(inb).map(|x| x.margin).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
+                // per cell: n, flip%, mean PR, and t→ = % of ablated top circuits that were themselves t-aligned (the
+                // "which circuit we knock out" confound — higher in μ_t≥2, which inflates its flip% vs μ_t=0).
+                println!("  {lbl:<10}{mm:>8.2}{:>8} {:>3.0}% {:>3.0} {:>3.0}%{:>8} {:>3.0}% {:>3.0} {:>3.0}%",
+                    hi_m.len(), fl(&hi_m), mpr(&hi_m), tal(&hi_m), lo_m.len(), fl(&lo_m), mpr(&lo_m), tal(&lo_m));
             }
-            println!("⇒ if COVERED flip% < COMPOSED flip% WITHIN a margin bin, redundancy is causal BEYOND confidence.");
+            println!("⇒ DECOUPLING (Grok) predicts μ_t≥2 flip% ≈ μ_t=0 flip% within a bin; a large gap (high-μ_t flips less) refutes it = redundancy is causally protective.");
+            println!("  (t→ = % of ablated circuits that were themselves t-supporters: if μ_t≥2's higher flip tracks higher t→, the reverse gap is the which-circuit confound, not protection failing.)");
             return;
         }
 
