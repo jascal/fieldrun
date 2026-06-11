@@ -489,6 +489,12 @@ fn anthropic_tool_frames(arch: &str, id: u64, text: &str, calls: &[crate::tools:
     out
 }
 
+/// Default head/tail window for the typed explain trace: deep-explain the first & last N generated tokens and elide
+/// the middle. Keeps a long reply's explanation readable AND fast — the per-token explain forward (Circuits/All) runs
+/// only on the shown frames, so a 200-token reply costs ~2N forwards, not 200. Live-tunable in chat via `/explain tokens N`.
+#[cfg(feature = "api")]
+const EXPLAIN_HEAD_TAIL: usize = 4;
+
 /// Print the full explain TRACE (one frame per generated token) to the server console (stderr). Used under `--serve`
 /// when a request sets `"explain": true` — the streamed/JSON response can't always carry the extension field, so the
 /// operator watches the circuits + named features for every forward pass of the reply on the console.
@@ -498,7 +504,7 @@ fn log_explanation(lm: &dyn Model, tg: &TextGen, prompt_ids: &[i64], gen_ids: &[
         return;
     }
     let dec = |id: i64| tg.token_label(id);
-    eprintln!("[fieldrun] {}", render_typed_trace(lm, prompt_ids, gen_ids, opts.store.as_ref(), &opts.cand, mode, &dec, 10));
+    eprintln!("[fieldrun] {}", render_typed_trace(lm, prompt_ids, gen_ids, opts.store.as_ref(), &opts.cand, mode, &dec, 10, EXPLAIN_HEAD_TAIL));
 }
 
 #[cfg(feature = "api")]
@@ -699,6 +705,7 @@ fn fmt_rule(r: &RuleHit, predicted: i64, dec: &dyn Fn(i64) -> String) -> String 
 /// exactly where the model composed); `All` shows the circuit breakdown for every token. `cand` bounds the KB set used
 /// to decide SELECTED-vs-COMPOSED. Returns the rendered trace; cheap modes never call `lm.explain`.
 #[cfg(feature = "api")]
+#[allow(clippy::too_many_arguments)]
 fn render_typed_trace(
     lm: &dyn Model,
     prompt_ids: &[i64],
@@ -708,47 +715,58 @@ fn render_typed_trace(
     mode: ExplainMode,
     dec: &dyn Fn(i64) -> String,
     max_ctx: usize,
+    head_tail: usize, // deep-explain only the first & last `head_tail` tokens; elide the middle (0 = all). Bounds
+                      // BOTH the reader's output AND the cost — the per-token explain forward runs only on shown frames.
 ) -> String {
     let legend = match mode {
         ExplainMode::Route => "route only (free — no extra forward)",
         ExplainMode::Circuits => "route + DLA circuits on COMPOSED tokens (the forge tax)",
         ExplainMode::All => "route + DLA circuits on every token",
     };
-    let mut out = vec![format!("explain trace [{legend}] — one frame per generated token, routed to a KB rule or to composition:")];
+    let n = gen_ids.len();
+    let windowed = head_tail > 0 && n > 2 * head_tail;
+    let show = |k: usize| !windowed || k < head_tail || k >= n - head_tail;
+    let win = if windowed { format!(" (showing first/last {head_tail})") } else { String::new() };
+    let mut out = vec![format!("explain trace [{legend}]{win} — one frame per token, routed to a KB rule or to composition:")];
     let (mut retr, mut sel, mut comp) = (0usize, 0usize, 0usize);
+    let mut elided: [usize; 3] = [0, 0, 0]; // RETRIEVED/SELECTED/COMPOSED counts of the elided middle run
     let mut ctx = prompt_ids.to_vec();
     for (k, &t) in gen_ids.iter().enumerate() {
         let (route, idiom) = token_route(store, &ctx, t, cand);
-        match route {
-            "RETRIEVED" => retr += 1,
-            "SELECTED" => sel += 1,
-            _ => comp += 1,
-        }
-        // the rule that explains THIS token (key → successors); its idiom names the route when present, so the label
-        // and the rule line agree. A SELECTED token with no rule came in via the recent/closed/unigram floor.
-        let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)) } else { None };
-        let via_name = match (&rule, route) {
-            (Some(rh), _) => rh.idiom.clone(),
-            (None, "SELECTED") => "candidate-set".to_string(),
-            _ => idiom,
-        };
-        let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
-        out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
-        if let Some(rh) = &rule {
-            out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
-        }
-        let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
-        if want_circuits {
-            if let Some(ex) = lm.explain(&ctx) {
-                out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
+        let ri = match route { "RETRIEVED" => 0, "SELECTED" => 1, _ => 2 };
+        match ri { 0 => retr += 1, 1 => sel += 1, _ => comp += 1 }
+        if show(k) {
+            if elided.iter().sum::<usize>() > 0 {
+                out.push(format!("\n┊  … {} tokens elided — RETRIEVED {} · SELECTED {} · COMPOSED {} …", elided.iter().sum::<usize>(), elided[0], elided[1], elided[2]));
+                elided = [0, 0, 0];
             }
+            // the rule that explains THIS token (key → successors); its idiom names the route when present.
+            let rule = if route != "COMPOSED" { store.and_then(|s| s.rule_for(&ctx, t)) } else { None };
+            let via_name = match (&rule, route) {
+                (Some(rh), _) => rh.idiom.clone(),
+                (None, "SELECTED") => "candidate-set".to_string(),
+                _ => idiom,
+            };
+            let via = if via_name.is_empty() { String::new() } else { format!(" via {via_name}") };
+            out.push(format!("\n┌─ #{k} {} ← {route}{via}", dec(t)));
+            if let Some(rh) = &rule {
+                out.push(fmt_rule(rh, t, dec)); // the retrieval half: the production rule made legible
+            }
+            let want_circuits = matches!(mode, ExplainMode::All) || (matches!(mode, ExplainMode::Circuits) && route == "COMPOSED");
+            if want_circuits {
+                if let Some(ex) = lm.explain(&ctx) {
+                    out.push(crate::explain::render(&ex, dec, max_ctx)); // the composition half (DLA heads/neurons)
+                }
+            }
+        } else {
+            elided[ri] += 1;
         }
         ctx.push(t);
     }
-    let n = gen_ids.len().max(1);
+    let nn = n.max(1);
     out.push(format!(
-        "\nrouted {} tokens — RETRIEVED {} ({:.0}%) · SELECTED {} ({:.0}%) · COMPOSED {} ({:.0}%)",
-        gen_ids.len(), retr, 100.0 * retr as f64 / n as f64, sel, 100.0 * sel as f64 / n as f64, comp, 100.0 * comp as f64 / n as f64
+        "\nrouted {n} tokens — RETRIEVED {retr} ({:.0}%) · SELECTED {sel} ({:.0}%) · COMPOSED {comp} ({:.0}%)",
+        100.0 * retr as f64 / nn as f64, 100.0 * sel as f64 / nn as f64, 100.0 * comp as f64 / nn as f64
     ));
     out.join("\n")
 }
@@ -1079,6 +1097,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
     let chatml = tg.knows_chatml(); // instruct model → ChatML template + history; base model → raw completion
     let mut history: Vec<(String, String)> = Vec::new();
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
+    let mut explain_tk: usize = EXPLAIN_HEAD_TAIL; // deep-explain only the first & last N reply tokens (0 = all); /explain tokens N
     // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
     // during readline; the generation/streaming below runs in normal mode exactly as before.
     let cfg = rustyline::Config::builder()
@@ -1146,8 +1165,17 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                         eprintln!("[fieldrun] explain context window = {}",
                                   if explain_ctx == 0 { "all".to_string() } else { explain_ctx.to_string() });
                     }
+                    Some("tokens") | Some("tok") => {
+                        explain_tk = match parts.next() {
+                            Some("all") | Some("full") | Some("0") => 0,
+                            Some(n) => n.parse().unwrap_or(explain_tk),
+                            None => explain_tk,
+                        };
+                        eprintln!("[fieldrun] explain shows {} (deep-explain first/last N reply tokens, elide the middle)",
+                                  if explain_tk == 0 { "ALL tokens".to_string() } else { format!("first/last {explain_tk}") });
+                    }
                     Some(other) => {
-                        eprintln!("[fieldrun] /explain {other}? use: off | route (free) | circuits (DLA on composed) | all | context N");
+                        eprintln!("[fieldrun] /explain {other}? use: off | route (free) | circuits (DLA on composed) | all | context N | tokens N");
                     }
                 },
                 "format" | "md" | "markdown" => {
@@ -1267,7 +1295,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                 eprintln!("[fieldrun] (no circuit explain for arch {arch} — showing route only; /explain route to silence)");
             }
             let dec = |id: i64| tg.token_label(id);
-            eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx));
+            eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx, explain_tk));
         }
         if chatml {
             // only instruct models carry conversation history (base completion is stateless per turn)
