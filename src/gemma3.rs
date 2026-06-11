@@ -244,8 +244,10 @@ impl Gemma3 {
             x = &x + &self.norm(&mlp, &format!("{p}post_feedforward_layernorm"));
         }
         let xf = self.norm(&x, "norm");
+        let x_last = x.row(seq - 1).to_vec(); // residual either side of the final norm — recovers its frozen scale
+        let xf_last = xf.row(seq - 1).to_vec();
         let un = self.unembed();
-        let lg = self.b.rowdot_f32(un, &xf.row(seq - 1).to_vec());
+        let lg = self.b.rowdot_f32(un, &xf_last);
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
         let gain = self.b.arr1("norm").to_vec(); // final RMSNorm gain (1+w baked at export) — for direct-logit attribution
         let u_pred = self.b.weight_row(un, model_predicts as usize);
@@ -258,6 +260,9 @@ impl Gemma3 {
             model_predicts,
             &gain,
             false,
+            &[],
+            &x_last,
+            &xf_last,
             &u_pred,
             |l, n| self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
             |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),

@@ -353,8 +353,10 @@ impl Mla {
             x = &x + &mlp;
         }
         let xf = self.norm(&x, "norm");
+        let x_last = x.row(seq - 1).to_vec(); // residual either side of the final norm — recovers its frozen scale
+        let xf_last = xf.row(seq - 1).to_vec();
         let un = self.unembed();
-        let lg = self.b.rowdot_f32(un, &xf.row(seq - 1).to_vec());
+        let lg = self.b.rowdot_f32(un, &xf_last);
         let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
         let gain = self.b.arr1("norm").to_vec();
         let (first_k, nl) = (self.first_k, self.nl);
@@ -369,6 +371,9 @@ impl Mla {
             model_predicts,
             &gain,
             false,
+            &[],
+            &x_last,
+            &xf_last,
             &u_pred,
             |l, n| {
                 let name = if l < first_k { format!("l{l}.mlp.down_proj") } else { format!("l{l}.shared.down") };
