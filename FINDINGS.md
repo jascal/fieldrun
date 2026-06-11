@@ -190,6 +190,20 @@ natural-text holdout, matched-vocab store.
   decoupling confirmed at the regression level. Aside: |w_Δ| > |w_Dj| on both ⇒ the margin protects *beyond* the linear
   identity (the indirect-rescue channel scales with Δ) — which is *why* flip ⟺ Δ<D_j is necessary but not sufficient.
 
+- **(A/B) the incoherence boundary + Δ-cushion (Grok's derivations, run on both models).** ρ = cos(U_t, U_{v\*});
+  among the s>0 set (linear identity predicts a flip), a **rescue** = the forward pass keeps t (indirect recomposition).
+  Grok's derivation is **2/3 confirmed**:
+  - **(B) Δ-cushion — confirmed.** Rescue rate rises monotonically with Δ at ~matched s (coder 14→39→50→61%; instruct
+    9→36→33→71%). Higher margin ⇒ more downstream rescue — the quantified reason flip ⟺ Δ<D_j is necessary-not-
+    sufficient and |w_Δ| > |w_Dj|.
+  - **(A) geometry — confirmed.** mean|D_j| and flip% both fall with ρ (coder |D_j| 1.47→0.86, flip 53→18%; instruct
+    1.56→0.84, 54→28%): near-synonym competitors have small pivotality D_j = c_j·(U_t−U_{v\*}) (common-mode cancels).
+  - **(A) stochastic-rescue collapse — falsified.** Grok predicted σ(ρ)∝√(1−ρ²)→0 ⇒ rescue→0 at high ρ; instead rescue
+    does *not* fall with ρ (coder 31→44%, instruct 26→40% — flat-to-rising). At high ρ the *linear* lever (D_j) weakens
+    but the *indirect* rescue does not — likely because high-ρ flips involve tiny *absolute* D_j perturbations the
+    forward pass trivially compensates. So near-synonyms are hard to edit because D_j is small, **not** because rescue
+    starves. (`Model::unembed_cos`, rope; explain-only.)
+
 - **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
   μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
   intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
@@ -216,7 +230,8 @@ natural-text holdout, matched-vocab store.
   `flip ~ Δ + D_j + 1[μ_t≥2]` on both models isolates the causal variables as the margin **Δ** and the ablated
   circuit's pivotality **D_j = c_j^t − c_j^{v\*}** (μ_t's independent log-loss value ≈ 0) — so μ_t is a *proxy*, and the
   theorem to write is about **D_j vs Δ plus an indirect-cushion term that scales with Δ** (|w_Δ|>|w_Dj|), not μ_t. The
-  sharp open test:
+  cushion term and the geometry are now **empirically confirmed** (§5c A/B); the one **falsified** sub-model is Grok's
+  σ(ρ)∝√(1−ρ²) rescue-collapse — rescue does not weaken at high ρ. The sharp open test:
   Grok's proof rests on an **incoherence assumption** (a circuit's push toward `t` is ≈ independent of its push toward
   the runner-up `v*`); it predicts decoupling should **break** — redundancy becoming protective — exactly when `v*` is
   a near-synonym of `t` (high `cos(U_t, U_{v*})`). Splitting the flip by runner-up coherence would confirm the proof

@@ -806,7 +806,7 @@ fn main() {
             // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
             // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
             // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
-            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32 }
+            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32 }
             let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
@@ -826,9 +826,10 @@ fn main() {
                     .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).filter(|&a| a == t).count();
                 let talign = top.4 == Some(t); // is the single circuit we ablate itself a t-supporter (isolated argmax == t)?
                 let dj = top.0 - top.5;        // D_j of the ablated top circuit (logit units): linear flip ⟺ margin < D_j
+                let rho = lm.unembed_cos(t as usize, ex.runner_up as usize).unwrap_or(0.0); // coherence cos(U_t, U_v*)
                 let (heads, neurons) = if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
                 let flip = lm.predict_ablated(c, &heads, &neurons) != Some(t);
-                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign, dj })
+                Some(A { route, margin: ex.predicted_logit - ex.runner_up_logit, pr, mu_t, flip, talign, dj, rho })
             }).collect();
             let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
             let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
@@ -957,6 +958,35 @@ fn main() {
             println!("\n  (logistic) flip ~ Δ + D_j + 1[μ_t≥2]  (Δ,D_j standardized → coeffs comparable; sign: +D_j/−Δ expected):");
             println!("    coeffs  bias {:+.2}   Δ {:+.2}   D_j {:+.2}   μ_t≥2 {:+.2}", wf[0], wf[1], wf[2], wf[3]);
             println!("    mean log-loss  full {llf:.3}  drop-μ_t {ll0:.3}  (Δ {:+.4} = μ_t's INDEPENDENT predictive value; ≈0 ⇒ proxy)", ll0 - llf);
+            // (A/B) Grok's incoherence-boundary + Δ-cushion tests. ρ = cos(U_t, U_v*). Among s>0 (linear predicts flip)
+            // a RESCUE = forward keeps t (indirect recomposition). Predictions: (A) P(rescue|s>0) FALLS as ρ↑
+            // [=1-Φ(s/σ), σ∝√(1-ρ²)→0], with |D_j|→0 mechanically as ρ→1; (B) rescue RISES with Δ (the cushion).
+            let mut rs: Vec<f32> = recs.iter().map(|x| x.rho).collect();
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let rq = |p: f32| if rs.is_empty() { 0.0 } else { rs[(((rs.len() - 1) as f32) * p) as usize] };
+            let (rq1, rq2, rq3) = (rq(0.25), rq(0.5), rq(0.75));
+            let rbins = [("Q1 lo ρ", f32::MIN, rq1), ("Q2     ", rq1, rq2), ("Q3     ", rq2, rq3), ("Q4 hi ρ", rq3, f32::MAX)];
+            println!("\n  (A) incoherence boundary: ρ = cos(U_t, U_v*) by quartile [pred: |D_j| ↓ as ρ ↑; rescue ↓ as ρ ↑]:");
+            println!("  {:<10}{:>5}{:>9}{:>11}{:>9}{:>20}", "ρ quart", "n", "mean ρ", "mean|D_j|", "flip%", "s>0: n rescue%");
+            for (lbl, lo, hi) in rbins {
+                let g: Vec<&A> = recs.iter().filter(|x| x.rho >= lo && x.rho < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                let sp: Vec<&A> = g.iter().copied().filter(|x| s_of(x) > 0.0).collect();
+                let resc = if sp.is_empty() { f32::NAN } else { 100.0 * sp.iter().filter(|x| !x.flip).count() as f32 / sp.len() as f32 };
+                println!("  {lbl:<10}{:>5}{:>9.2}{:>11.2}{:>8.0}%{:>12} {:>5.0}%", g.len(),
+                    g.iter().map(|x| x.rho).sum::<f32>() / n, g.iter().map(|x| x.dj.abs()).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| x.flip).count() as f32 / n, sp.len(), resc);
+            }
+            println!("  (B) Δ-cushion: among s>0 (linear predicts flip), rescue% by Δ [pred: rescue ↑ as Δ ↑]:");
+            for (lbl, lo, hi) in [("Δ<.3  ", f32::MIN, 0.3), ("0.3-.6", 0.3, 0.6), ("0.6-1.", 0.6, 1.0), ("Δ>1.0 ", 1.0, f32::MAX)] {
+                let g: Vec<&A> = recs.iter().filter(|x| s_of(x) > 0.0 && x.margin >= lo && x.margin < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len();
+                println!("  {lbl:<10}n {:>3}  rescue {:>4.0}%  (mean Δ {:.2}, mean s {:.2})", n,
+                    100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n as f32,
+                    g.iter().map(|x| x.margin).sum::<f32>() / n as f32, g.iter().map(|y| s_of(y)).sum::<f32>() / n as f32);
+            }
             return;
         }
 

@@ -190,6 +190,14 @@ pub trait Model: Sync {
         None
     }
 
+    /// Cosine similarity between two unembedding rows U_a, U_b — the runner-up *coherence* ρ for the incoherence-
+    /// boundary probe (`--probe-ablate`, problem A): the decoupling proof assumes a circuit's push toward `t` is ~⊥ its
+    /// push toward the runner-up `v*`; that fails when U_t ≈ U_{v*} (near-synonym, high ρ), where D_j = c_j·(U_t−U_{v*})
+    /// → 0. Default None; rope implements it.
+    fn unembed_cos(&self, _a: usize, _b: usize) -> Option<f32> {
+        None
+    }
+
     /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
     /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
     /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole

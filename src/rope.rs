@@ -479,6 +479,14 @@ impl Model for Rope {
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
     }
 
+    fn unembed_cos(&self, a: usize, b: usize) -> Option<f32> {
+        let un = self.unembed_name();
+        let (ua, ub) = (self.b.weight_row(un, a), self.b.weight_row(un, b));
+        let dot: f32 = ua.iter().zip(&ub).map(|(x, y)| x * y).sum();
+        let (na, nb) = (ua.iter().map(|x| x * x).sum::<f32>().sqrt(), ub.iter().map(|x| x * x).sum::<f32>().sqrt());
+        if na > 0.0 && nb > 0.0 { Some(dot / (na * nb)) } else { None }
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);
