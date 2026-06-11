@@ -126,8 +126,8 @@ fn main() {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
         }
-        if !["int4", "int8", "f16", "f32"].contains(&dtype) {
-            eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, int8, f16, f32)");
+        if !["int4", "q4a", "int8", "f16", "f32"].contains(&dtype) {
+            eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, q4a, int8, f16, f32)");
             std::process::exit(2);
         }
         // -o is optional; default groups bundles in a home cache (~/.cache/fieldrun/bundles/<name>/<name>), NOT the

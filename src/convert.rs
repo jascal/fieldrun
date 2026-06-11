@@ -14,6 +14,11 @@ use safetensors::{Dtype, SafeTensors};
 /// int4 group size (weights along the input dim share one fp16 scale per group). 32 is the GGUF/AWQ default.
 const I4_GROUP: usize = 32;
 
+/// q4a (affine group-int4) group size. 64 (vs int4's 32) keeps the bytes equal — int4 carries one fp16 scale/group
+/// (4 + 16/32 = 4.5 bpw), q4a carries an fp16 scale AND min/group (4 + (16+16)/64 = 4.5 bpw) — so a bench A/B isolates
+/// the *affine* (min-offset) quality win at the SAME bundle size. See the affine quant in `put_q4a`.
+const Q4A_GROUP: usize = 32;
+
 /// A model's weights, possibly sharded. mmaps each file (address space, not RAM); tensors are read on demand.
 struct Model {
     mmaps: Vec<Mmap>,
@@ -118,6 +123,7 @@ impl BundleWriter {
     fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
         if dtype == "int8" { return self.put_i8(name, data, out, inp, true); }
         if dtype == "int4" { return self.put_i4(name, data, out, inp, true); }
+        if dtype == "q4a" { return self.put_q4a(name, data, out, inp, true); }
         let mut t = vec![0f32; inp * out];
         for o in 0..out { for i in 0..inp { t[i * out + o] = data[o * inp + i]; } }
         self.put_small(name, &t, &[inp, out], dtype)
@@ -154,6 +160,50 @@ impl BundleWriter {
         self.bin.write_all(&packed)?;
         self.entry_g(name, "i4", &[out, inp], packed.len(), g);
         self.put_f16(&format!("{name}__scale"), &scale, &[out, ng])
+    }
+
+    /// Affine (asymmetric) group **q4a** from an (out, in) source (`transpose=true`) or (in, out) (`false`). Unsigned
+    /// 4-bit `q ∈ [0,15]` with a per-group fp16 `scale` AND `min`; dequant `x = scale*q + min`. The min offset (vs
+    /// symmetric int4) fits a group whose values aren't zero-centred far better — the same idea as GGUF Q4_1/Q4_K. With
+    /// group 64 the bytes match int4's 4.5 bpw, so the only variable vs int4 is the affine reconstruction. Stored
+    /// output-column-major `(out, in)`, 2 nibbles/byte along `in`; siblings `__scale` and `__min`, each fp16 (out, ng).
+    fn put_q4a(&mut self, name: &str, data: &[f32], rows: usize, cols: usize, transpose: bool) -> std::io::Result<()> {
+        let (out, inp) = if transpose { (rows, cols) } else { (cols, rows) };
+        let at = |i: usize, j: usize| if transpose { data[j * inp + i] } else { data[i * out + j] }; // logical W[in=i, out=j]
+        let g = Q4A_GROUP.min(inp.max(1));
+        let ng = inp.div_ceil(g);
+        let (mut scale, mut mins) = (vec![0f32; out * ng], vec![0f32; out * ng]);
+        for j in 0..out {
+            for gi in 0..ng {
+                let (lo, hi) = (gi * g, ((gi + 1) * g).min(inp));
+                let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                for i in lo..hi {
+                    let v = at(i, j);
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+                scale[j * ng + gi] = ((mx - mn) / 15.0).max(1e-8); // 15 levels for unsigned 4-bit
+                mins[j * ng + gi] = mn;
+            }
+        }
+        let row_bytes = inp.div_ceil(2);
+        let mut packed = vec![0u8; out * row_bytes];
+        for j in 0..out {
+            for i in 0..inp {
+                let gi = j * ng + i / g;
+                let q = (((at(i, j) - mins[gi]) / scale[gi]).round_ties_even()).clamp(0.0, 15.0) as u8; // unsigned [0,15]
+                let b = &mut packed[j * row_bytes + i / 2];
+                if i % 2 == 0 {
+                    *b |= q;
+                } else {
+                    *b |= q << 4;
+                }
+            }
+        }
+        self.bin.write_all(&packed)?;
+        self.entry_g(name, "q4a", &[out, inp], packed.len(), g);
+        self.put_f16(&format!("{name}__scale"), &scale, &[out, ng])?;
+        self.put_f16(&format!("{name}__min"), &mins, &[out, ng])
     }
 
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
@@ -1046,5 +1096,35 @@ mod tests {
         let (r0, r1) = (b.weight_row("m", 0), b.weight_row("m", 1));
         assert!((r0[0] - 1.0).abs() < 0.05 && (r0[1] - 2.0).abs() < 0.05, "{r0:?}");
         assert!((r1[0] - 3.0).abs() < 0.05 && (r1[1] - 4.0).abs() < 0.05, "{r1:?}");
+    }
+
+    /// The point of q4a: on a non-zero-centred weight (values clustered around +0.5), symmetric int4 wastes range on
+    /// the unused negative half, while q4a's per-group `min` captures the offset — so at equal bytes q4a's
+    /// reconstruction error must be far lower. Exercises the real convert→load→weight_row path for both dtypes.
+    #[test]
+    fn q4a_beats_int4_on_offset_data() {
+        let (inp, out) = (128usize, 4usize);
+        let data: Vec<f32> = (0..inp * out).map(|t| 0.5 + 0.18 * ((t % 37) as f32 / 37.0 - 0.5)).collect(); // ~[0.41, 0.59]
+        let dir = std::env::temp_dir().join(format!("fr_q4a_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut w = BundleWriter::new(&stem).unwrap();
+        w.put_i4("wi4", &data, inp, out, false).unwrap();
+        w.put_q4a("wq4a", &data, inp, out, false).unwrap();
+        w.finish(&stem, json!({"format": "fieldrun-bundle", "version": 1, "arch": "test", "config": []})).unwrap();
+        let b = crate::bundle::Bundle::load(&stem).unwrap();
+        let mse = |name: &str| -> f32 {
+            let mut e = 0.0f32;
+            for r in 0..inp {
+                let row = b.weight_row(name, r);
+                for j in 0..out {
+                    let d = row[j] - data[r * out + j];
+                    e += d * d;
+                }
+            }
+            e / (inp * out) as f32
+        };
+        let (e_i4, e_q4a) = (mse("wi4"), mse("wq4a"));
+        assert!(e_q4a < e_i4 * 0.5, "q4a MSE {e_q4a} should be << int4 MSE {e_i4} on offset data");
     }
 }

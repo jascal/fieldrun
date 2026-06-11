@@ -34,6 +34,7 @@ enum Arr {
     F16(Vec<half::f16>),
     I8(I8w), // per-output-column symmetric int8 (scale in sibling "<name>__scale"), repacked for the int8-dot path
     I4(I4w), // group-wise symmetric int4 (2 nibbles/byte, scale per out-col×group), dequantised to f32 on read
+    Q4A(Q4Aw), // group-wise AFFINE int4 (unsigned nibble; scale+min per out-col×group): x = scale*q + min
 }
 
 /// An int8 weight prepared for the int8 matmul: stored transposed to (out, in) so each output column's contiguous `k`
@@ -61,6 +62,23 @@ fn i4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> i32 {
     let byte = packed[j * row_bytes + i / 2];
     let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
     (((nib << 4) as i8) >> 4) as i32
+}
+
+/// A group-wise AFFINE int4 weight (the `q4a` dtype): same packed (out, in) layout as `I4w`, but the nibble is an
+/// UNSIGNED `q ∈ [0,15]` and dequant is `x = scale*q + min` with a per-(output-col, group) fp16 `scale` AND `min`
+/// (siblings `__scale`/`__min`). The min offset captures non-zero-centred groups that symmetric int4 can't.
+struct Q4Aw {
+    packed: Vec<u8>, // (n, ceil(k/2)) row-major
+    k: usize,        // in
+    n: usize,        // out
+    g: usize,        // group size along `in`
+}
+
+/// The unsigned 4-bit value packed at logical (output-col `j`, input-pos `i`) — the `q ∈ [0,15]` for affine dequant.
+#[inline]
+fn u4_nibble(packed: &[u8], row_bytes: usize, j: usize, i: usize) -> f32 {
+    let byte = packed[j * row_bytes + i / 2];
+    (if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }) as f32
 }
 
 #[derive(Deserialize)]
@@ -155,6 +173,11 @@ impl Bundle {
                         let (n, k) = (a.shape[0], a.shape[1]); // (out, in)
                         Arr::I4(I4w { packed: raw.to_vec(), k, n, g: a.group.unwrap_or(32) })
                     }
+                    "q4a" => {
+                        // affine int4: same packed layout as i4; dequant uses the __scale + __min siblings per mm.
+                        let (n, k) = (a.shape[0], a.shape[1]); // (out, in)
+                        Arr::Q4A(Q4Aw { packed: raw.to_vec(), k, n, g: a.group.unwrap_or(64) })
+                    }
                     d => panic!("unsupported array dtype {d:?} in bundle"),
                 };
                 (a.name, (a.shape, arr))
@@ -219,6 +242,21 @@ impl Bundle {
                 }
                 (vec![k, n], v)
             }
+            "q4a" => {
+                let (n, k) = (e.shape[0], e.shape[1]); // stored (out, in); dequant to (in, out): x = scale*q + min
+                let g = e.group.unwrap_or(64);
+                let (ng, row_bytes) = (k.div_ceil(g), k.div_ceil(2));
+                let scale = self.arr1o(&format!("{name}__scale"));
+                let mins = self.arr1o(&format!("{name}__min"));
+                let mut v = vec![0f32; k * n];
+                for j in 0..n {
+                    for i in 0..k {
+                        let gi = j * ng + i / g;
+                        v[i * n + j] = scale[gi] * u4_nibble(raw, row_bytes, j, i) + mins[gi];
+                    }
+                }
+                (vec![k, n], v)
+            }
             "f16" => (e.shape.clone(), raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect()),
             "f32" => (e.shape.clone(), raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
             d => panic!("expert dtype {d:?} unsupported"),
@@ -251,7 +289,7 @@ impl Bundle {
     /// Numerically identical to zeroing the bottom (1-frac) neurons then a dense down-proj (the pylm `--route-frac`).
     pub fn mm_routed_down(&self, h: &Array2<f32>, name: &str, frac: f32) -> Array2<f32> {
         let (shape, arr) = self.get(name); // down: (ffn, d)
-        if matches!(arr, Arr::I8(_) | Arr::I4(_)) {
+        if matches!(arr, Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_)) {
             return self.mm(h, name); // int8/int4 down is quantised → routing falls back to a dense mm for now
         }
         let (ffn, d) = (shape[0], shape[1]);
@@ -270,7 +308,7 @@ impl Bundle {
                 match arr {
                     Arr::F32(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, &w)| *a += hk * w),
                     Arr::F16(v) => acc.iter_mut().zip(&v[k * d..(k + 1) * d]).for_each(|(a, w)| *a += hk * w.to_f32()),
-                    Arr::I8(_) | Arr::I4(_) => unreachable!(),
+                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => unreachable!(),
                 }
             }
             out.row_mut(i).assign(&ArrayView1::from(acc.as_slice()));
@@ -304,6 +342,17 @@ impl Bundle {
                 let scale = self.arr1o(&format!("{name}__scale"));
                 let (ng, row_bytes) = (w4.k.div_ceil(w4.g), w4.k.div_ceil(2));
                 (0..w4.n).map(|j| i4_nibble(&w4.packed, row_bytes, j, r) as f32 * scale[j * ng + r / w4.g]).collect()
+            }
+            Arr::Q4A(w4) => {
+                let scale = self.arr1o(&format!("{name}__scale"));
+                let mins = self.arr1o(&format!("{name}__min"));
+                let (ng, row_bytes) = (w4.k.div_ceil(w4.g), w4.k.div_ceil(2));
+                (0..w4.n)
+                    .map(|j| {
+                        let gi = j * ng + r / w4.g;
+                        scale[gi] * u4_nibble(&w4.packed, row_bytes, j, r) + mins[gi]
+                    })
+                    .collect()
             }
         }
     }
@@ -443,6 +492,38 @@ impl Bundle {
                 }
                 out
             }
+            // group-wise AFFINE int4 (q4a): unpack the unsigned nibble + apply per-group `scale*q + min` into a local
+            // f32 block, then GEMM (W4A_f32, like i4 but with the min offset). Same byte budget as i4 at group 64.
+            Arr::Q4A(w4) => {
+                let scale = self.arr1o(&format!("{name}__scale")); // (n, ng) f32
+                let mins = self.arr1o(&format!("{name}__min")); // (n, ng) f32
+                let (k, nn, g) = (w4.k, w4.n, w4.g);
+                let (ng, row_bytes) = (k.div_ceil(g), k.div_ceil(2));
+                let packed = &w4.packed;
+                let block = 512.min(nn.max(1));
+                let mut blocks: Vec<(usize, Array2<f32>)> = (0..nn.div_ceil(block))
+                    .into_par_iter()
+                    .map(|bi| {
+                        let (c0, bw) = (bi * block, block.min(nn - bi * block));
+                        let mut buf = vec![0f32; k * bw]; // (k, bw) for a.dot
+                        for col in 0..bw {
+                            let j = c0 + col;
+                            for kk in 0..k {
+                                let gi = j * ng + kk / g;
+                                buf[kk * bw + col] = scale[gi] * u4_nibble(packed, row_bytes, j, kk) + mins[gi];
+                            }
+                        }
+                        let wblock = ArrayView2::from_shape((k, bw), &buf).unwrap();
+                        (c0, a.dot(&wblock))
+                    })
+                    .collect();
+                let mut out = Array2::<f32>::zeros((a.nrows(), nn));
+                for (c0, ob) in blocks.drain(..) {
+                    let bw = ob.ncols();
+                    out.slice_mut(s![.., c0..c0 + bw]).assign(&ob);
+                }
+                out
+            }
             Arr::F16(v) => {
                 // Upcast W one column-block at a time into a local f32 buffer, then GEMM the block — this keeps the
                 // vectorised matmul while bounding the f32 upcast to one block (so a multi-GB f16 weight is never
@@ -504,7 +585,7 @@ impl Bundle {
         match arr {
             Arr::F32(v) => v.clone(),
             Arr::F16(v) => v.iter().map(|h| h.to_f32()).collect(),
-            Arr::I8(_) | Arr::I4(_) => panic!("upcast: quantised weight needs its scale; go through mm()"),
+            Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("upcast: quantised weight needs its scale; go through mm()"),
         }
     }
 
@@ -519,7 +600,7 @@ impl Bundle {
             match arr {
                 Arr::F32(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, &s)| *o = s),
                 Arr::F16(v) => out.row_mut(t).iter_mut().zip(&v[base..base + d]).for_each(|(o, s)| *o = s.to_f32()),
-                Arr::I8(_) | Arr::I4(_) => panic!("rows_f32: quantised embed unsupported (embed stays f16)"),
+                Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rows_f32: quantised embed unsupported (embed stays f16)"),
             }
         }
         out
@@ -538,7 +619,7 @@ impl Bundle {
                 match arr {
                     Arr::F32(v) => v[base..base + d].iter().zip(x).map(|(&w, &xi)| w * xi).sum(),
                     Arr::F16(v) => v[base..base + d].iter().zip(x).map(|(w, &xi)| w.to_f32() * xi).sum(),
-                    Arr::I8(_) | Arr::I4(_) => panic!("rowdot_f32: quantised unembed unsupported (embed stays f16)"),
+                    Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rowdot_f32: quantised unembed unsupported (embed stays f16)"),
                 }
             })
             .collect()
