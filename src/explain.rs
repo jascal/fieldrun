@@ -48,6 +48,10 @@ pub struct Explanation {
     pub head_circuits: Vec<HeadCircuit>,
     pub sink_heads: usize,
     pub mlp_features: Vec<MlpFeature>,
+    /// Every scored circuit's DLA to the predicted token (all ~64 head + ~384 neuron candidates, not just the shown
+    /// top-6+6) — for concentration/participation-ratio analysis (`--probe-dla`). Not serialized (a probe aid).
+    #[serde(skip)]
+    pub all_dla: Vec<f32>,
 }
 
 /// How much of the explain trace to render — modelled on a database `EXPLAIN`'s option levels, because the deeper
@@ -256,6 +260,8 @@ where
         })
         .collect();
     head_circuits.sort_by(|a, b| b.dla.total_cmp(&a.dla));
+    // capture every candidate head's DLA before truncating to the shown few (full-spectrum concentration analysis).
+    let mut all_dla: Vec<f32> = head_circuits.iter().map(|h| h.dla).collect();
     head_circuits.truncate(HEAD_SHOW);
     // Recompute the post-norm contribution for the few shown heads to fill in their "promotes" (a full-vocab projection,
     // so it's done for HEAD_SHOW heads, not all candidates). The head_raw re-read is intentional: caching every
@@ -294,6 +300,7 @@ where
         })
         .collect();
     mlp_features.sort_by(|a, b| b.dla.total_cmp(&a.dla));
+    all_dla.extend(mlp_features.iter().map(|f| f.dla)); // + every candidate neuron's DLA
     mlp_features.truncate(MLP_SHOW);
     for f in mlp_features.iter_mut() {
         let mut w = neuron_write(f.layer, f.neuron);
@@ -313,6 +320,7 @@ where
         head_circuits,
         sink_heads,
         mlp_features,
+        all_dla,
     }
 }
 

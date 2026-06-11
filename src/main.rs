@@ -616,38 +616,36 @@ fn main() {
                 return;
             }
             eprintln!("[fieldrun] --probe-dla: {} positions (ctx {ctx_window}) — running faithful explain forwards…", positions.len());
-            // (route, top1_share, participation_ratio, top1/logit, n_circuits_captured)
-            let recs: Vec<(u8, f32, f32, f32)> = positions.par_iter().filter_map(|c| {
+            // (route, top1_share, participation_ratio, n_captured, decision_margin) over the FULL candidate DLA spectrum.
+            let recs: Vec<(u8, f32, f32, usize, f32)> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let pick = ex.model_predicts;
                 let (kb, _) = store.predict(c);
                 let covered = store.candidates(c, &cfg).contains(&pick);
                 let route = if kb == pick { 0u8 } else if covered { 1 } else { 2 };
-                // positive DLA contributions to the predicted token, from the captured top circuits (heads + neurons).
-                let mut d: Vec<f32> = ex.head_circuits.iter().map(|h| h.dla).chain(ex.mlp_features.iter().map(|m| m.dla)).filter(|&x| x > 0.0).collect();
+                // FULL spectrum: every scored circuit's DLA (~64 heads + ~384 neurons), positive contributions only.
+                let mut d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
                 if d.is_empty() { return None; }
                 d.sort_by(|a, b| b.partial_cmp(a).unwrap());
                 let sum: f32 = d.iter().sum();
                 let sumsq: f32 = d.iter().map(|x| x * x).sum();
-                let top1 = d[0];
                 let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
-                let top1_logit = if ex.predicted_logit > 0.0 { top1 / ex.predicted_logit } else { f32::NAN };
-                Some((route, top1 / sum, pr, top1_logit))
+                let margin = ex.predicted_logit - ex.runner_up_logit; // distance to the nearest U-power-diagram facet (Q1)
+                Some((route, d[0] / sum, pr, d.len(), margin))
             }).collect();
 
-            println!("\n=== (C) combine vs select — concentration of the per-circuit DLA on the predicted token ===");
-            println!("(captured = top-6 heads + top-6 neurons by DLA; top1-share/PR are AMONG those — truncated tail biases toward concentration, but the route comparison is the signal)");
-            println!("{:<12}{:>7}{:>14}{:>14}{:>16}", "route", "n", "top1-share", "PR (eff #)", "top1/logit");
+            println!("\n=== (C) combine vs select — DLA concentration on the predicted token (FULL spectrum: ~64 heads + ~384 neurons) ===");
+            println!("{:<12}{:>7}{:>11}{:>13}{:>15}{:>16}", "route", "n", "captured", "top1-share", "PR (eff #)", "margin (Q1)");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
-                let g: Vec<&(u8, f32, f32, f32)> = recs.iter().filter(|x| x.0 == r).collect();
+                let g: Vec<&(u8, f32, f32, usize, f32)> = recs.iter().filter(|x| x.0 == r).collect();
                 if g.is_empty() { println!("{lbl:<12}{:>7}", 0); continue; }
                 let n = g.len() as f32;
-                let mean = |f: &dyn Fn(&(u8, f32, f32, f32)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
-                let logits: Vec<f32> = g.iter().map(|x| x.3).filter(|x| x.is_finite()).collect();
-                let ml = if logits.is_empty() { f32::NAN } else { logits.iter().sum::<f32>() / logits.len() as f32 };
-                println!("{lbl:<12}{:>7}{:>13.2}{:>14.2}{:>15.2}", g.len(), mean(&|x| x.1), mean(&|x| x.2), ml);
+                let mean = |f: &dyn Fn(&(u8, f32, f32, usize, f32)) -> f32| g.iter().map(|x| f(x)).sum::<f32>() / n;
+                println!("{lbl:<12}{:>7}{:>11.0}{:>13.3}{:>14.1}{:>16.2}", g.len(), mean(&|x| x.3 as f32), mean(&|x| x.1), mean(&|x| x.2), mean(&|x| x.4));
             }
-            println!("(one circuit dominates → top1-share→1, PR→1 = selection;  spread → top1-share low, PR high = superposition/combination)");
+            println!("(C) one circuit dominates → top1-share→1, PR→1 = selection;  spread → PR high = superposition/combination.");
+            println!("(Q1) decision margin = L_t − runner-up = distance to the nearest unembedding power-diagram facet;");
+            println!("     RETRIEVED deeper-in-cell (large margin) vs COMPOSED on-a-fine-facet (small margin) ⇒ the polyhedral-alignment picture.");
             return;
         }
 
