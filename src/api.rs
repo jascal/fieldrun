@@ -104,7 +104,7 @@ impl TextGen {
 
     /// A display label for a token id, used in explain output: its decoded text quoted (`" lunch" [54809]`), or for a
     /// special token that decodes to "" its vocab name (`<|im_start|> [151644]`), with the id appended.
-    fn token_label(&self, id: i64) -> String {
+    pub fn token_label(&self, id: i64) -> String {
         let s = self.decode(&[id]);
         let meaning = if !s.is_empty() { format!("{s:?}") } else { self.id_to_token(id).unwrap_or_default() };
         if meaning.is_empty() {

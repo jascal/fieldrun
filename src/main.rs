@@ -730,7 +730,14 @@ fn main() {
             let cap = (end - ctx_window).min(n_eval).min(300);
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
             eprintln!("[fieldrun] --probe-facet: {} positions — full logits + nearest-facet over {vocab} tokens…", positions.len());
-            struct F { route: u8, dx: f32, vstar_is_ru: bool, vstar_is_kb: bool }
+            #[cfg(feature = "api")]
+            let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                Some(tg) => Box::new(move |id| tg.token_label(id)),
+                None => load_decoder(flag(&args, "--vocab")),
+            };
+            #[cfg(not(feature = "api"))]
+            let dec = load_decoder(flag(&args, "--vocab"));
+            struct F { route: u8, dx: f32, vstar_is_ru: bool, vstar_is_kb: bool, pick: i64, kb: i64 }
             let recs: Vec<F> = positions.par_iter().filter_map(|c| {
                 let r = lm.final_residual(c)?;
                 let l = b2.rowdot_f32(un, &r); // full logits L_v = ⟨U_v, r⟩
@@ -751,7 +758,7 @@ fn main() {
                 let kb = store.predict(c).0 as usize;
                 let covered = store.candidates(c, &cfg).contains(&(t as i64));
                 let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
-                Some(F { route, dx: best_d, vstar_is_ru: vstar == ru, vstar_is_kb: vstar == kb })
+                Some(F { route, dx: best_d, vstar_is_ru: vstar == ru, vstar_is_kb: vstar == kb, pick: t as i64, kb: kb as i64 })
             }).collect();
             let pct = |g: &[&F], f: &dyn Fn(&F) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
             let meanf = |g: &[&F], f: &dyn Fn(&F) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
@@ -764,7 +771,16 @@ fn main() {
             }
             let all: Vec<&F> = recs.iter().collect();
             println!("(nearest facet == logit runner-up overall: {:.0}%  ⇒ how often the runner-up proxy IS the nearest facet)", pct(&all, &|x| x.vstar_is_ru));
-            println!("(killer) COMPOSED v*==KB-top1 = r(x) sits on the bisector with the KB's prediction = composition crossed out of the KB cell.");
+            // characterize the near-miss-of-retrieval subclass: tokens where the nearest facet IS the KB's prediction
+            // (model and KB one facet apart). What ARE they — function words / near-synonyms / high-freq glue?
+            for (lbl, r) in [("SELECTED", 1u8), ("COMPOSED", 2u8)] {
+                let nm: Vec<&F> = recs.iter().filter(|x| x.route == r && x.vstar_is_kb).collect();
+                if nm.is_empty() { continue; }
+                println!("\n  {lbl} near-miss-of-retrieval ({} tokens) — model's pick  ⟂(one facet)⟂  KB's prediction:", nm.len());
+                for f in nm.iter().take(30) {
+                    println!("    {}   ⟂   KB {}", dec(f.pick), dec(f.kb));
+                }
+            }
             return;
         }
 
