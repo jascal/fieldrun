@@ -176,6 +176,20 @@ pub trait Model: Sync {
         None
     }
 
+    /// The final post-norm residual `r(x)` at the predicting position — the exact vector the unembedding dots against
+    /// (`logits = U·r`). Exposed for the power-diagram geometry probe (`--probe-facet`): the token cells in r-space are
+    /// the Laguerre power diagram of the unembedding rows. Default None; arches implement it where wired.
+    fn final_residual(&self, _ids: &[i64]) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Causal ablation: top-1 next token with the given attention heads (`heads`: layer, head) and MLP neurons
+    /// (`neurons`: layer, neuron) ZEROED out of the forward pass. For the `--probe-ablate` redundancy test — is a
+    /// covered token robust to knocking out its top circuits (redundant) vs a composed one fragile (emergent)?
+    fn predict_ablated(&self, _ids: &[i64], _heads: &[(usize, usize)], _neurons: &[(usize, usize)]) -> Option<i64> {
+        None
+    }
+
     /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
     /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
     /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole

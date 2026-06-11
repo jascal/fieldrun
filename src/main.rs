@@ -706,6 +706,150 @@ fn main() {
             return;
         }
 
+        // --probe-facet (tighten Q1): the token cells in r-space ARE the Laguerre power diagram of {U_v} (weights
+        // ‖U_v‖²+2b_v). Compute the EXACT nearest facet argmin_{v≠t}(L_t−L_v)/‖U_t−U_v‖ (not the logit-runner-up proxy)
+        // and (a) how often the nearest facet == the logit runner-up, (b) the killer check: for COMPOSED, is the token
+        // across the nearest facet the KB's own top-1? If yes, composition = r(x) having crossed the facet out of the
+        // KB's cell. Needs an arch exposing final_residual (rope).
+        if has_flag(&args, "--probe-facet") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-facet needs --store"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, _d) = b2.dims(un);
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() {
+                eprintln!("[fieldrun] --probe-facet: arch {arch} doesn't expose final_residual (rope only)");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-facet: precomputing ‖U_v‖² for {vocab} unembed rows…");
+            let unorm: Vec<f32> = (0..vocab).into_par_iter().map(|v| b2.weight_row(un, v).iter().map(|x| x * x).sum()).collect();
+            let cap = (end - ctx_window).min(n_eval).min(300);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-facet: {} positions — full logits + nearest-facet over {vocab} tokens…", positions.len());
+            #[cfg(feature = "api")]
+            let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                Some(tg) => Box::new(move |id| tg.token_label(id)),
+                None => load_decoder(flag(&args, "--vocab")),
+            };
+            #[cfg(not(feature = "api"))]
+            let dec = load_decoder(flag(&args, "--vocab"));
+            struct F { route: u8, dx: f32, vstar_is_ru: bool, vstar_is_kb: bool, pick: i64, kb: i64 }
+            let recs: Vec<F> = positions.par_iter().filter_map(|c| {
+                let r = lm.final_residual(c)?;
+                let l = b2.rowdot_f32(un, &r); // full logits L_v = ⟨U_v, r⟩
+                let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
+                let ut = b2.weight_row(un, t);
+                let g = b2.rowdot_f32(un, &ut); // ⟨U_v, U_t⟩ for all v → ‖U_t−U_v‖² = ‖U_t‖²+‖U_v‖²−2⟨U_v,U_t⟩
+                let (mut best_d, mut vstar) = (f32::INFINITY, t);
+                let (mut best_l, mut ru) = (f32::NEG_INFINITY, t);
+                for v in 0..vocab {
+                    if v == t { continue; }
+                    if l[v] > best_l { best_l = l[v]; ru = v; }
+                    let dvv2 = unorm[t] + unorm[v] - 2.0 * g[v];
+                    if dvv2 > 1e-4 {
+                        let dv = (l[t] - l[v]) / dvv2.sqrt(); // exact Euclidean distance to the t–v bisector facet
+                        if dv < best_d { best_d = dv; vstar = v; }
+                    }
+                }
+                let kb = store.predict(c).0 as usize;
+                let covered = store.candidates(c, &cfg).contains(&(t as i64));
+                let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
+                Some(F { route, dx: best_d, vstar_is_ru: vstar == ru, vstar_is_kb: vstar == kb, pick: t as i64, kb: kb as i64 })
+            }).collect();
+            let pct = |g: &[&F], f: &dyn Fn(&F) -> bool| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| f(x)).count() as f32 / g.len() as f32 };
+            let meanf = |g: &[&F], f: &dyn Fn(&F) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== (Q1 tight) exact power-diagram nearest facet ({} positions, {vocab} tokens) ===", recs.len());
+            println!("{:<12}{:>6}{:>18}{:>22}{:>24}", "route", "n", "nearest-facet dist", "v*==logit-runner-up", "v*==KB-top1 (killer)");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&F> = recs.iter().filter(|x| x.route == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                println!("{lbl:<12}{:>6}{:>18.3}{:>21.0}%{:>23.0}%", g.len(), meanf(&g, &|x| x.dx), pct(&g, &|x| x.vstar_is_ru), pct(&g, &|x| x.vstar_is_kb));
+            }
+            let all: Vec<&F> = recs.iter().collect();
+            println!("(nearest facet == logit runner-up overall: {:.0}%  ⇒ how often the runner-up proxy IS the nearest facet)", pct(&all, &|x| x.vstar_is_ru));
+            // characterize the near-miss-of-retrieval subclass: tokens where the nearest facet IS the KB's prediction
+            // (model and KB one facet apart). What ARE they — function words / near-synonyms / high-freq glue?
+            for (lbl, r) in [("SELECTED", 1u8), ("COMPOSED", 2u8)] {
+                let nm: Vec<&F> = recs.iter().filter(|x| x.route == r && x.vstar_is_kb).collect();
+                if nm.is_empty() { continue; }
+                println!("\n  {lbl} near-miss-of-retrieval ({} tokens) — model's pick  ⟂(one facet)⟂  KB's prediction:", nm.len());
+                for f in nm.iter().take(30) {
+                    println!("    {}   ⟂   KB {}", dec(f.pick), dec(f.kb));
+                }
+            }
+            return;
+        }
+
+        // --probe-ablate (CAUSAL test of the μ_t redundancy claim): knock out the top-k DLA circuits in the FORWARD
+        // PASS (re-run with them zeroed) and ask whether the prediction flips. Redundancy prediction: COVERED tokens
+        // (many individually-sufficient circuits, μ_t≫1) survive (low flip); COMPOSED tokens (emergent, μ_t≈0) collapse
+        // (high flip). Converts the readout correlation into a causal claim. Rope-only (needs predict_ablated).
+        if has_flag(&args, "--probe-ablate") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-ablate needs --store"); return; }
+            };
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            if lm.predict_ablated(&ids[..ctx_window.min(ids.len())], &[], &[]).is_none() {
+                eprintln!("[fieldrun] --probe-ablate: arch {arch} doesn't support ablation (rope only)");
+                return;
+            }
+            let cap = (end - ctx_window).min(n_eval).min(150); // 1 explain + 3 ablated forwards / position
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…", positions.len());
+            let ks = [1usize, 2, 4];
+            // (route, margin, [flip@k1, flip@k2, flip@k4])
+            let recs: Vec<(u8, f32, [bool; 3])> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain(c)?;
+                let t = ex.model_predicts;
+                let mut circ: Vec<(f32, bool, usize, usize)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head))
+                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron))).collect();
+                circ.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let (kb, _) = store.predict(c);
+                let covered = store.candidates(c, &cfg).contains(&t);
+                let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
+                let mut flips = [false; 3];
+                for (ki, &k) in ks.iter().enumerate() {
+                    let topk = &circ[..k.min(circ.len())];
+                    let heads: Vec<(usize, usize)> = topk.iter().filter(|c| c.1).map(|c| (c.2, c.3)).collect();
+                    let neurons: Vec<(usize, usize)> = topk.iter().filter(|c| !c.1).map(|c| (c.2, c.3)).collect();
+                    flips[ki] = lm.predict_ablated(c, &heads, &neurons) != Some(t);
+                }
+                Some((route, ex.predicted_logit - ex.runner_up_logit, flips))
+            }).collect();
+            println!("\n=== (causal) ablate the top-k DLA circuits in the forward pass → does the prediction FLIP? ===");
+            println!("{:<12}{:>6}{:>10}{:>12}{:>12}{:>12}", "route", "n", "margin", "flip@k1", "flip@k2", "flip@k4");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| x.0 == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                let f = |ki: usize| 100.0 * g.iter().filter(|x| x.2[ki]).count() as f32 / g.len() as f32;
+                let mm = g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32;
+                println!("{lbl:<12}{:>6}{:>10.2}{:>11.0}%{:>11.0}%{:>11.0}%", g.len(), mm, f(0), f(1), f(2));
+            }
+            // de-confound margin: within matched margin bins, does coverage predict robustness (lower flip@k1)?
+            let mut ms: Vec<f32> = recs.iter().map(|x| x.1).collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: f32| if ms.is_empty() { 0.0 } else { ms[(((ms.len() - 1) as f32) * p) as usize] };
+            let (t1, t2) = (q(0.333), q(0.667));
+            println!("\n  (de-confound) flip@k1 WITHIN matched margin bins — COVERED (R+S) vs COMPOSED:");
+            println!("  {:<12}{:>12}{:>20}{:>20}", "margin bin", "mean margin", "COVERED n flip%", "COMPOSED n flip%");
+            for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
+                let inb = |x: &&(u8, f32, [bool; 3])| x.1 >= lo && x.1 < hi;
+                let cov: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 != 2).collect();
+                let cmp: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 == 2).collect();
+                let fl = |g: &[&(u8, f32, [bool; 3])]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.2[0]).count() as f32 / g.len() as f32 };
+                let mm = recs.iter().filter(inb).map(|x| x.1).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
+                println!("  {lbl:<12}{mm:>12.2}{:>14} {:>4.0}%{:>14} {:>4.0}%", cov.len(), fl(&cov), cmp.len(), fl(&cmp));
+            }
+            println!("⇒ if COVERED flip% < COMPOSED flip% WITHIN a margin bin, redundancy is causal BEYOND confidence.");
+            return;
+        }
+
         // --serve / --server <PORT> (accept both spellings — a common typo). The API server (no ids needed).
         let serve_port = flag(&args, "--serve")
             .or_else(|| flag(&args, "--server"))
