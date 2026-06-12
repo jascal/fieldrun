@@ -376,30 +376,62 @@ souffle --parse-errors prog.dl                 # syntax check only
 souffle --show=transformed-ast prog.dl         # see the desugared program
 fieldrun stitch out.*.dl -o whole.dl           # merge a per-step trace into ONE step-indexed .dl
 souffle whole.dl -D -                           # decide(step, token) for the whole reply
+fieldrun --bundle <small-rope> export --logic-whole --out cf.dl   # LO3a: CONTEXT-FREE whole-model emit (§8)
+souffle cf.dl -F ctx -D -                       # compute next token for ANY ctx/token.facts (pos<TAB>id)
 ```
 
 ---
 
-## 8. The open frontier: a single program that answers NEW queries (LO3a)
+## 8. The context-free whole-model emit (LO3a) — `export --logic-whole`
 
-Everything above produces artifacts **specialized to one context** — a single decision, or a stitched
-trace of one reply. None of them generalize. The standing research goal (`LOGIC_EXPORT.md` LO3a) is the
-**context-free whole-model emit**: one `.dl` that takes an arbitrary token context as `.input` and
-*computes* the next token — a program you could actually query, run in Soufflé on inputs the exporter
-never saw, and statically verify.
+Everything in §0–§6.5 produces artifacts **specialized to one context** — a single decision, or a
+stitched trace of one reply. None of them generalize. `LOGIC_EXPORT.md` LO3a asks for the opposite: a
+**context-free whole-model emit** — one `.dl` that takes an arbitrary token context as `.input` and
+*computes* the next token from scratch, runnable in Soufflé on inputs the exporter never saw.
 
-Why it's hard (and why it's the same wall as the rest of the proposal):
-- The current `contrib(block, token, w)` facts are **partial evaluations** — the dot products
-  `⟨d_j, U_v⟩` already resolved for the specific residual directions a given context produced. A
-  context-free program can't hardcode them; it has to export the computation that *produces* them.
-- That computation is attention (a softmax over QK across positions) and the MLPs (GELU) — real-valued
-  **nonlinear** functions. Semiring Datalog natively gives you `+` and `max`; the full forward pass
-  needs general arithmetic (Soufflé functors/FFI), at which point you've re-embedded the kernels rather
-  than exported logic.
-- The retrievable fragment (induction = a recursive clause, n-gram = a fact) *is* compactly
-  context-free already. The **computed fragment** (the dense "forge tax") is the dense-Gram /
-  high-treewidth region — `LE-T2`/`LE-T4` — which provably has no compact extension.
+**This now exists** (`fieldrun export --logic-whole`), demonstrated on the rope family at small scale:
 
-So `fieldrun stitch` deliberately solves the *tractable* half — one file for one query's whole
-trajectory — and labels itself as **not** LO3a in its own header. LO3a is the next goal, not a missing
-flag.
+```bash
+# emit the WHOLE forward pass of a (small) rope bundle as one context-free Datalog program:
+fieldrun --bundle <small-rope-bundle> export --logic-whole --out whole.dl --maxpos 64
+
+# run it on ANY context — the only input is token(pos,id):
+printf '0\t785\n1\t6722\n2\t315\n' > ctx/token.facts
+souffle whole.dl -F ctx -D -        # -> decide(v) = the next-token argmax, computed from scratch
+```
+
+Unlike `export --logic` (whose `contrib(block,token,w)` facts are **partial evaluations** baked to one
+context), this emits the **computation itself**: weights are facts, the forward pass is rules —
+RMSNorm, RoPE attention (GQA, causal), SwiGLU MLP, the tied/untied unembed, and the argmax. Change
+`token.facts` and Soufflé recomputes; it answers contexts the emitter never saw. That is the LO3a
+property.
+
+### How it fits in plain Datalog (no FFI)
+
+Soufflé has only `+ - * / ^` and `sum`/`max` aggregates — no `exp`/`sqrt`/`sin`/`cos`. That turns out
+to be enough:
+- `sqrt(x) = x ^ 0.5` (RMSNorm), `exp(x) = E ^ x` (softmax, SiLU) — `^` does real powers.
+- RoPE `sin`/`cos` depend **only on position**, never on token content, so they are precomputed
+  **model-constant facts** (`rope_cos(pos,j,c)`), not partial evaluations of the input.
+- matmul `C[i,o] = Σ_k A[i,k]·W[k,o]` is a `sum`-aggregate; softmax is `max` then `^(s-m)` then `/Z`;
+  argmax is the same `max`-witness rule the rest of this doc uses.
+
+So it is plain, standard Datalog — the same "verify in a neutral engine" property §0 relies on, extended
+to the whole model. Verified: across base / +bias (Qwen2.5-style) / untied / bias+untied tiny rope
+bundles, Soufflé's `decide` matches both fieldrun's own forward and an independent numpy reference on
+every held-out context. (Reproduce: `lo3a/verify_all.py`.)
+
+### The wall moved from "possible?" to "compact?"
+
+LO3a was filed as the open frontier because the **computed fragment** (the dense forge tax) is the
+dense-Gram / high-treewidth region (`LE-T2`/`LE-T4`) with **no compact extension**. That is exactly what
+survives: the program *exists and is correct for any model*, but its size is the embed/unembed fact
+count `vocab × d`. For a tiny bundle that is a few thousand facts; for Qwen2.5-0.5B it is ~136M embed
+facts alone, so `export --logic-whole` **refuses by default** (naming LE-T4) and needs `--force`. The
+open part of LO3a is no longer *can you emit a context-free program* — you can — it is *can the dense
+fragment be emitted compactly*, and `LE-T2`/`LE-T4` say it cannot. The size guard is that wall, made
+operational.
+
+`fieldrun stitch` (§6.5) still solves the other, tractable artifact — one file for one query's whole
+trajectory — and remains **not** LO3a (it does not generalize). `export --logic-whole` is LO3a: it
+generalizes, at the cost of carrying the whole model.

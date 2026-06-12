@@ -1,0 +1,7 @@
+# lo3a/ is a verification harness: track only the scripts + README, ignore everything generated
+# (minted bundles, emitted .dl programs, context fact dirs, souffle outputs, scratch json).
+*
+!.gitignore
+!README.md
+!mint_and_emit.py
+!verify_all.py

@@ -190,6 +190,18 @@ as provenance structure vs intervention diffuseness.
   decision on demand, in the live chat context (ChatML template + history). *Remaining:* (a) the whole-model
   (context-free) emit — the trace is still a *sequence* of per-context programs, not one program over all contexts;
   (b) the sparse-`(max,+)`-matmul performance face of §1.5.
+- **LO3a** — **emitter DONE at small scale** (`fieldrun … export --logic-whole`, rope family). The CONTEXT-FREE
+  whole-model emit: one `.dl` whose only input is `token(pos,id)` and that *computes* the next token from scratch —
+  weights are facts, the forward pass (RMSNorm, RoPE/GQA attention, SwiGLU MLP, tied/untied unembed, argmax) is rules.
+  Not a partial evaluation: swap the token facts and Soufflé recomputes, answering contexts the emitter never saw.
+  It is **plain Datalog, no FFI** — Soufflé's `^` gives `sqrt(x)=x^0.5` and `exp(x)=E^x`, and RoPE `sin`/`cos` depend
+  only on position so they are precomputed model-constant facts (never token-dependent). Verified: across base /
+  +bias / untied / bias+untied tiny rope bundles, Soufflé's `decide` == fieldrun's forward == an independent numpy
+  reference on every held-out context (`lo3a/verify_all.py`). **What stays open is LE-T2/LE-T4, exactly as predicted:**
+  the program exists and is correct for *any* model, but the dense `embed`/`unembed` fragment costs `vocab×d` facts —
+  the non-compact dense-Gram wall. So `export --logic-whole` refuses full-scale bundles by default (naming LE-T4) and
+  needs `--force`. LO3a moved the frontier from *can a context-free program be emitted?* (yes) to *can the dense
+  fragment be emitted COMPACTLY?* — which is LE-T2, still open. See [`SOUFFLE.md`](./SOUFFLE.md) §8.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the

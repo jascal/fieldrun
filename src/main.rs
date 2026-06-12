@@ -15,6 +15,7 @@ mod bundle;
 #[cfg(feature = "jit")]
 mod jit;
 mod logic;
+mod logic_whole;
 mod composition;
 mod convert;
 mod device;
@@ -1006,6 +1007,42 @@ fn main() {
         // id (unique, runnable); text is in comments. Σ contrib == logit (LE-T5); a round-trip self-check confirms the
         // emitted program's decode == the model. Rope-only (needs residual_decomp). For a multi-step decode TRACE
         // (one .dl per generated token), see `--export-logic <prefix>` below.
+        // export --logic-whole (LOGIC_EXPORT LO3a): the CONTEXT-FREE whole-model emit. Unlike `export --logic`
+        // (one decision as partial-evaluation facts) this emits the forward pass ITSELF as Datalog rules over
+        // weight facts, taking `token(pos,id)` as the only input — one program that computes the next token for
+        // ANY context, runnable in Soufflé on inputs the exporter never saw. Rope family; small bundles (the
+        // embed/unembed fact count vocab×d is the dense-Gram wall, LE-T4 — correct but not compact at scale).
+        if args.iter().any(|a| a == "export") && has_flag(&args, "--logic-whole") {
+            let maxpos: usize = flag(&args, "--maxpos").and_then(|s| s.parse().ok()).unwrap_or(64);
+            let b = match Bundle::load(&stem) {
+                Ok(b) => b,
+                Err(e) => { eprintln!("[fieldrun] export --logic-whole: couldn't reload bundle: {e}"); return; }
+            };
+            let (vc, dd) = (b.config.get(6).copied().unwrap_or(0) as usize, b.config.get(4).copied().unwrap_or(0) as usize);
+            let est = vc.saturating_mul(dd);
+            if est > 4_000_000 && !has_flag(&args, "--force") {
+                eprintln!("[fieldrun] export --logic-whole: vocab×d = {vc}×{dd} ≈ {est} embed facts (×2 if untied) — that is the\n\
+                           dense-Gram / high-treewidth wall (LOGIC_EXPORT LE-T4): the program is correct but not COMPACT at this\n\
+                           scale. Demonstrate on a small rope bundle, or re-run with --force to emit anyway.");
+                return;
+            }
+            match logic_whole::emit_whole(&b, maxpos) {
+                Ok(prog) => match flag(&args, "--out") {
+                    Some(p) => {
+                        if std::fs::write(p, &prog).is_ok() {
+                            eprintln!("[fieldrun] export --logic-whole → {p}  (context-free; maxpos {maxpos}) — run:\n  \
+                                       printf '0\\t<id0>\\n1\\t<id1>\\n…' > ctx/token.facts && souffle {p} -F ctx -D -");
+                        } else {
+                            eprintln!("[fieldrun] export --logic-whole: could not write {p}");
+                        }
+                    }
+                    None => print!("{prog}"),
+                },
+                Err(e) => eprintln!("[fieldrun] {e}"),
+            }
+            return;
+        }
+
         let export_logic = args.iter().any(|a| a == "export") && has_flag(&args, "--logic");
         if export_logic {
             use retrieval::CandCfg;
@@ -1872,6 +1909,8 @@ RUN\n\
 \n\
 LOGIC EXPORT  (LOGIC_EXPORT.md — the model as a semiring-Datalog program; rope arch, needs --ids)\n\
   export --logic [--out f.dl]   emit ONE next-token decision as a runnable .dl (Soufflé / `fieldrun eval`)\n\
+  export --logic-whole [--out f.dl] [--maxpos N]  emit the CONTEXT-FREE WHOLE-MODEL forward pass — one .dl that\n\
+  \x20             computes the next token for ANY token(pos,id) input (LO3a). Small rope bundles. Run: souffle f.dl -F <ctxdir> -D -\n\
   --export-logic <prefix>       emit a decode TRACE: one .dl per step (prefix.000.dl …); count via --steps N (default 8)\n\
   --candidates N  candidate-set cap (default 48)             --store <f>     add KB n-gram facts (Tier A)\n\
   eval <prog.dl> [--semiring max|log]   run an emitted program — max → greedy decode (T=0), log → distribution (T=1)\n\
