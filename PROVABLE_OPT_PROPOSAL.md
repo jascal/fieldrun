@@ -215,6 +215,13 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   round-trips back through `fieldrun convert` with 12/12 identical decodes** — closing the loop
   *bundle → Datalog → optimize → reduce → HF-publishable model → bundle*. *Remaining:* a static (a-priori)
   `δ` bound through the layers so deeper drops are certified, not just verified (the propagation caveat, §5).
+  **Validated on a REAL small Llama** (SmolLM-135M, `lo3a/run_smollm.py`): `fieldrun convert` → certified
+  FFN reduce → HF `safetensors` (`LlamaForCausalLM`, publishable) → `fieldrun convert` → bundle′, the round
+  trip **bit-identical (Δ=0 weights, 18/18 decode)**. Two findings carry the thesis: (i) the *whole-model
+  Soufflé emit refuses* at `vocab×d = 28M` facts — the LE-T4 wall in practice; (ii) a *trained* dense FFN has
+  **≈0 exactly-dead neurons**, so the losslessly-removable set is ≈0 and zero-shot pruning trades decode
+  fidelity (15/18 at 1–2% smaller, 12/18 at 4–6%). That is **PO-T2 measured on a real model**: the dense
+  computed fragment does not compress losslessly — the forge tax is real, and the certifier names exactly where.
 - **PO2 — the magic-sets forge-tax measure.** Emit `Π` with an explicit retrievable fragment (induction =
   recursive clause, n-gram = fact) and the dense fragment; run `--magic-transform`; report lossless tuple
   reduction (= retrievable mass) and residual (= forge tax); correlate with PR / treewidth (LO4 bridge).

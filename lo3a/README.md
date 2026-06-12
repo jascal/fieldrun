@@ -27,7 +27,19 @@ Soufflé has only `+ - * / ^` and `sum`/`max` — no `exp`/`sqrt`/`sin`/`cos`. S
 | `reduce.py` | **certified Π → smaller bundle reducer**: scores FFN neurons over a calibration set, drops the provably-dead (zero `down_proj` row ⇒ δ=0, exact on every input) and margin-dominated ones, writes a structurally smaller bundle, and certifies decode preservation against fieldrun. |
 | `to_safetensors.py` | **HF export + complete round trip**: reduced bundle → Hugging-Face `safetensors` + `config.json` (`LlamaForCausalLM`) → `fieldrun convert` → bundle′ → decode-compare. Closes the loop bundle ↔ HF. |
 
+| `run_smollm.py` | the **whole pipeline on a REAL small Llama** (SmolLM-135M): `fieldrun convert` → certified FFN reduce → HF safetensors → `fieldrun convert` → bundle′. Uses real high-margin contexts from a fieldrun greedy trace. |
+
 The full pipeline these demonstrate: **fieldrun model → LO3a Datalog (`export --logic-whole`) → lossless optimize (`bench.sh`, ~190×) → certified reduce (`reduce.py`, smaller bundle) → HF safetensors (`to_safetensors.py`, publishable) → round-trips back to fieldrun losslessly.**
+
+### Real-model run (SmolLM-135M, `run_smollm.py`)
+
+A real pretrained Llama (d=576, 30 layers, GQA 9/3, vocab 49152), end to end:
+- **convert** → 513 MB f32 bundle; decodes faithfully (`export --logic` FAITHFUL ✓).
+- **whole-model Soufflé emit REFUSES** — `vocab×d = 28.3M` facts, the LE-T4 wall. The single-decision `export --logic` still works; only the *context-free whole-model* emit hits the dense wall, exactly as the proposal predicts.
+- **certified FFN reduce**: preserves decode 15/18 at 1–2% smaller, 12/18 at 4–6%. The honest result — a *trained* dense FFN has ~0 exactly-dead neurons, so the **losslessly**-removable set is ≈0 and approximate pruning trades fidelity. That **is** the forge tax (PO-T2) measured on a real model: the dense computed fragment does not compress losslessly.
+- **HF safetensors round trip**: reduced model → `LlamaForCausalLM` safetensors (509 MB, publishable) → `fieldrun convert` → bundle′ — **weights bit-identical (Δ=0), decode 18/18 ✓**.
+
+(Generate the contexts first: `printf '/export-logic /tmp/smtr.dl <prompt>\n/exit\n' | fieldrun --bundle lo3a/smollm/smollm --chat`.)
 | `tiny*/` | the minted bundles (gitignored). |
 | `whole*.dl`, `ctx*/`, `*.facts` | generated programs and context inputs (gitignored). |
 

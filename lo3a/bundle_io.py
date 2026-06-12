@@ -50,17 +50,14 @@ def forward(W, cfg, cfg_f, ids, want_acts=False):
     HALF, REP = HD // 2, H // NKV
     inv = (1.0 / (theta ** (2.0 * np.arange(HALF, dtype=np.float32) / HD))).astype(np.float32)
     bias = (f"l0.self_attn.q_proj.bias" in W)
-    def rope(x, nh):
-        x = x.copy(); seq = x.shape[0]
-        for i in range(seq):
-            for h in range(nh):
-                b = h * HD
-                for j in range(HALF):
-                    ang = np.float32(i) * inv[j]; c, s = np.float32(np.cos(ang)), np.float32(np.sin(ang))
-                    a, bb = x[i, b+j], x[i, b+j+HALF]
-                    x[i, b+j] = a*c - bb*s; x[i, b+j+HALF] = bb*c + a*s
-        return x.astype(np.float32)
     ids = list(ids); seq = len(ids)
+    ang = (np.arange(seq, dtype=np.float32)[:, None] * inv[None, :])   # [seq, half]
+    COS = np.cos(ang).astype(np.float32)[:, None, :]                   # [seq,1,half]
+    SIN = np.sin(ang).astype(np.float32)[:, None, :]
+    causal = np.triu(np.ones((seq, seq), dtype=bool), k=1)             # j>i masked
+    def rope(x, nh):                                                   # x:[seq, nh*hd]; rotate (j, j+half) per head
+        xr = x.reshape(seq, nh, HD); x1, x2 = xr[..., :HALF], xr[..., HALF:]
+        return np.concatenate([x1*COS - x2*SIN, x2*COS + x1*SIN], axis=-1).reshape(seq, nh*HD).astype(np.float32)
     x = W["embed"][ids].astype(np.float32)
     acts = []
     for l in range(n_layer):
@@ -77,8 +74,7 @@ def forward(W, cfg, cfg_f, ids, want_acts=False):
             kv = h // REP
             qh, kh, vh = q[:, h*HD:(h+1)*HD], k[:, kv*HD:(kv+1)*HD], v[:, kv*HD:(kv+1)*HD]
             sc = (qh @ kh.T).astype(np.float32) / np.float32(np.sqrt(HD))
-            for i in range(seq):
-                for j in range(i+1, seq): sc[i, j] = np.float32(-1e30)
+            sc[causal] = np.float32(-1e30)
             sc = np.exp(sc - sc.max(axis=1, keepdims=True)).astype(np.float32)
             sc = (sc / sc.sum(axis=1, keepdims=True)).astype(np.float32)
             ao[:, h*HD:(h+1)*HD] = (sc @ vh).astype(np.float32)

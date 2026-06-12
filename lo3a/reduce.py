@@ -61,8 +61,7 @@ def reduce_bundle(in_stem, out_stem, calib, drop_per_layer=None):
         Wr[p+"mlp.down_proj"] = W[p+"mlp.down_proj"][keep_idx, :]   # [ffn, d] -> [keep, d]
     cfg_r = list(cfg); cfg_r[5] = keep
     order = bio.layer_order(n_layer, tied, bias)
-    bytes_in = bio.write_bundle(in_stem + "__copy", man["arch"], cfg, cfg_f, W, order)  # for size baseline
-    os.remove(in_stem + "__copy.fieldrun.json"); os.remove(in_stem + "__copy.fieldrun.bin")
+    bytes_in = os.path.getsize(in_stem + ".fieldrun.bin")
     bytes_out = bio.write_bundle(out_stem, man["arch"], cfg_r, cfg_f, Wr, order)
     params = lambda c: int(c[6])*int(c[4]) + sum(  # rough param count
         np.prod(Wr[n].shape) if n in Wr else 0 for n in order)
