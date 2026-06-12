@@ -915,6 +915,75 @@ fn main() {
             return;
         }
 
+        // --probe-quant (research → speed bridge): does a block's pivotality D_b predict how much QUANTIZING it
+        // perturbs the decode? Per position × block: quantize that one block's residual write (per-row int{bits}
+        // round-trip), re-decode, record flip; correlate with D_b. If high-|D_b| flips more ⇒ protect high-D_b blocks,
+        // quantize low-D_b hard (principled per-block bit allocation). Rope-only.
+        if has_flag(&args, "--probe-quant") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let bits: u8 = flag(&args, "--bits").and_then(|s| s.parse().ok()).unwrap_or(4);
+            if lm.predict_block_quant(&ids[..ctx_window.min(ids.len())], 0, bits).is_none() {
+                eprintln!("[fieldrun] --probe-quant: arch {arch} has no predict_block_quant (rope only)");
+                return;
+            }
+            let cap = (end - ctx_window).min(n_eval).min(120); // ~nblocks forwards/position — keep n modest
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-quant: {} positions × per-block int{bits} quant…", positions.len());
+            struct Q { route: u8, dj: f32, contrib: f32, flip: bool }
+            let recs: Vec<Q> = positions.par_iter().flat_map(|c| {
+                let mut out: Vec<Q> = Vec::new();
+                let Some(ex) = lm.explain(c) else { return out; };
+                let (t, vs) = (ex.model_predicts, ex.runner_up);
+                let Some((_lab, contrib)) = lm.residual_decomp(c, &[t, vs]) else { return out; };
+                let route = match &store {
+                    Some(st) => { let (kb, _) = st.predict(c); if kb == t { 0u8 } else if st.candidates(c, &cfg).contains(&t) { 1 } else { 2 } }
+                    None => 3,
+                };
+                for b in 0..contrib.len() {
+                    let flip = lm.predict_block_quant(c, b, bits) != Some(t);
+                    out.push(Q { route, dj: contrib[b][0] - contrib[b][1], contrib: contrib[b][0], flip });
+                }
+                out
+            }).collect();
+            let n = recs.len().max(1);
+            let pearson = |x: &[f32], y: &[f32]| -> f32 {
+                let m = x.len() as f32;
+                let (mx, my) = (x.iter().sum::<f32>() / m, y.iter().sum::<f32>() / m);
+                let (mut sxy, mut sxx, mut syy) = (0f32, 0f32, 0f32);
+                for (&a, &b) in x.iter().zip(y) { let (dx, dy) = (a - mx, b - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+                if sxx > 0.0 && syy > 0.0 { sxy / (sxx * syy).sqrt() } else { 0.0 }
+            };
+            let ys: Vec<f32> = recs.iter().map(|r| if r.flip { 1.0 } else { 0.0 }).collect();
+            let xd: Vec<f32> = recs.iter().map(|r| r.dj.abs()).collect();
+            let xc: Vec<f32> = recs.iter().map(|r| r.contrib.abs()).collect();
+            let flip_rate = 100.0 * recs.iter().filter(|r| r.flip).count() as f32 / n as f32;
+            println!("\n=== (D_j vs quant-sensitivity) per-block int{bits} quant — {n} (position×block) pairs ===");
+            println!("mean single-block flip {flip_rate:.1}%   corr(|D_b|, flip) = {:+.3}   corr(|contrib_t|, flip) = {:+.3}",
+                pearson(&xd, &ys), pearson(&xc, &ys));
+            let mut da = xd.clone();
+            da.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (q1, q2) = (da[n / 3], da[2 * n / 3]);
+            println!("|D_b| tercile → single-block flip%  (rising ⇒ pivotality predicts quant-sensitivity ⇒ protect high-D_b, quantize low-D_b hard):");
+            println!("  {:<6}{:>7}{:>11}{:>10}", "bin", "n", "mean|D_b|", "flip%");
+            for (lbl, lo, hi) in [("low ", f32::MIN, q1), ("mid ", q1, q2), ("high", q2, f32::MAX)] {
+                let g: Vec<&Q> = recs.iter().filter(|r| r.dj.abs() >= lo && r.dj.abs() < hi).collect();
+                if g.is_empty() { continue; }
+                let m = g.len() as f32;
+                println!("  {lbl:<6}{:>7}{:>11.2}{:>9.1}%", g.len(), g.iter().map(|r| r.dj.abs()).sum::<f32>() / m, 100.0 * g.iter().filter(|r| r.flip).count() as f32 / m);
+            }
+            if store.is_some() {
+                println!("by route (mean single-block flip% across its blocks):");
+                for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                    let g: Vec<&Q> = recs.iter().filter(|x| x.route == r).collect();
+                    if g.is_empty() { continue; }
+                    println!("  {lbl:<12} n {:>5}  flip {:.1}%", g.len(), 100.0 * g.iter().filter(|x| x.flip).count() as f32 / g.len() as f32);
+                }
+            }
+            return;
+        }
+
         // --probe-reconstruct (LE-T5 / LOGIC_EXPORT LO2): decompose the predicted-token logit into per-block residual
         // writes (embed + each layer's attn + mlp). Σ_blocks == logit EXACTLY (residual-stream additivity) ⇒ the
         // reconstruction residual measures decompiler completeness (LE-T5 exact); the per-block concentration of the
