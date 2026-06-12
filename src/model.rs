@@ -49,7 +49,9 @@ impl PrefixKv {
 ///   * `alloc(total)` → zeroed `(kc, vc)` with that arch's per-layer K/V column widths, sized for `total` rows;
 ///   * `fwd(ids, cur, &mut kc, &mut vc)` → run the block over `ids` placed at absolute position `cur` (writing their
 ///      K/V into rows `[cur..cur+ids.len())` and attending to the reused prefix `[0..cur)`), returning the hidden block;
-///   * `argmax(&hidden)` → next-token id from the last row.
+///   * `argmax(&hidden, ctx)` → next-token id from the last row. `ctx` is the full context (prompt + emitted so far)
+///      at that step, so a margin-gated pruned head (`--pruned-head`) can build its KB candidate set; plain kernels
+///      ignore it.
 ///
 /// Reuse is byte-identical to a full recompute — K/V are deterministic functions of the prefix tokens and the chunked
 /// forward at `cur=L` attends to the copied prefix rows exactly as a fresh prefill would — so this runs unconditionally;
@@ -65,7 +67,7 @@ pub fn prefix_generate(
     n_layer: usize,
     alloc: &dyn Fn(usize) -> (Vec<Array2<f32>>, Vec<Array2<f32>>),
     fwd: &mut dyn FnMut(&[i64], usize, &mut [Array2<f32>], &mut [Array2<f32>]) -> Array2<f32>,
-    argmax: &dyn Fn(&Array2<f32>) -> i64,
+    argmax: &dyn Fn(&Array2<f32>, &[i64]) -> i64,
 ) -> Vec<i64> {
     let total = prompt.len() + max_tokens;
     let l = cache.reuse_len(prompt);
@@ -77,8 +79,9 @@ pub fn prefix_generate(
         }
     }
     // Prefill the suffix in one chunked forward at position l (attends to the reused prefix rows [0..l)).
+    let mut ctx: Vec<i64> = prompt.to_vec(); // running context for argmax (the gated head keys its KB lookup on it)
     let xb = fwd(&prompt[l..], l, &mut kc, &mut vc);
-    let mut next = argmax(&xb);
+    let mut next = argmax(&xb, &ctx);
     let mut out = Vec::new();
     let mut pos = prompt.len();
     loop {
@@ -89,8 +92,9 @@ pub fn prefix_generate(
         if !emit(next) || out.len() == max_tokens {
             break;
         }
+        ctx.push(next);
         let xb = fwd(&[next], pos, &mut kc, &mut vc);
-        next = argmax(&xb);
+        next = argmax(&xb, &ctx);
         pos += 1;
     }
     // Persist the full (prompt + emitted) K/V for the next turn — exactly `pos` rows are populated (the decode loop
@@ -120,7 +124,7 @@ pub fn prefix_generate_q(
     n_layer: usize,
     alloc: &dyn Fn(usize) -> (Vec<Vec<i8>>, Vec<Vec<i8>>, Vec<Vec<f32>>, Vec<Vec<f32>>),
     fwd: &mut dyn FnMut(&[i64], usize, &mut [Vec<i8>], &mut [Vec<f32>], &mut [Vec<i8>], &mut [Vec<f32>]) -> Array2<f32>,
-    argmax: &dyn Fn(&Array2<f32>) -> i64,
+    argmax: &dyn Fn(&Array2<f32>, &[i64]) -> i64,
 ) -> Vec<i64> {
     let total = prompt.len() + max_tokens;
     let l = cache.reuse_len(prompt);
@@ -139,8 +143,9 @@ pub fn prefix_generate_q(
         }
     }
     // Prefill the suffix in one chunked forward at position l (attends to the reused prefix rows [0..l)).
+    let mut ctx: Vec<i64> = prompt.to_vec(); // running context for argmax (the gated head keys its KB lookup on it)
     let xb = fwd(&prompt[l..], l, &mut kc, &mut ks, &mut vc, &mut vs);
-    let mut next = argmax(&xb);
+    let mut next = argmax(&xb, &ctx);
     let mut out = Vec::new();
     let mut pos = prompt.len();
     loop {
@@ -151,8 +156,9 @@ pub fn prefix_generate_q(
         if !emit(next) || out.len() == max_tokens {
             break;
         }
+        ctx.push(next);
         let xb = fwd(&[next], pos, &mut kc, &mut ks, &mut vc, &mut vs);
-        next = argmax(&xb);
+        next = argmax(&xb, &ctx);
         pos += 1;
     }
     let mut ids: Vec<i64> = Vec::with_capacity(pos);
@@ -189,6 +195,22 @@ pub trait Model: Sync {
     fn predict_ablated(&self, _ids: &[i64], _heads: &[(usize, usize)], _neurons: &[(usize, usize)]) -> Option<i64> {
         None
     }
+
+    /// Install a margin-gated retrieval-pruned output head (`--pruned-head`) on the DECODE loops — the serve/chat
+    /// streaming paths only; `predict` (scoring, probes) always runs the full head. Returns false if the arch doesn't
+    /// wire it (default). See `headgate::HeadGate`.
+    fn set_head_gate(&mut self, _gate: std::sync::Arc<crate::headgate::HeadGate>) -> bool {
+        false
+    }
+
+    /// (accepted, fallback) decode-step counts of the installed head gate, if any — for `--gate-check` / exit stats.
+    fn head_gate_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Remove the head gate (back to the full head on every step) — `--gate-check` uses this to run its ungated
+    /// reference stream on the same model instance.
+    fn clear_head_gate(&mut self) {}
 
     /// Decode with ONE residual-stream block's write quantized (per-row symmetric to `bits`, round-trip) — for
     /// `--probe-quant`: does a block's pivotality `D_b` predict how much quantizing it perturbs the decode? `block`

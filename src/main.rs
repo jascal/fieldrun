@@ -27,6 +27,7 @@ mod gpu_mm;
 #[cfg(feature = "gpu")]
 mod gpu_rope;
 mod gemma;
+mod headgate;
 mod gemma3;
 mod gemma4;
 #[cfg(feature = "api")]
@@ -36,6 +37,7 @@ mod hub;
 mod minimax;
 mod mla;
 mod model;
+mod neox;
 mod qwen3moe;
 mod retrieval;
 mod rope;
@@ -60,6 +62,7 @@ use gemma3::Gemma3;
 use gemma4::Gemma4;
 use minimax::MiniMax;
 use mla::Mla;
+use neox::Neox;
 // mdfmt (Markdown→ANSI for the chat REPL) is only used by the api `chat`; module declared below under cfg(api).
 use model::Model;
 use qwen3moe::Qwen3Moe;
@@ -133,7 +136,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
@@ -379,8 +382,9 @@ fn main() {
         let eos = bundle.eos.clone(); // for the text API / --chat stop condition
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let kv_int8 = has_flag(&args, "--kv-int8");
-        let lm: Box<dyn Model> = match arch.as_str() {
+        let mut lm: Box<dyn Model> = match arch.as_str() {
             "gpt2" => Box::new(Gpt2::new(bundle, route, kv_int8)),
+            "neox" => Box::new(Neox::new(bundle, route, kv_int8)),
             "rope" => Box::new(Rope::new(bundle, route, kv_int8)),
             "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
@@ -389,8 +393,28 @@ fn main() {
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
+
+        // --pruned-head: margin-gated retrieval-pruned output head on the DECODE loops (serve/chat/stream). The KB
+        // proposes ~540 candidates per step; the unembed scores only those rows; the pick is accepted iff the in-set
+        // normalized margin (exact facet distance, FINDINGS §5b) clears --pruned-margin, else the full head runs.
+        // Distinct from --prune-head (the explain-only measurement mode): this one changes the serving decode, so it
+        // is opt-in, off by default, and measured by --gate-check (top-1 agreement vs the full head).
+        if has_flag(&args, "--pruned-head") {
+            let thr: f32 = flag(&args, "--pruned-margin").and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            match flag(&args, "--store").map(Store::load) {
+                Some(Ok(s)) => {
+                    if lm.set_head_gate(std::sync::Arc::new(headgate::HeadGate::new(s, thr))) {
+                        eprintln!("[fieldrun] --pruned-head: margin-gated pruned unembed ON (accept ≥ {thr} normalized margin; below it, full-head fallback)");
+                    } else {
+                        eprintln!("[fieldrun] --pruned-head: arch {arch} doesn't wire the gated head (rope only) — running ungated");
+                    }
+                }
+                Some(Err(e)) => eprintln!("[fieldrun] --pruned-head: couldn't load --store: {e} — running ungated"),
+                None => eprintln!("[fieldrun] --pruned-head needs --store <store.json> (the KB proposes the candidate set) — running ungated"),
+            }
+        }
 
         // --prune-head (Phase 8b): measure the retrieval-pruned output head. The KB proposes a small candidate set per
         // position; the full-vocab unembed collapses to scoring only those. Because the pruned head scores the SAME
@@ -1426,6 +1450,54 @@ fn main() {
             return;
         }
 
+        // --gate-check N: the faithfulness measurement for --pruned-head. Generate N tokens through the GATED stream
+        // decode vs the ungated full-head stream on the same prompts, report the identical prefix + accept rate.
+        // This is how a --pruned-margin threshold is calibrated: raise it until the prefix holds at the length you
+        // serve. (Past the first divergence the contexts differ, so only the prefix is the agreement metric.) The
+        // reference is the ungated KV stream — itself gated byte-identical to the naive recompute by --gen-prefix /
+        // validate_all.sh — so the check is N decode steps, not N full-context forwards. --gate-prompts P spreads P
+        // prompts evenly across the --ids stream (closed-loop trajectories from one prompt are a sample size of 1).
+        if let Some(n) = flag(&args, "--gate-check").and_then(|s| s.parse::<usize>().ok()) {
+            if ids.len() < ctx_window {
+                eprintln!("[fieldrun] --gate-check needs --ids with at least --ctx tokens (a prompt to generate from)");
+                return;
+            }
+            let p_cnt: usize = flag(&args, "--gate-prompts").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            let span = ids.len() - ctx_window;
+            let offsets: Vec<usize> = (0..p_cnt).map(|i| span * i / p_cnt).collect();
+            let t0 = std::time::Instant::now();
+            let gated: Vec<Vec<i64>> = offsets.iter().map(|&o| lm.generate_stream(&ids[o..o + ctx_window], n, &[], &mut |_| true)).collect();
+            let gated_s = t0.elapsed().as_secs_f64();
+            let stats = lm.head_gate_stats(); // capture before clearing for the reference pass
+            lm.clear_head_gate();
+            let t1 = std::time::Instant::now();
+            let full: Vec<Vec<i64>> = offsets.iter().map(|&o| lm.generate_stream(&ids[o..o + ctx_window], n, &[], &mut |_| true)).collect();
+            let full_s = t1.elapsed().as_secs_f64();
+            println!("[fieldrun] gate-check · {arch} · {} prompts × {n} tokens (ctx {ctx_window})", offsets.len());
+            let (mut tok_tot, mut agree_tot, mut exact) = (0usize, 0usize, 0usize);
+            for (i, (g, f)) in gated.iter().zip(&full).enumerate() {
+                let m = g.len().min(f.len());
+                let agree = g.iter().zip(f.iter()).take_while(|(a, b)| a == b).count();
+                tok_tot += m;
+                agree_tot += agree;
+                if agree == m { exact += 1; }
+                println!("[fieldrun]   prompt@{:<6} identical prefix: {agree}/{m}{}", offsets[i],
+                         if agree == m { String::new() } else { format!("  (diverged at token {agree})") });
+            }
+            println!("[fieldrun]   exact trajectories: {exact}/{} · mean identical prefix: {:.0}%",
+                     offsets.len(), 100.0 * agree_tot as f64 / tok_tot.max(1) as f64);
+            match stats {
+                Some((acc, fb)) => {
+                    let tot = (acc + fb).max(1);
+                    println!("[fieldrun]   gate: {acc} pruned + {fb} full-head fallback ({:.0}% accepted)", 100.0 * acc as f64 / tot as f64);
+                }
+                None => println!("[fieldrun]   gate: none installed (pass --pruned-head --store <store.json>)"),
+            }
+            println!("[fieldrun]   gated: {gated_s:.2}s ({:.1} tok/s) · ungated full head: {full_s:.2}s ({:.1} tok/s) · {:.2}× decode",
+                     (tok_tot as f64) / gated_s.max(1e-9), (tok_tot as f64) / full_s.max(1e-9), full_s / gated_s.max(1e-9));
+            return;
+        }
+
         // --generate N: greedy autoregressive generation from the first --ctx tokens; compares KV-cache vs naive.
         if let Some(n) = flag(&args, "--generate").and_then(|s| s.parse::<usize>().ok()) {
             let prompt = &ids[..ctx_window.min(ids.len())];
@@ -1590,7 +1662,7 @@ USAGE\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
-  --arch <A>      gpt2 | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
+  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
   --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
@@ -1603,6 +1675,11 @@ RUN\n\
   --explain       with --ids: explain that prediction;       --vocab <f>     gpt2 vocab.json for readable explain labels\n\
   \x20               in chat: per-reply explanations (toggle /explain on|off)\n\
   --serve <PORT>  start the HTTP API (--server also works)   --dump <f>      write predictions, one id per line\n\
+  --pruned-head   serve/chat decode: margin-gated retrieval-pruned unembed (needs --store; rope arch). Scores only\n\
+  \x20               the KB's ~540 candidate rows; falls back to the full head when the in-set normalized margin is\n\
+  \x20               below --pruned-margin M (default 2.0). Opt-in + lossy: calibrate with --gate-check N (generates\n\
+  \x20               N gated tokens vs the full head, reports the identical prefix + accept rate; --gate-prompts P\n\
+  \x20               spreads P prompts across the --ids stream).\n\
   --raw           chat: stream raw text, no Markdown render   --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
   --device cpu|gpu|auto   --max-vram <GB>  override the RAM-fit budget (default: detected system RAM)   GPU: {gpu}\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu

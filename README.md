@@ -19,7 +19,7 @@ model, chat — in five copy-paste steps.
 | Tier | What it adds | Status |
 |------|--------------|--------|
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
-| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch reference |
+| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, GPT-NeoX/Pythia, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch (or pure-numpy) reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py`. In chat: `--explain` / `/explain on`; over the API: native `/explain` or `"explain":true` |
 | API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** (default build) — `--serve PORT` (native `/predict`·`/generate`·`/explain` + `/v1/chat/completions`·`/v1/completions`·`/v1/messages`, streaming, **tool/function calling**) and `--chat` |
@@ -41,6 +41,14 @@ ARM) with **stable NEON** intrinsics (`vmull_s8` → `vpadalq_s16`, 16 lanes/ite
 everywhere else — all on stable Rust, no feature flag or nightly. (Activations are quantised to *signed* int8; this is
 bit-exact to the scalar dot, so the faithfulness numbers are unchanged. We avoid the one-instruction `sdot`/`vdotq_s32`
 on purpose — it's still behind an unstable feature and would force nightly.)
+
+Also: a **margin-gated retrieval-pruned output head** on the serve/chat decode loops (`--pruned-head`, needs `--store`;
+rope arch). Per decode step the KB proposes ~540 candidate tokens and the unembed scores only those rows; the pick is
+accepted iff the in-set normalized margin `(L_t − L_v)/‖U_t − U_v‖` (the exact distance to the nearest candidate
+power-diagram facet — see [`FINDINGS.md`](FINDINGS.md) §5b) clears `--pruned-margin` (default 2.0), else the full
+(vocab × d) head runs. Opt-in and deliberately lossy (an accuracy-vs-speed knob like `--route-frac`): measure it with
+`--gate-check N`, which generates N tokens through the gated decode vs the ungated full head and reports the identical
+prefix + accept rate. At threshold +∞ every step falls back and the output is byte-identical to the full head.
 
 The weights + store load from a **fieldrun bundle** ([`FORMAT.md`](FORMAT.md)) — a flat manifest + raw blob (f32/f16/i8)
 that the build side (`lm-sae`'s `pylm/export_bundle.py`, the one-time Hugging Face step) writes and the runtime reads.

@@ -287,6 +287,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         // resolves to `gemma3` (not `gemma`) and "deepseek_v3" to `mla`. Longest-prefix-wins disambiguates the families.
         let table: &[(&str, &[&str])] = &[
             ("gpt2", &["gpt2"]),
+            ("neox", &["gpt_neox"]),
             ("rope", &["llama", "qwen2", "mistral", "phi"]),
             ("gemma", &["gemma", "gemma2"]),
             ("gemma3", &["gemma3"]),
@@ -324,6 +325,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
     }
     let n = match arch {
         "gpt2" => convert_gpt2(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "neox" => convert_neox(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "rope" => convert_rope(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma" => convert_gemma(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma3" => convert_gemma3(&cfg, &m, dtype, embed_dtype, out_stem)?,
@@ -332,7 +334,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
+        other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
     };
     // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
     let eos = eos_ids(&cfg);
@@ -385,6 +387,71 @@ fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
             sml(&mut w, &format!("h{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
         }
     }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
+/// GPT-NeoX / Pythia: LayerNorm(+bias) backbone, **parallel residual**, **partial rotary** (`rotary_pct` of each
+/// head), GELU MLP, untied `embed_out`. The fused `attention.query_key_value` packs [q,k,v] PER HEAD (rows
+/// `h·3·hd .. (h+1)·3·hd` are that head's q,k,v stacked), so it's de-interleaved into plain q/k/v linears here —
+/// the kernel never sees the fusion. config: [nl, nh, hd, d, ffn, vocab, rot_ndims, parallel]; config_f: [theta, eps].
+fn convert_neox(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = d / nh;
+    let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
+    let rot = (((hd as f64 * getf(c, "rotary_pct").unwrap_or(1.0)).round() as usize).max(2)) & !1; // even, ≥2
+    let theta = getf(c, "rotary_emb_base").unwrap_or(10000.0);
+    let eps = getf(c, "layer_norm_eps").unwrap_or(1e-5);
+    let par = c.get("use_parallel_residual").and_then(|v| v.as_bool()).unwrap_or(true);
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "neox",
+        "config": [nl, nh, hd, d, ffn, vocab, rot, par as usize], "config_f": [theta, eps] });
+    let mut w = BundleWriter::new(stem)?;
+    let sml = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    {
+        let (s, dt) = m.read("gpt_neox.embed_in.weight");
+        w.put_embed("embed", &dt, &s, edt, dtype)?;
+    }
+    {
+        // untied unembed: read row-wise by rowdot_f32 as (vocab, d) → stored raw, not transposed
+        let (s, dt) = m.read("embed_out.weight");
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
+    }
+    sml(&mut w, "ln_f.weight", "gpt_neox.final_layer_norm.weight")?;
+    sml(&mut w, "ln_f.bias", "gpt_neox.final_layer_norm.bias")?;
+    for l in 0..nl {
+        let p = format!("gpt_neox.layers.{l}.");
+        sml(&mut w, &format!("l{l}.ln1.weight"), &format!("{p}input_layernorm.weight"))?;
+        sml(&mut w, &format!("l{l}.ln1.bias"), &format!("{p}input_layernorm.bias"))?;
+        sml(&mut w, &format!("l{l}.ln2.weight"), &format!("{p}post_attention_layernorm.weight"))?;
+        sml(&mut w, &format!("l{l}.ln2.bias"), &format!("{p}post_attention_layernorm.bias"))?;
+        // de-interleave the fused qkv: per head h, source rows (h·3 + which)·hd .. +hd are q/k/v for which = 0/1/2
+        let (qs, qd) = m.read(&format!("{p}attention.query_key_value.weight")); // (3d, d)
+        assert_eq!(qs, vec![3 * d, d], "neox qkv weight shape");
+        let (_, qb) = m.read(&format!("{p}attention.query_key_value.bias")); // (3d,)
+        for (which, nm) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
+            let mut sub = vec![0f32; d * d];
+            let mut sb = vec![0f32; d];
+            for h in 0..nh {
+                let src = (h * 3 + which) * hd;
+                let dst = h * hd;
+                sub[dst * d..(dst + hd) * d].copy_from_slice(&qd[src * d..(src + hd) * d]);
+                sb[dst..dst + hd].copy_from_slice(&qb[src..src + hd]);
+            }
+            w.put_lin(&format!("l{l}.{nm}"), &sub, d, d, dtype)?;
+            w.put_small(&format!("l{l}.{nm}.bias"), &sb, &[d], dtype)?;
+        }
+        for (fr, hf) in [("dense", "attention.dense"), ("fc_in", "mlp.dense_h_to_4h"), ("fc_out", "mlp.dense_4h_to_h")] {
+            let (s, dt) = m.read(&format!("{p}{hf}.weight"));
+            w.put_lin(&format!("l{l}.{fr}"), &dt, s[0], s[1], dtype)?;
+            sml(&mut w, &format!("l{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
+        }
+    }
+    let _ = ffn;
     let n = w.arrays.len();
     w.finish(stem, manifest)?;
     Ok(n)
