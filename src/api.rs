@@ -1124,7 +1124,7 @@ impl rustyline::completion::Completer for SlashHelper {
             };
             Ok((arg_start, subs.iter().filter(|s| s.starts_with(frag)).map(|s| pair(s)).collect()))
         } else {
-            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/format", "/raw", "/help"];
+            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/export-logic", "/format", "/raw", "/help"];
             Ok((0, CMDS.iter().filter(|c| c.starts_with(upto)).map(|c| pair(c)).collect()))
         }
     }
@@ -1170,6 +1170,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
     let mut history: Vec<(String, String)> = Vec::new();
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
     let mut explain_tk: usize = EXPLAIN_HEAD_TAIL; // deep-explain only the first & last N reply tokens (0 = all); /explain tokens N
+    let mut logic_seq: usize = 0; // auto-numbers default `/export-logic` filenames (logic-001.dl, …) when no path is given
     // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
     // during readline; the generation/streaming below runs in normal mode exactly as before.
     let cfg = rustyline::Config::builder()
@@ -1262,8 +1263,49 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                     fmt = false;
                     eprintln!("[fieldrun] markdown rendering OFF (raw)");
                 }
+                // /export-logic [file.dl] <prompt> — emit the semiring-Datalog program (LOGIC_EXPORT.md) for the next-token
+                // decision after <prompt>, taken in the SAME chat context (template + history) a real turn would use. One
+                // command → one decode → one runnable .dl (`fieldrun eval` / Soufflé). Reuses logic::build, so it's the
+                // provenance of the actual decision, not a reconstruction. Rope archs only (needs residual_decomp).
+                "export-logic" | "logic-export" | "export_logic" => {
+                    let toks: Vec<&str> = parts.collect();
+                    // first token is the path iff it ends in .dl; otherwise auto-number and treat all of it as the prompt.
+                    let (path, prompt) = match toks.first() {
+                        Some(f) if f.ends_with(".dl") => (f.to_string(), toks[1..].join(" ")),
+                        _ => {
+                            logic_seq += 1;
+                            (format!("logic-{logic_seq:03}.dl"), toks.join(" "))
+                        }
+                    };
+                    if prompt.trim().is_empty() {
+                        eprintln!("[fieldrun] /export-logic [file.dl] <prompt> — emit the next-token decision for <prompt> \
+                                   as a runnable semiring-Datalog program. e.g. /export-logic out.dl The capital of France is");
+                    } else {
+                        // build the context exactly as a turn would (ChatML template + history for instruct; raw + BOS for base)
+                        let (p, add_special) = if chatml {
+                            (tg.chat_prompt(None, &history, &prompt), false)
+                        } else {
+                            (prompt.clone(), true)
+                        };
+                        let ctx_ids = tg.encode(&p, add_special);
+                        match crate::logic::build(lm.as_ref(), &ctx_ids, store.as_ref(), &cand, 48) {
+                            Some(prov) => {
+                                let dec = |id: i64| tg.token_label(id);
+                                let dl = crate::logic::emit_dl(&prov, &ctx_ids, &dec);
+                                let faithful = dl.contains("✓ FAITHFUL");
+                                match std::fs::write(&path, &dl) {
+                                    Ok(()) => eprintln!("[fieldrun] /export-logic → {path}  ({} candidates, {} blocks, decode {}) — run: fieldrun eval {path} --semiring max|log",
+                                                        prov.candidates.len(), prov.blocks.len(), if faithful { "FAITHFUL ✓" } else { "MISMATCH ✗" }),
+                                    Err(e) => eprintln!("[fieldrun] /export-logic: could not write {path}: {e}"),
+                                }
+                            }
+                            None => eprintln!("[fieldrun] /export-logic: arch {arch} has no residual_decomp — logic export is rope-only (Qwen2.5/Llama)"),
+                        }
+                    }
+                }
                 "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
                                      /explain [on|off] (circuits + features) · /explain context <N|all> · \
+                                     /export-logic [file.dl] <prompt> (semiring-Datalog export) · \
                                      /format [on|off] (markdown) · /help"),
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }

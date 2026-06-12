@@ -871,13 +871,13 @@ fn main() {
             return;
         }
 
-        // export --logic / --export-logic (LOGIC_EXPORT LO3): emit a runnable semiring-Datalog program SPECIALIZED to
-        // ONE next-token decision — the retrievable fragment as readable clauses/facts (Tier A), the composition as
-        // per-block weighted contrib facts (Tier B, the forge tax), and the decode as a (max,+) argmax aggregate. Tokens
-        // are referenced by id (unique, runnable); text is in comments. Σ contrib == logit (LE-T5); a round-trip
-        // self-check confirms the emitted program's decode == the model. Rope-only (needs residual_decomp).
-        let export_logic = has_flag(&args, "--export-logic")
-            || (args.iter().any(|a| a == "export") && has_flag(&args, "--logic"));
+        // export --logic (LOGIC_EXPORT LO3): emit a runnable semiring-Datalog program SPECIALIZED to ONE next-token
+        // decision — the retrievable fragment as readable clauses/facts (Tier A), the composition as per-block weighted
+        // contrib facts (Tier B, the forge tax), and the decode as a (max,+) argmax aggregate. Tokens are referenced by
+        // id (unique, runnable); text is in comments. Σ contrib == logit (LE-T5); a round-trip self-check confirms the
+        // emitted program's decode == the model. Rope-only (needs residual_decomp). For a multi-step decode TRACE
+        // (one .dl per generated token), see `--export-logic <prefix>` below.
+        let export_logic = args.iter().any(|a| a == "export") && has_flag(&args, "--logic");
         if export_logic {
             use retrieval::CandCfg;
             let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
@@ -918,6 +918,58 @@ fn main() {
                 }
                 None => print!("{o}"),
             }
+            return;
+        }
+
+        // --export-logic <prefix>: emit a per-step semiring-Datalog TRACE of a greedy decode — one runnable .dl per
+        // generated token (prefix.000.dl, prefix.001.dl, …), each an INDEPENDENT program (`fieldrun eval` / Soufflé).
+        // Deliberately NOT one merged file: concatenating complete programs redeclares relations (Soufflé errors) and
+        // makes `eval` sum contribs across different tokens (silently wrong) — so each decode is its own file. The
+        // context advances by the model's own pick each step, so the .dl set is a faithful decode trajectory. Steps via
+        // --steps N (default 8). Rope-only (needs residual_decomp). One full explain+residual_decomp forward per step.
+        if let Some(prefix) = flag(&args, "--export-logic") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap_c: usize = flag(&args, "--candidates").and_then(|s| s.parse().ok()).unwrap_or(48);
+            let steps: usize = flag(&args, "--steps").and_then(|s| s.parse().ok()).unwrap_or(8);
+            if ids.len() < 2 {
+                eprintln!("[fieldrun] --export-logic needs --ids with a context (≥2 tokens)");
+                return;
+            }
+            if prefix.ends_with(".dl") {
+                eprintln!("[fieldrun] --export-logic writes ONE file PER decode step (prefix.000.dl, …) — it wants a PREFIX, \
+                           not a single .dl (concatenated programs aren't runnable). Got {prefix:?}; using its stem.");
+            }
+            let stem_pfx = prefix.strip_suffix(".dl").unwrap_or(prefix);
+            let mut ctx_v: Vec<i64> = if ids.len() > ctx_window { ids[..ctx_window].to_vec() } else { ids[..ids.len() - 1].to_vec() };
+            // token text for the .dl comments comes from the tokenizer (api feature); without it, fall back to ids.
+            #[cfg(feature = "api")]
+            let tg = api::TextGen::load(&stem, eos.clone());
+            let (mut written, mut faithful) = (0usize, 0usize);
+            for step in 0..steps {
+                let Some(prov) = logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) else {
+                    eprintln!("[fieldrun] --export-logic: arch {arch} has no residual_decomp (rope only)");
+                    return;
+                };
+                #[cfg(feature = "api")]
+                let o = {
+                    let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
+                    logic::emit_dl(&prov, &ctx_v, &lbl)
+                };
+                #[cfg(not(feature = "api"))]
+                let o = logic::emit_dl(&prov, &ctx_v, &|id: i64| format!("[{id}]"));
+                let path = format!("{stem_pfx}.{step:03}.dl");
+                if std::fs::write(&path, &o).is_ok() {
+                    written += 1;
+                    if o.contains("✓ FAITHFUL") { faithful += 1; }
+                } else {
+                    eprintln!("[fieldrun] --export-logic: could not write {path}");
+                }
+                ctx_v.push(prov.predicted); // advance by the model's greedy pick → the trace follows a real trajectory
+            }
+            eprintln!("[fieldrun] --export-logic → {stem_pfx}.{{000..{:03}}}.dl  ({written} steps, {faithful} FAITHFUL ✓) — run: fieldrun eval {stem_pfx}.000.dl --semiring max|log",
+                      steps.saturating_sub(1));
             return;
         }
 
@@ -1687,7 +1739,14 @@ RUN\n\
   \x20               N gated tokens vs the full head, reports the identical prefix + accept rate; --gate-prompts P\n\
   \x20               spreads P prompts across the --ids stream).\n\
   --raw           chat: stream raw text, no Markdown render   --max-tokens N  reply cap (default 512; 2048 if reasoning)\n\
-  --device cpu|gpu|auto   --max-vram <GB>  override the RAM-fit budget (default: detected system RAM)   GPU: {gpu}\n",
+  --device cpu|gpu|auto   --max-vram <GB>  override the RAM-fit budget (default: detected system RAM)   GPU: {gpu}\n\
+\n\
+LOGIC EXPORT  (LOGIC_EXPORT.md — the model as a semiring-Datalog program; rope arch, needs --ids)\n\
+  export --logic [--out f.dl]   emit ONE next-token decision as a runnable .dl (Soufflé / `fieldrun eval`)\n\
+  --export-logic <prefix>       emit a decode TRACE: one .dl per step (prefix.000.dl …); count via --steps N (default 8)\n\
+  --candidates N  candidate-set cap (default 48)             --store <f>     add KB n-gram facts (Tier A)\n\
+  eval <prog.dl> [--semiring max|log]   run an emitted program — max → greedy decode (T=0), log → distribution (T=1)\n\
+  (in --chat: /export-logic [file.dl] <prompt> writes the .dl for that decision on demand)\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );
 }
