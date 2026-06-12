@@ -198,6 +198,15 @@ def main() -> None:
     page = template.replace("__PAPER__", "\n".join(parts)).replace(
         "__SLIDES__", json.dumps(slides, ensure_ascii=False)
     )
+
+    # Validate BEFORE writing anything: a malformed draft (a slide's target section not found
+    # in the PDF) must fail without leaving a stale/broken docs/index.html behind. Otherwise a
+    # bad draft both fails CI *and* clobbers the last-good site on disk.
+    ids = {heading_id(h) for h, _, _ in sections}
+    bad = [s["target"] for s in slides if s["target"] not in ids]
+    if bad:
+        sys.exit(f"slide targets missing from paper: {bad}")
+
     OUT_DIR.mkdir(exist_ok=True)
     (OUT_DIR / "index.html").write_text(page)
     (OUT_DIR / ".nojekyll").write_text("")
@@ -207,11 +216,6 @@ def main() -> None:
           f"{found} highlights placed, {len(missing)} quotes unmatched")
     for idx, q in missing:
         print(f"  [warn] slide {idx}: quote not found: {q!r}…")
-    # fail CI only if a slide's *target* section is missing
-    ids = {heading_id(h) for h, _, _ in sections}
-    bad = [s["target"] for s in slides if s["target"] not in ids]
-    if bad:
-        sys.exit(f"slide targets missing from paper: {bad}")
 
 
 if __name__ == "__main__":
