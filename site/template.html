@@ -34,28 +34,11 @@
   .dot{width:8px;height:8px;border-radius:50%;background:#3a4356;cursor:pointer;}
   .dot.on{background:var(--accent);}
 
-  /* ---------- Gemini panel ---------- */
-  #ai{border-top:1px solid rgba(255,255,255,.12);font-family:Helvetica,Arial,sans-serif;background:#121620;}
-  #ai-head{display:flex;align-items:center;gap:8px;padding:9px 38px;cursor:pointer;font-size:13px;color:var(--slide-dim);}
-  #ai-head b{color:#8ab4f8;}
-  #ai-body{display:none;padding:0 38px 14px;}
-  #ai.open #ai-body{display:block;}
-  #keyrow{display:flex;gap:6px;margin-bottom:8px;}
-  #keyrow input{flex:1;background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;padding:7px 10px;font-size:12.5px;}
-  #keyrow select{background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;font-size:12px;}
-  #chatlog{max-height:200px;overflow-y:auto;font-size:13.5px;line-height:1.45;margin-bottom:8px;}
-  .msg{margin:7px 0;padding:8px 11px;border-radius:8px;white-space:pre-wrap;}
-  .msg.user{background:#243047;color:#dfe6f5;}
-  .msg.model{background:#1c2434;color:#cfd8ea;border-left:3px solid #8ab4f8;}
-  .msg.err{background:#3a1d1d;color:#f3b8b8;}
-  #askrow{display:flex;gap:6px;}
-  #askrow textarea{flex:1;background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;padding:8px 10px;font-size:13.5px;resize:none;height:44px;font-family:inherit;}
-  #askrow button{background:#8ab4f8;color:#10131a;border:0;border-radius:6px;padding:0 18px;font-weight:bold;cursor:pointer;}
-  #askrow button:disabled{opacity:.45;cursor:default;}
-  #chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}
-  .chip{font-size:11.5px;background:#1e2533;border:1px solid #333d52;color:#9fb4d8;border-radius:12px;padding:3px 10px;cursor:pointer;}
-  .chip:hover{border-color:#8ab4f8;}
-  #ai-note{font-size:10.5px;color:#5d6878;margin-top:6px;}
+  /* ---------- full-PDF link (figures & tables live in the source PDF) ---------- */
+  #nav a#pdflink{background:#3a2f26;color:#ffd9b3;text-decoration:none;border-radius:6px;padding:8px 14px;font-size:13px;border:1px solid #5a4636;}
+  #nav a#pdflink:hover{background:#4a3a2c;}
+  #pdfview{margin-top:46px;border-top:2px solid #e4ded2;padding-top:10px;}
+  #pdfview object{border:1px solid #d8d2c4;border-radius:6px;margin-top:8px;background:#fff;}
 
   /* ---------- RIGHT: paper ---------- */
   #right{flex:1;height:100vh;overflow-y:auto;padding:40px 56px 120px;scroll-behavior:smooth;}
@@ -97,41 +80,21 @@
     <button id="prev">&#8592; Prev</button>
     <button id="next">Next &#8594;</button>
     <div id="dots"></div>
+    <a id="pdflink" href="paper.pdf" target="_blank" rel="noopener">&#128196; Full PDF</a>
     <span id="counter"></span>
-  </div>
-  <div id="ai">
-    <div id="ai-head" onclick="document.getElementById('ai').classList.toggle('open')">
-      &#10024; <b>Ask Gemini about this paper</b> <span style="margin-left:auto">click to open/close</span>
-    </div>
-    <div id="ai-body">
-      <div id="keyrow">
-        <input id="gkey" type="password" placeholder="Paste your Gemini API key (stored only in this browser)">
-        <select id="gmodel">
-          <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-          <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-          <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-        </select>
-      </div>
-      <div id="chips">
-        <span class="chip">Explain the three routes simply</span>
-        <span class="chip">What is the participation ratio?</span>
-        <span class="chip">Why Datalog and not Prolog?</span>
-        <span class="chip">What does &mu;t = 0 mean?</span>
-        <span class="chip">Summarize the open problems</span>
-      </div>
-      <div id="chatlog"></div>
-      <div id="askrow">
-        <textarea id="q" placeholder="Ask anything about the paper&hellip; (Enter to send)"></textarea>
-        <button id="send">Ask</button>
-      </div>
-      <div id="ai-note">Your key is kept in this browser's localStorage and sent only to Google's Gemini API (generativelanguage.googleapis.com), together with the paper text and your question. Get a free key at aistudio.google.com.</div>
-    </div>
   </div>
 </div>
 
 <!-- ============ RIGHT: PAPER ============ -->
 <div id="right">
 __PAPER__
+<section id="pdfview">
+  <h2>Full paper &mdash; figures &amp; tables</h2>
+  <p class="caption">The reader above is the paper's text. Figures and tables (e.g. Figure&nbsp;1, Table&nbsp;1) are vector graphics in the source PDF &mdash; view or download the full draft below.</p>
+  <object data="paper.pdf" type="application/pdf" width="100%" height="860">
+    <p><a href="paper.pdf">Open the full PDF (figures &amp; tables)</a> &mdash; your browser can't embed it inline.</p>
+  </object>
+</section>
 </div>
 
 <script>
@@ -168,68 +131,6 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowLeft'||e.key==='PageUp') {e.preventDefault();go(cur-1);}
 });
 go(0);
-
-/* ================= GEMINI ================= */
-const keyEl = document.getElementById('gkey');
-keyEl.value = localStorage.getItem('gemini_key') || '';
-keyEl.addEventListener('change', ()=>localStorage.setItem('gemini_key', keyEl.value.trim()));
-const log = document.getElementById('chatlog');
-const qEl = document.getElementById('q');
-const sendBtn = document.getElementById('send');
-let history = [];
-
-function addMsg(cls, text){
-  const d = document.createElement('div');
-  d.className = 'msg '+cls; d.textContent = text;
-  log.appendChild(d); log.scrollTop = log.scrollHeight;
-  return d;
-}
-
-document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{qEl.value=c.textContent;ask();});
-sendBtn.onclick = ask;
-qEl.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); ask(); }});
-
-async function ask(){
-  const q = qEl.value.trim();
-  const key = keyEl.value.trim();
-  if(!q) return;
-  if(!key){ addMsg('err','Paste a Gemini API key first (free at aistudio.google.com).'); return; }
-  localStorage.setItem('gemini_key', key);
-  qEl.value=''; addMsg('user', q);
-  history.push({role:'user', parts:[{text:q}]});
-  sendBtn.disabled = true;
-  const thinking = addMsg('model','…thinking…');
-  const paperText = document.getElementById('right').innerText;
-  const sys = "You are a helpful expert assistant embedded in a slide-reader for the research paper below. " +
-    "Answer the reader's questions about the paper: explain its concepts, claims, evidence, math and context plainly and accurately. " +
-    "Ground answers in the paper text; if asked something the paper does not address, say so and answer from general knowledge, clearly labelled. " +
-    "Be concise (a few short paragraphs at most). The reader is currently viewing the slide titled: \"" + slides[cur].t + "\".\n\n" +
-    "=== FULL PAPER TEXT ===\n" + paperText;
-  const model = document.getElementById('gmodel').value;
-  try{
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        system_instruction:{parts:[{text:sys}]},
-        contents: history,
-        generationConfig:{temperature:0.3, maxOutputTokens:1024}
-      })
-    });
-    const j = await r.json();
-    if(!r.ok){ throw new Error(j.error && j.error.message ? j.error.message : ('HTTP '+r.status)); }
-    const a = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts
-              ? j.candidates[0].content.parts.map(p=>p.text||'').join('') : '(no answer returned)';
-    thinking.textContent = a;
-    history.push({role:'model', parts:[{text:a}]});
-    if(history.length > 12) history = history.slice(-12);
-  }catch(err){
-    thinking.className = 'msg err';
-    thinking.textContent = 'Gemini error: ' + err.message;
-    history.pop();
-  }finally{
-    sendBtn.disabled = false;
-  }
-}
 </script>
 </body>
 </html>
