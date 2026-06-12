@@ -205,7 +205,9 @@ as provenance structure vs intervention diffuseness.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the
-  retrievable fragment alone (provably, no dense-`G` term) vs require the computed fragment.
+  retrievable fragment alone (provably, no dense-`G` term) vs require the computed fragment. *Now the
+  subject of a companion proposal — [`PROVABLE_OPT_PROPOSAL.md`](./PROVABLE_OPT_PROPOSAL.md) — which casts
+  LO5 as a certified Datalog reduction (magic-sets demand pruning) and adds margin-certified pruning/quant.*
 
 ---
 
