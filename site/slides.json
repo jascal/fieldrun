@@ -1,0 +1,169 @@
+[
+  {
+    "k": "Paper",
+    "t": "What a Transformer Retrieves and What It Computes",
+    "target": "sec-abstract",
+    "quotes": [
+      "is the model retrieving a symbolic rule, selecting within a rule-proposed set, or computing something new?",
+      "splits roughly 25% retrieved, 60% selected, 15% composed"
+    ],
+    "h": "<p class='big'>A measured theory of the composition core — with <b>incidence calculus</b>, <b>tropical geometry</b>, and <b>semiring Datalog</b> as three interpretations of one object.</p><ul><li>Every next-token decision classified: <b>retrieved</b>, <b>selected</b>, or <b>computed</b>.</li><li>Headline: <span class='num'>~25% / 60% / 15%</span> — and the computed core <b>grows with scale</b>.</li><li>One theory, two temperatures: soft logic at T=1, hard geometry at T=0, one Datalog program under two semirings.</li></ul><p class='dim'>J. Allan Scott — use ←/→ keys or the buttons below. The right pane highlights the matching paper text for each slide.</p>"
+  },
+  {
+    "k": "§1 · The question",
+    "t": "Lookup table or genuine computation?",
+    "target": "sec-1",
+    "quotes": [
+      "how to tell these apart operationally, on a real model, token by token",
+      "a flat retrieval store (n-gram successor tables, induction copy-rules, a closed-class grammar skeleton)"
+    ],
+    "h": "<ul><li>\"The capital of France is\" = <b>retrieval</b>. But many tokens are <b>assembled on the fly</b> from distributed partial contributions.</li><li>This paper makes the distinction <b>operational, per token, on real models</b>.</li><li>Tool: the <b>fieldrun decompiler</b> — splits a transformer into a flat retrieval store (n-grams, induction rules, grammar — reconstructs ~half the predictions with <i>no linear algebra</i>) + a composition kernel.</li><li>Faithful, not approximate: every tier validated by <b>exact top-1 agreement</b> with reference implementations.</li></ul>"
+  },
+  {
+    "k": "§1/§3 · The three routes",
+    "t": "Retrieved · Selected · Composed",
+    "target": "sec-3",
+    "quotes": [
+      "we classify the model’s argmax token t into three routes",
+      "All probes below are explain-only: the decode path is untouched"
+    ],
+    "h": "<ul><li><b>RETRIEVED</b> — a single store rule's top-1 <i>is</i> the model's token: pure symbolic lookup.</li><li><b>SELECTED</b> — the token is <i>in</i> the rule-proposed candidate set, but no rule picks it: the choice is made elsewhere.</li><li><b>COMPOSED</b> — in <i>no</i> rule's output: the <b>irreducible computation</b>.</li></ul><p>Four measured quantities organise everything: the <b>participation ratio PR</b>, the <b>normalised margin</b> (distance to the nearest decision facet), the <b>readout multiplicity μ<sub>t</sub></b>, and the <b>pivotality D<sub>j</sub></b>.</p><p class='dim'>All probes are explain-only — the decode path is untouched, so the numbers describe the real model.</p>"
+  },
+  {
+    "k": "§4.1 · Headline",
+    "t": "The labour splits 25 / 60 / 15",
+    "target": "sec-4-1",
+    "quotes": [
+      "roughly 25% RETRIEVED, 60% SELECTED, 15% COMPOSED",
+      "covers the model’s argmax ∼85% of the time on natural text but only ∼63% on code"
+    ],
+    "h": "<ul><li>Natural text: <span class='num'>~25%</span> retrieved, <span class='num'>~60%</span> selected, <span class='num'>~15%</span> composed. Most \"computation\" is <b>disambiguation within a retrieved set</b>.</li><li>Regime-dependent as expected: store covers <span class='num'>85%</span> of natural text but only <span class='num'>63%</span> of code — <b>code is computed, not retrieved</b>.</li><li>Replicates across a second architecture family (Pythia 70M–1B) and a different store construction (Table 1).</li><li>The composed share <b>grows monotonically with scale</b>: 7.8 → 14.8% up the Pythia ladder against a fixed store. <b>Bigger models compute more.</b></li></ul>"
+  },
+  {
+    "k": "§4.2 · No dominant circuit",
+    "t": "A uniform ~45-way sum — magnitude decides nothing",
+    "target": "sec-4-2",
+    "quotes": [
+      "The participation ratio is PR ≈ 42–49 on Qwen",
+      "No source dominates the logit magnitude, ever."
+    ],
+    "h": "<ul><li>Obvious hypothesis (retrieved = one dominant circuit) is <b>false</b>.</li><li>Participation ratio <span class='num'>PR ≈ 42–49</span>, <b>route-invariant</b>: even tokens an n-gram rule reproduces perfectly are carried by a ~45-way distributed sum.</li><li><b>No source ever dominates the logit.</b> Mechanism: uniformly distributed additive sum + argmax — exactly what superposition predicts.</li><li>On Pythia, PR tracks <b>head count</b>, not parameter count: it's an architecture-shape parameter.</li></ul>"
+  },
+  {
+    "k": "§4.3 · The two axes",
+    "t": "Margin and readout multiplicity separate the routes",
+    "target": "sec-4-3",
+    "quotes": [
+      "monotone RETRIEVED ≫ SELECTED > COMPOSED",
+      "the argmax of a sum that is the argmax of no summand."
+    ],
+    "h": "<ul><li>Two nearly-independent axes (r ≈ 0.15, ~2% shared variance):</li><li><b>Geometry:</b> exact facet distance is monotone <span class='num'>R ≫ S > C</span> — retrieved tokens sit <b>deep in their decision cell</b>, composed tokens hug a facet.</li><li><b>Redundancy:</b> <span class='num'>~80%</span> of composed tokens have <b>μ<sub>t</sub> = 0</b> — no single circuit, in isolation, picks the answer.</li></ul><div class='pull'>Emergence, operationally: the argmax of a sum that is the argmax of no summand.</div><p class='dim'>Survives a confidence control — it's not just \"the store covers the easy ones.\"</p>"
+  },
+  {
+    "k": "§4.3 · Critical test",
+    "t": "Composition is NOT a near-miss of the rule",
+    "target": "sec-4-3",
+    "quotes": [
+      "own prediction for only 14%/8%",
+      "composition is a non-local divergence from the rule, not a near-miss"
+    ],
+    "h": "<ul><li>Natural story: a composed token is the residual <b>drifting just across the facet</b> out of the store's cell.</li><li><b>Refuted:</b> the nearest facet is the store's own prediction for only <span class='num'>14% / 8%</span> of composed tokens.</li><li>For <span class='num'>~85%</span>, the store's prediction <b>isn't even the nearest competitor</b> — composition is a <b>non-local divergence</b>, not a near-miss.</li><li>The ~14% near-miss residue is one identifiable thing: closed-class / morphological coin-flips (a⊥the, will⊥is) — grammar, not novel computation.</li></ul>"
+  },
+  {
+    "k": "§4.4 · Causal ablation",
+    "t": "Composed is fragile; the causal variable is D vs Δ",
+    "target": "sec-4-4",
+    "quotes": [
+      "knock out the single top circuit and a composed token flips ∼2.4× as often as a retrieved one",
+      "holds as a near-perfect necessary condition"
+    ],
+    "h": "<ul><li><b>Route-ordered fragility:</b> knock out one top circuit → flips R <span class='num'>22/26%</span> &lt; S <span class='num'>40/48%</span> &lt; C <span class='num'>54/61%</span> (~2.4×). But <b>margin is the governor</b> — flips collapse 76→41→17% across margin terciles.</li><li><b>Redundancy is non-compensatory:</b> backups (μ<sub>t</sub>≥2) confer no protection. Many weak readers ≠ fault tolerance.</li><li><b>The linear flip identity</b> flip ⇔ Δ &lt; D<sub>j</sub> is a near-perfect <i>necessary</i> condition; logistic control shows μ<sub>t</sub> carries ~zero causal weight — it's a proxy for (Δ, D<sub>j</sub>).</li></ul>"
+  },
+  {
+    "k": "§4.4 · Kernel & repair",
+    "t": "Near-synonyms cancel; the repair is diffuse",
+    "target": "sec-4-4",
+    "quotes": [
+      "common-mode evidence cancels",
+      "the per-head un-rescue rate is order-1/PR"
+    ],
+    "h": "<ul><li><b>Non-truth-functionality is a kernel:</b> as the runner-up becomes a near-synonym (ρ = cos(U<sub>t</sub>,U<sub>v*</sub>) → 1), pivotality collapses — common-mode evidence cancels. Competition hardness is read <b>directly off the Gram</b>.</li><li><b>Rescue:</b> when the identity predicts a flip, downstream recomposition saves the token <span class='num'>~half</span> the time; the cushion scales with margin (14→61%).</li><li>But the repair is <b>not localisable</b>: per-head un-rescue is order <span class='num'>1/PR</span> (4.0–4.1% vs 2.5–2.8%); 18–34% of rescues survive every single-block ablation. <b>No surgical repair target exists.</b></li></ul>"
+  },
+  {
+    "k": "§4.5–4.6 · Exactness & scale",
+    "t": "Exact reconstruction · scaling · a quantisation bridge",
+    "target": "sec-4-5",
+    "quotes": [
+      "floating-point exact reconstruction",
+      "quantise the retrievable tier hard, protect the computed core"
+    ],
+    "h": "<ul><li><b>Σblocks = logit to floating point</b> (error ~6×10<sup>−6</sup>): the static decomposition is exact — the empirical face of the export soundness theorem.</li><li>Decision is <b>block-sparse</b> (~8–10 of 49 blocks) but <b>circuit-dense</b> below block granularity.</li><li>μ<sub>t</sub>-redundancy is <b>scale-emergent</b> (appears between 160M and 410M); margin geometry is scale-stable from 70M.</li><li><b>Deployment bridge:</b> int4 flip rates R <span class='num'>3.6/2.4%</span> ≪ C <span class='num'>5.9/18.8%</span> — quantise the retrievable tier hard, protect the computed core.</li></ul>"
+  },
+  {
+    "k": "§5 · The theory",
+    "t": "Five measured constraints → one object, three views",
+    "target": "sec-5",
+    "quotes": [
+      "We now give a structure with all five properties"
+    ],
+    "h": "<p>Any theory of the core must be:</p><ul><li><b>additive</b> (the logit is an exact sum),</li><li><b>cardinality-inert</b> (only D<sub>j</sub> and Δ matter, not the count μ<sub>t</sub>),</li><li>carry a <b>non-truth-functional coupling</b> hardening with ρ,</li><li>decide by <b>weighted threshold beyond Horn clauses</b>,</li><li>and have a <b>diffuse 1/PR repair layer</b>.</li></ul><p class='big'>The paper gives one structure with all five properties — seen as <b>logic (T=1)</b>, <b>geometry (T=0)</b>, or <b>computation (a semiring program)</b>.</p>"
+  },
+  {
+    "k": "§5.1 · Interpretation I",
+    "t": "Logic at T=1: Projective Incidence Calculus",
+    "target": "sec-5-1",
+    "quotes": [
+      "ours is the linear functional",
+      "recovered as a PIC incidence frequency"
+    ],
+    "h": "<ul><li>Bundy 1985: probability isn't truth-functional, but <b>incidence</b> is — track the worlds, recover probability as measure.</li><li>PIC: incidence sets → <b>linear functionals ⟨·,U<sub>v</sub>⟩</b>; set overlap → <b>Gram kernel G<sub>vw</sub></b>; ∩/∪ → <b>weighted threshold</b>.</li><li><b>Thm 2:</b> competition hardness is monotone in ρ; classical Boolean calculus = the diagonal-G limit.</li><li><b>Thm 4:</b> the model's softmax recovered <i>exactly</i> as a PIC incidence frequency (product of experts) — \"probability as proportion of worlds,\" forty years on.</li><li><b>Thm 5:</b> the repair layer is provably diffuse: single-module influence O(1/PR).</li></ul>"
+  },
+  {
+    "k": "§5.2 · Interpretation II",
+    "t": "Geometry at T=0: the tropical decision surface",
+    "target": "sec-5-2",
+    "quotes": [
+      "is a tropical polynomial in r over the (max, +) semiring",
+      "the decision cells no lookup table reproduces"
+    ],
+    "h": "<ul><li>The max-logit M(r) = max<sub>v</sub>(⟨r,U<sub>v</sub>⟩+b<sub>v</sub>) is a <b>tropical polynomial</b>; its hypersurface is the decision boundary; its cells are the <b>Laguerre power diagram</b> (Prop. 1).</li><li><b>Prop. 2 — measured:</b> the normalised margin <i>is</i> the exact Euclidean facet distance, computed over all 151,936 tokens.</li><li>Emergence = <b>interior cells</b>: the winning monomial belongs to no single source.</li><li><b>Tropical-rank floor:</b> a lookup table has one monomial per stored key; composition needs monomials <i>not in any table</i> — a gap linear (SVD) rank structurally cannot see.</li></ul>"
+  },
+  {
+    "k": "§5.3 · Interpretation III",
+    "t": "Computation: one Datalog program, two semirings",
+    "target": "sec-5-3",
+    "quotes": [
+      "exactly Datalog evaluated under a provenance semiring",
+      "PTIME data complexity, a unique least fixpoint"
+    ],
+    "h": "<ul><li>The core's decode <i>is</i> Datalog under a <b>provenance semiring</b>: rules for the retrievable fragment, a flagged dense aggregate for the computed one.</li><li><b>Thm 6:</b> log-semiring → sum-product → <b>the softmax</b>; tropical semiring → max-product → <b>the greedy decode</b>. One program, two temperatures.</li><li>Why Datalog, not Prolog: semiring laws survive (no cut/clause-order), bottom-up <b>least fixpoint</b> matches residual accumulation, and the program is decidable &amp; statically analysable (<b>PTIME data complexity</b>).</li><li><b>Conjecture 1 (provenance gap):</b> scalar semirings are exact only on diagonal G — dense G needs geometry-valued provenance.</li></ul>"
+  },
+  {
+    "k": "§5.4 · Unification",
+    "t": "One wall, three measures; one kernel, three roles",
+    "target": "sec-5-4",
+    "quotes": [
+      "One wall, three measures: participation ratio, tropical rank, treewidth"
+    ],
+    "h": "<ul><li><b>Maslov dequantization</b> is the bridge: T logΣexp(L/T) → max L, softmax → argmax. The power diagram is the T→0 limit of the softmax cells.</li><li>The <b>same irreducible computation</b> appears as: high PR (logic) = high tropical rank (geometry) = high treewidth (computation).</li><li>The <b>same kernel G</b> is: the non-truth-functionality operator = the facet geometry = the provenance coupling.</li><li>Retrievable fragment: additive / low-rank / low-treewidth → exports compactly. Computed fragment: diffuse / high-rank / dense-G → no compact symbolic form.</li></ul>"
+  },
+  {
+    "k": "§6–7 · Repro & open",
+    "t": "Reproducibility and the open frontier",
+    "target": "sec-6",
+    "quotes": [
+      "Every quantitative claim traces to an explain-only probe"
+    ],
+    "h": "<ul><li><b>Every quantitative claim</b> traces to an explain-only probe: <code>--attribute</code>, <code>--probe-dla</code>, <code>--probe-facet</code>, <code>--probe-ablate</code>, <code>--probe-reconstruct</code>, <code>--probe-quant</code>, <code>export --logic</code>.</li><li>Open problems: <b>O1</b> soundness of coalition inference · <b>O2</b> support number ~ PR? · <b>O3</b> derive the ~1.5× repair constant · <b>O4 (central)</b> a geometry-valued provenance semiring carrying G · <b>O5</b> treewidth as the third wall-measure · <b>O6</b> cross-scale invariance of G's spectrum.</li></ul>"
+  },
+  {
+    "k": "§8 · Conclusion",
+    "t": "Mostly retrieval, a scale-growing computed remainder",
+    "target": "sec-8",
+    "quotes": [
+      "the central idea is Bundy’s",
+      "one kernel G, one wall measured three ways"
+    ],
+    "h": "<ul><li>A transformer spends most of its labour <b>retrieving and selecting</b>; a small, scale-growing remainder <b>computes something new</b> — now measurable, with an exact geometric and causal characterisation.</li><li>The three interpretations share <b>one kernel G</b>, <b>one wall</b> measured three ways, and <b>one homomorphism</b> between temperatures. Not analogies — one theory.</li><li>And the lineage is the point: <i>the central idea is Bundy's</i> — incidence calculus, forty years on, meeting a substrate he could not have had.</li></ul><p class='dim'>Use the Gemini panel below to interrogate any claim.</p>"
+  }
+]

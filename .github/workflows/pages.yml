@@ -1,0 +1,46 @@
+name: Build & deploy paper site
+
+# The draft paper (paper/*.pdf) is turned into the slide-reader site
+# automatically: scripts/build_site.py extracts the text, places the
+# slide highlights from site/slides.json, renders site/template.html,
+# and the result is deployed to GitHub Pages.
+#
+# To publish a new draft: replace the PDF in paper/ and push.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'paper/**'
+      - 'site/**'
+      - 'scripts/build_site.py'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pdftotext
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Build site from the draft PDF
+        run: python3 scripts/build_site.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4
