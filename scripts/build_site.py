@@ -12,6 +12,7 @@ Requires: pdftotext (poppler-utils). Stdlib-only Python.
 """
 import json
 import re
+import shutil
 import subprocess
 import sys
 from html import escape
@@ -210,6 +211,9 @@ def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     (OUT_DIR / "index.html").write_text(page)
     (OUT_DIR / ".nojekyll").write_text("")
+    # Ship the source PDF alongside the site so the reader can link/embed it (figures and tables are
+    # vector graphics pdftotext can't extract — paper.pdf is the canonical figures-and-tables view).
+    shutil.copyfile(pdf, OUT_DIR / "paper.pdf")
 
     found = sum(len(v) for v in marks.values())
     print(f"built docs/index.html from {pdf.name}: {len(sections)} sections, "
