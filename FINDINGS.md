@@ -269,6 +269,27 @@ checks `Σ_blocks == logit`. This is the empirical face of the logic-export soun
   there for composed tokens** — below the block it is the dense forge-tax sum (T4 / LE-T2). The source-level O2 σ is the
   circuit-coalition question (§5c), not this block-level one.
 
+## 5e. Quantization sensitivity tracks the retrievable/computed split (the research→speed bridge)
+
+`--probe-quant` quantizes each residual-stream block's write per-row to int4 (round-trip) **one at a time**, re-decodes,
+and asks whether the prediction flips — testing whether a block's pivotality `D_b` (its contribution to the t-vs-v\*
+margin) predicts how much quantizing it perturbs the decode. Both Qwen2.5-0.5B, 80 positions × 49 blocks.
+
+- **Pivotality predicts quant-sensitivity — monotone but weak.** Top-`|D_b|` tercile single-block flip **7.0% / 14.2%**
+  vs bottom **3.1% / 8.9%** (coder/instruct) — a 1.6–2.3× rise; `corr(|D_b|, flip) ≈ 0.09` (low, but flip is a rare
+  binary event so the tercile is the readout). A modest *static* lever: late blocks carry high average `D_b` (§5d), so
+  protect late-block weights, quantize early hard.
+- **The stronger signal is the ROUTE: quant-robustness tracks the retrievable/computed split.** Single-block int4 flip
+  by route: RETRIEVED **3.6% / 2.4%** ≪ SELECTED 4.5% / 12.9% < COMPOSED **5.9% / 18.8%** — RETRIEVED tokens are
+  **2–8×** more quant-robust than COMPOSED. ⇒ **tier-differentiated quantization (Phase 4b) is justified by data**: the
+  retrievable tier (knowledge) survives aggressive quant; the composition tier (the forge tax) is where quant error
+  concentrates and decisions flip. *Quantize the retrievable tier hard, protect the core* — and *why* is the thesis
+  (composed = computed, needs precision).
+- *Honest caveats:* single-block int4 is the **marginal** sensitivity (real quant hits all blocks at once; interactions
+  untested); instruct is more fragile overall (mean flip 11.6% vs 4.5%); the `corr` is weak so per-block `D_b` is a
+  *soft* knob and the route is the strong one. (`Model::predict_block_quant`, rope; explain/probe-only — decode path
+  untouched.)
+
 ## 6. Open math questions (with empirical status)
 
 - **Q1 (tropical/Boolean boundary).** The retrieval/composition boundary as alignment between the U
@@ -319,6 +340,9 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-recon
 # emit a runnable semiring-Datalog program for ONE decode (LOGIC_EXPORT.md LO3; retrievable clauses + per-block
 # contrib facts + (max,+) decode; self-checks Σcontrib==logit and decode==model). rope arch.
 fieldrun --bundle <qwen> --ids <ctx.json> --store <store.json> export --logic --ctx 32 --candidates 24 --out decode.dl
+# D_j vs quantization sensitivity: per-block int{bits} quant → flip vs pivotality, by route (§5e; the research→speed
+# bridge — tier-differentiated quant justified). rope arch; ~nblocks forwards/position, keep --n-eval modest.
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-quant --bits 4 --n-eval 80
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).

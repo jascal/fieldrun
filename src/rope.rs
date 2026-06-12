@@ -497,6 +497,77 @@ impl Model for Rope {
         Some((self.b.config[0] as usize, self.b.config[1] as usize)) // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
     }
 
+    fn predict_block_quant(&self, ids: &[i64], block: usize, bits: u8) -> Option<i64> {
+        // Mirror `hidden`, but quantize the `block`-th residual write (per-row symmetric round-trip to `bits`) before
+        // it is added to the stream — so downstream layers recompute over the quantized contribution (the real
+        // sensitivity, including the diffuse cushion). block 0 = embed; layer l → 2l+1 attn, 2l+2 mlp.
+        let q = ((1i32 << (bits - 1)) - 1) as f32; // 127 (int8) / 7 (int4)
+        let qz = |a: &mut Array2<f32>| {
+            for mut row in a.rows_mut() {
+                let mx = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                if mx > 0.0 {
+                    let s = mx / q;
+                    row.iter_mut().for_each(|v| *v = (*v / s).round() * s);
+                }
+            }
+        };
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        if block == 0 {
+            qz(&mut x);
+        }
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut qp = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut qp, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut qp, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = qp.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let mut aw = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            if block == 2 * l + 1 {
+                qz(&mut aw);
+            }
+            x = &x + &aw;
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidn = gate;
+            for (hv, uv) in hidn.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            let mut mw = self.down(&hidn, &format!("{p}mlp.down_proj"));
+            if block == 2 * l + 2 {
+                qz(&mut mw);
+            }
+            x = &x + &mw;
+        }
+        let xf = rmsnorm(&x, self.b.arr1("norm"), self.eps);
+        let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(seq - 1).to_vec());
+        Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
     fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
         // Re-run the forward, capturing each residual-stream WRITE at the last position: the embedding, then per layer
         // the attention block's o_proj output and the MLP block's down_proj output. These sum (linearly) to the
