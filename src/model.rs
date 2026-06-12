@@ -190,6 +190,14 @@ pub trait Model: Sync {
         None
     }
 
+    /// Decode with ONE residual-stream block's write quantized (per-row symmetric to `bits`, round-trip) — for
+    /// `--probe-quant`: does a block's pivotality `D_b` predict how much quantizing it perturbs the decode? `block`
+    /// indexes the residual writes as `residual_decomp` labels them (0 = embed; layer l → `2l+1` attn, `2l+2` mlp).
+    /// Returns the new top-1 token. Default None; rope implements it.
+    fn predict_block_quant(&self, _ids: &[i64], _block: usize, _bits: u8) -> Option<i64> {
+        None
+    }
+
     /// Per-block residual decomposition at the predicting position, for the LE-T5 / `--probe-reconstruct` test: returns
     /// `(labels, contrib)` where `labels[b]` names a residual-stream write (embedding, each layer's attention, each
     /// layer's MLP) and `contrib[b][i]` is that block's exact contribution to the logit of `toks[i]` (in true logit
