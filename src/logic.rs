@@ -86,46 +86,47 @@ pub fn explain_line(p: &Provenance, label: &dyn Fn(i64) -> String) -> String {
 /// the program references tokens by id).
 pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> String {
     let mut o = String::new();
-    o.push_str("% ============================================================\n");
-    o.push_str("% fieldrun logic export — semiring-Datalog program for ONE next-token decision\n");
-    o.push_str("% Greedy decode = (max,+) provenance; swap to log-semiring for the full distribution (LOGIC_EXPORT.md).\n");
-    o.push_str("% The model SPECIALIZED to one context (a partial evaluation / decode trace). Tokens = ids; text in comments.\n");
-    o.push_str("% Soufflé-compatible. Σ over contrib/3 == the true logit (LE-T5). Run: fieldrun eval <this>.dl --semiring max|log\n");
-    o.push_str("% ============================================================\n\n");
+    o.push_str("// ============================================================\n");
+    o.push_str("// fieldrun logic export — semiring-Datalog program for ONE next-token decision\n");
+    o.push_str("// Greedy decode = (max,+) provenance; swap to log-semiring for the full distribution (LOGIC_EXPORT.md).\n");
+    o.push_str("// The model SPECIALIZED to one context (a partial evaluation / decode trace). Tokens = ids; text in comments.\n");
+    o.push_str("// Soufflé-compatible. Σ over contrib/3 == the true logit (LE-T5). Run: fieldrun eval <this>.dl --semiring max|log\n");
+    o.push_str("// ============================================================\n\n");
     o.push_str(".decl candidate(t:number)\n.decl contrib(block:symbol, t:number, w:float)\n");
-    o.push_str(".decl logit(t:number, s:float)\n.decl decide(t:number)\n.decl retrieved(t:number)\n\n");
-    o.push_str("% context:");
+    o.push_str(".decl logit(t:number, s:float)\n.decl decide(t:number)\n.decl retrieved(t:number)\n");
+    o.push_str(".decl induction_copy(t:number)\n.decl ngram_succ(key:symbol, t:number)\n\n"); // Soufflé: all relations declared
+    o.push_str("// context:");
     for &id in ctx.iter().rev().take(16).rev() {
         o.push_str(&format!(" {}", label(id)));
     }
     o.push_str(&format!(
-        "\n% model predicts: {}  (logit {:.3}, margin {:+.3} over runner-up {})\n\n",
+        "\n// model predicts: {}  (logit {:.3}, margin {:+.3} over runner-up {})\n\n",
         label(p.predicted), p.pred_logit, p.margin, label(p.runner_up)
     ));
-    o.push_str(&format!("% ---- candidate set (predicted ∪ runner-up ∪ KB-proposed), |C| = {} ----\n", p.candidates.len()));
+    o.push_str(&format!("// ---- candidate set (predicted ∪ runner-up ∪ KB-proposed), |C| = {} ----\n", p.candidates.len()));
     for &id in &p.candidates {
-        o.push_str(&format!("candidate({}).   % {}\n", id, label(id)));
+        o.push_str(&format!("candidate({}).   // {}\n", id, label(id)));
     }
     o.push('\n');
-    o.push_str("% ---- TIER A: retrievable fragment (looked up; no composition) ----\n");
+    o.push_str("// ---- TIER A: retrievable fragment (looked up; no composition) ----\n");
     if p.induction {
-        o.push_str(&format!("% induction (in-context copy): the predicted token {} repeats an earlier token.\n", label(p.predicted)));
-        o.push_str("retrieved(T) :- induction_copy(T).   % the clean recursive rule: copy the token after the matched prefix\n");
+        o.push_str(&format!("// induction (in-context copy): the predicted token {} repeats an earlier token.\n", label(p.predicted)));
+        o.push_str("retrieved(T) :- induction_copy(T).   // the clean recursive rule: copy the token after the matched prefix\n");
         o.push_str(&format!("induction_copy({}).\n", p.predicted));
     }
     if let Some(r) = &p.rule {
         if !r.idiom.contains("induction") {
             let key_s: Vec<String> = r.key.iter().map(|&k| label(k)).collect();
             let key_atom = r.key.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("_");
-            o.push_str(&format!("% {} rule: key [{}] → predicted token (rank {})\n", r.idiom, key_s.join(", "), r.rank.map(|x| x.to_string()).unwrap_or_else(|| "-".into())));
-            o.push_str(&format!("ngram_succ(\"{}\", {}).   % {} proposes the predicted token\n", key_atom, p.predicted, r.idiom));
+            o.push_str(&format!("// {} rule: key [{}] → predicted token (rank {})\n", r.idiom, key_s.join(", "), r.rank.map(|x| x.to_string()).unwrap_or_else(|| "-".into())));
+            o.push_str(&format!("ngram_succ(\"{}\", {}).   // {} proposes the predicted token\n", key_atom, p.predicted, r.idiom));
         }
     }
     o.push('\n');
-    o.push_str("% ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");
-    o.push_str("% contrib(Block, Token, Weight): block's exact contribution to Token's logit. Σ_Block = logit(Token).\n");
-    o.push_str("% |W|>=0.1 blocks shown; the dense remainder folds into block \"rest\" (the irreducible high-PR\n");
-    o.push_str("% forge-tax sum — no compact rule; LOGIC_EXPORT LE-T2/T4). 'rest' keeps the per-token sum exact.\n");
+    o.push_str("// ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");
+    o.push_str("// contrib(Block, Token, Weight): block's exact contribution to Token's logit. Σ_Block = logit(Token).\n");
+    o.push_str("// |W|>=0.1 blocks shown; the dense remainder folds into block \"rest\" (the irreducible high-PR\n");
+    o.push_str("// forge-tax sum — no compact rule; LOGIC_EXPORT LE-T2/T4). 'rest' keeps the per-token sum exact.\n");
     for (ci, &tok) in p.candidates.iter().enumerate() {
         let total: f32 = p.blocks.iter().map(|(_, ws)| ws[ci]).sum();
         let mut shown = 0.0f32;
@@ -135,12 +136,12 @@ pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> St
                 shown += ws[ci];
             }
         }
-        o.push_str(&format!("contrib(\"rest\", {}, {:.4}).   % dense remainder for {}\n", tok, total - shown, label(tok)));
+        o.push_str(&format!("contrib(\"rest\", {}, {:.4}).   // dense remainder for {}\n", tok, total - shown, label(tok)));
     }
     o.push('\n');
-    o.push_str("% ---- accumulation (⊗ = +) and decision (⊕ = max) — the semiring decode ----\n");
-    o.push_str("logit(T, S) :- candidate(T), S = sum W : { contrib(_, T, W) }.   % ⊗ over blocks (log-semiring +)\n");
-    o.push_str("decide(T)   :- logit(T, S), S = max S2 : { logit(_, S2) }.        % ⊕ = max (max-product, T=0)\n");
+    o.push_str("// ---- accumulation (⊗ = +) and decision (⊕ = max) — the semiring decode ----\n");
+    o.push_str("logit(T, S) :- candidate(T), S = sum W : { contrib(_, T, W) }.   // ⊗ over blocks (log-semiring +)\n");
+    o.push_str("decide(T)   :- logit(T, S), S = max S2 : { logit(_, S2) }.        // ⊕ = max (max-product, T=0)\n");
     o.push_str(".output decide\n\n");
     // LE-T5 round-trip self-check: argmax over candidates from the contrib facts == the model's token.
     let am = (0..p.candidates.len()).max_by(|&a, &b| {
@@ -148,7 +149,7 @@ pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> St
         sa.partial_cmp(&sb).unwrap()
     }).map(|i| p.candidates[i]).unwrap_or(p.predicted);
     o.push_str(&format!(
-        "% LE-T5 round-trip: decide/1 under (max,+) == model argmax {} : {}\n",
+        "// LE-T5 round-trip: decide/1 under (max,+) == model argmax {} : {}\n",
         label(p.predicted), if am == p.predicted { "✓ FAITHFUL" } else { "✗ MISMATCH (candidate set missed the argmax)" }
     ));
     o
