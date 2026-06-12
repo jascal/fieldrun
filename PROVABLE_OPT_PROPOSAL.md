@@ -204,9 +204,17 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
 
-- **PO1 — certified pruning, DEMONSTRABLE next.** Emit, alongside the LO3a program, `margin/1`, `delta/1`,
-  `certified/0`; sweep prune depth (blocks/heads/candidates) and report the *certified rate* vs depth. The
-  immediate buildable step on the artifact already shipped.
+- **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
+  Scores FFN neurons over a calibration set; drops the **provably-dead** (a zero `down_proj` row writes
+  nothing to the residual for *any* activation ⇒ `δ = 0`, exact on every input — the sound certificate core)
+  and the margin-dominated ones; writes a structurally **smaller** fieldrun bundle; certifies decode
+  preservation against fieldrun itself. Measured (tiny rope bundle, 12/64 dead FFN neurons/layer planted):
+  certified-lossless reduction ffn 64→52 (**11% smaller bundle, 20/20 decode match**); margin-gated to
+  ffn 64→36 (**27% smaller, still 20/20**), first flip at 64→28 (19/20 — where the `m>2δ` certificate refuses).
+  The reduced model then **exports to Hugging-Face `safetensors` + `config.json` (`LlamaForCausalLM`) and
+  round-trips back through `fieldrun convert` with 12/12 identical decodes** — closing the loop
+  *bundle → Datalog → optimize → reduce → HF-publishable model → bundle*. *Remaining:* a static (a-priori)
+  `δ` bound through the layers so deeper drops are certified, not just verified (the propagation caveat, §5).
 - **PO2 — the magic-sets forge-tax measure.** Emit `Π` with an explicit retrievable fragment (induction =
   recursive clause, n-gram = fact) and the dense fragment; run `--magic-transform`; report lossless tuple
   reduction (= retrievable mass) and residual (= forge tax); correlate with PR / treewidth (LO4 bridge).

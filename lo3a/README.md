@@ -23,6 +23,11 @@ Soufflé has only `+ - * / ^` and `sum`/`max` — no `exp`/`sqrt`/`sin`/`cos`. S
 | `mint_and_emit.py` | mints a TINY real rope bundle (fieldrun-loadable), a numpy reference forward mirroring `src/rope.rs` (f32), and (for the base variant) a reference Datalog emit. Knobs: `BIAS=1`, `UNTIE=1`. |
 | `verify_all.py` | the verifier: for base / +bias / +untied / +bias+untied, mints a bundle, has **fieldrun** emit the whole-model `.dl`, and checks `souffle(decide) == numpy == fieldrun` on a battery of held-out contexts. |
 | `bench.sh` | provable-optimization anchor: compiles the program (`souffle -o`, native C++), checks the decode is identical + logits agree to ~1 ULP (lossless), and times interpreter vs compiled (**~190× faster**, semantics-preserving). See `../PROVABLE_OPT_PROPOSAL.md` §2.1. Needs the local compiled-mode setup (`../SOUFFLE.md` §1.1). |
+| `bundle_io.py` | read/write fieldrun rope bundles (f32) + a parametric numpy forward mirroring `src/rope.rs`. Shared by the reducer/exporter. |
+| `reduce.py` | **certified Π → smaller bundle reducer**: scores FFN neurons over a calibration set, drops the provably-dead (zero `down_proj` row ⇒ δ=0, exact on every input) and margin-dominated ones, writes a structurally smaller bundle, and certifies decode preservation against fieldrun. |
+| `to_safetensors.py` | **HF export + complete round trip**: reduced bundle → Hugging-Face `safetensors` + `config.json` (`LlamaForCausalLM`) → `fieldrun convert` → bundle′ → decode-compare. Closes the loop bundle ↔ HF. |
+
+The full pipeline these demonstrate: **fieldrun model → LO3a Datalog (`export --logic-whole`) → lossless optimize (`bench.sh`, ~190×) → certified reduce (`reduce.py`, smaller bundle) → HF safetensors (`to_safetensors.py`, publishable) → round-trips back to fieldrun losslessly.**
 | `tiny*/` | the minted bundles (gitignored). |
 | `whole*.dl`, `ctx*/`, `*.facts` | generated programs and context inputs (gitignored). |
 
