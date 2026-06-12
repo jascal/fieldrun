@@ -19,7 +19,7 @@ model, chat — in five copy-paste steps.
 | Tier | What it adds | Status |
 |------|--------------|--------|
 | **A · retrieval** | induction + n-gram backoff + grammar skeleton over the flat store | **done** — bit-for-bit faithful to `lm.py` |
-| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch reference |
+| **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, GPT-NeoX/Pythia, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch (or pure-numpy) reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py`. In chat: `--explain` / `/explain on`; over the API: native `/explain` or `"explain":true` |
 | API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** (default build) — `--serve PORT` (native `/predict`·`/generate`·`/explain` + `/v1/chat/completions`·`/v1/completions`·`/v1/messages`, streaming, **tool/function calling**) and `--chat` |

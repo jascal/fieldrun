@@ -32,6 +32,11 @@ diverges without explaining why.
   **cblas (sgemm)** when built with a BLAS backend — `--features accelerate` (macOS) or `openblas` (Linux) — the lever
   for usable *dense* large-model speed on CPU; the pure-Rust column-block path is the default + faithful reference
   (int8 always uses `i8dot`). `mm_routed_down` (Tier C), and the row-wise embed helpers.
+- `src/neox.rs` — GPT-NeoX/Pythia: LayerNorm(+bias), parallel residual, partial rotary (`rotary_pct` of each head),
+  exact erf GELU, untied `embed_out` (the fused qkv is de-interleaved at convert). Full probe surface
+  (`final_residual`/`explain`/`predict_ablated`), so the FINDINGS battery runs on the Pythia ladder. Faithfulness
+  gate: top-1 exact vs the pure-numpy `scripts/neox_ref.py` (no torch installs on the dev box) — 160m 60/60,
+  70m/410m 20/20. No int8-KV yet (`--kv-int8` warns and uses the f32 cache).
 - `src/composition.rs` / `src/rope.rs` / `src/gemma.rs` / `src/gemma3.rs` / `src/gemma4.rs` — Tier B forward passes
   (GPT-2 / Llama-Qwen / Gemma-2 / Gemma-3 / Gemma-4). **Every arch now has a KV-cache `generate`/`generate_stream`
   (+ int8-KV) and `explain`** — the KV-cache decode is byte-identical to the naive full-recompute path (the f32
@@ -87,7 +92,7 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**9 archs**: GPT-2, RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE** incl. sliding window, **MLA** (DeepSeek-V3/R1/Kimi-K2, incl. YaRN + interleaved rotary; V4 is a different attention class, see below), **MiniMax-M2**), KV-cache +
+Done across the board: Tier A/B (**10 archs**: GPT-2, GPT-NeoX/Pythia (neox), RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE** incl. sliding window, **MLA** (DeepSeek-V3/R1/Kimi-K2, incl. YaRN + interleaved rotary; V4 is a different attention class, see below), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 W8A8 +
 outlier-aware quant; signed int8 dot — stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), **MoE expert-offload**
