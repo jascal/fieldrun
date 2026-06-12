@@ -37,16 +37,27 @@ directive is what makes Soufflé emit a result. That's the whole program — fac
 
 ## 1. Install Soufflé
 
-This machine already has it (`/usr/local/bin/souffle`, **version 2.5**, built with `ffi ncurses
-sqlite zlib`). To check / install elsewhere:
+This machine has **Soufflé 2.5** at `~/.local/bin/souffle` (on `PATH`), built with `ffi openmp
+ncurses sqlite zlib`. Confirm with `souffle --version`. If it's missing (a fresh box, or `which
+souffle` comes up empty), install it — `souffle` is **not** in the Pop!_OS/Ubuntu-24.04 apt repos,
+so on this machine use the official release `.deb`, which needs no root:
 
 ```bash
 souffle --version           # confirm it's present
 
+# This machine (Pop!_OS / Ubuntu 24.04, x86_64) — official 2.5 release .deb, extracted WITHOUT sudo:
+cd /tmp
+curl -sSL -o souffle-2.5.deb \
+  https://github.com/souffle-lang/souffle/releases/download/2.5/x86_64-ubuntu-2404-souffle-2.5-Linux.deb
+dpkg-deb -x souffle-2.5.deb /tmp/souffle-local
+cp /tmp/souffle-local/usr/bin/souffle /tmp/souffle-local/usr/bin/souffleprof \
+   /tmp/souffle-local/usr/bin/souffle-compile.py ~/.local/bin/      # ~/.local/bin is already on PATH
+cp -r /tmp/souffle-local/usr/include/souffle ~/.local/include/      # only needed for compiled mode (`-c`)
+
 # macOS
 brew install souffle
 
-# Debian/Ubuntu
+# Debian/Ubuntu where the apt package exists
 sudo apt-get install souffle
 
 # from source: https://souffle-lang.github.io/build
