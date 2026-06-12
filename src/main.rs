@@ -897,9 +897,15 @@ fn main() {
                 eprintln!("[fieldrun] export --logic: arch {arch} has no residual_decomp (rope only)");
                 return;
             };
-            let tg = api::TextGen::load(&stem, eos.clone());
-            let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
-            let o = logic::emit_dl(&prov, c, &lbl);
+            // token text for the .dl comments comes from the tokenizer (api feature); without it, fall back to ids.
+            #[cfg(feature = "api")]
+            let o = {
+                let tg = api::TextGen::load(&stem, eos.clone());
+                let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
+                logic::emit_dl(&prov, c, &lbl)
+            };
+            #[cfg(not(feature = "api"))]
+            let o = logic::emit_dl(&prov, c, &|id: i64| format!("[{id}]"));
             let faithful = o.contains("✓ FAITHFUL");
             match flag(&args, "--out") {
                 Some(p) => {
