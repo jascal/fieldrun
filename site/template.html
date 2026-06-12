@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What a Transformer Retrieves and What It Computes — slide reader</title>
+<style>
+  :root{
+    --ink:#1a1d23; --paper:#fbfaf7; --accent:#b3541e; --accent2:#1e6fb3;
+    --slide-bg:#171c26; --slide-ink:#e8eaf0; --slide-dim:#9aa3b5;
+    --hl:#ffe9a8; --hl-border:#e8b931;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;}
+  body{display:flex;font-family:Georgia,'Times New Roman',serif;color:var(--ink);background:var(--paper);}
+
+  /* ---------- LEFT: slides ---------- */
+  #left{width:44%;min-width:380px;display:flex;flex-direction:column;background:var(--slide-bg);color:var(--slide-ink);height:100vh;}
+  #slidebox{flex:1;overflow-y:auto;padding:34px 38px 12px;}
+  #slidebox h1{font-family:Helvetica,Arial,sans-serif;font-size:24px;line-height:1.25;margin:0 0 6px;color:#fff;}
+  #slidebox .kicker{font-family:Helvetica,Arial,sans-serif;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);margin-bottom:14px;}
+  #slidebox ul{padding-left:20px;margin:10px 0;}
+  #slidebox li{margin:9px 0;line-height:1.45;font-size:15.5px;}
+  #slidebox .big{font-size:17px;line-height:1.5;}
+  #slidebox .num{color:#ffd27a;font-weight:bold;}
+  #slidebox .dim{color:var(--slide-dim);font-size:13.5px;}
+  #slidebox .pull{border-left:3px solid var(--accent);padding:6px 12px;margin:14px 0;background:rgba(255,255,255,.05);font-style:italic;}
+  #slidebox code{font-family:Menlo,Consolas,monospace;font-size:13px;background:rgba(255,255,255,.1);padding:1px 5px;border-radius:3px;}
+  #nav{display:flex;align-items:center;gap:10px;padding:10px 38px;border-top:1px solid rgba(255,255,255,.12);font-family:Helvetica,Arial,sans-serif;}
+  #nav button{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;}
+  #nav button:hover{background:#39435a;}
+  #counter{font-size:12.5px;color:var(--slide-dim);margin-left:auto;}
+  #dots{display:flex;gap:4px;flex-wrap:wrap;}
+  .dot{width:8px;height:8px;border-radius:50%;background:#3a4356;cursor:pointer;}
+  .dot.on{background:var(--accent);}
+
+  /* ---------- Gemini panel ---------- */
+  #ai{border-top:1px solid rgba(255,255,255,.12);font-family:Helvetica,Arial,sans-serif;background:#121620;}
+  #ai-head{display:flex;align-items:center;gap:8px;padding:9px 38px;cursor:pointer;font-size:13px;color:var(--slide-dim);}
+  #ai-head b{color:#8ab4f8;}
+  #ai-body{display:none;padding:0 38px 14px;}
+  #ai.open #ai-body{display:block;}
+  #keyrow{display:flex;gap:6px;margin-bottom:8px;}
+  #keyrow input{flex:1;background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;padding:7px 10px;font-size:12.5px;}
+  #keyrow select{background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;font-size:12px;}
+  #chatlog{max-height:200px;overflow-y:auto;font-size:13.5px;line-height:1.45;margin-bottom:8px;}
+  .msg{margin:7px 0;padding:8px 11px;border-radius:8px;white-space:pre-wrap;}
+  .msg.user{background:#243047;color:#dfe6f5;}
+  .msg.model{background:#1c2434;color:#cfd8ea;border-left:3px solid #8ab4f8;}
+  .msg.err{background:#3a1d1d;color:#f3b8b8;}
+  #askrow{display:flex;gap:6px;}
+  #askrow textarea{flex:1;background:#1e2533;border:1px solid #333d52;border-radius:6px;color:#e8eaf0;padding:8px 10px;font-size:13.5px;resize:none;height:44px;font-family:inherit;}
+  #askrow button{background:#8ab4f8;color:#10131a;border:0;border-radius:6px;padding:0 18px;font-weight:bold;cursor:pointer;}
+  #askrow button:disabled{opacity:.45;cursor:default;}
+  #chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}
+  .chip{font-size:11.5px;background:#1e2533;border:1px solid #333d52;color:#9fb4d8;border-radius:12px;padding:3px 10px;cursor:pointer;}
+  .chip:hover{border-color:#8ab4f8;}
+  #ai-note{font-size:10.5px;color:#5d6878;margin-top:6px;}
+
+  /* ---------- RIGHT: paper ---------- */
+  #right{flex:1;height:100vh;overflow-y:auto;padding:40px 56px 120px;scroll-behavior:smooth;}
+  #right h2{font-family:Helvetica,Arial,sans-serif;font-size:17px;margin:34px 0 10px;border-bottom:2px solid #e4ded2;padding-bottom:5px;}
+  #right h3{font-family:Helvetica,Arial,sans-serif;font-size:14.5px;margin:22px 0 6px;color:#444;}
+  #right p{line-height:1.62;font-size:15px;margin:10px 0;text-align:justify;}
+  #right .thm{margin:14px 0;padding:10px 16px;background:#f3efe6;border-left:3px solid var(--accent2);font-size:14.5px;line-height:1.55;}
+  #right .thm b{font-family:Helvetica,Arial,sans-serif;font-size:13px;}
+  #ptitle{font-size:23px;line-height:1.3;font-weight:bold;margin-bottom:4px;}
+  #pauth{color:#666;font-size:14px;margin-bottom:24px;}
+  section{border-left:4px solid transparent;padding-left:14px;margin-left:-18px;transition:border-color .3s, background .3s;}
+  section.live{border-left-color:var(--accent);background:rgba(179,84,30,.035);}
+  mark.hl{background:transparent;color:inherit;border-radius:3px;padding:0 1px;transition:background .35s;}
+  mark.hl.lit{background:var(--hl);box-shadow:0 0 0 2px var(--hl);border-bottom:2px solid var(--hl-border);}
+  table.routes{border-collapse:collapse;margin:14px auto;font-size:13.5px;font-family:Helvetica,Arial,sans-serif;}
+  table.routes th,table.routes td{border:1px solid #d8d2c4;padding:5px 12px;text-align:center;}
+  table.routes th{background:#efe9db;}
+  .caption{font-size:13px;color:#666;font-style:italic;margin:6px 0 18px;text-align:center;}
+  /* tiny stacked bar figure */
+  #fig1{display:flex;gap:14px;align-items:flex-end;justify-content:center;margin:18px 0 4px;height:170px;font-family:Helvetica,Arial,sans-serif;}
+  .bar{width:64px;display:flex;flex-direction:column-reverse;height:150px;border-radius:4px 4px 0 0;overflow:hidden;}
+  .bar .r{background:#7da7d9;} .bar .s{background:#b8cce4;} .bar .c{background:#c0504d;}
+  .barlab{font-size:10px;text-align:center;margin-top:4px;color:#555;}
+  .barval{font-size:10px;text-align:center;color:#c0504d;font-weight:bold;}
+  #legend{display:flex;gap:16px;justify-content:center;font-size:11.5px;font-family:Helvetica,Arial,sans-serif;color:#555;margin-bottom:4px;}
+  #legend span i{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px;}
+  pre.repro{background:#23282f;color:#cdd6e3;padding:14px 18px;border-radius:8px;font-size:12px;line-height:1.5;overflow-x:auto;font-family:Menlo,Consolas,monospace;}
+  ol.refs{font-size:13px;line-height:1.5;padding-left:26px;}
+  ol.refs li{margin:7px 0;}
+  @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
+</style>
+</head>
+<body>
+
+<!-- ============ LEFT: SLIDES ============ -->
+<div id="left">
+  <div id="slidebox"></div>
+  <div id="nav">
+    <button id="prev">&#8592; Prev</button>
+    <button id="next">Next &#8594;</button>
+    <div id="dots"></div>
+    <span id="counter"></span>
+  </div>
+  <div id="ai">
+    <div id="ai-head" onclick="document.getElementById('ai').classList.toggle('open')">
+      &#10024; <b>Ask Gemini about this paper</b> <span style="margin-left:auto">click to open/close</span>
+    </div>
+    <div id="ai-body">
+      <div id="keyrow">
+        <input id="gkey" type="password" placeholder="Paste your Gemini API key (stored only in this browser)">
+        <select id="gmodel">
+          <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+          <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+          <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+        </select>
+      </div>
+      <div id="chips">
+        <span class="chip">Explain the three routes simply</span>
+        <span class="chip">What is the participation ratio?</span>
+        <span class="chip">Why Datalog and not Prolog?</span>
+        <span class="chip">What does &mu;t = 0 mean?</span>
+        <span class="chip">Summarize the open problems</span>
+      </div>
+      <div id="chatlog"></div>
+      <div id="askrow">
+        <textarea id="q" placeholder="Ask anything about the paper&hellip; (Enter to send)"></textarea>
+        <button id="send">Ask</button>
+      </div>
+      <div id="ai-note">Your key is kept in this browser's localStorage and sent only to Google's Gemini API (generativelanguage.googleapis.com), together with the paper text and your question. Get a free key at aistudio.google.com.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ RIGHT: PAPER ============ -->
+<div id="right">
+__PAPER__
+</div>
+
+<script>
+/* ================= SLIDES ================= */
+const slides = __SLIDES__;
+
+let cur = 0;
+const box = document.getElementById('slidebox');
+const dots = document.getElementById('dots');
+slides.forEach((s,i)=>{const d=document.createElement('span');d.className='dot';d.onclick=()=>go(i);dots.appendChild(d);});
+
+function go(n){
+  cur = Math.max(0, Math.min(slides.length-1, n));
+  const s = slides[cur];
+  box.innerHTML = `<div class="kicker">${s.k}</div><h1>${s.t}</h1>${s.h}`;
+  box.scrollTop = 0;
+  document.getElementById('counter').textContent = (cur+1)+' / '+slides.length;
+  [...dots.children].forEach((d,i)=>d.classList.toggle('on', i===cur));
+  // highlight paper
+  document.querySelectorAll('mark.hl.lit').forEach(m=>m.classList.remove('lit'));
+  document.querySelectorAll('section.live').forEach(x=>x.classList.remove('live'));
+  const sec = document.getElementById(s.target);
+  if(sec){ sec.classList.add('live'); }
+  const marks = document.querySelectorAll('mark.hl.s'+cur);
+  marks.forEach(m=>m.classList.add('lit'));
+  const first = marks[0] || sec;
+  if(first) first.scrollIntoView({behavior:'smooth', block:'center'});
+}
+document.getElementById('prev').onclick=()=>go(cur-1);
+document.getElementById('next').onclick=()=>go(cur+1);
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT') return;
+  if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' ') {e.preventDefault();go(cur+1);}
+  if(e.key==='ArrowLeft'||e.key==='PageUp') {e.preventDefault();go(cur-1);}
+});
+go(0);
+
+/* ================= GEMINI ================= */
+const keyEl = document.getElementById('gkey');
+keyEl.value = localStorage.getItem('gemini_key') || '';
+keyEl.addEventListener('change', ()=>localStorage.setItem('gemini_key', keyEl.value.trim()));
+const log = document.getElementById('chatlog');
+const qEl = document.getElementById('q');
+const sendBtn = document.getElementById('send');
+let history = [];
+
+function addMsg(cls, text){
+  const d = document.createElement('div');
+  d.className = 'msg '+cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{qEl.value=c.textContent;ask();});
+sendBtn.onclick = ask;
+qEl.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); ask(); }});
+
+async function ask(){
+  const q = qEl.value.trim();
+  const key = keyEl.value.trim();
+  if(!q) return;
+  if(!key){ addMsg('err','Paste a Gemini API key first (free at aistudio.google.com).'); return; }
+  localStorage.setItem('gemini_key', key);
+  qEl.value=''; addMsg('user', q);
+  history.push({role:'user', parts:[{text:q}]});
+  sendBtn.disabled = true;
+  const thinking = addMsg('model','…thinking…');
+  const paperText = document.getElementById('right').innerText;
+  const sys = "You are a helpful expert assistant embedded in a slide-reader for the research paper below. " +
+    "Answer the reader's questions about the paper: explain its concepts, claims, evidence, math and context plainly and accurately. " +
+    "Ground answers in the paper text; if asked something the paper does not address, say so and answer from general knowledge, clearly labelled. " +
+    "Be concise (a few short paragraphs at most). The reader is currently viewing the slide titled: \"" + slides[cur].t + "\".\n\n" +
+    "=== FULL PAPER TEXT ===\n" + paperText;
+  const model = document.getElementById('gmodel').value;
+  try{
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        system_instruction:{parts:[{text:sys}]},
+        contents: history,
+        generationConfig:{temperature:0.3, maxOutputTokens:1024}
+      })
+    });
+    const j = await r.json();
+    if(!r.ok){ throw new Error(j.error && j.error.message ? j.error.message : ('HTTP '+r.status)); }
+    const a = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts
+              ? j.candidates[0].content.parts.map(p=>p.text||'').join('') : '(no answer returned)';
+    thinking.textContent = a;
+    history.push({role:'model', parts:[{text:a}]});
+    if(history.length > 12) history = history.slice(-12);
+  }catch(err){
+    thinking.className = 'msg err';
+    thinking.textContent = 'Gemini error: ' + err.message;
+    history.pop();
+  }finally{
+    sendBtn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
