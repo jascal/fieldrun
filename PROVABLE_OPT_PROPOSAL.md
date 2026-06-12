@@ -81,6 +81,28 @@ All of these preserve the *full* least model of `Π`, hence the whole forward pa
 > (standard Datalog equivalence theory) and **anchored**: the magic-sets transform reproduces the
 > emitted whole-model decode exactly on `lo3a/whole_base.dl`.
 
+### 2.1 Measured: lossless compiled synthesis is ~200× faster (the `T=0` matmul-performance face)
+
+Compiled synthesis is the lossless transform with the largest measured payoff on `Π`, and it is exactly
+the sparse-`(max,+)`-matmul performance face LOGIC_EXPORT §1.5 / LO3(b) names. On `lo3a/whole_base.dl`
+(the LO3a whole-model program), `souffle -o` turns the Datalog into a native binary; the result preserves
+the decode and the logits to one ULP, at ~200× the speed:
+
+| Execution of the *same* `Π` | ms / decode | decode | logit vs interpreter |
+|---|---|---|---|
+| Soufflé interpreter (naive bottom-up aggregate joins) | **4360** | 29 | — |
+| Soufflé **compiled** (`-o`, native C++, semi-naïve + index selection) | **22** | 29 | max Δ = **4.4e-15 (1 ULP)** |
+| fieldrun native kernel (dense f32 LA; incl. model load) | 255 | 29 | exact |
+
+The compiled `decide` is **identical** to the interpreter on every held-out context (10/10 + the LO3a
+48/48); the logit reassociation (4.4e-15) is summation-order from the compiled join plan, below any margin.
+So the speedup is **lossless** in the decisive sense (the decode) and ULP-exact in the logits — a
+semantics-preserving optimization (Soufflé's synthesis is a Futamura projection over the RAM machine,
+provably the same least model), measured. Reproduce: `lo3a/bench.sh`. The interpreter's cost is the naive
+aggregate join (near-cross-product); compilation selects indices and emits native loops — *the same
+move that turns the matmul-aggregate into a kernel*, which is why fieldrun's hand-written dense kernel is
+the limit of this same lossless ladder.
+
 ---
 
 ## 3. PO-T2 — the magic-sets residual *is* the forge tax

@@ -22,6 +22,7 @@ Soufflé has only `+ - * / ^` and `sum`/`max` — no `exp`/`sqrt`/`sin`/`cos`. S
 |------|------|
 | `mint_and_emit.py` | mints a TINY real rope bundle (fieldrun-loadable), a numpy reference forward mirroring `src/rope.rs` (f32), and (for the base variant) a reference Datalog emit. Knobs: `BIAS=1`, `UNTIE=1`. |
 | `verify_all.py` | the verifier: for base / +bias / +untied / +bias+untied, mints a bundle, has **fieldrun** emit the whole-model `.dl`, and checks `souffle(decide) == numpy == fieldrun` on a battery of held-out contexts. |
+| `bench.sh` | provable-optimization anchor: compiles the program (`souffle -o`, native C++), checks the decode is identical + logits agree to ~1 ULP (lossless), and times interpreter vs compiled (**~190× faster**, semantics-preserving). See `../PROVABLE_OPT_PROPOSAL.md` §2.1. Needs the local compiled-mode setup (`../SOUFFLE.md` §1.1). |
 | `tiny*/` | the minted bundles (gitignored). |
 | `whole*.dl`, `ctx*/`, `*.facts` | generated programs and context inputs (gitignored). |
 

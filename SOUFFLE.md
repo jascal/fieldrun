@@ -66,6 +66,35 @@ sudo apt-get install souffle
 `ncurses` + `sqlite` in the build matters here — they enable the interactive profiler and SQLite
 output used in §5.
 
+### 1.1 Compiled mode (`-c` / `-o`) without root
+
+The interpreter needs nothing more. **Compiled synthesis** (`souffle -c`/`-o`, Datalog → native C++ —
+the ~200× lossless speedup in [`PROVABLE_OPT_PROPOSAL.md`](./PROVABLE_OPT_PROPOSAL.md) §2.1) needs the
+Soufflé **source headers** plus the `sqlite`/`zlib`/`ncurses` dev headers and link libs, which the
+runtime `.deb` omits. On a box without root, install them locally:
+
+```bash
+# Soufflé source headers (incl. CompiledSouffle.h, absent from the runtime .deb)
+curl -sSL https://github.com/souffle-lang/souffle/archive/refs/tags/2.5.tar.gz | tar xz -C /tmp
+cp -r /tmp/souffle-2.5/src/include/souffle ~/.local/include/
+
+# sqlite/zlib/ncurses dev headers + link libs — apt-get download needs no root
+cd /tmp && apt-get download libsqlite3-dev zlib1g-dev libncurses-dev libtinfo6
+for d in *.deb; do dpkg-deb -x "$d" /tmp/dev; done
+cp /tmp/dev/usr/include/{sqlite3.h,zlib.h,zconf.h} ~/.local/include/
+cp -P /tmp/dev/usr/lib/x86_64-linux-gnu/lib{sqlite3,z,ncurses,tinfo}.so* ~/.local/lib/
+
+# point souffle's compile driver at the local libs (it hardcodes /usr/lib absolute paths)
+sed -i "s#/usr/lib/x86_64-linux-gnu/lib\(sqlite3\|z\|ncurses\).so#$HOME/.local/lib/lib\1.so#g" \
+    ~/.local/bin/souffle-compile.py
+
+# then, with the local include/lib dirs on the toolchain paths:
+export CPATH="$HOME/.local/include:$CPATH"
+export LIBRARY_PATH="$HOME/.local/lib:$LIBRARY_PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+souffle -o decoder prog.dl && ./decoder -F ctx -D -     # native binary; same result, ~200× faster
+```
+
 ---
 
 ## 2. Run a `.dl` — the two execution modes
