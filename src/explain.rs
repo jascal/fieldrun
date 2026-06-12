@@ -28,7 +28,9 @@ pub struct HeadCircuit {
     pub dla: f32,           // direct logit attribution: this head's contribution to the predicted token's logit
     pub promotes: Vec<i64>, // the tokens the head WRITES to the logits (top of its OV→unembed projection)
     pub pred_rank: u32,     // where the predicted token sits among this head's writes (1 = its top token) — makes the Δ
-}                           // legible when the predicted token isn't in the shown top-5 (a cluster / indirect push)
+    #[serde(skip)]          // legible when the predicted token isn't in the shown top-5 (a cluster / indirect push)
+    pub dla_v: f32,         // this head's contribution to the RUNNER-UP's logit (only set for shown circuits); the
+}                           // per-circuit flip pivotality is D = dla - dla_v (ablate it ⇒ margin shifts by -D). Probe aid.
 
 #[derive(Serialize)]
 pub struct MlpFeature {
@@ -38,7 +40,9 @@ pub struct MlpFeature {
     pub dla: f32,           // direct logit attribution: this neuron's contribution to the predicted token's logit
     pub promotes: Vec<i64>,
     pub pred_rank: u32,     // where the predicted token sits among this neuron's promoted tokens (1 = top); a large rank
-}                           // with a positive Δ flags an indirect / suppressor contribution rather than a direct writer
+    #[serde(skip)]          // with a positive Δ flags an indirect / suppressor contribution rather than a direct writer
+    pub dla_v: f32,         // this neuron's contribution to the RUNNER-UP's logit (shown circuits only); D = dla - dla_v.
+}
 
 #[derive(Serialize)]
 pub struct Explanation {
@@ -66,6 +70,10 @@ pub enum ExplainMode {
     Route,
     Circuits,
     All,
+    /// The logic-export view: per token, the provenance the semiring-Datalog program encodes — route + fired rule +
+    /// the top contributing residual blocks + the margin (LOGIC_EXPORT.md). Faithful-by-construction (it is the
+    /// provenance of the actual decode; LE-T5). Pays one forward/token (the `residual_decomp` deopt).
+    Logic,
 }
 
 impl ExplainMode {
@@ -75,6 +83,7 @@ impl ExplainMode {
             "route" | "routes" | "on" | "true" | "1" => Some(ExplainMode::Route),
             "circuits" | "circuit" | "dla" => Some(ExplainMode::Circuits),
             "all" | "full" | "verbose" => Some(ExplainMode::All),
+            "logic" | "provenance" | "datalog" => Some(ExplainMode::Logic),
             _ => None,
         }
     }
@@ -271,7 +280,7 @@ where
         .map(|&(l, h, role, j, mass, _)| {
             let c = apply_final_norm(head_raw(l, h), gain, center);
             let dla = dot(&c, u_pred) * final_scale;
-            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new(), pred_rank: 0 }
+            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0 }
         })
         .collect();
     head_circuits.sort_by(|a, b| b.dla.total_cmp(&a.dla));
@@ -285,6 +294,8 @@ where
         let proj = project_vocab(&apply_final_norm(head_raw(hc.layer, hc.head), gain, center));
         hc.promotes = top_promoted(&proj, 1.0, 5);
         hc.pred_rank = rank_of(&proj, model_predicts);
+        // contribution to the runner-up, same units as `dla` (proj[pred]*final_scale == dla) → D = dla - dla_v.
+        hc.dla_v = proj.get(runner_up as usize).copied().unwrap_or(0.0) * final_scale;
         debug_assert!(hc.attends_to < ids.len(), "attends_to out of range");
     }
 
@@ -312,7 +323,7 @@ where
             let mut w = neuron_write(l, n);
             w.iter_mut().for_each(|v| *v *= act);
             let c = apply_final_norm(w, gain, center);
-            MlpFeature { layer: l, neuron: n, act, dla: dot(&c, u_pred) * final_scale, promotes: Vec::new(), pred_rank: 0 }
+            MlpFeature { layer: l, neuron: n, act, dla: dot(&c, u_pred) * final_scale, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0 }
         })
         .collect();
     mlp_features.sort_by(|a, b| b.dla.total_cmp(&a.dla));
@@ -324,6 +335,7 @@ where
         let proj = project_vocab(&apply_final_norm(w, gain, center));
         f.promotes = top_promoted(&proj, 1.0, 5);
         f.pred_rank = rank_of(&proj, model_predicts);
+        f.dla_v = proj.get(runner_up as usize).copied().unwrap_or(0.0) * final_scale;
     }
 
     // store the FULL context (it's just the input ids) — render trims the printed preview, but nothing is lost: the

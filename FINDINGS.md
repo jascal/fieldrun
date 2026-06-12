@@ -125,25 +125,149 @@ the `t`–`v` bisector). Both models, 300 positions:
   (model=KB, deep cell) / COMPOSED-85% (genuine divergence, KB geometrically far) / near-miss-15% (function-word
   coin-flip the rule also offered — *not* novel computation).
 
-## 5c. Causal ablation — composed is fragile, but redundancy-beyond-margin is weak
+## 5c. Causal ablation — composed is fragile, and μ_t-redundancy confers no causal protection (decoupling, margin-matched + confound-controlled)
 
-`--probe-ablate` knocks out the top-k DLA circuits in the *forward pass* (`hidden_ab` re-runs with the heads/
-neurons zeroed; `Model::predict_ablated`) and asks whether the prediction flips — converting the μ_t readout
-into a causal intervention.
+`--probe-ablate` knocks out the single top-DLA circuit in the *forward pass* (`hidden_ab` re-runs with the head/
+neuron zeroed; `Model::predict_ablated`) and asks whether the prediction flips — converting the μ_t readout into a
+causal intervention. k=1 (cheap → enough positions for a μ_t × margin split), n=300, both Qwen2.5-0.5B models,
+natural-text holdout, matched-vocab store.
 
-- **Route-ordered fragility, replicated.** flip@k1 RETRIEVED 25%/25% < SELECTED 36%/52% < COMPOSED **59%/75%**
-  (coder/instruct). Knock out just the *top* circuit and COMPOSED flips ~2× as often as RETRIEVED — composed
-  tokens are *causally* fragile (emergent), retrieved ones robust.
-- **De-confound (flip@k1 within matched margin bins) is mixed/weak.** Covered flips less than composed in the
-  *low*-margin bin on both models (coder 69<86, instruct 80<100), but weak/absent in mid and n-starved in high
-  (composed n=3–5). So the flip-ordering is **largely margin** (composed near the boundary), with only a faint
-  redundancy residual.
-- **Resolution of the readout↔causal split.** The *readout* μ_t shows *strong* redundancy-beyond-margin; the
-  *causal* ablation shows it's mostly margin. Why: **redundant encoding (high μ_t) ≠ causal robustness when the
-  margin is thin.** The redundant supporters are individually *weak* (PR≈45, none > ~10% of the logit), so even
-  though *many* circuits point at `t`, removing the top few can still drop it below the runner-up if the cushion
-  is small. μ_t-redundancy and ablation-robustness are **distinct properties that decouple at thin margin** —
-  which is exactly why the readout looked strong while the causal test looked margin-dominated.
+- **Route-ordered fragility, replicated.** flip@k1 RETRIEVED 22%/26% < SELECTED 40%/48% < COMPOSED **54%/61%**
+  (coder/instruct). Knock out just the *top* circuit and COMPOSED flips ~2.4× as often as RETRIEVED — composed
+  tokens are *causally* fragile (emergent), retrieved ones robust. But this tracks margin (RETRIEVED Δ≈1.4–1.6 vs
+  COMPOSED Δ≈0.7), so it must be de-confounded.
+
+- **Grok's decisive falsifier — μ_t split WITHIN matched margin bins.** Grok's incoherence-regime proof predicts the
+  flip is governed by margin Δ and PR, *not* μ_t — so at matched margin, μ_t≥2 (redundantly read) and μ_t=0 (strictly
+  emergent) should flip at the *same* rate; a protective gap (high-μ_t flips *less*) would refute decoupling =
+  redundancy is causally protective. Result — flip% | mean PR | `t→` (= % of ablated circuits that are themselves
+  t-supporters, isolated argmax == t), both models:
+
+  | bin (mean Δ) | μ_t≥2 flip / PR / t→ | μ_t=0 flip / PR / t→ | gap |
+  |---|---|---|---|
+  | coder low 0.19  | 76% / 41 / 80% | 69% / 53 / 0% | +7  |
+  | coder mid 0.65  | 41% / 40 / 91% | 27% / 52 / 0% | +14 |
+  | coder high 1.91 | 17% / 39 / 71% |  7% / 44 / 0% | +10 |
+  | instr low 0.17  | 88% / 37 / 62% | 73% / 48 / 0% | +15 |
+  | instr mid 0.68  | 46% / 37 / 54% | 40% / 46 / 0% |  +6 |
+  | instr high 2.15 | 17% / 32 / 51% |  7% / 43 / 0% | +10 |
+
+  **Margin is the governor** — flip collapses 76→41→17 (μ_t≥2) and 69→27→7 (μ_t=0) across margin terciles, *identically*
+  for both μ_t levels. The residual μ_t gap is small and in the **anti-protective** direction (+6 to +15pp; high-μ_t
+  flips *more*, not less), and the `t→` control explains it exactly: the μ_t≥2 group ablates a *confirmed* t-supporter
+  51–91% of the time vs **0%** for μ_t=0 (structural — μ_t=0 has no individually-t-aligned circuit to remove), so the
+  high-μ_t group strips more pivotal mass. PR is flat — even slightly *higher* in μ_t=0 (44–53 vs 32–41) — so PR doesn't
+  drive the gap either. ⇒ **decoupling confirmed, redundancy-protection falsified.** The deepest reading: in the μ_t≥2
+  cells we remove a confirmed t-supporter *and ≥2 such supporters exist*, yet flip still tracks margin alone — the
+  redundant backups (PR≈40, individually < ~10% of the logit) provide essentially no cushion.
+
+- **(B-clean) the airtight backup test — redundancy is *non-compensatory*.** Restrict to `t→`=1 (we *always* ablate a
+  confirmed t-supporter), then split μ_t=1 (no backup left) vs μ_t≥2 (≥1 backup remains) at matched margin — this holds
+  the which-circuit confound fixed by construction, so the *only* difference between arms is whether redundant backups
+  exist. Pooled over both models (μ_t=1 / μ_t≥2): low-Δ 90% / 80%, mid 36% / 40%, high 4% / 21%. **Backups confer no
+  robust protection** — flat in the bulk, *anti*-protective at high Δ (small n), and only a faint non-significant ~10pp
+  protective hint at the very thinnest margin (the facet, where any cushion would matter most). ⇒ superposition
+  redundancy is **non-compensatory**: removing one t-supporter is *not* caught by the others — no error-correction
+  dynamics in the forward pass, so apparent agreement (many readers) ≠ fault tolerance. This is stronger than "μ_t
+  doesn't predict robustness": by the linear flip identity (flip ⟺ Δ < D_j = c_j^t − c_j^{v*}, j = ablated circuit),
+  μ_t is a property of circuits we *don't* touch, so it's *structurally* irrelevant to single-ablation — the real causal
+  variable is the **ablated circuit's pivotality D_j vs the margin Δ**, of which μ_t is a noisy proxy. (The high-Δ
+  anti-protective blip is almost certainly D_j selection — μ_t≥2 high-margin tokens happen to carry a more dominant top
+  circuit — itself the next thread: regress flip on D_j/Δ directly.)
+
+- **(D_j regression) the causal variable is the ablated circuit's pivotality, not μ_t.** Exposed each circuit's
+  contribution to the *runner-up* (`dla_v`, explain.rs) → per-circuit pivotality **D_j = dla − dla_v** (ablating
+  circuit j shifts the t-vs-v\* margin by −D_j). The **linear flip identity** flip ⟺ Δ < D_j holds as a near-perfect
+  *necessary* condition: binning the linear flip score s = D_j − Δ, actual flip steps cleanly at s=0 (coder 0–4% below
+  → 45–80% above; instruct 11–15% → 60–78%), and sign(s) mispredicts a *non*-flip only 3/300 (coder) / 17/300 (instruct)
+  times — when D_j < Δ the token essentially never flips. It is *not sufficient* (fp 60/51): when s>0, indirect/
+  downstream recomposition **rescues** t about half the time (indirect effects are overwhelmingly protective — ~60
+  rescues vs ~3 betrayals). Matching on s, μ_t≥2 *appears* to flip less, but the per-cell Δ exposes the **margin
+  confound** — μ_t≥2 sits at higher Δ at matched s (coder mid 0.72 vs 0.41; instruct high 1.00 vs 0.32). The principled
+  control settles it: logistic `flip ~ Δ + D_j + 1[μ_t≥2]` (Δ,D_j standardized) gives Δ **−4.21/−3.11**, D_j
+  **+2.82/+1.16**, μ_t≥2 **−0.60/+0.06** (opposite signs across models = noise around 0); **dropping μ_t costs
+  +0.0035/+0.000 mean log-loss** — nothing. ⇒ **μ_t is a proxy for (Δ, D_j) position, not an independent cause**;
+  decoupling confirmed at the regression level. Aside: |w_Δ| > |w_Dj| on both ⇒ the margin protects *beyond* the linear
+  identity (the indirect-rescue channel scales with Δ) — which is *why* flip ⟺ Δ<D_j is necessary but not sufficient.
+
+- **(A/B) the incoherence boundary + Δ-cushion (Grok's derivations, run on both models).** ρ = cos(U_t, U_{v\*});
+  among the s>0 set (linear identity predicts a flip), a **rescue** = the forward pass keeps t (indirect recomposition).
+  Grok's derivation is **2/3 confirmed**:
+  - **(B) Δ-cushion — confirmed.** Rescue rate rises monotonically with Δ at ~matched s (coder 14→39→50→61%; instruct
+    9→36→33→71%). Higher margin ⇒ more downstream rescue — the quantified reason flip ⟺ Δ<D_j is necessary-not-
+    sufficient and |w_Δ| > |w_Dj|.
+  - **(A) geometry — confirmed.** mean|D_j| and flip% both fall with ρ (coder |D_j| 1.47→0.86, flip 53→18%; instruct
+    1.56→0.84, 54→28%): near-synonym competitors have small pivotality D_j = c_j·(U_t−U_{v\*}) (common-mode cancels).
+  - **(A) stochastic-rescue collapse — falsified.** Grok predicted σ(ρ)∝√(1−ρ²)→0 ⇒ rescue→0 at high ρ; instead rescue
+    does *not* fall with ρ (coder 31→44%, instruct 26→40% — flat-to-rising). At high ρ the *linear* lever (D_j) weakens
+    but the *indirect* rescue does not — likely because high-ρ flips involve tiny *absolute* D_j perturbations the
+    forward pass trivially compensates. So near-synonyms are hard to edit because D_j is small, **not** because rescue
+    starves. (`Model::unembed_cos`, rope; explain-only.)
+
+- **(coalition additivity) ΣD_j predicts joint ablation; the cushion is finite; a new-winner channel opens at large k.**
+  Ablating the top-k circuits *jointly* (k=1,2,3,5), the coalition linear identity flip ⟺ Δ < ΣD_j (sk = ΣD_j − Δ):
+  - **(1) additivity holds** — sign(sk) vs forward-flip accuracy stays flat at ~75–83% across k on both models. The
+    *individually*-measured D_j's **add**; indirect effects don't corrupt the sum (I'd predicted additivity would break
+    — it didn't).
+  - **(2) cushion exhausts** — rescue rate among sk>0 falls monotonically with k (coder 35→25→16→16%, instruct
+    31→22→17→11%): stripping more pivotality leaves the forward pass less headroom to rescue, so larger coalitions are
+    more reliably destructive (Grok's "coalition exceeding the cushion", confirmed).
+  - **(3) a new-winner channel opens** — fn (flip despite sk<0) rises with k (coder 3→17, instruct 17→32) while fp
+    falls: at large k the post-ablation argmax becomes a *third* token the t-vs-v\* identity doesn't model (the global
+    power-diagram "surprise", made measurable).
+  ⇒ the editing-budget rule is **ΣD_j > Δ + cushion(Δ,ρ)**, with the cushion exhausting as the coalition grows, plus a
+  multi-facet correction at large k.
+
+- **(rescue localization) the rescue is downstream but DIFFUSE — not a localizable lever.** Two robust facts (both
+  models): (1) the top-DLA circuit is **always late** — L_top mean 20–21 of 24 layers; the highest-direct-attribution
+  circuit sits near the output, so the rescue must operate within the last ~4 layers + final norm. (2) Sweeping {top +
+  a whole downstream layer's **attention** *or* **MLP** block} per k=1 rescue: the MLP carries rescue comparably to
+  attention (Δdepth1 attn/MLP coder 32/36%, instruct 20/33%), and breakability by *some single* downstream block rises
+  to attn 42/58% · MLP 56/67% · **either 66/82%** — but **18–34% of rescues survive every single-block ablation**
+  (genuinely distributed across multiple blocks), with a per-depth profile that **does not replicate** across models. So
+  the rescue is *not* concentrated in a small set of late heads/blocks. ⇒ Grok's "localize δ to a few heads → a cheap
+  hardening/editing lever" is **not supported**; there is no surgical rescue target. This mirrors the rest of the thread:
+  the repair is diffuse *for the same reason* μ_t-redundancy is causally inert and PR≈45 — the whole system is
+  **distributed-superposition, readout AND repair**. Grok's **PR→localizability lemma** (P(single-module un-rescue) ≈
+  1/PR) is **order-of-magnitude confirmed** (`--head-sweep`, 2198/1694 single-downstream-head ablations): per-head
+  un-rescue **4.1% / 4.0%** vs 1/PR **2.5% / 2.8%** (PR 40/35) — a ~1.4–1.6× constant above 1/PR (mild within-substrate
+  concentration; repair not *perfectly* equitable). Cross-check: the measured per-*layer* (≈14-head) rate ~32% is
+  *below* the 1−(1−0.04)¹⁴ ≈ 44% that independent heads predict ⇒ a layer's heads **share** repair (positively
+  correlated un-rescues), so the repair is diffuse *across* layers but partly *redundant within* a layer. (Caveats:
+  whole-block ablation is destructive = upper-bound/non-specific; L_top-always-late limits depth dynamic range.
+  `Model::dims`/`predict_ablated_blocks`, rope; explain-only.)
+
+- **Resolution of the readout↔causal split.** The *readout* μ_t separates routes strongly (coverable redundantly read,
+  μ_t≫1; composed strictly emergent, μ_t≈0). The *causal* ablation shows that redundancy is **inert** under
+  intervention: **redundant encoding (high μ_t) ≠ causal robustness when the margin is thin**, because the redundant
+  supporters are individually weak (PR≈40). μ_t-redundancy and ablation-robustness are **distinct properties that
+  decouple at thin margin in the incoherent regime** — which is exactly why the readout looked strong while the causal
+  test is margin-dominated. *(Hedge, per "no necessity claims": shown at matched margin in this thin-margin/incoherent
+  regime; whether a clean multi-ablation removing **all** t-supporters surfaces protection — and whether decoupling
+  **breaks** for near-synonym runner-ups, where the incoherence assumption fails — is the open follow-on, §6 Q4b.)*
+
+## 5d. Per-block logit reconstruction — the export is faithful (LE-T5), the decision is block-sparse but circuit-dense
+
+`--probe-reconstruct` (`Model::residual_decomp`, rope) decomposes the predicting-position logit into its **per-block
+residual-stream writes** — embedding + each layer's attention + each layer's MLP (49 blocks for a 24-layer model) — and
+checks `Σ_blocks == logit`. This is the empirical face of the logic-export soundness theorem (`LOGIC_EXPORT.md` LE-T5).
+
+- **Reconstruction is EXACT.** `|Σ_blocks − logit|` mean **5.9e-6 / 7.2e-6**, max **2.1e-5 / 3.2e-5** (coder/instruct) —
+  floating-point. Residual-stream additivity holds, so the additive (static) decomposition reconstructs every logit
+  exactly. **The semiring-Datalog export is faithful by LE-T5, confirmed numerically** (no missing components, no
+  nonlinearity in the *static* decode — the only nonlinearity is the per-position final-norm scalar, which folds in).
+- **The decision is block-SPARSE** (margin t-vs-v* over the 49 blocks): effective supporting blocks (block-PR) ≈
+  **8–10 of 49**, top-block share **23–29%**, and σ (top blocks to drop to flip) ≈ **1.1–1.6** — the margin is thin
+  enough that removing the single top (usually late) block flips it. So a decision attributes to a *few* blocks: good
+  for navigating the exported program.
+- **But it is circuit-DENSE within a block** — and **PIC's O2 (composed → *larger* support) does NOT hold at block
+  granularity; it mildly reverses.** COMPOSED is slightly *more* block-concentrated than RETRIEVED (PR 8.2/8.5 < 9.9/8.8,
+  σ 1.2/1.1 < 1.6/1.5, top-block 27/29% > 23/26%) — because composed = thin margin = block-fragile. The "composed is
+  distributed" story is *within-block* (high PR ≈ 45 over a block's ~14 heads / ~4864 neurons; §5c), **not across
+  blocks**. ⇒ **the decision is block-sparse but circuit-dense**: a handful of (mostly late) blocks, each an internally
+  dense sum. For the logic export this means the readable fragment is compact at *block* granularity but **bottoms out
+  there for composed tokens** — below the block it is the dense forge-tax sum (T4 / LE-T2). The source-level O2 σ is the
+  circuit-coalition question (§5c), not this block-level one.
 
 ## 6. Open math questions (with empirical status)
 
@@ -157,9 +281,17 @@ into a causal intervention.
 - **Q4b (code-multiplicity transition — the new object).** `μ_t ≫ 1` for coverable, `μ_t ≈ 0` for composed,
   independent of margin and PR. The reconciliation question: how is a token the argmax of *many* circuits yet
   *no* circuit dominates the magnitude (geometry of redundant weak codes)? And the emergence definition:
-  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. NB the
-  causal ablation (§5c) shows redundancy (μ_t) and robustness *decouple at thin margin* — they're distinct
-  properties, so a theorem must relate `μ_t`, PR, and margin jointly (not μ_t ⇒ robustness).
+  "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem. The causal
+  ablation (§5c) now **confirms decoupling causally** — margin-matched + `t→`-controlled, *and* a logistic
+  `flip ~ Δ + D_j + 1[μ_t≥2]` on both models isolates the causal variables as the margin **Δ** and the ablated
+  circuit's pivotality **D_j = c_j^t − c_j^{v\*}** (μ_t's independent log-loss value ≈ 0) — so μ_t is a *proxy*, and the
+  theorem to write is about **D_j vs Δ plus an indirect-cushion term that scales with Δ** (|w_Δ|>|w_Dj|), not μ_t. The
+  cushion term and the geometry are now **empirically confirmed** (§5c A/B); the one **falsified** sub-model is Grok's
+  σ(ρ)∝√(1−ρ²) rescue-collapse — rescue does not weaken at high ρ. The sharp open test:
+  Grok's proof rests on an **incoherence assumption** (a circuit's push toward `t` is ≈ independent of its push toward
+  the runner-up `v*`); it predicts decoupling should **break** — redundancy becoming protective — exactly when `v*` is
+  a near-synonym of `t` (high `cos(U_t, U_{v*})`). Splitting the flip by runner-up coherence would confirm the proof
+  *by finding its boundary*. Not yet run.
 - Q2 (incidence-granularity entropy rate / forge-tax as positive asymptotic residual), Q3 (continuous
   incidence calculus & failure of truth-functionality, measurable via SAE features), Q5 (rank of the
   resolution map), Q6 (MDL of the boundary / ILP-over-COMPOSED) — open, measurable on this decompile.
@@ -177,8 +309,16 @@ fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-dla --n-eval 500
 # exact power-diagram nearest facet + the killer check + near-miss subclass (§5b; rope arch — needs final_residual)
 fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-facet
-# causal: ablate top-k DLA circuits in the forward pass → flip rate by route, margin-de-confounded (§5c; rope arch)
-fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 200
+# causal: ablate the top DLA circuit → flip; Grok μ_t-falsifier (flip split by μ_t WITHIN matched margin bins,
+# + per-cell PR and t→ which-circuit control) → decoupling confirmed (§5c; rope arch — needs predict_ablated)
+# (add --head-sweep for the per-module 1/PR lemma test; heavy: ~nh forwards/rescue)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-ablate --n-eval 300
+# per-block logit reconstruction: Σ_blocks == logit (LE-T5 exact) + block-level decision support by route
+# (§5d; rope arch — needs residual_decomp; the LOGIC_EXPORT LE-T5/LO2 brick)
+fieldrun --bundle <qwen> --ids <holdout.json> --store <store.json> --probe-reconstruct --n-eval 300
+# emit a runnable semiring-Datalog program for ONE decode (LOGIC_EXPORT.md LO3; retrievable clauses + per-block
+# contrib facts + (max,+) decode; self-checks Σcontrib==logit and decode==model). rope arch.
+fieldrun --bundle <qwen> --ids <ctx.json> --store <store.json> export --logic --ctx 32 --candidates 24 --out decode.dl
 ```
 
 All modes are explain-only; the decode/forward path is untouched (no faithfulness-gate risk).

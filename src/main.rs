@@ -14,6 +14,7 @@ mod api;
 mod bundle;
 #[cfg(feature = "jit")]
 mod jit;
+mod logic;
 mod composition;
 mod convert;
 mod device;
@@ -195,6 +196,68 @@ fn main() {
         if let Err(e) = convert::convert(&model_dir, arch, dtype, embed_dtype, &out) {
             eprintln!("[fieldrun] convert failed: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // `fieldrun eval <prog.dl> [--semiring max|log]` — run an emitted `export --logic` program with the built-in
+    // semiring evaluator (no Soufflé needed). Parses candidate/contrib facts, accumulates logit(T)=Σ contrib (⊗=+),
+    // then applies the cross-candidate ⊕: max-product (default) → decide(T)=argmax (the greedy decode, T=0); log-
+    // semiring → the softmax distribution (T=1). ONE program, two semirings — LE-T5 + the two-temperature claim, run.
+    if matches!(args.get(1).map(String::as_str), Some("eval")) {
+        let path = match args.iter().skip(2).find(|a| !a.starts_with('-')).cloned().or_else(|| flag(&args, "--in").map(String::from)) {
+            Some(p) => p,
+            None => {
+                eprintln!("[fieldrun] eval: give an emitted program — fieldrun eval prog.dl [--semiring max|log]");
+                std::process::exit(2);
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("[fieldrun] eval: cannot read {path}: {e}"); std::process::exit(1); }
+        };
+        let semiring = flag(&args, "--semiring").unwrap_or("max");
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut cands: Vec<i64> = Vec::new();
+        let mut logit: BTreeMap<i64, f64> = BTreeMap::new();
+        let mut blocks: BTreeSet<String> = BTreeSet::new();
+        for line in text.lines() {
+            let l = line.trim();
+            if let Some(rest) = l.strip_prefix("candidate(") {
+                if let Some(Ok(id)) = rest.split(')').next().map(|s| s.trim().parse::<i64>()) {
+                    if !cands.contains(&id) { cands.push(id); logit.entry(id).or_insert(0.0); }
+                }
+            } else if let Some(rest) = l.strip_prefix("contrib(") {
+                let inner = rest.split(')').next().unwrap_or("");
+                let parts: Vec<&str> = inner.splitn(3, ',').collect();
+                if parts.len() == 3 {
+                    if let (Ok(id), Ok(w)) = (parts[1].trim().parse::<i64>(), parts[2].trim().parse::<f64>()) {
+                        *logit.entry(id).or_insert(0.0) += w;
+                        blocks.insert(parts[0].trim().trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            eprintln!("[fieldrun] eval: no candidate/contrib facts in {path} (is it an `export --logic` program?)");
+            std::process::exit(1);
+        }
+        eprintln!("[fieldrun] eval {path}: {} candidates · {} blocks · semiring={semiring}", cands.len(), blocks.len());
+        let mut scored: Vec<(i64, f64)> = cands.iter().map(|&t| (t, *logit.get(&t).unwrap_or(&0.0))).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if semiring == "log" {
+            let mx = scored[0].1;
+            let z: f64 = scored.iter().map(|(_, s)| (s - mx).exp()).sum();
+            println!("% distribution over candidates (log-semiring / sum-product, T=1):");
+            for (t, s) in scored.iter().take(12) {
+                println!("  P {:>6.3}   logit {:>8.3}   token {t}", (s - mx).exp() / z, s);
+            }
+        } else {
+            let (t, s) = scored[0];
+            println!("decide({t}).   % logit {s:.4}  (max-product / argmax, T=0)");
+            if scored.len() > 1 {
+                println!("% runner-up token {} logit {:.4}  margin {:+.4}", scored[1].0, scored[1].1, s - scored[1].1);
+            }
         }
         return;
     }
@@ -808,6 +871,109 @@ fn main() {
             return;
         }
 
+        // export --logic / --export-logic (LOGIC_EXPORT LO3): emit a runnable semiring-Datalog program SPECIALIZED to
+        // ONE next-token decision — the retrievable fragment as readable clauses/facts (Tier A), the composition as
+        // per-block weighted contrib facts (Tier B, the forge tax), and the decode as a (max,+) argmax aggregate. Tokens
+        // are referenced by id (unique, runnable); text is in comments. Σ contrib == logit (LE-T5); a round-trip
+        // self-check confirms the emitted program's decode == the model. Rope-only (needs residual_decomp).
+        let export_logic = has_flag(&args, "--export-logic")
+            || (args.iter().any(|a| a == "export") && has_flag(&args, "--logic"));
+        if export_logic {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap_c: usize = flag(&args, "--candidates").and_then(|s| s.parse().ok()).unwrap_or(48);
+            if ids.len() < 2 {
+                eprintln!("[fieldrun] export --logic needs --ids with a context (≥2 tokens)");
+                return;
+            }
+            let c: &[i64] = if ids.len() > ctx_window { &ids[..ctx_window] } else { &ids[..ids.len() - 1] };
+            let Some(ex) = lm.explain(c) else {
+                eprintln!("[fieldrun] export --logic: arch {arch} has no explain");
+                return;
+            };
+            let _ = ex; // explain re-run inside logic::build; keep the early arch-support check above
+            let Some(prov) = logic::build(lm.as_ref(), c, store.as_ref(), &cfg, cap_c) else {
+                eprintln!("[fieldrun] export --logic: arch {arch} has no residual_decomp (rope only)");
+                return;
+            };
+            let tg = api::TextGen::load(&stem, eos.clone());
+            let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
+            let o = logic::emit_dl(&prov, c, &lbl);
+            let faithful = o.contains("✓ FAITHFUL");
+            match flag(&args, "--out") {
+                Some(p) => {
+                    if std::fs::write(p, &o).is_ok() {
+                        eprintln!("[fieldrun] export --logic → {p}  ({} candidates, {} blocks, decode {})",
+                            prov.candidates.len(), prov.blocks.len(), if faithful { "FAITHFUL ✓" } else { "MISMATCH ✗" });
+                    } else {
+                        eprintln!("[fieldrun] export --logic: could not write {p}");
+                    }
+                }
+                None => print!("{o}"),
+            }
+            return;
+        }
+
+        // --probe-reconstruct (LE-T5 / LOGIC_EXPORT LO2): decompose the predicted-token logit into per-block residual
+        // writes (embed + each layer's attn + mlp). Σ_blocks == logit EXACTLY (residual-stream additivity) ⇒ the
+        // reconstruction residual measures decompiler completeness (LE-T5 exact); the per-block concentration of the
+        // t-vs-v* margin is the decision's block-level support number (PIC O2: small=retrieved, large=composed). Rope-only.
+        if has_flag(&args, "--probe-reconstruct") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            if lm.residual_decomp(&ids[..ctx_window.min(ids.len())], &[0]).is_none() {
+                eprintln!("[fieldrun] --probe-reconstruct: arch {arch} has no residual_decomp (rope only)");
+                return;
+            }
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-reconstruct: {} positions — block decomposition…", positions.len());
+            struct R { route: u8, err: f32, block_pr: f32, top1: f32, sigma: usize }
+            let mut nblocks = 0usize;
+            let recs: Vec<R> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain(c)?;
+                let (t, v) = (ex.model_predicts, ex.runner_up);
+                let (_lab, contrib) = lm.residual_decomp(c, &[t, v])?;
+                let lt: f32 = contrib.iter().map(|b| b[0]).sum();
+                let err = (lt - ex.predicted_logit).abs(); // LE-T5: should be ~0 (additive reconstruction is exact)
+                let mut db: Vec<f32> = contrib.iter().map(|b| b[0] - b[1]).collect(); // per-block t-vs-v* pivotality
+                let margin = db.iter().sum::<f32>(); // == Δ (the decision margin)
+                let pos: Vec<f32> = db.iter().copied().filter(|&x| x > 0.0).collect();
+                let (s, sq): (f32, f32) = (pos.iter().sum(), pos.iter().map(|x| x * x).sum());
+                let block_pr = if sq > 0.0 { s * s / sq } else { 1.0 };          // effective # of supporting blocks
+                let top1 = if s > 0.0 { pos.iter().cloned().fold(0.0, f32::max) / s } else { 0.0 }; // top-block share
+                db.sort_by(|a, b| b.partial_cmp(a).unwrap()); // σ = #top blocks to REMOVE to flip (Σ removed > Δ)
+                let (mut acc, mut sigma) = (0.0f32, 0usize);
+                for &x in &db { if acc > margin { break; } acc += x; sigma += 1; }
+                let route = if let Some(st) = &store {
+                    let (kb, _) = st.predict(c);
+                    if kb == t { 0u8 } else if st.candidates(c, &cfg).contains(&t) { 1 } else { 2 }
+                } else { 3 };
+                Some(R { route, err, block_pr, top1, sigma })
+            }).collect();
+            if let Some((lab, _)) = lm.residual_decomp(positions[0], &[0]) { nblocks = lab.len(); }
+            let n = recs.len().max(1) as f32;
+            let (mean_err, max_err) = (recs.iter().map(|r| r.err).sum::<f32>() / n, recs.iter().map(|r| r.err).fold(0.0, f32::max));
+            println!("\n=== (LE-T5) per-block logit reconstruction over {} blocks (embed + {}×{{attn,mlp}}) ===", nblocks, (nblocks - 1) / 2);
+            println!("reconstruction |Σ_blocks − logit|: mean {mean_err:.2e}  max {max_err:.2e}  ⇒ {}",
+                if max_err < 1e-2 { "EXACT (residual-stream additivity holds; the export is faithful by LE-T5)" } else { "NON-zero (missing components / numerical)" });
+            println!("\n=== block-level decision support (margin t-vs-v* across {} blocks) ===", nblocks);
+            println!("{:<12}{:>6}{:>12}{:>14}{:>16}", "route", "n", "block-PR", "top-block %", "σ (drop→flip)");
+            let groups: &[(&str, u8)] = if store.is_some() { &[("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2)] } else { &[("ALL", 3)] };
+            for (lbl, r) in groups {
+                let g: Vec<&R> = recs.iter().filter(|x| x.route == *r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                let m = g.len() as f32;
+                println!("{lbl:<12}{:>6}{:>12.1}{:>13.0}%{:>16.1}", g.len(),
+                    g.iter().map(|x| x.block_pr).sum::<f32>() / m, 100.0 * g.iter().map(|x| x.top1).sum::<f32>() / m,
+                    g.iter().map(|x| x.sigma as f32).sum::<f32>() / m);
+            }
+            println!("⇒ block-PR / σ = the decision's block-level support number (PIC O2): small ⇒ retrieved-concentrated, large ⇒ composed-distributed. This bounds how compact the emitted retrievable Datalog fragment can be (LOGIC_EXPORT LO3).");
+            return;
+        }
+
         // --probe-ablate (CAUSAL test of the μ_t redundancy claim): knock out the top-k DLA circuits in the FORWARD
         // PASS (re-run with them zeroed) and ask whether the prediction flips. Redundancy prediction: COVERED tokens
         // (many individually-sufficient circuits, μ_t≫1) survive (low flip); COMPOSED tokens (emergent, μ_t≈0) collapse
@@ -823,54 +989,306 @@ fn main() {
                 eprintln!("[fieldrun] --probe-ablate: arch {arch} doesn't support ablation (rope only)");
                 return;
             }
-            let cap = (end - ctx_window).min(n_eval).min(150); // 1 explain + 3 ablated forwards / position
+            let cap = (end - ctx_window).min(n_eval); // k=1: 1 explain + 1 ablated forward / position (cheap → use all n_eval)
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
-            eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…", positions.len());
-            let ks = [1usize, 2, 4];
-            // (route, margin, [flip@k1, flip@k2, flip@k4])
-            let recs: Vec<(u8, f32, [bool; 3])> = positions.par_iter().filter_map(|c| {
+            let head_sweep = has_flag(&args, "--head-sweep"); // per-module O(1/PR) lemma test (expensive: nh forwards/rescue)
+            eprintln!("[fieldrun] --probe-ablate: {} positions — explain + ablated forwards…{}", positions.len(),
+                if head_sweep { " (+per-head sweep)" } else { "" });
+            // Grok's decisive falsifier: ablate the SINGLE top circuit (k=1), record margin + PR + μ_t per position,
+            // then split flip@k1 by μ_t (high ≥2 vs low =0) WITHIN matched margin bins. The decoupling theorem predicts
+            // NO μ_t gap at matched margin (robustness governed by Δ, PR — not μ_t); a large gap (high-μ_t flips less)
+            // would mean redundancy IS causally protective. k=1 is cheap → more positions for the 2-way split.
+            const KS: [usize; 4] = [1, 2, 3, 5]; // coalition sizes for the additivity test
+            struct A { route: u8, margin: f32, pr: f32, mu_t: usize, flip: bool, talign: bool, dj: f32, rho: f32,
+                       sk: [f32; 4], flipk: [bool; 4], // sk[i] = ΣD_j(top KS[i]) − Δ ; flipk[i] = forward flip ablating those
+                       l_top: usize, sweep: Vec<(usize, bool, bool)>, // L_top = ablated circuit's layer; sweep =
+                       // (downstream layer ℓ, un-rescue via ℓ's ATTN block?, un-rescue via ℓ's MLP block?) — k=1 rescues only
+                       head_tried: usize, head_unresc: usize, pr_at: f32 } // per-MODULE (single downstream head) un-rescue
+                       // counts (--head-sweep): tests Grok's lemma P(single-module un-rescue) ≈ 1/PR. pr_at = PR at this rescue
+            let recs: Vec<A> = positions.par_iter().filter_map(|c| {
                 let ex = lm.explain(c)?;
                 let t = ex.model_predicts;
-                let mut circ: Vec<(f32, bool, usize, usize)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head))
-                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron))).collect();
+                // carry isolated argmax (promotes[0]) and dla_v (contribution to the runner-up) per circuit: the ablated
+                // circuit's pivotality D_j = dla - dla_v is the LINEAR flip threshold (ablate ⇒ margin shifts by -D_j).
+                let mut circ: Vec<(f32, bool, usize, usize, Option<i64>, f32)> = ex.head_circuits.iter().map(|h| (h.dla, true, h.layer, h.head, h.promotes.first().copied(), h.dla_v))
+                    .chain(ex.mlp_features.iter().map(|m| (m.dla, false, m.layer, m.neuron, m.promotes.first().copied(), m.dla_v))).collect();
                 circ.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let top = *circ.first()?;
                 let (kb, _) = store.predict(c);
                 let covered = store.candidates(c, &cfg).contains(&t);
                 let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
-                let mut flips = [false; 3];
-                for (ki, &k) in ks.iter().enumerate() {
-                    let topk = &circ[..k.min(circ.len())];
-                    let heads: Vec<(usize, usize)> = topk.iter().filter(|c| c.1).map(|c| (c.2, c.3)).collect();
-                    let neurons: Vec<(usize, usize)> = topk.iter().filter(|c| !c.1).map(|c| (c.2, c.3)).collect();
-                    flips[ki] = lm.predict_ablated(c, &heads, &neurons) != Some(t);
+                let d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                let mu_t = ex.head_circuits.iter().filter_map(|h| h.promotes.first().copied())
+                    .chain(ex.mlp_features.iter().filter_map(|m| m.promotes.first().copied())).filter(|&a| a == t).count();
+                let talign = top.4 == Some(t); // is the single circuit we ablate itself a t-supporter (isolated argmax == t)?
+                let dj = top.0 - top.5;        // D_j of the ablated top circuit (logit units): linear flip ⟺ margin < D_j
+                let rho = lm.unembed_cos(t as usize, ex.runner_up as usize).unwrap_or(0.0); // coherence cos(U_t, U_v*)
+                let margin = ex.predicted_logit - ex.runner_up_logit;
+                // coalition additivity: ablate the top-k circuits JOINTLY. ΣD_j over them is the LINEAR margin shift
+                // (DLA is additive), so the coalition linear identity is flip ⟺ Δ < ΣD_j. As k grows we strip more
+                // pivotality AND leave the forward pass less headroom to rescue — tests additivity + cushion-exhaustion.
+                let (mut sk, mut flipk) = ([0f32; 4], [false; 4]);
+                for (ki, &k) in KS.iter().enumerate() {
+                    let kk = k.min(circ.len());
+                    let (mut hs, mut ns, mut sumdj) = (Vec::new(), Vec::new(), 0f32);
+                    for cc in &circ[..kk] {
+                        sumdj += cc.0 - cc.5; // this circuit's D_j
+                        if cc.1 { hs.push((cc.2, cc.3)); } else { ns.push((cc.2, cc.3)); }
+                    }
+                    sk[ki] = sumdj - margin;
+                    flipk[ki] = lm.predict_ablated(c, &hs, &ns) != Some(t);
                 }
-                Some((route, ex.predicted_logit - ex.runner_up_logit, flips))
+                let flip = flipk[0]; // k=1 single-circuit flip (reused by every earlier table)
+                // rescue localization: for a k=1 RESCUE (s>0 but forward kept t), find WHERE the rescue lives — ablate
+                // {top circuit + a whole downstream layer ℓ's attention} for each ℓ > L_top and see which ℓ un-rescues
+                // (flips). Concentration at small ℓ-L_top ⇒ local rescue just downstream; spread ⇒ diffuse/deep.
+                let l_top = top.2;
+                let mut sweep: Vec<(usize, bool, bool)> = Vec::new();
+                let (mut head_tried, mut head_unresc) = (0usize, 0usize);
+                if sk[0] > 0.0 && !flipk[0] {
+                    if let Some((nl, nh)) = lm.dims() {
+                        let (hh, nnn): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
+                            if top.1 { (vec![(top.2, top.3)], vec![]) } else { (vec![], vec![(top.2, top.3)]) };
+                        for l2 in (l_top + 1)..nl {
+                            // ablate {top circuit + whole ATTN block of ℓ} and {top + whole MLP block of ℓ} separately
+                            let un_attn = lm.predict_ablated_blocks(c, &hh, &nnn, &[l2], &[]) != Some(t);
+                            let un_mlp = lm.predict_ablated_blocks(c, &hh, &nnn, &[], &[l2]) != Some(t);
+                            sweep.push((l2, un_attn, un_mlp));
+                        }
+                        // --head-sweep: per-MODULE test of Grok's lemma — ablate {top + a SINGLE downstream head} for
+                        // every downstream head; P(single-module un-rescue) should ≈ 1/PR (≈2%) in the high-PR regime.
+                        if head_sweep {
+                            for l2 in (l_top + 1)..nl {
+                                for h in 0..nh {
+                                    let mut hs = hh.clone();
+                                    hs.push((l2, h));
+                                    head_tried += 1;
+                                    if lm.predict_ablated(c, &hs, &nnn) != Some(t) { head_unresc += 1; }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(A { route, margin, pr, mu_t, flip, talign, dj, rho, sk, flipk, l_top, sweep, head_tried, head_unresc, pr_at: pr })
             }).collect();
-            println!("\n=== (causal) ablate the top-k DLA circuits in the forward pass → does the prediction FLIP? ===");
-            println!("{:<12}{:>6}{:>10}{:>12}{:>12}{:>12}", "route", "n", "margin", "flip@k1", "flip@k2", "flip@k4");
+            let prs: Vec<f32> = recs.iter().map(|x| x.pr).collect();
+            let prmin = prs.iter().cloned().fold(f32::MAX, f32::min);
+            let prmax = prs.iter().cloned().fold(f32::MIN, f32::max);
+            println!("\n=== (causal) ablate the single top DLA circuit → flip? by route (PR range {prmin:.0}-{prmax:.0}, ~flat) ===");
+            println!("{:<12}{:>6}{:>10}{:>10}{:>12}", "route", "n", "margin", "μ_t", "flip@k1");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
-                let g: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| x.0 == r).collect();
+                let g: Vec<&A> = recs.iter().filter(|x| x.route == r).collect();
                 if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
-                let f = |ki: usize| 100.0 * g.iter().filter(|x| x.2[ki]).count() as f32 / g.len() as f32;
-                let mm = g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32;
-                println!("{lbl:<12}{:>6}{:>10.2}{:>11.0}%{:>11.0}%{:>11.0}%", g.len(), mm, f(0), f(1), f(2));
+                let n = g.len() as f32;
+                println!("{lbl:<12}{:>6}{:>10.2}{:>10.2}{:>11.0}%", g.len(),
+                    g.iter().map(|x| x.margin).sum::<f32>() / n, g.iter().map(|x| x.mu_t as f32).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| x.flip).count() as f32 / n);
             }
-            // de-confound margin: within matched margin bins, does coverage predict robustness (lower flip@k1)?
-            let mut ms: Vec<f32> = recs.iter().map(|x| x.1).collect();
+            // Grok's falsifier: μ_t-split WITHIN matched margin bins (PR ~flat, so margin-matching ≈ (Δ,PR)-matching).
+            let mut ms: Vec<f32> = recs.iter().map(|x| x.margin).collect();
             ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let q = |p: f32| if ms.is_empty() { 0.0 } else { ms[(((ms.len() - 1) as f32) * p) as usize] };
             let (t1, t2) = (q(0.333), q(0.667));
-            println!("\n  (de-confound) flip@k1 WITHIN matched margin bins — COVERED (R+S) vs COMPOSED:");
-            println!("  {:<12}{:>12}{:>20}{:>20}", "margin bin", "mean margin", "COVERED n flip%", "COMPOSED n flip%");
+            let fl = |g: &[&A]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.flip).count() as f32 / g.len() as f32 };
+            let mpr = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.pr).sum::<f32>() / g.len() as f32 };
+            let tal = |g: &[&A]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.talign).count() as f32 / g.len() as f32 };
+            println!("\n  (Grok falsifier) flip@k1 split by μ_t WITHIN matched margin bins:");
+            println!("  {:<10}{:>8}{:>22}{:>22}", "margin bin", "mean Δ", "μ_t≥2  n flip PR t→", "μ_t=0  n flip PR t→");
             for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
-                let inb = |x: &&(u8, f32, [bool; 3])| x.1 >= lo && x.1 < hi;
-                let cov: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 != 2).collect();
-                let cmp: Vec<&(u8, f32, [bool; 3])> = recs.iter().filter(|x| inb(x) && x.0 == 2).collect();
-                let fl = |g: &[&(u8, f32, [bool; 3])]| if g.is_empty() { f32::NAN } else { 100.0 * g.iter().filter(|x| x.2[0]).count() as f32 / g.len() as f32 };
-                let mm = recs.iter().filter(inb).map(|x| x.1).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
-                println!("  {lbl:<12}{mm:>12.2}{:>14} {:>4.0}%{:>14} {:>4.0}%", cov.len(), fl(&cov), cmp.len(), fl(&cmp));
+                let inb = |x: &&A| x.margin >= lo && x.margin < hi;
+                let hi_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t >= 2).collect();
+                let lo_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t == 0).collect();
+                let mm = recs.iter().filter(inb).map(|x| x.margin).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
+                // per cell: n, flip%, mean PR, and t→ = % of ablated top circuits that were themselves t-aligned (the
+                // "which circuit we knock out" confound — higher in μ_t≥2, which inflates its flip% vs μ_t=0).
+                println!("  {lbl:<10}{mm:>8.2}{:>8} {:>3.0}% {:>3.0} {:>3.0}%{:>8} {:>3.0}% {:>3.0} {:>3.0}%",
+                    hi_m.len(), fl(&hi_m), mpr(&hi_m), tal(&hi_m), lo_m.len(), fl(&lo_m), mpr(&lo_m), tal(&lo_m));
             }
-            println!("⇒ if COVERED flip% < COMPOSED flip% WITHIN a margin bin, redundancy is causal BEYOND confidence.");
+            println!("⇒ DECOUPLING (Grok) predicts μ_t≥2 flip% ≈ μ_t=0 flip% within a bin; a large gap (high-μ_t flips less) refutes it = redundancy is causally protective.");
+            println!("  (t→ = % of ablated circuits that were themselves t-supporters: if μ_t≥2's higher flip tracks higher t→, the reverse gap is the which-circuit confound, not protection failing.)");
+            // (B-clean) hold the which-circuit confound FIXED: restrict to t→=1 (we ALWAYS ablate a confirmed
+            // t-supporter), then split flip by μ_t WITHIN matched margin bins. μ_t=1 = we removed the ONLY supporter
+            // (none left); μ_t≥2 = we removed one, ≥1 backup remains. This is the airtight "do backups protect?" test —
+            // both arms ablate a genuine t-supporter, so the only difference is whether redundant backups exist.
+            // DECOUPLING predicts μ_t=1 flip% ≈ μ_t≥2 flip% (backups inert); μ_t≥2 flipping LESS = redundancy protects.
+            let md = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.margin).sum::<f32>() / g.len() as f32 };
+            let nta = recs.iter().filter(|x| x.talign).count();
+            println!("\n  (B-clean) within t→=1 ONLY (always ablate a CONFIRMED t-supporter, n={nta}): flip by μ_t in matched margin bins:");
+            println!("  {:<10}{:>22}{:>22}", "margin bin", "μ_t=1 (none left)  n Δ flip", "μ_t≥2 (backups)  n Δ flip");
+            for (lbl, lo, hi) in [("low ", f32::MIN, t1), ("mid ", t1, t2), ("high", t2, f32::MAX)] {
+                let one: Vec<&A> = recs.iter().filter(|x| x.talign && x.margin >= lo && x.margin < hi && x.mu_t == 1).collect();
+                let many: Vec<&A> = recs.iter().filter(|x| x.talign && x.margin >= lo && x.margin < hi && x.mu_t >= 2).collect();
+                println!("  {lbl:<10}{:>8} {:>5.2} {:>4.0}%{:>12} {:>5.2} {:>4.0}%",
+                    one.len(), md(&one), fl(&one), many.len(), md(&many), fl(&many));
+            }
+            println!("⇒ DECOUPLING predicts μ_t=1 flip% ≈ μ_t≥2 flip% (backups don't catch the loss); μ_t≥2 flipping LESS at matched Δ = redundancy is causally protective. Both arms remove a genuine t-supporter, so this isolates μ_t from the which-circuit confound.");
+            // (D_j regression) the LINEAR flip identity: ablating the top circuit flips iff Δ < D_j (D_j = dla - dla_v,
+            // the circuit's pivotality = how much it shifts the t-vs-v* margin). s = D_j - Δ is the linear flip score
+            // (>0 ⇒ linear predicts flip). Three things at once: (1) does actual forward-flip rise as a step at s=0
+            // (linear identity holds causally)? (2) the confusion of sign(s) vs actual flip (the indirect-effect gap);
+            // (3) is μ_t inert once we bin on s (μ_t≥2 vs μ_t=0 flip% within s-bins should match — μ_t a noisy proxy).
+            let s_of = |x: &A| x.dj - x.margin;
+            println!("\n  (D_j regression) linear flip score s = D_j - Δ  (D_j = dla-dla_v of the ablated circuit):");
+            println!("  {:<14}{:>6}{:>10}{:>12}", "s bin", "n", "mean s", "flip%");
+            for (lbl, lo, hi) in [("s<-1   ", f32::MIN, -1.0), ("-1..-.3", -1.0, -0.3), ("-.3..0 ", -0.3, 0.0),
+                                  ("0..+.3 ", 0.0, 0.3), ("+.3..1 ", 0.3, 1.0), ("s>+1   ", 1.0, f32::MAX)] {
+                let g: Vec<&A> = recs.iter().filter(|x| { let s = s_of(x); s >= lo && s < hi }).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                println!("  {lbl:<14}{:>6}{:>10.2}{:>11.0}%", g.len(), g.iter().map(|y| s_of(y)).sum::<f32>() / n, 100.0 * g.iter().filter(|x| x.flip).count() as f32 / n);
+            }
+            let pred_flip = |x: &A| s_of(x) > 0.0; // linear identity's prediction
+            let (mut tp, mut tn, mut fp, mut fn_) = (0u32, 0u32, 0u32, 0u32);
+            for x in &recs { match (pred_flip(x), x.flip) { (true, true) => tp += 1, (true, false) => fp += 1, (false, true) => fn_ += 1, (false, false) => tn += 1 } }
+            let n = recs.len() as f32;
+            println!("  linear identity sign(s)>0 vs actual flip: acc {:.0}%  [tp {tp} tn {tn} | fp {fp} fn {fn_}]  (fp+fn = indirect-effect / new-winner≠v* gap)",
+                100.0 * (tp + tn) as f32 / n);
+            println!("  ⇒ μ_t inert once s is fixed? flip% by μ_t WITHIN |s| bins (linear-score-matched, the cleanest control):");
+            let mut ss: Vec<f32> = recs.iter().map(|y| s_of(y)).collect();
+            ss.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let sq = |p: f32| if ss.is_empty() { 0.0 } else { ss[(((ss.len() - 1) as f32) * p) as usize] };
+            let (s1, s2) = (sq(0.333), sq(0.667));
+            // per-cell mean Δ and mean D_j: the CONFOUND CHECK. μ_t≥2 flipping less at matched s is genuine indirect
+            // μ_t-protection ONLY if its Δ (and D_j) are ~equal to μ_t=0's; if μ_t≥2 has much higher Δ, the "protection"
+            // is a margin/scale effect (more total cushion), not redundancy. (s = D_j - Δ, so matched s lets Δ co-vary.)
+            let mg = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.margin).sum::<f32>() / g.len() as f32 };
+            let mdj = |g: &[&A]| if g.is_empty() { f32::NAN } else { g.iter().map(|x| x.dj).sum::<f32>() / g.len() as f32 };
+            println!("  {:<8}{:>8}{:>26}{:>26}", "s bin", "mean s", "μ_t≥2  n flip Δ D_j", "μ_t=0  n flip Δ D_j");
+            for (lbl, lo, hi) in [("low s ", f32::MIN, s1), ("mid s ", s1, s2), ("high s", s2, f32::MAX)] {
+                let inb = |x: &&A| { let s = s_of(x); s >= lo && s < hi };
+                let hi_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t >= 2).collect();
+                let lo_m: Vec<&A> = recs.iter().filter(|x| inb(x) && x.mu_t == 0).collect();
+                let ms = recs.iter().filter(inb).map(|y| s_of(y)).sum::<f32>() / recs.iter().filter(inb).count().max(1) as f32;
+                println!("  {lbl:<8}{ms:>8.2}{:>8} {:>4.0}% {:>5.2} {:>5.2}{:>10} {:>4.0}% {:>5.2} {:>5.2}",
+                    hi_m.len(), fl(&hi_m), mg(&hi_m), mdj(&hi_m), lo_m.len(), fl(&lo_m), mg(&lo_m), mdj(&lo_m));
+            }
+            println!("  (μ_t≥2 flips less at matched s ⇒ indirect μ_t-protection IF its Δ≈μ_t=0's; if its Δ is much higher, it's a margin/scale effect, not redundancy.)");
+            // (logistic) the principled control: fit flip ~ Δ + D_j + 1[μ_t≥2]. Does μ_t add predictive power AFTER the
+            // two real causal variables? Standardize Δ,D_j (coeffs comparable); GD. The mean-log-loss penalty from
+            // DROPPING μ_t is its independent value: ≈0 ⇒ μ_t inert (proxy); large ⇒ μ_t independently causal.
+            let ys: Vec<f32> = recs.iter().map(|r| if r.flip { 1.0 } else { 0.0 }).collect();
+            let raw: Vec<[f32; 3]> = recs.iter().map(|r| [r.margin, r.dj, if r.mu_t >= 2 { 1.0 } else { 0.0 }]).collect();
+            let nn = raw.len() as f32;
+            let (mut mu, mut sd) = ([0f32; 2], [1f32; 2]);
+            for j in 0..2 {
+                mu[j] = raw.iter().map(|x| x[j]).sum::<f32>() / nn;
+                sd[j] = (raw.iter().map(|x| (x[j] - mu[j]).powi(2)).sum::<f32>() / nn).sqrt().max(1e-6);
+            }
+            let z: Vec<[f32; 3]> = raw.iter().map(|x| [(x[0] - mu[0]) / sd[0], (x[1] - mu[1]) / sd[1], x[2]]).collect();
+            let fit = |use_mu: bool| -> ([f32; 4], f32) {
+                let mut w = [0f32; 4]; // bias, Δ, D_j, μ_t≥2
+                for _ in 0..6000 {
+                    let mut g = [0f32; 4];
+                    for (zi, &y) in z.iter().zip(&ys) {
+                        let lin = w[0] + w[1] * zi[0] + w[2] * zi[1] + if use_mu { w[3] * zi[2] } else { 0.0 };
+                        let e = 1.0 / (1.0 + (-lin).exp()) - y;
+                        g[0] += e; g[1] += e * zi[0]; g[2] += e * zi[1]; if use_mu { g[3] += e * zi[2]; }
+                    }
+                    for k in 0..4 { w[k] -= 0.3 * g[k] / nn; }
+                }
+                let ll = z.iter().zip(&ys).map(|(zi, &y)| {
+                    let lin = w[0] + w[1] * zi[0] + w[2] * zi[1] + if use_mu { w[3] * zi[2] } else { 0.0 };
+                    let p = (1.0 / (1.0 + (-lin).exp())).clamp(1e-6, 1.0 - 1e-6);
+                    -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+                }).sum::<f32>() / nn;
+                (w, ll)
+            };
+            let (wf, llf) = fit(true);
+            let (_, ll0) = fit(false);
+            println!("\n  (logistic) flip ~ Δ + D_j + 1[μ_t≥2]  (Δ,D_j standardized → coeffs comparable; sign: +D_j/−Δ expected):");
+            println!("    coeffs  bias {:+.2}   Δ {:+.2}   D_j {:+.2}   μ_t≥2 {:+.2}", wf[0], wf[1], wf[2], wf[3]);
+            println!("    mean log-loss  full {llf:.3}  drop-μ_t {ll0:.3}  (Δ {:+.4} = μ_t's INDEPENDENT predictive value; ≈0 ⇒ proxy)", ll0 - llf);
+            // (A/B) Grok's incoherence-boundary + Δ-cushion tests. ρ = cos(U_t, U_v*). Among s>0 (linear predicts flip)
+            // a RESCUE = forward keeps t (indirect recomposition). Predictions: (A) P(rescue|s>0) FALLS as ρ↑
+            // [=1-Φ(s/σ), σ∝√(1-ρ²)→0], with |D_j|→0 mechanically as ρ→1; (B) rescue RISES with Δ (the cushion).
+            let mut rs: Vec<f32> = recs.iter().map(|x| x.rho).collect();
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let rq = |p: f32| if rs.is_empty() { 0.0 } else { rs[(((rs.len() - 1) as f32) * p) as usize] };
+            let (rq1, rq2, rq3) = (rq(0.25), rq(0.5), rq(0.75));
+            let rbins = [("Q1 lo ρ", f32::MIN, rq1), ("Q2     ", rq1, rq2), ("Q3     ", rq2, rq3), ("Q4 hi ρ", rq3, f32::MAX)];
+            println!("\n  (A) incoherence boundary: ρ = cos(U_t, U_v*) by quartile [pred: |D_j| ↓ as ρ ↑; rescue ↓ as ρ ↑]:");
+            println!("  {:<10}{:>5}{:>9}{:>11}{:>9}{:>20}", "ρ quart", "n", "mean ρ", "mean|D_j|", "flip%", "s>0: n rescue%");
+            for (lbl, lo, hi) in rbins {
+                let g: Vec<&A> = recs.iter().filter(|x| x.rho >= lo && x.rho < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                let sp: Vec<&A> = g.iter().copied().filter(|x| s_of(x) > 0.0).collect();
+                let resc = if sp.is_empty() { f32::NAN } else { 100.0 * sp.iter().filter(|x| !x.flip).count() as f32 / sp.len() as f32 };
+                println!("  {lbl:<10}{:>5}{:>9.2}{:>11.2}{:>8.0}%{:>12} {:>5.0}%", g.len(),
+                    g.iter().map(|x| x.rho).sum::<f32>() / n, g.iter().map(|x| x.dj.abs()).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| x.flip).count() as f32 / n, sp.len(), resc);
+            }
+            println!("  (B) Δ-cushion: among s>0 (linear predicts flip), rescue% by Δ [pred: rescue ↑ as Δ ↑]:");
+            for (lbl, lo, hi) in [("Δ<.3  ", f32::MIN, 0.3), ("0.3-.6", 0.3, 0.6), ("0.6-1.", 0.6, 1.0), ("Δ>1.0 ", 1.0, f32::MAX)] {
+                let g: Vec<&A> = recs.iter().filter(|x| s_of(x) > 0.0 && x.margin >= lo && x.margin < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len();
+                println!("  {lbl:<10}n {:>3}  rescue {:>4.0}%  (mean Δ {:.2}, mean s {:.2})", n,
+                    100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n as f32,
+                    g.iter().map(|x| x.margin).sum::<f32>() / n as f32, g.iter().map(|y| s_of(y)).sum::<f32>() / n as f32);
+            }
+            // (coalition additivity) ablate the top-k JOINTLY; the linear coalition identity is flip ⟺ Δ < ΣD_j, i.e.
+            // sk = ΣD_j − Δ > 0. Per k: flip%, linear-identity accuracy (sign(sk) vs forward flip), and the rescue rate
+            // among sk>0 (forward keeps t). Predictions: identity stays a good NECESSARY condition; rescue rate FALLS as
+            // k grows (more pivotality stripped ⇒ less downstream headroom = cushion exhaustion); the residual (fp) is
+            // indirect-effect + new-winner≠v* (grows with k as other facets enter).
+            let nrec = recs.len() as f32;
+            println!("\n  (coalition additivity) ablate top-k JOINTLY; linear identity flip ⟺ Δ < ΣD_j (sk=ΣD_j−Δ):");
+            println!("  {:>4}{:>10}{:>12}{:>16}{:>16}", "k", "flip%", "mean sk", "ident-acc[fp fn]", "sk>0: n rescue%");
+            for (ki, &k) in KS.iter().enumerate() {
+                let flippct = 100.0 * recs.iter().filter(|x| x.flipk[ki]).count() as f32 / nrec;
+                let msk = recs.iter().map(|x| x.sk[ki]).sum::<f32>() / nrec;
+                let (mut tp, mut tn, mut fp, mut fnn) = (0u32, 0u32, 0u32, 0u32);
+                for x in &recs { match (x.sk[ki] > 0.0, x.flipk[ki]) { (true, true) => tp += 1, (true, false) => fp += 1, (false, true) => fnn += 1, (false, false) => tn += 1 } }
+                let acc = 100.0 * (tp + tn) as f32 / nrec;
+                let sp = recs.iter().filter(|x| x.sk[ki] > 0.0).count();
+                let resc = if sp == 0 { f32::NAN } else { 100.0 * recs.iter().filter(|x| x.sk[ki] > 0.0 && !x.flipk[ki]).count() as f32 / sp as f32 };
+                println!("  {k:>4}{flippct:>9.0}%{msk:>12.2}{acc:>11.0}% [{fp:>2} {fnn:>2}]{sp:>10} {resc:>5.0}%", );
+            }
+            println!("  ⇒ additivity holds if ident-acc stays high; cushion exhausts if rescue% falls with k; fp rising with k = new-winner≠v* (other facets).");
+            // (rescue localization) where does the indirect rescue δ live? (1) does rescue scale with L_top depth
+            // (downstream headroom)? (2) layer sweep: ablate {top + a whole downstream layer's attention} → which ℓ
+            // un-rescues, by relative depth ℓ−L_top.
+            let nl = lm.dims().map(|d| d.0).unwrap_or(24);
+            println!("\n  (rescue localization) is the rescue DOWNSTREAM? among s>0 (k=1), rescue% by L_top depth [pred: early L_top ⇒ more headroom ⇒ more rescue]:");
+            println!("  {:<8}{:>8}{:>12}{:>10}", "L_top", "n(s>0)", "mean L_top", "rescue%");
+            for (lbl, lo, hi) in [("early ", 0usize, nl / 3), ("mid   ", nl / 3, 2 * nl / 3), ("late  ", 2 * nl / 3, nl + 1)] {
+                let g: Vec<&A> = recs.iter().filter(|x| x.sk[0] > 0.0 && x.l_top >= lo && x.l_top < hi).collect();
+                if g.is_empty() { continue; }
+                let n = g.len() as f32;
+                println!("  {lbl:<8}{:>8}{:>12.1}{:>9.0}%", g.len(), g.iter().map(|x| x.l_top as f32).sum::<f32>() / n,
+                    100.0 * g.iter().filter(|x| !x.flip).count() as f32 / n);
+            }
+            println!("  layer sweep over k=1 rescues: ablate {{top + downstream layer ℓ's ATTN | MLP}} → un-rescue% by relative depth (ℓ−L_top):");
+            println!("  {:<10}{:>6}{:>14}{:>14}", "Δdepth", "n", "attn un-resc%", "MLP un-resc%");
+            let maxd = recs.iter().flat_map(|x| x.sweep.iter().map(|s| s.0 - x.l_top)).max().unwrap_or(0);
+            for d in 1..=maxd.min(10) {
+                let (mut tot, mut una, mut unm) = (0usize, 0usize, 0usize);
+                for x in &recs { for &(l2, ua, um) in &x.sweep { if l2 - x.l_top == d { tot += 1; if ua { una += 1; } if um { unm += 1; } } } }
+                if tot == 0 { continue; }
+                println!("  Δdepth {d:>2}{:>8}{:>13.0}%{:>13.0}%", tot, 100.0 * una as f32 / tot as f32, 100.0 * unm as f32 / tot as f32);
+            }
+            let nresc = recs.iter().filter(|x| !x.sweep.is_empty()).count().max(1);
+            let brk_a = recs.iter().filter(|x| x.sweep.iter().any(|&(_, ua, _)| ua)).count();
+            let brk_m = recs.iter().filter(|x| x.sweep.iter().any(|&(_, _, um)| um)).count();
+            let brk_e = recs.iter().filter(|x| x.sweep.iter().any(|&(_, ua, um)| ua || um)).count();
+            println!("  of {nresc} k=1 rescues, breakable by SOME single downstream block: attn {brk_a} ({:.0}%) · MLP {brk_m} ({:.0}%) · either {brk_e} ({:.0}%)  [residual = diffuse across layers].",
+                100.0 * brk_a as f32 / nresc as f32, 100.0 * brk_m as f32 / nresc as f32, 100.0 * brk_e as f32 / nresc as f32);
+            if head_sweep {
+                // Grok's PR→localizability lemma: P(single-MODULE un-rescue) ≈ 1/PR. Per-head un-rescue rate, pooled over
+                // all downstream single-head ablations of all rescues, vs the measured mean 1/PR at those rescues.
+                let tried: usize = recs.iter().map(|x| x.head_tried).sum();
+                let unre: usize = recs.iter().map(|x| x.head_unresc).sum();
+                let prr: Vec<f32> = recs.iter().filter(|x| x.head_tried > 0).map(|x| x.pr_at).collect();
+                let mean_pr = if prr.is_empty() { f32::NAN } else { prr.iter().sum::<f32>() / prr.len() as f32 };
+                let perhead = if tried == 0 { f32::NAN } else { 100.0 * unre as f32 / tried as f32 };
+                println!("\n  (Grok lemma) per-MODULE un-rescue: ablate {{top + a SINGLE downstream head}} over ALL such heads:");
+                println!("    {unre}/{tried} single-head ablations un-rescue = {perhead:.1}% per head   vs   1/PR = {:.1}% (mean PR {mean_pr:.0} at rescues)",
+                    100.0 / mean_pr);
+                println!("  ⇒ lemma predicts per-module un-rescue ≈ 1/PR; match ⇒ repair diffuse in a high-PR substrate (no surgical head).");
+            }
             return;
         }
 

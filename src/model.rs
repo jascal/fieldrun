@@ -212,6 +212,37 @@ pub trait Model: Sync {
     /// reference stream on the same model instance.
     fn clear_head_gate(&mut self) {}
 
+    /// Per-block residual decomposition at the predicting position, for the LE-T5 / `--probe-reconstruct` test: returns
+    /// `(labels, contrib)` where `labels[b]` names a residual-stream write (embedding, each layer's attention, each
+    /// layer's MLP) and `contrib[b][i]` is that block's exact contribution to the logit of `toks[i]` (in true logit
+    /// units, final-norm folded in). By residual-stream additivity `Σ_b contrib[b][i] == logit(toks[i])` exactly — so
+    /// the reconstruction residual measures decompiler completeness, and the per-block concentration is the decision's
+    /// "support number" (PIC O2: small for retrieved, large for composed). Default None; rope implements it.
+    fn residual_decomp(&self, _ids: &[i64], _toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        None
+    }
+
+    /// Like `predict_ablated`, but also zeroes a *whole* attention block (`attn_layers`) and/or *whole* MLP block
+    /// (`mlp_layers`) of the listed layers — for the rescue-localization sweep (ablate {top circuit + downstream layer
+    /// ℓ's MLP or attention}). Default None; rope implements it.
+    fn predict_ablated_blocks(&self, _ids: &[i64], _heads: &[(usize, usize)], _neurons: &[(usize, usize)], _attn_layers: &[usize], _mlp_layers: &[usize]) -> Option<i64> {
+        None
+    }
+
+    /// (n_layer, n_head) — for the rescue-localization layer sweep (`--probe-ablate`): ablate the top circuit + a whole
+    /// downstream layer's attention to find where the indirect rescue δ lives. Default None; rope implements it.
+    fn dims(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Cosine similarity between two unembedding rows U_a, U_b — the runner-up *coherence* ρ for the incoherence-
+    /// boundary probe (`--probe-ablate`, problem A): the decoupling proof assumes a circuit's push toward `t` is ~⊥ its
+    /// push toward the runner-up `v*`; that fails when U_t ≈ U_{v*} (near-synonym, high ρ), where D_j = c_j·(U_t−U_{v*})
+    /// → 0. Default None; rope implements it.
+    fn unembed_cos(&self, _a: usize, _b: usize) -> Option<f32> {
+        None
+    }
+
     /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
     /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
     /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole
