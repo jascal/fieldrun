@@ -1263,13 +1263,14 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                     fmt = false;
                     eprintln!("[fieldrun] markdown rendering OFF (raw)");
                 }
-                // /export-logic [file.dl] <prompt> — emit the semiring-Datalog program (LOGIC_EXPORT.md) for the next-token
-                // decision after <prompt>, taken in the SAME chat context (template + history) a real turn would use. One
-                // command → one decode → one runnable .dl (`fieldrun eval` / Soufflé). Reuses logic::build, so it's the
-                // provenance of the actual decision, not a reconstruction. Rope archs only (needs residual_decomp).
+                // /export-logic [file.dl] <prompt> — generate the WHOLE reply to <prompt> (greedy, to EOS / max_tokens) in the
+                // SAME chat context a real turn uses, and emit it as a semiring-Datalog decode TRACE: one runnable .dl per
+                // generated token (prefix.000.dl, prefix.001.dl, …). gen_ids IS the trajectory; we walk it exactly like the
+                // explain trace, so each file is the faithful provenance of that one decision (reuses logic::build). Combine
+                // the parts into ONE step-indexed program with `fieldrun stitch`. Rope archs only (needs residual_decomp).
                 "export-logic" | "logic-export" | "export_logic" => {
                     let toks: Vec<&str> = parts.collect();
-                    // first token is the path iff it ends in .dl; otherwise auto-number and treat all of it as the prompt.
+                    // first token is the file/prefix iff it ends in .dl; otherwise auto-number and treat all of it as the prompt.
                     let (path, prompt) = match toks.first() {
                         Some(f) if f.ends_with(".dl") => (f.to_string(), toks[1..].join(" ")),
                         _ => {
@@ -1278,28 +1279,49 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                         }
                     };
                     if prompt.trim().is_empty() {
-                        eprintln!("[fieldrun] /export-logic [file.dl] <prompt> — emit the next-token decision for <prompt> \
-                                   as a runnable semiring-Datalog program. e.g. /export-logic out.dl The capital of France is");
+                        eprintln!("[fieldrun] /export-logic [file.dl] <prompt> — generate the WHOLE reply to <prompt> and emit it \
+                                   as a decode TRACE (one .dl per token: prefix.000.dl, …). Stitch into one program: \
+                                   `fieldrun stitch prefix.*.dl -o whole.dl`. e.g. /export-logic out.dl The capital of France is");
                     } else {
-                        // build the context exactly as a turn would (ChatML template + history for instruct; raw + BOS for base)
+                        // build the context exactly as a turn would (ChatML + history for instruct; raw + BOS for base), then
+                        // greedily generate the whole reply — gen_ids is the trajectory we walk to emit one .dl per step.
                         let (p, add_special) = if chatml {
                             (tg.chat_prompt(None, &history, &prompt), false)
                         } else {
                             (prompt.clone(), true)
                         };
-                        let ctx_ids = tg.encode(&p, add_special);
-                        match crate::logic::build(lm.as_ref(), &ctx_ids, store.as_ref(), &cand, 48) {
-                            Some(prov) => {
-                                let dec = |id: i64| tg.token_label(id);
-                                let dl = crate::logic::emit_dl(&prov, &ctx_ids, &dec);
-                                let faithful = dl.contains("✓ FAITHFUL");
-                                match std::fs::write(&path, &dl) {
-                                    Ok(()) => eprintln!("[fieldrun] /export-logic → {path}  ({} candidates, {} blocks, decode {}) — run: fieldrun eval {path} --semiring max|log",
-                                                        prov.candidates.len(), prov.blocks.len(), if faithful { "FAITHFUL ✓" } else { "MISMATCH ✗" }),
-                                    Err(e) => eprintln!("[fieldrun] /export-logic: could not write {path}: {e}"),
+                        let g = tg.gen(lm.as_ref(), &p, max_tokens, add_special, &mut |_| {});
+                        let dec = |id: i64| tg.token_label(id);
+                        let stem_pfx = path.strip_suffix(".dl").unwrap_or(&path);
+                        eprintln!("[fieldrun] /export-logic: reply is {} tokens — exporting one .dl per step…", g.gen_ids.len());
+                        // walk the trajectory: provenance at each step, context advancing by the model's own pick.
+                        let mut ctx = g.prompt_ids.clone();
+                        let (mut written, mut faithful, mut unsupported) = (0usize, 0usize, false);
+                        for (k, &t) in g.gen_ids.iter().enumerate() {
+                            match crate::logic::build(lm.as_ref(), &ctx, store.as_ref(), &cand, 48) {
+                                Some(prov) => {
+                                    let dl = crate::logic::emit_dl(&prov, &ctx, &dec);
+                                    let pth = format!("{stem_pfx}.{k:03}.dl");
+                                    if std::fs::write(&pth, &dl).is_ok() {
+                                        written += 1;
+                                        if dl.contains("✓ FAITHFUL") { faithful += 1; }
+                                    }
+                                    eprint!("\r[fieldrun] /export-logic: step {}/{}…", k + 1, g.gen_ids.len());
+                                    let _ = std::io::stderr().flush();
                                 }
+                                None => { unsupported = true; break; }
                             }
-                            None => eprintln!("[fieldrun] /export-logic: arch {arch} has no residual_decomp — logic export is rope-only (Qwen2.5/Llama)"),
+                            ctx.push(t);
+                        }
+                        eprint!("\r\x1b[2K");
+                        if unsupported {
+                            eprintln!("[fieldrun] /export-logic: arch {arch} has no residual_decomp — logic export is rope-only (Qwen2.5/Llama)");
+                        } else if written == 0 {
+                            eprintln!("[fieldrun] /export-logic: the model produced no tokens for that prompt");
+                        } else {
+                            eprintln!("[fieldrun] /export-logic → {stem_pfx}.{{000..{:03}}}.dl  ({written} steps, {faithful} FAITHFUL ✓{}) — stitch into one program: fieldrun stitch {stem_pfx}.*.dl -o {stem_pfx}.whole.dl",
+                                      written.saturating_sub(1), if g.hit_eos { "" } else { ", stopped at max_tokens" });
+                            eprintln!("[fieldrun] reply: {}", g.text.trim());
                         }
                     }
                 }

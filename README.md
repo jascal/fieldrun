@@ -22,6 +22,7 @@ model, chat — in five copy-paste steps.
 | **B · composition** | the attention + MLP forward pass as Rust matmuls | **done — GPT-2, GPT-NeoX/Pythia, Llama/Qwen2.5 (RoPE), Gemma-2/3/4** (incl. **Gemma-4 MoE**), **Qwen3-MoE**, each exact vs the Python/torch (or pure-numpy) reference |
 | **C · router** | compute only the top fraction of MLP neurons/token | **done** — `--route-frac` (accuracy-vs-budget probe; see note) |
 | `explain` | "explain this prediction": live circuits + named features | **done — all archs**; byte-identical to `explain.py`. In chat: `--explain` / `/explain on`; over the API: native `/explain` or `"explain":true` |
+| `logic` | export the decode as a **semiring-Datalog program** (greedy = max-product, sampling = sum-product) | **done — rope archs** (Qwen2.5/Llama). `export --logic` (one decision) · `--export-logic <prefix>` (per-step trace) · `/export-logic` in chat; run with the built-in `eval` (`--semiring max|log`) or Soufflé. See [`LOGIC_EXPORT.md`](LOGIC_EXPORT.md) |
 | API | HTTP server + **OpenAI- & Anthropic-compatible** endpoints + **interactive chat** | **done** (default build) — `--serve PORT` (native `/predict`·`/generate`·`/explain` + `/v1/chat/completions`·`/v1/completions`·`/v1/messages`, streaming, **tool/function calling**) and `--chat` |
 
 **GPU backend** (opt-in, `--features gpu`, via **wgpu** → Metal/DX12/Vulkan): `--device cpu|gpu|auto` + `--max-vram`
@@ -218,6 +219,14 @@ fieldrun --bundle Qwen2.5-7B-Instruct --serve 8731
 # 4. SCORE / GENERATE / EXPLAIN against a held-out token-id stream ({"holdout_ids":[…]} from the model's tokenizer)
 fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --n-eval 200      # next-token top-1
 fieldrun --bundle Qwen2.5-7B-Instruct --ids holdout.json --ctx 64 --generate 128
+
+# 5. LOGIC EXPORT — the decode as a runnable semiring-Datalog program (rope archs; see LOGIC_EXPORT.md)
+fieldrun --bundle Qwen2.5-0.5B-Instruct --ids holdout.json export --logic --out decision.dl   # ONE next-token decision
+fieldrun --bundle Qwen2.5-0.5B-Instruct --ids holdout.json --export-logic trace --steps 8      # per-step decode trace → trace.000.dl, trace.001.dl, …
+fieldrun eval decision.dl --semiring max                   # run it without Soufflé: max → greedy decode (T=0)
+fieldrun eval decision.dl --semiring log                   #                         log → the distribution over candidates (T=1)
+#   compile a standalone "expert":  souffle -o expert decision.dl && ./expert   (writes decide.csv)
+#   in chat:  /export-logic decision.dl <prompt>           # emit the .dl for that decision on demand
 ```
 
 A bare `fieldrun` (or `--help`) prints the full flag list. The default build includes HF pull (`hub`) and the

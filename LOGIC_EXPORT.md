@@ -180,8 +180,16 @@ as provenance structure vs intervention diffuseness.
   Qwen2.5-0.5B). **A built-in evaluator runs it without Soufflé:** `fieldrun eval prog.dl --semiring max|log` parses the
   candidate/contrib facts and applies the cross-candidate `⊕` — `max` → `decide(T)` (greedy decode), `log` → the
   softmax distribution. Verified: `eval --semiring max` on the emitted program returns the model's token; `--semiring
-  log` returns the distribution — **one program, two semirings, two temperatures, run.** *Remaining:* (a) the
-  whole-model (not per-context) emit; (b) the sparse-`(max,+)`-matmul performance face of §1.5.
+  log` returns the distribution — **one program, two semirings, two temperatures, run.**
+  **Three entry points, one builder** (`logic::build` — so each is the provenance of the actual decode, faithful by
+  construction, not a reconstruction): (i) `fieldrun … export --logic [--out f.dl]` — one decision; (ii) `fieldrun …
+  --export-logic <prefix> [--steps N]` — a multi-step decode **trace**: one *independent* program per generated token
+  (`prefix.000.dl`, `prefix.001.dl`, …), the context advancing by the model's own greedy pick each step (deliberately
+  per-step files, not one concatenated program — merged programs redeclare relations and make `eval` sum `contrib`
+  across tokens); (iii) `/export-logic [file.dl] <prompt>` inside the `--chat` REPL — emit the `.dl` for a chosen
+  decision on demand, in the live chat context (ChatML template + history). *Remaining:* (a) the whole-model
+  (context-free) emit — the trace is still a *sequence* of per-context programs, not one program over all contexts;
+  (b) the sparse-`(max,+)`-matmul performance face of §1.5.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the

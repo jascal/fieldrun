@@ -218,46 +218,175 @@ fn main() {
         };
         let semiring = flag(&args, "--semiring").unwrap_or("max");
         use std::collections::{BTreeMap, BTreeSet};
-        let mut cands: Vec<i64> = Vec::new();
-        let mut logit: BTreeMap<i64, f64> = BTreeMap::new();
+        // (step, token) -> Σ contrib. `multi` flips on for a step-indexed program (a stitched TRACE:
+        // candidate(Step,T) / contrib(Step,Block,T,W)); a single-decision program stays at step 0 and prints exactly as
+        // before. `order` keeps first-seen candidate order within a step.
+        let mut logit: BTreeMap<(i64, i64), f64> = BTreeMap::new();
+        let mut order: Vec<(i64, i64)> = Vec::new();
         let mut blocks: BTreeSet<String> = BTreeSet::new();
+        let mut multi = false;
         for line in text.lines() {
             let l = line.trim();
             if let Some(rest) = l.strip_prefix("candidate(") {
-                if let Some(Ok(id)) = rest.split(')').next().map(|s| s.trim().parse::<i64>()) {
-                    if !cands.contains(&id) { cands.push(id); logit.entry(id).or_insert(0.0); }
+                let f: Vec<&str> = rest.split(')').next().unwrap_or("").split(',').map(|s| s.trim()).collect();
+                let (step, tok) = match f.len() {
+                    1 => (0i64, f[0].parse::<i64>().ok()),
+                    _ => { multi = true; (f[0].parse::<i64>().unwrap_or(0), f[1].parse::<i64>().ok()) }
+                };
+                if let Some(tok) = tok {
+                    let key = (step, tok);
+                    if !logit.contains_key(&key) { order.push(key); logit.insert(key, 0.0); }
                 }
             } else if let Some(rest) = l.strip_prefix("contrib(") {
-                let inner = rest.split(')').next().unwrap_or("");
-                let parts: Vec<&str> = inner.splitn(3, ',').collect();
-                if parts.len() == 3 {
-                    if let (Ok(id), Ok(w)) = (parts[1].trim().parse::<i64>(), parts[2].trim().parse::<f64>()) {
-                        *logit.entry(id).or_insert(0.0) += w;
-                        blocks.insert(parts[0].trim().trim_matches('"').to_string());
+                let f: Vec<&str> = rest.split(')').next().unwrap_or("").split(',').map(|s| s.trim()).collect();
+                // single-decision: (block, tok, w) ; stitched trace: (step, block, tok, w)
+                let (step, blk, tok, w) = match f.len() {
+                    3 => (0i64, f[0], f[1].parse::<i64>().ok(), f[2].parse::<f64>().ok()),
+                    4 => { multi = true; (f[0].parse::<i64>().unwrap_or(0), f[1], f[2].parse::<i64>().ok(), f[3].parse::<f64>().ok()) }
+                    _ => (0, "", None, None),
+                };
+                if let (Some(tok), Some(w)) = (tok, w) {
+                    let key = (step, tok);
+                    if !logit.contains_key(&key) { order.push(key); logit.insert(key, 0.0); }
+                    *logit.get_mut(&key).unwrap() += w;
+                    blocks.insert(blk.trim_matches('"').to_string());
+                }
+            }
+        }
+        if order.is_empty() {
+            eprintln!("[fieldrun] eval: no candidate/contrib facts in {path} (is it an `export --logic` / stitched program?)");
+            std::process::exit(1);
+        }
+        if multi {
+            // stitched TRACE: decode each step independently (the per-step sums never mix — that's the point of the index).
+            let steps: Vec<i64> = order.iter().map(|&(s, _)| s).collect::<BTreeSet<_>>().into_iter().collect();
+            eprintln!("[fieldrun] eval {path}: TRACE · {} steps · {} blocks · semiring={semiring}", steps.len(), blocks.len());
+            for s in steps {
+                let mut scored: Vec<(i64, f64)> = order.iter().filter(|&&(st, _)| st == s).map(|&(_, t)| (t, logit[&(s, t)])).collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                if semiring == "log" {
+                    let mx = scored[0].1;
+                    let z: f64 = scored.iter().map(|(_, v)| (v - mx).exp()).sum();
+                    println!("% step {s}: distribution (log-semiring, T=1):");
+                    for (t, v) in scored.iter().take(6) {
+                        println!("    P {:>6.3}   logit {:>8.3}   token {t}", (v - mx).exp() / z, v);
+                    }
+                } else {
+                    let (t, v) = scored[0];
+                    let runner = scored.get(1).map(|(rt, rv)| format!("  (margin {:+.4} vs {rt})", v - rv)).unwrap_or_default();
+                    println!("decide({s}, {t}).   % logit {v:.4}{runner}");
+                }
+            }
+        } else {
+            eprintln!("[fieldrun] eval {path}: {} candidates · {} blocks · semiring={semiring}", order.len(), blocks.len());
+            let mut scored: Vec<(i64, f64)> = order.iter().map(|&(_, t)| (t, logit[&(0, t)])).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            if semiring == "log" {
+                let mx = scored[0].1;
+                let z: f64 = scored.iter().map(|(_, s)| (s - mx).exp()).sum();
+                println!("% distribution over candidates (log-semiring / sum-product, T=1):");
+                for (t, s) in scored.iter().take(12) {
+                    println!("  P {:>6.3}   logit {:>8.3}   token {t}", (s - mx).exp() / z, s);
+                }
+            } else {
+                let (t, s) = scored[0];
+                println!("decide({t}).   % logit {s:.4}  (max-product / argmax, T=0)");
+                if scored.len() > 1 {
+                    println!("% runner-up token {} logit {:.4}  margin {:+.4}", scored[1].0, scored[1].1, s - scored[1].1);
+                }
+            }
+        }
+        return;
+    }
+
+    // `fieldrun stitch <step.dl …> [-o out.dl]` — merge N per-step `export --logic` / `/export-logic` programs (each ONE
+    // next-token decision) into ONE runnable, step-indexed semiring-Datalog program: decide(Step,T) over the whole decode
+    // trajectory. PURE TEXT — no model: it parses the candidate/contrib FACTS out of each file and re-emits them under a
+    // step index, so the per-step Σ-contrib sums never collide (the reason a naïve `cat` of the parts is wrong). Batch:
+    // pass the files (shell glob `prefix.*.dl`) or a bare prefix. Runs in Soufflé AND `fieldrun eval` (step-aware).
+    // This is the "single .dl for the whole query" — but it is a TRACE of THIS query's trajectory: it does NOT answer new
+    // queries (that's the context-free whole-model emit, LOGIC_EXPORT LO3a, still open). Stitch documents; it doesn't generalize.
+    if matches!(args.get(1).map(String::as_str), Some("stitch")) {
+        let out_path = flag(&args, "-o").or_else(|| flag(&args, "--out")).map(String::from);
+        // inputs = the non-flag args after `stitch`; a bare prefix (no .dl) expands to sibling <prefix>*.dl in its dir.
+        let mut inputs: Vec<String> = Vec::new();
+        let mut it = args.iter().skip(2).peekable();
+        while let Some(a) = it.next() {
+            if a == "-o" || a == "--out" { it.next(); continue; }
+            if a.starts_with('-') { continue; }
+            if a.ends_with(".dl") {
+                inputs.push(a.clone());
+            } else {
+                let p = std::path::Path::new(a);
+                let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+                let base = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&base) && name.ends_with(".dl") {
+                            inputs.push(e.path().to_string_lossy().to_string());
+                        }
                     }
                 }
             }
         }
-        if cands.is_empty() {
-            eprintln!("[fieldrun] eval: no candidate/contrib facts in {path} (is it an `export --logic` program?)");
-            std::process::exit(1);
+        inputs.sort(); // prefix.000.dl, prefix.001.dl, … sort into decode order; user's logic-001/003 sort numerically too
+        inputs.dedup();
+        if inputs.is_empty() {
+            eprintln!("[fieldrun] stitch: no input .dl files — give the per-step programs, e.g. fieldrun stitch trace.*.dl -o whole.dl");
+            std::process::exit(2);
         }
-        eprintln!("[fieldrun] eval {path}: {} candidates · {} blocks · semiring={semiring}", cands.len(), blocks.len());
-        let mut scored: Vec<(i64, f64)> = cands.iter().map(|&t| (t, *logit.get(&t).unwrap_or(&0.0))).collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        if semiring == "log" {
-            let mx = scored[0].1;
-            let z: f64 = scored.iter().map(|(_, s)| (s - mx).exp()).sum();
-            println!("% distribution over candidates (log-semiring / sum-product, T=1):");
-            for (t, s) in scored.iter().take(12) {
-                println!("  P {:>6.3}   logit {:>8.3}   token {t}", (s - mx).exp() / z, s);
+        let mut body = String::new();
+        let mut steps = 0usize;
+        for (k, f) in inputs.iter().enumerate() {
+            let text = match std::fs::read_to_string(f) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("[fieldrun] stitch: cannot read {f}: {e}"); std::process::exit(1); }
+            };
+            let pred = text.lines().find(|l| l.trim_start().starts_with("// model predicts:"))
+                .map(|l| l.trim_start().trim_start_matches("// ").to_string()).unwrap_or_default();
+            let fname = std::path::Path::new(f).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
+            body.push_str(&format!("\n// ---- step {k:03}  ({fname})  {pred} ----\n"));
+            let mut facts = 0usize;
+            for line in text.lines() {
+                let t = line.trim_start();
+                let open = match t.find('(') { Some(i) => i, None => continue };
+                let head = &t[..open];
+                if head != "candidate" && head != "contrib" { continue; } // FACTS only — skip decls, rules, .output, comments
+                let close = match t.find(')') { Some(c) => c, None => continue };
+                let inner = &t[open + 1..close];
+                let after = &t[close + 1..]; // ".   // comment" — preserved
+                body.push_str(&format!("{head}({k}, {inner}){after}\n"));
+                facts += 1;
             }
-        } else {
-            let (t, s) = scored[0];
-            println!("decide({t}).   % logit {s:.4}  (max-product / argmax, T=0)");
-            if scored.len() > 1 {
-                println!("% runner-up token {} logit {:.4}  margin {:+.4}", scored[1].0, scored[1].1, s - scored[1].1);
+            if facts == 0 {
+                eprintln!("[fieldrun] stitch: {f} had no candidate/contrib facts (is it an export --logic program?) — skipping");
+            } else {
+                steps += 1;
             }
+        }
+        let mut prog = String::new();
+        prog.push_str("// ============================================================\n");
+        prog.push_str("// fieldrun logic STITCH — N per-step decode programs merged into ONE step-indexed semiring-Datalog program.\n");
+        prog.push_str("// Each input was ONE next-token decision; step S here indexes the decode trajectory. decide(S,T) = token at step S.\n");
+        prog.push_str("// A single runnable file for the WHOLE query's decode — but a TRACE of THIS query, NOT the context-free\n");
+        prog.push_str("// whole-model program (it does not answer new queries; that is LOGIC_EXPORT LO3a, open).\n");
+        prog.push_str(&format!("// {steps} steps. Run: souffle <this>.dl -D -   |   fieldrun eval <this>.dl --semiring max|log\n"));
+        prog.push_str("// ============================================================\n\n");
+        prog.push_str(".decl candidate(step:number, t:number)\n");
+        prog.push_str(".decl contrib(step:number, block:symbol, t:number, w:float)\n");
+        prog.push_str(".decl logit(step:number, t:number, s:float)\n");
+        prog.push_str(".decl decide(step:number, t:number)\n\n");
+        prog.push_str("logit(Step, T, S) :- candidate(Step, T), S = sum W : { contrib(Step, _, T, W) }.   // ⊗ over blocks, scoped per step\n");
+        prog.push_str("decide(Step, T)   :- logit(Step, T, S), S = max S2 : { logit(Step, _, S2) }.        // ⊕ = max within each step\n");
+        prog.push_str(".output decide\n");
+        prog.push_str(&body);
+        match &out_path {
+            Some(p) => match std::fs::write(p, &prog) {
+                Ok(()) => eprintln!("[fieldrun] stitch → {p}  ({steps} steps from {} files) — run: souffle {p} -D -  |  fieldrun eval {p} --semiring max|log", inputs.len()),
+                Err(e) => { eprintln!("[fieldrun] stitch: cannot write {p}: {e}"); std::process::exit(1); }
+            },
+            None => print!("{prog}"),
         }
         return;
     }
@@ -1746,7 +1875,8 @@ LOGIC EXPORT  (LOGIC_EXPORT.md — the model as a semiring-Datalog program; rope
   --export-logic <prefix>       emit a decode TRACE: one .dl per step (prefix.000.dl …); count via --steps N (default 8)\n\
   --candidates N  candidate-set cap (default 48)             --store <f>     add KB n-gram facts (Tier A)\n\
   eval <prog.dl> [--semiring max|log]   run an emitted program — max → greedy decode (T=0), log → distribution (T=1)\n\
-  (in --chat: /export-logic [file.dl] <prompt> writes the .dl for that decision on demand)\n",
+  stitch <step.dl …> [-o out.dl]        merge per-step programs into ONE step-indexed .dl: decide(Step,T) over the trace\n\
+  (in --chat: /export-logic [file.dl] <prompt> exports the WHOLE reply as a per-step trace, on demand)\n",
         ver = env!("CARGO_PKG_VERSION"), hub = hub, gpu = gpu
     );
 }
