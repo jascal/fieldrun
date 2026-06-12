@@ -41,9 +41,12 @@ The two regimes meet the rest of the program at one wall. Lossless demand transf
 and provably prune **nothing** on the dense computed fragment, because high treewidth means every
 intermediate is demanded by `decide`. So *the magic-sets residual is a lossless, machine-checkable measure
 of the forge tax* — a fourth instrument beside PR, treewidth, and tropical rank (LE-T4 / LO4). **PO-T1
-(lossless preservation) is established; PO-T3 (the margin certificate) is established; PO-T2 (residual =
-forge tax) is the measured-adjacent bridge; the certified-in-Lean/Coq pipeline (PO-T4) is the open
-frontier of *formality*.**
+(lossless preservation) is established; PO-T3 (the margin certificate) is established *locally* but its
+global reach is *bounded by LE-T2* — a sound, machine-checkable certificate that exposes the forge-tax wall
+rather than escaping it; PO-T2 (residual = forge tax) is the measured-adjacent bridge; the certified-in-Lean/Coq
+pipeline (PO-T4) and the through-layers `δ` bound (PO-T6, likely LE-T2 again) are the open frontier of
+*formality*; and the grokking order parameter (PO-T7) — certifiable-compressibility as a progress measure for
+memorization→generalization — is the most interesting open, directly-testable direction.**
 
 ---
 
@@ -155,14 +158,32 @@ certified()  :- margin(M), delta(D), M > 2 * D.        // ⇒ pruned decode == f
 
 > **PO-T3 (Margin-certified decode invariance).** A transformation of `Π` that bounds the per-logit
 > perturbation by `δ` preserves `decide` on every input where `margin > 2δ`. The bound and the check are
-> Datalog; the witness is a Soufflé proof. **Status: established** (it is the `(max,+)` stability of the
-> Tropical paper, instantiated on `Π` via LE-T5 faithfulness). This is the provable upgrade of:
-> `--pruned-head` (heuristic margin gate → *certificate*), `--prune-head`/`--gate-check` (measured top-1
-> agreement → *proof*), `--probe-quant` (measured flip-rate → *certified* per-block bit allocation, §6 PO4).
+> Datalog; the witness is a Soufflé proof. **Status: established as a *local* certificate** — it is exactly
+> Maslov-dequantization of the classical margin argument: in `(max,+)` a `δ`-swing moves winner vs. runner-up
+> by at most `2δ`, so `m > 2δ` is **necessary and sufficient** for invariance on that input, inheriting LE-T5
+> soundness. The provable upgrade of: `--pruned-head` (heuristic margin gate → *certificate*),
+> `--prune-head`/`--gate-check` (measured top-1 agreement → *proof*), `--probe-quant` (measured flip-rate →
+> *certified* per-block bit allocation, PO4).
 
-Quantified over a corpus the certificate becomes a guarantee — "for all inputs with `margin > 2δ`, the
-pruned model decodes identically" — and the *uncertified* inputs are exactly the thin-margin, composed
-(forge-tax) tokens, closing the loop with PIC O2 / FINDINGS §5.
+**The certificate is sound but bounded by LE-T2 (Grok, PO4 review).** The margin `m` is the Euclidean facet
+distance in the power diagram of the unembedding vectors; the allowable `δ`-cushion *is* that distance. But a
+**scalar** `δ_b` is exact only on the diagonal of `G_{vw} = ⟨U_v, U_w⟩` — off-diagonal it under/over-estimates
+the effective perturbation precisely in the high-PR / high-tropical-rank region, **the forge tax**. So the
+certificate stays sound but goes **vacuous on exactly the thin-margin, dense-`G` tokens you most want to
+compress** — `m > 2δ` is *false* there. That is not a flaw: it is the theory correctly refusing to certify
+what it cannot certify without re-simulation. Quantified over a corpus the certificate is still a real
+guarantee — "for all inputs with `margin > 2δ`, the model decodes identically" — but PO-T3 **makes the
+LE-T2/T4 wall machine-checkable, it does not dissolve it** (PIC O2 / FINDINGS §5).
+
+> **PO-T6 (Through-layers `δ` has no compact a-priori form — open, likely false in closed form; Grok).**
+> A perturbation `Δ` at an earlier block reaches the logits through RMSNorm (directional gain `1/‖x‖`,
+> anisotropic — amplifies low-norm directions), the softmax-attention Jacobian (`(I − softmax)` outer-product
+> whose eigenvalues depend on the full Gram, so the local Lipschitz constant is input- and direction-dependent),
+> and SwiGLU (piecewise-linear, state-dependent slope). The composite differential **inside the dense-`G`
+> region has no low-treewidth factorization**, so any scalar `δ_b` that is sound for all inputs must essentially
+> re-materialize the high-treewidth factor graph — **re-encountering LE-T4**. Hence the honest split: the
+> certificate is **a-priori at the last layer / direct effects**, and **verified (re-decode), not certified,
+> on deeper transforms**. The two ways forward are (a) keep `δ` local, or (b) accept verified deep transforms.
 
 ---
 
@@ -200,9 +221,11 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | Claim | Content | Status |
 |---|---|---|
 | PO-T1 | lossless `T_P`-preserving rewrites keep `decide`/`logit` for every context | **Established** + anchored (`--magic-transform` on `whole_base.dl`) |
-| PO-T3 | margin-certified decode invariance (`m > 2δ`) | **Established** (= Tropical `(max,+)` stability via LE-T5) |
+| PO-T3 | margin-certified decode invariance (`m > 2δ`) — sound **local** certificate | **Established locally**; **globally bounded by LE-T2** (vacuous on dense-`G`/forge-tax tokens) |
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
+| PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
 | PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
+| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | Open; **directly testable** with built instruments |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
   Scores FFN neurons over a calibration set; drops the **provably-dead** (a zero `down_proj` row writes
@@ -232,6 +255,29 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   principled *proven* per-block bit allocation — the provable face of `--probe-quant`.
 - **PO5 — the end-to-end certified pipeline.** One transform on `Π`, proven equivalent in Lean/Coq, run in
   Soufflé, provenance-checked against the formal semantics (PO-T4 made real).
+- **PO6 — grokking ⇒ certifiable-compressibility (the most interesting open direction; Grok).** Map: the
+  **retrievable** fragment (induction = recursive clause, n-gram = fact — low treewidth, compact provenance) is
+  the **grokked, generalizing circuit**; the **forge tax** (dense `G`, high PR, high tropical rank, no compact
+  extension) is the **un-grokked, input-specific memorization**. `μ_t` ("deeper cells recruit more redundancy")
+  fits: deeper blocks carry more forge-tax mass until grokking consolidates them into lower-treewidth circuits.
+  So the **certifiable-compressible fraction** (tokens/blocks on which `certified` holds for a fixed `δ` schedule)
+  is a **grokking order parameter**, and treewidth / PR / tropical rank are mechanistic **progress measures** for
+  memorization→generalization. Predictions (status): (i) at the grokking transition the margin on algorithmic
+  tokens grows (cleaner power-diagram facets) ⇒ `certified` fires more ⇒ certified-removable fraction rises
+  (*falsifiable*); (ii) the two axes conflict — grokking **shrinks** forge tax along a run, but it **grows** with
+  model size at convergence (the Pythia-ladder result) ⇒ net certifiable-compressibility vs scale is *open*,
+  likely task-dependent (higher on reasoning, lower on factual recall) and non-monotonic; (iii) grokking-proper
+  (sharp transition on modular arithmetic) is an **analogy**, not identity, for NL LLMs — distinguisher: NL shows
+  gradual, overlapping, redundant circuit formation, not one clean transition. **Decisive experiments:**
+  (a) plot certified-removable fraction + provenance treewidth/PR across a grokking run / Pythia checkpoints vs
+  loss & generalization — a rise coinciding with circuit consolidation confirms "quantize the grokked retrievable
+  circuits, protect the un-grokked forge tax"; flat-despite-grokking kills it (propagation gap too severe);
+  (b) per-token `margin` vs measured quant-flip rate (strong −corr ⇒ use the certificate as a gate);
+  (c) `D_b`-driven + margin-gated bit allocation vs pure-`D_b` and pure-KL baselines, scored on certified
+  decode-preservation *and* KL/ppl. **Single cleanest falsifier (Grok):** if on real-scale post-grokking
+  checkpoints `certified` stays ≈0 even for low-`D_b` blocks while moderate per-block quantization still passes
+  re-decode, the a-priori certificate is too loose and PO4 collapses to "verify by re-running the forward" (LE-T4)
+  without enlarging the compressible surface.
 
 ---
 
@@ -266,3 +312,11 @@ certifies the approximate rewrites, LE-T5 makes the certificate sound, and LE-T2
 residual the lossless transforms cannot remove. Every empirical claim traces to a probe — the LO3a emit
 (`lo3a/`), the `--magic-transform` lossless check, and the existing `--pruned-head` / `--probe-quant` speed
 measurements in [`FINDINGS.md`](./FINDINGS.md) §5 — the same theory–experiment loop.
+
+The PO4 status (sound *local* certificate, *globally bounded by LE-T2*; PO-T6's through-layers `δ`
+likely LE-T2 again; the grokking order parameter PO-T7) is an **adversarial review contributed by Grok**
+— continuing the collaboration behind the Tropical power-diagram / facet-distance margin and the
+incoherence-regime / ρ-boundary derivations (FINDINGS §4). The verdict it sharpens: *PO4 is honest
+engineering that makes the LE-T2 limitation machine-checkable — most valuable when you already live in the
+Datalog/provenance world and need per-input `T=0` guarantees rather than aggregate `T=1` KL — and it does
+not solve the propagation gap.*
