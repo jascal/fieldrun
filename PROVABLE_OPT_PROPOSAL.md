@@ -337,10 +337,22 @@ circuit-DLA `d/PR` reaches 6×→11×→**22×** at 1.7B while fixed-rank peak p
 `span90` grows 65→96. Two knobs respond to the spreading without jumping to full `d`.
 
 **Operational flow.** (1) Project the residual onto the readout-aligned basis (fixed linear step).
-(2) Default = top-`PR` components (the compact PR-core). (3) Gate on coverage — **the margin is the gate**
-(`m > 2δ` = PO-T3 ≡ this policy's router, for free at decode time). (4) If thin-margin, promote that
-decision to the top-`span90` components — still linear, still `≪ d`. (5) Log the spectral triple
-(`hard_rank`, `soft_rank`, `α`) to set/adapt the knobs per model.
+(2) Default = top-`PR` components (the compact PR-core). (3) Choose the rank for target coverage; (4) log
+the spectral triple (`hard_rank`, `soft_rank`, `α`) to set/adapt the knobs per model.
+
+**Measured (`lo3a/pr_core.py`, the factored readout `logit_v ∝ ⟨S·x_f, S·(gain⊙U_v)⟩`).** On SmolLM-135M the
+PR-core (r=92) is a **6.2× smaller unembedding** (4.6M vs 28.3M params) preserving **67%** of decodes;
+r=128/256 → 69%/75% at 4.4×/2.2×. The `d/PR` ratio grows with scale, so this is a **lossy *size* lever**
+(datalog/embedding storage — the LE-T4 fragment shrinks ~`d/PR` for the bulk) that *improves* on bigger models.
+
+**Correction (the gate is NOT free — building it exposed this).** A margin gate on the *core* margin does
+**not** yield a decode-exact hybrid: the core is *confidently wrong* on the ~33% tail and **cannot
+self-detect** (the discarded directions are exactly the missing decode info), so routing on the core margin
+adds almost nothing (measured 67%→70% across τ). Decode-exactness needs either the **full readout** (the true
+margin — no compute saving) or the **sound δ-bound** `‖(I−P_r)x‖·‖gain⊙ΔU‖`, which fires *rarely* because
+(spectral capstone) most of `x`'s energy lies *outside* the decision subspace → the discarded norm is large.
+So PR-core is a **lossy compression with a known coverage**, not a free decode-exact speedup; PO-T3's
+certificate requires the full margin, not the core's.
 
 **Why linear, for now.** The Volterra/polynomial probe on the PR core was **flat** (degree 1/2/3 ≈ 68/68/64%
 vs 65% linear) — low-order interactions don't reach the `α≈1` heavy tail. A non-linear series re-opens only
