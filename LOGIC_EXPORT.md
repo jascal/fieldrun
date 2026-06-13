@@ -234,6 +234,18 @@ as provenance structure vs intervention diffuseness.
     margin wall** as PO4 and the circuit `faithful_r`: *choosing the decision basis helps, but the decode-
     faithful rank of any fixed valuation is ≈ the participation ratio.* (Open refinement: a non-orthogonal /
     readout-aligned / margin-weighted basis might lift the 70% ceiling; real-text contexts; multiple models.)
+  - **The hatch is CLOSED — the decode-optimal basis does not beat the ceiling (`lo3a/lo1_readout.py`,
+    `lo1_readout.png`).** Rebuilding `S` from the **readout diffs** `gain⊙(U_pred − U_v)` over the top-8
+    competitors (Grok's decode-optimal basis) vs the variance-PCA of the runner-up direction: **at rank ≈ PR
+    both give ~70%** (readout 67–71% vs variance 64–70% — only ~1–3% higher). The readout basis's only edge is
+    that it is *monotonic* (no crash) and reaches 100% at **r = d** (full rank, identity — not compression);
+    >90% coverage needs `r` approaching `d`. So the **~70%-at-PR ceiling is BASIS-INDEPENDENT** — it is a real
+    floor, not a basis-misalignment tax (Grok's "low-80s" prediction is refuted). **LO1 final landing:** the
+    descriptive escape (`Δ_descr`) buys ~70% of decodes with a fixed ≈PR-rank valuation *regardless of basis*;
+    the remaining ~30% requires ~the full residual dimension and is **not escapable by any fixed low-rank
+    description** — that is the `τ*`/`Δ_repr` intrinsic floor, pinned at the participation ratio. The forge tax
+    on the decode axis is therefore **mostly intrinsic, with a real but bounded descriptive escape**, and
+    `Δ_descr` / `PO4` / the circuit `faithful_r` all bottom out at the **same scalar-PR / margin wall**.
 - **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
   **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
   **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
