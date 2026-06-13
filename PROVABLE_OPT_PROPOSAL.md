@@ -382,9 +382,20 @@ activation SAE / raw-residual dictionary starts from the *wrong, deceptively-com
 decode-faithful compact representations (this policy, polygram/sae-forge dictionaries, verifiable circuits),
 **the readout-aligned decision directions are the right first-class input**, not raw activations.
 
+**Shipped (`lo3a/pr_core_export.py`).** The lever is now a re-loadable artifact, not just analysis: it
+fits the rank-`r` head, writes `<out>.prcore.npz` (`S`, `A`) + a `.json` manifest (rank, sizes,
+compression, measured `decode_kept`, **`lossy: true`**, provenance), and **verifies** preservation on a
+*fresh* held-out battery (re-runs the real rope forward, compares the PR-core argmax to the model's). With
+`--datalog` it also emits the **factored readout as a souffle-runnable `.dl`** — applying the LO1 lever *to
+the logic export itself*: the dense `vocab×d` embed facts become `proj(i)=Σ_j xraw(j)·sbasis(i,j)` then
+`corelogit(v)=Σ_i proj(i)·acore(i,v)`, i.e. `r(d+vocab)` facts. On SmolLM-135M: `6.2×@67%`, and the emitted
+program runs in Soufflé to `best(28)`, matching the full-model argmax. (Full readout stays the exact default;
+this is the labeled-lossy storage/datalog/embedding mode.)
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
-decode-targeted trained head is the one experiment that could re-open a non-linear extension.*
+decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
+recommendation is now realized in-repo as a shipped, verified, datalog-emitting artifact.*
 
 ---
 

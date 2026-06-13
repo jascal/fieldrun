@@ -45,6 +45,36 @@ A real pretrained Llama (d=576, 30 layers, GQA 9/3, vocab 49152), end to end:
 | `tiny*/` | the minted bundles (gitignored). |
 | `whole*.dl`, `ctx*/`, `*.facts` | generated programs and context inputs (gitignored). |
 
+### Shipping the lever: the two-knob PR-core head (`pr_core_export.py`)
+
+The LE-T4 wall above is on the *lossless* path. `LOGIC_EXPORT.md` LO1 and `PROVABLE_OPT_PROPOSAL.md`
+§7 establish the **lossy** escape: the readout argmax factors through a rank-r readout-aligned decision
+basis `S`, so the `vocab × d` unembedding becomes `S` (`r × d`) + `A = S·(gain⊙U)ᵀ` (`r × vocab`) — a
+**tunable lossy size dial** at `r(d+vocab)` floats with *known, measured* decode preservation. The heavy
+tail is intrinsic (τ\*): three cheap routers all fail to make the core decode-exact (`pr_core_v2.py`), so
+PR-core ships as a labeled-lossy storage mode, not a free win. The full readout stays the exact default.
+
+`pr_core_export.py` is the shipped artifact:
+- **export** — fits `S` on calibration decisions, writes `<out>.prcore.npz` (`S`, `A`) + `.json` manifest
+  (rank, sizes, compression, `decode_kept`, lossy flag, provenance), and **verifies** preservation on a
+  *fresh* held-out battery (re-runs the real rope forward, compares PR-core argmax to the model's argmax).
+- **`--datalog`** — emits a self-contained, souffle-runnable **factored readout** `.dl`:
+  `proj(i)=Σ_j xraw(j)·sbasis(i,j)`, `corelogit(v)=Σ_i proj(i)·acore(i,v)`, `best = argmax`. This is the
+  LO1 lever applied *to the logic export itself* — the dense `vocab×d` embed facts shrink to the factored
+  `r(d+vocab)`. Shortlisted to stay runnable; the manifest records the true full-vocab fact count.
+
+```bash
+python3 pr_core_export.py --datalog          # SmolLM-135M, r=92
+# -> head 4.6M floats vs 28.3M = 6.2× smaller (LOSSY); decode kept 67% on 450 fresh held-out decisions
+# -> factored-readout .dl: PR-core argmax == full argmax (MATCH)
+souffle -D- prcore_head/smollm.prcore.dl     # -> best(28), the factored readout run in a neutral engine
+```
+
+| `pr_core.py` | the two-knob operating table (PR-core / span90 / wide) + the margin-gated hybrid, on the readout-aligned basis. |
+| `pr_core_v2.py` | the router-salvage attempts (Q1 second-stage rank-agreement gate, Q3 activation-covariance whitening) — **both fail**; the decode floor is τ\*. |
+| `pr_core_export.py` | **ships the lever**: re-loadable lossy head (`.prcore.npz`+`.json`), held-out verification, and the souffle-runnable factored-readout `.dl`. |
+| `prcore_head/` | the exported heads + emitted `.dl` (gitignored). |
+
 ## Reproduce
 
 ```bash
