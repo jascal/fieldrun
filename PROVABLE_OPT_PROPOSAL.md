@@ -521,7 +521,28 @@ Toki Pona and Finnish jump to `ρ/d=1.00` — cheapness is entirely lens-relativ
 confounds "language entropy" with "the model emits few distinct tokens on text it can't model"; the clean,
 deployment-relevant statement is that the forge tax = the effective rank of the output distribution on the
 *target data*, so richly-generating in-distribution use pays the tax while constrained / small-output-vocabulary
-deployment (structured output, tool grammars, classification) is highly compressible.
+deployment (structured output, tool grammars, classification) is highly compressible. (c) *In-distribution
+control — laundry-folding-robot instructions* removes the OOD confound: it is **English** (the model is fluent,
+4.2 bits/tok — far from the OOD 7+) yet a **constrained procedural domain** (86 distinct outputs vs English's
+264). It is *genuinely* compressible (`ρ/d` 0.08, R@32 85%) — the deployment-relevant good case, cleanly
+distinguished from the OOD-collapse "cheapness" of Toki Pona/Finnish. So the practical law: a **fluent** model on
+a **constrained-output** domain (robot instructions, tool calls, structured generation) pays a small tax and
+compresses well; open-ended fluent generation does not — and the right knob to predict it is `distinct a*`, the
+effective output vocabulary, measurable from a sample of the target traffic. (Fully training a model fluent in a
+*high*-output-diversity designed language — to reach the otherwise-unreachable "fluent + high-entropy" worst-case
+cell — needs a trainer/GPU and is out of this repo's no-torch scope; English already occupies that cell as the
+natural high-diversity-fluent point.)
+
+**The theoretical worst case (`lo3a/worst_case.py`) — `recoverable rank ≈ min(exp(H_output), d)`.** Computed
+directly on the real readout geometry over synthetic output distributions (no forward pass). (1) A Zipf-exponent
+sweep at fixed vocab 2048: the effective output vocabulary `exp(H)` falls 2048→10 as `s`:0→1.7 and recoverable
+rank tracks it (`ρ/d` 0.89→0.01; R@32 20%→95%) — at the natural `s≈1`, `exp(H)≈281 ≪ 2048`, so **Zipf is what
+*saves* natural language**. (2) Uniform over `m` forms gives recoverable rank `≈ min(m, d)` exactly (`m=64`→rank
+92; `m≥d`→saturates at `d`, R@32→30%). So the worst-case "conlang" for a low-rank readout is **flat, anti-Zipf
+frequency over ≥ d equiprobable, decision-distinct word-forms** — *not* "many cases"; cases only inflate the tax
+if usage stays uniform AND a model fluent enough emits the full diversity (an English-only model fed such a
+conlang collapses to few outputs, artificially cheap). Final closed form of the forge tax: `τ* = min(exp(H_output),
+d)` — the effective rank of the model's output distribution on the data, capped at the residual width.
 
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a

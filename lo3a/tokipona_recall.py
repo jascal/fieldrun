@@ -56,12 +56,36 @@ FINNISH=[
 ]
 FI_CLOSED=set("ja mutta tai koska kun että on oli ei en et emme ette eivät ole se ne tämä nämä hän minä sinä me te he joka jossa josta niin myös vielä jo vain kuin kanssa mukaan jälkeen ennen sekä eli jos vaikka kunnes kuten".split())
 
+# Laundry-folding-robot instructions: in-distribution ENGLISH (the model is fluent, low perplexity) but a
+# CONSTRAINED procedural domain (low output diversity: fold/lay/sleeve/toward/center). The no-OOD-confound test —
+# compressible because genuinely constrained, not because the model collapsed on text it can't model.
+LAUNDRY=[
+ "Pick up the t-shirt by the shoulders. Lay it flat face down. Fold the left sleeve inward toward the center. Fold the right sleeve inward toward the center. Fold the bottom third of the shirt upward. Fold the top third down over the bottom. Smooth out any wrinkles.",
+ "Unbutton the shirt completely. Lay it face down. Fold one side of the shirt toward the center, tucking in the sleeve. Repeat on the other side. Fold the sleeves back if they stick out. Fold the bottom of the shirt up in thirds. Fold the collar end down to meet the bottom edge.",
+ "Lay the jeans flat with the front side up. Fold one leg over the other so the seams align. Fold the waistband down about one-third of the way. Fold the bottom of the legs up to meet the waistband. Smooth the folded jeans.",
+ "Hold two adjacent corners of the sheet. Tuck one corner into the other to form a pocket. Repeat with the remaining two corners. Lay the sheet flat on a surface. Fold into thirds lengthwise, then fold into thirds widthwise.",
+ "Lay the towel flat horizontally. Fold one long side toward the center. Fold the other long side over it. Fold the towel in half from the short end. Fold in half again if desired for a smaller bundle.",
+ "Lay the pants flat with the front side up. Align the legs on top of each other. Fold one leg over if needed to align seams. Fold the waistband down one-third. Fold the bottom of the legs up to meet the waistband. Press gently to remove wrinkles.",
+ "Lay the hoodie face down. Fold the sleeves inward across the back. Fold the bottom hem upward one-third. Fold the top hood down over the bottom section. Smooth out the fabric.",
+ "Lay both socks flat on top of each other, aligning the toes and heels. Fold the pair in half from the toe to the cuff. Roll tightly from the toe upward into a compact bundle.",
+ "Lay the blouse face down carefully. Fold the sleeves inward gently without creasing. Fold the sides toward the center. Fold the bottom upward in loose thirds. Avoid sharp creases on delicate fabric.",
+ "Lay the sheet completely flat. Fold in half lengthwise. Fold in half lengthwise again. Fold in half widthwise. Continue folding until it reaches the desired size. Smooth between folds.",
+ "Lay the polo shirt face down. Fold the sleeves back toward the center. Fold the bottom third upward. Fold the collar section down. Lightly press to reduce wrinkles.",
+ "Lay the sweater face down. Fold the sleeves across the back, slightly overlapping if needed. Fold the bottom hem upward in thirds. Fold the top down to create a compact rectangle.",
+ "Lay the shorts flat. Fold one leg over the other. Fold the waistband down one-third. Fold the bottom upward to meet the waistband. Press lightly.",
+ "Lay the tablecloth completely flat. Fold in half lengthwise. Fold in half widthwise. Continue folding in half until it reaches a manageable size. Keep edges aligned.",
+ "Lay the onesie face down. Fold the sleeves inward. Fold the bottom snap section upward. Fold the top down over the bottom. Keep the fabric smooth.",
+ "Shake the shirt gently to loosen wrinkles. Lay it face down. Mist lightly with water if needed. Follow the standard dress shirt folding procedure, pressing more firmly between folds.",
+ "Fold the towel first using the bath towel procedure. Set aside. Fold each t-shirt individually using the basic method. Stack the folded items with the towel on the bottom for stability.",
+ "Fold the duvet cover in half lengthwise twice. Then fold widthwise in thirds. Use the robot's full reach for alignment.",
+]
+
 def cls_for(lang):
     def f(s):
         c=fine_class(s);
         if c in ("space","punct","digit"): return "closed"
         b=s.strip().lower()
-        if lang=="English": return "closed" if b in FUNCTION else "open"
+        if lang in ("English","Laundry"): return "closed" if b in FUNCTION else "open"
         if lang=="TokiPona": return "closed" if b in TP_CLOSED else "open"
         if lang=="Finnish": return "closed" if b in FI_CLOSED else "open"
         return "open"                                   # Lisp: operators/symbols are open; parens already "closed"
@@ -100,10 +124,10 @@ def main(stem):
     bpe=BPE(os.path.join(os.path.dirname(stem),os.path.basename(stem)+".tokenizer.json"))
     gU=(W["embed"] if cfg[7] else W["lm_head"]).astype(np.float64)*W["norm"].astype(np.float64)
     corp={}
-    for nm,tx in [("TokiPona",TOKIPONA),("Lisp",LISP_PASSAGES),("English",PASSAGES),("Finnish",FINNISH)]:
+    for nm,tx in [("TokiPona",TOKIPONA),("Laundry",LAUNDRY),("Lisp",LISP_PASSAGES),("English",PASSAGES),("Finnish",FINNISH)]:
         decs,freq,ppl=collect(W,cfg,cfg_f,bpe,tx); corp[nm]=dict(decs=decs,freq=freq,ppl=ppl)
     rows=[]
-    for nm in ("TokiPona","Lisp","English","Finnish"):                   # the journey: minimal → morphologically explosive
+    for nm in ("TokiPona","Laundry","Lisp","English","Finnish"):         # constrained→open; Laundry = in-distribution control
         c=corp[nm]; n=len(c["decs"]); tr,te=c["decs"][:n//2],c["decs"][n//2:]
         Vt=fit_basis(tr,gU); m=evaluate(nm,te,c["freq"],Vt,gU,d,bpe); m.update(name=nm,ppl=c["ppl"]); rows.append(m)
     # cross-lens: each extreme's decisions scored against the ENGLISH-fit basis (the model's natural geometry)
@@ -112,16 +136,27 @@ def main(stem):
         c=corp[nm]; m=evaluate(nm,c["decs"][len(c["decs"])//2:],c["freq"],Vt_eng,gU,d,bpe)
         m.update(name=f"{nm[:4]}@Eng-lens",ppl=c["ppl"]); rows.append(m)
 
-    print(f"== an entropy-per-token journey: Toki Pona → Lisp → English → Finnish (SmolLM-135M) ==")
+    print(f"== an entropy-per-token journey (SmolLM-135M): Toki Pona · Laundry · Lisp · English · Finnish ==")
     print(f"   {'corpus':<13}{'n':>5}{'bits/tok':>10}{'distinct a*':>12}{'R@32 all':>10}{'R@32 open':>11}{'med ρ/d':>9}{'Spear':>7}")
     for r in rows:
         print(f"   {r['name']:<13}{r['nte']:>5}{r['ppl']:>10.1f}{r['distinct']:>12}{100*r['R32']:>9.0f}%{100*r['R32_open']:>10.0f}%{r['medrank']:>9.2f}{r['sp']:>+7.2f}")
-    print(f"\n   bits/tok = model cross-entropy on the language; distinct a* = number of distinct argmax tokens")
-    print(f"   (output-vocabulary diversity); med ρ/d = normalized recoverable rank.")
-    print(f"   recoverable rank tracks OUTPUT DIVERSITY, not the model's competence/surprisal: Toki Pona is the")
-    print(f"   model's HARDEST (highest bits/tok) yet MOST compressible (few distinct outputs); Finnish, with its")
-    print(f"   agglutinative long tail, is the open-class extreme. cross-lens (@Eng): scored in the model's natural")
-    print(f"   geometry instead of its own — separates the language's intrinsic diversity from the lens it's fit to.")
+    print(f"\n   bits/tok = model cross-entropy on the language; distinct a* = distinct argmax tokens (output diversity).")
+    print(f"   recoverable rank tracks OUTPUT DIVERSITY of a FLUENT model: Laundry (in-distribution, 4.2 bits/tok,")
+    print(f"   86 outputs) is GENUINELY compressible (ρ/d 0.08); Toki Pona/Finnish are cheap only via OOD-collapse")
+    print(f"   (7+ bits/tok; cross-lens @Eng → ρ/d 1.00); English (fluent, open-ended, 264 outputs) is the dear case.")
+    try:
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        fig,ax=plt.subplots(figsize=(7,4.6))
+        for r in rows:
+            ood = r["ppl"]>=6 and "Eng-lens" not in r["name"]
+            c = "#c33" if "Eng-lens" in r["name"] else ("#e90" if ood else "#39c")
+            ax.scatter(r["distinct"],r["medrank"],s=70,c=c,edgecolor="k",zorder=3)
+            ax.annotate(r["name"],(r["distinct"],r["medrank"]),fontsize=8,xytext=(5,4),textcoords="offset points")
+        ax.set_xlabel("distinct argmax tokens  (output-vocabulary diversity)"); ax.set_ylabel("median normalized recoverable rank  ρ/d")
+        ax.set_title("recoverable rank tracks OUTPUT DIVERSITY (blue=fluent · orange=OOD-collapse · red=cross-lens)")
+        ax.set_ylim(-0.05,1.08); fig.tight_layout(); out=os.path.join(HERE,"entropy_spectrum.png"); fig.savefig(out,dpi=110)
+        print(f"\n   plot: {out}")
+    except Exception as e: print(f"   (plot skipped: {e})")
 
 if __name__=="__main__":
     main(sys.argv[1] if len(sys.argv)>1 else os.path.join(HERE,"smollm","smollm"))
