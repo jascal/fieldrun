@@ -457,6 +457,19 @@ head; `τ*` stands). The class is in the residual *geometry*, not the lossy core
 format-biased) — itself the cleanest statement of the forge tax: the model *knows* it is about to emit content
 (linearly, cheaply), but emitting *which* content is the irreducible cost.
 
+**Q1 localization — the "content-incoming" signal is a late-layer MLP feature (`lo3a/lo1_localize.py`).**
+The probe coordinate `ŵ·x` decomposes *exactly* into each circuit's additive contribution; taking the
+class-mean difference (content − syntax) gives every head's and neuron's **discriminative** contribution to the
+separation. Result: the content/syntax distinction is **83% MLP-neuron, 17% attention-head, ~0% embedding**,
+and **69% built in the late layers (L20–29)**. It is **semi-localized** — not one circuit, but far from uniform:
+a *single* last-layer neuron (**L29 #906**) carries **13% of the entire separation**, the top 0.2% of neurons
+(84) carry half of it, the top 10% carry 90%. L29 #906 tops *both* the raw-magnitude and the discriminative
+rankings, so it is a genuine content-signaling unit, not a massive-activation artifact — a concrete, ablatable
+handle. So "about to emit content" is a sparse-ish, late-layer **MLP** computation with a dominant detector
+neuron, consistent with the forge tax being a distributed *content* computation rather than a localizable
+*syntax* shortcut. (Q3 is settled in passing: the free `Sx` probe (83%) matched the full-residual `x` probe
+(82%), so the cheap `r`-dim gate is optimal — there is no reason to read the full residual for routing.)
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
