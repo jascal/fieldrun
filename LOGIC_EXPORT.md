@@ -205,6 +205,22 @@ as provenance structure vs intervention diffuseness.
     intrinsic-or-`Δ_repr` (a real wall), not a scalar-lens artifact. *(Caveats: single model; `effrank` =
     energy PR vs `faithful_r` = a coarse rank sweep truncated to the top-256 components; a margin-aware /
     non-orthogonal valuation beating SVD-truncation is not yet ruled out — the open refinement.)*
+  - **Decision-direction span — the deciding number (Grok), and it PARTIALLY REVERSES the above
+    (`lo3a/lo1_span.py`, SmolLM-135M, 800 decisions).** A *context-free* valuation has fixed operators and
+    cannot adapt per input, so the intrinsic object is the span `S = span{ΔU(x)/m(x)}` of the
+    (margin-normalized) decision directions `ΔU = gain⊙(U_pred − U_runnerup)`. Measured: **effrank(unit ΔU)
+    ≈ 16** of 576 (forge-tax 14.5, retrievable 23.2), **90%-energy rank ≈ 115**, margin-normalized effrank
+    ≈ 5. This is **LOW** — so the energy-basis `faithful_r ≈ 213` was the *wrong basis*: the decision
+    directions live in a shared low-rank subspace `S`, and a **context-free valuation whose fixed basis is
+    `S` can preserve decodes at moderate rank without per-input adaptation**. By Grok's own criterion
+    (low span ⇒ escape hatch open), **`Δ_descr` is alive on the decision axis** — the forge tax is more a
+    *basis-choice (scalar-lens) artifact* than intrinsic, **provided the valuation is built in the decision
+    basis, not the energy basis**. Two tensions keep it from a clean win: the 90%-coverage rank (~115) ≈ the
+    scalar PR (~92), so the escape is *partial*; and forge-tax span is *lower* than retrievable (against the
+    "forge tax needs more width" prediction). *Net: the basis choice (decision vs energy) is the lever Grok
+    flagged — choose it right and the descriptive escape mostly works; the clean closer is to BUILD the
+    fixed-`S` rank-r valuation and measure decode preservation vs r across inputs.* (Caveat: one model;
+    random contexts may understate `dim(S)` vs real text.)
 - **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
   **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
   **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
