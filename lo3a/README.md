@@ -29,6 +29,7 @@ Soufflé has only `+ - * / ^` and `sum`/`max` — no `exp`/`sqrt`/`sin`/`cos`. S
 
 | `run_smollm.py` | the **whole pipeline on a REAL small Llama** (SmolLM-135M): `fieldrun convert` → certified FFN reduce → HF safetensors → `fieldrun convert` → bundle′. Uses real high-margin contexts from a fieldrun greedy trace. |
 | `pythia_grok.py` | **PO-T7 grokking order-parameter experiment** — converts 28 Pythia-70m checkpoints (step0→143k via `@stepN`), runs the new `--probe-margin`, and plots the certifiable-compressible fraction / margin / PR / accuracy across training (`pythia_grok.png`). Finding: cert fraction *saturates* with accuracy, but PR (circuit concentration) consolidates in **two events** — including a **discrete late one (~step 70k) invisible to accuracy/margin/cert**. The dissociation is the certificate's confidence-boundedness. |
+| `lo1_matrix.py` | **LO1 attack** (Grok's matrix/operator-semiring valuation): the descriptive escape's width = the *effective rank* of the dense fragment's Gram, so escape ⟺ low-rank. Synthetic part proves the mechanism; real part (SmolLM) finds the **token-coupling** Gram is low-rank (effrank/K≈0.34) **but margin-invariant** → the forge tax is *not* there, it's in the **circuit-coupling** axis. See `../LOGIC_EXPORT.md` LO1. |
 
 The full pipeline these demonstrate: **fieldrun model → LO3a Datalog (`export --logic-whole`) → lossless optimize (`bench.sh`, ~190×) → certified reduce (`reduce.py`, smaller bundle) → HF safetensors (`to_safetensors.py`, publishable) → round-trips back to fieldrun losslessly.**
 

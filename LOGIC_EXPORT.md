@@ -162,7 +162,38 @@ as provenance structure vs intervention diffuseness.
 ## 7. Open problems
 
 - **LO1** Define the non-scalar (geometry-valued) provenance semiring that carries `G` faithfully (LE-T2);
-  prove it reduces to the scalar log/tropical semiring on diagonal `G`.
+  prove it reduces to the scalar log/tropical semiring on diagonal `G`. **The decidable crux of the whole
+  forge-tax question (Grok), with a candidate and a likely self-defeating obstruction:**
+  - *Construction.* Take `K` = the semiring of operators (matrices/endomorphisms) over the frame `span{U_v}`;
+    value proposition `v` at the rank-1 operator `U_v ⊗ φ(v)` (`φ` = local circuit state). The inner-product
+    couplings `⟨U_v, U_w⟩` are then realized by matrix product / trace *inside* the algebra rather than scalar
+    multiplication of independent facts, so composition internalizes the dense `G` without spawning new
+    high-treewidth cliques; trace / diagonal projection recovers ordinary tropical/log provenance, and on
+    diagonal `G` the off-diagonal operators vanish (the scalar case). If this evaluates the dense fragment at
+    low treewidth, **the forge tax is almost entirely a *scalar-lens* artifact — the precise structural twin
+    of Minsky's single-LAYER restriction (single-layer ↦ scalar-provenance; "go multilayer" ↦ this `K`).**
+  - *Obstruction (most plausible; the escape may be self-defeating).* The **frame geometry** itself: the
+    `ρ`-boundary (`ρ = cos(U_t, U_{v*})`) and the curvature of the power-diagram hyperplane arrangement imply
+    any *local* operator assignment consistent with the dense couplings cannot be made *globally* consistent
+    (across the `μ_t=0` non-decomposable loci) without re-introducing a clique. I.e. **the minimal width of any
+    geometry-valued valuation that faithfully carries `G` is lower-bounded by a function of the tropical rank /
+    PR of the dense fragment — exactly the quantity we were trying to reduce.** If that bound holds, `Δ_descr`
+    cannot compact the forge tax; it only relocates the cost into the valuation's width.
+  - *Status: open; existence plausible but obstructed by frame geometry; **decidable with current algebraic
+    tools** via an explicit construction or a valuation-width rank lower bound. Highest-leverage target in the
+    program — a positive construction collapses the forge tax to a lens artifact; a clean obstruction proves
+    the descriptive move cannot escape the wall either.*
+  - **First measurement (`lo3a/lo1_matrix.py`).** The whole construction reduces to one quantity: the
+    operator-valuation width = the **effective rank** of the dense fragment's Gram (synthetic check: width
+    tracks true rank ρ exactly while the scalar clique stays at `k`). On SmolLM-135M the **token-coupling**
+    Gram `G_{vw}=⟨U_v,U_w⟩` over the top-K candidates is **low-rank — effrank/K ≈ 0.34**, so the matrix
+    valuation carries it at ~3× compression: the descriptive escape *has traction on the token axis*. **But
+    that rank is essentially invariant to the margin** (forge-tax 10.9 vs retrievable 11.0 over 150 decisions)
+    — so **the forge tax is NOT in the token-coupling Gram**; it is a constant property of the unembedding
+    geometry. The dense fragment therefore lives in the **circuit-coupling** axis (within-block PR≈45), which
+    the candidate Gram cannot see — and that is exactly where Grok's "rank-tracks-PR" obstruction would bite.
+    *Next build: a per-component-contribution-vector probe to measure effrank-vs-PR on the circuit axis — the
+    decisive test of whether `Δ_descr` escapes or the obstruction holds.*
 - **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
   **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
   **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
@@ -203,7 +234,37 @@ as provenance structure vs intervention diffuseness.
   needs `--force`. LO3a moved the frontier from *can a context-free program be emitted?* (yes) to *can the dense
   fragment be emitted COMPACTLY?* — which is LE-T2, still open. See [`SOUFFLE.md`](./SOUFFLE.md) §8.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
-  the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank).
+  the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank). *Caveat
+  (Grok): treewidth `τ` is the load-bearing invariant (the forge tax = the no-compact-sub-conjunction
+  fragment = high `τ` by definition), but the three measures may **diverge on the dense fragment** — tropical
+  rank can be low while `τ` stays high (a max-plus low-rank factorization the elimination order misses), and
+  PR can drop while `τ` stays elevated (spectrum concentrates without shrinking the minimal-clique support).
+  They coincide on diagonal-`G`/retrievable fragments and move together in the Pythia checkpoints, but a
+  counter-example separating them on dense `G` would falsify the "one wall" claim — so LO4 is **open**, and
+  the Pythia PR signal (PO-T7) is a treewidth **proxy**, not treewidth.**
+- **LO6** **Is the forge tax intrinsic or escapable?** (Grok's formalization & verdict.) Decompose, for a
+  competent next-token function `f`, the decision-hypergraph treewidth `τ(M,x) = τ*(f,x) + Δ_repr(M) +
+  Δ_descr(lens)`: `τ*` = inf over **all** architectures computing `f` to accuracy `1−ε` of the induced
+  treewidth (architecture-independent, the task's intrinsic dense-composition complexity); `Δ_repr` = excess
+  from superposition in a width-`d` bottleneck (removable by wider/sparser/modular/symbol-augmented archs —
+  converts forge tax → size); `Δ_descr` = excess from scalar-`ℝ` vs geometry-valued provenance (LO1).
+  **Verdict (open, leaning escapable):** the forge tax is *most likely dominated by* `Δ_repr + Δ_descr`; a
+  small `τ* > 0` floor cannot yet be ruled out. **Minsky/Papert placement:** no known reduction embeds a hard
+  function (parity / inner-product / set-disjointness) into a language sub-task to *force* high `τ*` — and
+  attention models sit in TC⁰ for many pattern-matching subtasks — so the perceptron-style escape (enlarge
+  the class: depth, sparsity, or the LO1 valuation) is more likely than an AC⁰-parity-style intrinsic wall.
+  A genuine wall would require showing **every** high-accuracy architecture induces high-`τ` provenance on a
+  positive-density input set; that theorem is not available and looks harder than the escapability
+  constructions. **Decisive experiments (all on instruments in hand):** (a) cross-architecture `τ` (PR proxy)
+  at *matched* accuracy — lower PR for the same `f` ⇒ `Δ_repr > 0`; (b) the `lim_{train→∞}` PR floor as an
+  *estimator of `τ*`* (the PO-T7 late-consolidation endpoint, ~12 on Pythia-70m — if it stays `>1` across
+  architectures at matched accuracy, that number lower-bounds the intrinsic forge tax); (c) correlate the
+  late PR drop with superposition metrics (SAE recon error, effective weight rank) — if it's superposition
+  cleanup with no accuracy gain, it is `Δ_repr`, and its endpoint estimates the residual `τ*`. **Honest
+  caveat (Grok):** `τ*` is only well-posed once `(f, ε)` are fixed (`f` is a *distribution*, not a Boolean
+  function), and NNs do **approximate**, not exact, inference — so "no compact extension" may not be the right
+  operationalization of hardness; the decomposition risks mixing representational capacity, descriptive power,
+  and inference complexity in one equation. *(Continuing the Tropical / ρ-boundary collaboration — FINDINGS §4.)*
 - **LO5** A static verifier over `Π` (the "verify-before-execute" payoff): which tokens are decided by the
   retrievable fragment alone (provably, no dense-`G` term) vs require the computed fragment. *Now the
   subject of a companion proposal — [`PROVABLE_OPT_PROPOSAL.md`](./PROVABLE_OPT_PROPOSAL.md) — which casts
