@@ -128,6 +128,16 @@ def run_model(mid, dtype, max_ctx, device):
     td = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[dtype]
     tok = AutoTokenizer.from_pretrained(mid)
     model = AutoModelForCausalLM.from_pretrained(mid, torch_dtype=td, low_cpu_mem_usage=True).to(device).eval()
+    # The hook is applied IDENTICALLY for every architecture/tokenizer — there are no per-arch adjustments,
+    # by construction. Every HF causal LM ends in `lm_head(h)`, so we hook the unembed's INPUT `h` (the
+    # already-normed readout residual) and take `U = lm_head.weight`. Edge cases all fold in for free:
+    #   * tied embeddings  → get_output_embeddings() still returns the lm_head Linear (weight = the embedding),
+    #     so U and the hook are correct without special handling;
+    #   * embedding-scale / (1+w) norms (Gemma) → already applied inside the forward, so they live in `h`;
+    #   * final logit softcap (Gemma) → applied AFTER lm_head and monotone in each logit, so argmax(out.logits)
+    #     == argmax(h·Uᵀ) == a*; we target a* (from out.logits) and fit the lens on U rows, all consistent;
+    #   * large vocab (Gemma 262k, Qwen 152k) → U is upcast to float64 for the rank math; bf16 weights upcast
+    #     on capture. So vocab size and tying never need a code path — only RAM (the >1B models run in bf16).
     head = model.get_output_embeddings()
     U = head.weight.detach().float().cpu().numpy()                           # [V, d]
     V, d = U.shape

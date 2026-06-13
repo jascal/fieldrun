@@ -323,10 +323,20 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
     structural reorganization seen on 70m (there ~20→12 at ~80k). **What consolidates:** the new per-checkpoint
     dominant-DLA-circuit fingerprint (aggregate `(layer,head)` DLA, emitted by `--probe-margin` as
     `PROBE_CIRCUITS`) shows the late event is a **migration of the dominant decode circuits onto the FINAL layer.**
-    Across 96k→110k the top-circuit set turns over (Jaccard **0.40**): mid-layer heads `{10.1, 5.0, 5.2, 8.10}`
-    *leave* the top set and the persistent dominant circuits are **all layer-11** (`11.0, 11.5, 11.9, 11.11`, +
-    `11.1/11.6` entering) — the last layer of the 12-layer model. Net over training (step 2k→143k) the dominant
-    set has Jaccard 0.25 with `{11.0, 11.11, 11.9}` persisting throughout. So the late, certificate-invisible PR
+    The top-5 dominant `(layer.head)` DLA circuits across the consolidation make the migration legible:
+
+    | step | PR | top-5 dominant circuits `(layer.head)` |
+    |---:|---:|---|
+    | 64 000 | 35.5 | `8.2  8.3  10.1  5.2  5.0` — mid-layers (8/10/5) |
+    | 96 000 | 39.2 | `11.0  11.11  11.5  11.9  10.1` — migration underway |
+    | 110 000 | 26.5 | `11.0  11.5  11.11  11.1  11.9` — **all layer-11** |
+    | 143 000 | 26.1 | `11.0  11.5  11.11  11.6  11.9` — all layer-11 (stable) |
+
+    Across 96k→110k the top-circuit set turns over (Jaccard **0.40** over the top-8): mid-layer heads
+    `{10.1, 5.0, 5.2, 8.10}` *leave* the top set and the persistent dominant circuits are **all layer-11**
+    (`11.0, 11.5, 11.9, 11.11`, + `11.1/11.6` entering) — the last layer of the 12-layer model. Net over
+    training (step 2k→143k) the dominant set has Jaccard 0.25 with `{11.0, 11.11, 11.9}` persisting throughout.
+    So the late, certificate-invisible PR
     drop is a **real circuit-identity reorganization — decode attribution concentrating onto final-layer heads —
     not a magnitude artifact**, and it is *not* the same circuits the early learning-phase consolidation used.
     Descriptive, per `no-necessity-claims`: this is the measured 160m pattern, not a "grokking = X" claim (the
@@ -430,6 +440,14 @@ probe on the *frozen* core was flat (degree 1/2/3 ≈ 68/68/64% vs 65% linear), 
 hard for low-order interactions too. So the two-knob *linear* policy stays the cheapest, most robust,
 verification- and MPS-compatible default; the trained head is a **measured, partial re-opener at the
 compressed end**, not a free win and not a closed door.
+
+*(Cross-program note.* This "a decode/capability-targeted basis beats the reconstruction-optimal one"
+result is the LO1 echo of `sae-forge`'s **cosine-vs-capability** lesson — a forge can read residual-cosine
+"useless" yet retain a downstream SAE's per-feature AUC, because Frobenius/L2-optimal ≠ capability-optimal.
+Here the same gap appears in the *decode*: a cross-entropy-trained projection beats Frobenius-optimal SVD at
+matched rank. The readout-aligned decision directions (§7) are also exactly the "right first-class input"
+that `polygram`/`sae-forge` dictionaries should be built on rather than raw activations — so R1/R2 reinforce
+that basis choice from the decode side.)*
 
 **Cross-architecture validation of the `τ*` basis (R1; `lo3a/tau_star_xarch.py`).** The whole two-knob
 policy rests on `τ* ≈ min(exp(H_output), d)` and the open-class-tail forge tax, both established on SmolLM

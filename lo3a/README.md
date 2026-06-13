@@ -117,3 +117,23 @@ matching the model — LO3a's "possible?" is **yes**. What stays open is **LE-T2
 *compact* at full scale (Qwen2.5-0.5B ≈ 136M embed facts — `export --logic-whole` refuses it without
 `--force`, naming the wall). The frontier moved from *can you emit a context-free program?* to *can the
 dense fragment be emitted compactly?* — see `../SOUFFLE.md` §8 and `../LOGIC_EXPORT.md` LO3a.
+
+## LO1 / FABLE R1–R4 batteries (cross-arch τ\*, trained head, grokking ladder, PO-T2)
+
+Four hand-off directions worked end-to-end. **Outputs (JSON/PNG) are gitignored** (`.gitignore` tracks
+only `*.py`/`*.sh`/`*.md` here); the result numbers live in `../FINDINGS_PYTHIA.md` and
+`../PROVABLE_OPT_PROPOSAL.md` (§3/§6/§7), and the tables regenerate from the committed scripts. R1/R2/R3
+need `torch`+`transformers` — run with the sibling **lm-sae venv**; R4 needs `souffle` in `PATH`.
+
+| Script | Direction | Run | Regenerate table |
+|---|---|---|---|
+| `tau_star_xarch.py` | **R1** cross-arch τ\* (9 models, 4 tokenizer families) | `…/lm-sae/.venv/bin/python tau_star_xarch.py` (add `--models …` for more) | `tau_star_table.py` ← `tau_star_xarch.json` |
+| `tau_star_trained.py` | **R2** frozen SVD vs trained projection (free + matched-capacity tied) | `… tau_star_trained.py --hf-models gpt2 EleutherAI/pythia-160m` | `tau_star_trained_table.py` ← `tau_star_trained.json` |
+| `tau_star_budget.py` | **R2** step-budget control (is the high-rank shortfall under-fitting?) | `… tau_star_budget.py --model gpt2 --steps 150 400 800` | — (`tau_star_budget.json`) |
+| `pythia_grok.py` | **R3** PO-T7 grokking ladder + `PROBE_CIRCUITS` late-event circuit drift | `… pythia_grok.py --model EleutherAI/pythia-160m` (default 70m) | self-plots `pythia_grok[_p160m].png` |
+| `magic_residual.py` | **R4** PO-T2: Soufflé demand transform on the emittable Π (decode-lossless, dense un-prunable) | `python3 mint_and_emit.py && printf '0\t3\n1\t14\n2\t7\n3\t2\n4\t29\n' > ctx/token.facts && …/python magic_residual.py` | — (`magic_residual.json`) |
+
+R3 emits a new `PROBE_CIRCUITS` line (aggregate `(layer,head)` DLA) under `fieldrun … --probe-margin`
+(additive; the existing `PROBE_MARGIN` line is unchanged), so the grok run records a per-checkpoint
+dominant-circuit fingerprint and diffs it across the late consolidation. The **410m** ladder rung is the
+one piece not run here (≈22 GB of checkpoint downloads — flagged, no silent cap).
