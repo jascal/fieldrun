@@ -505,6 +505,24 @@ information and is incompressible by *any* fixed low-rank lens. The forge tax is
 it is Zipf's law. (Caveat: a single 135M model and a modest real corpus; the trend is strong and monotonic but
 the absolute ranks are model/corpus-specific.)
 
+**Scale + cross-linguistic — `τ*` is the effective rank of the model's OUTPUT distribution (`lo3a/lo1_ladder.py`,
+`lo3a/tokipona_recall.py`).** (a) *Ladder* (135M→360M→1.7B): the recoverable-rank↔self-info law **strengthens**
+with scale (Spearman 0.67→0.72→0.76) — a property of language+linear-readout, not a small-model artifact. The
+*relative* tax shrinks (content `ρ/d` 1.00→0.75; bits-per-rank 19.8→30.4) but the *absolute* rank grows (content
+576→1536 dims): scale conditions the tax down as a fraction of capacity without removing it — *changes the
+constant, not the floor*. (b) *Cross-linguistic* (Toki Pona → Lisp → English → Finnish): perplexity and
+recoverable rank **dissociate**. English — the language SmolLM models *best* (2.4 bits/tok) — is the *least*
+compressible (`ρ/d` 0.33, R@32 68%); Toki Pona (7.2 bits/tok, the model's *hardest*) and Finnish (7.0) are the
+*most* compressible (`ρ/d` 0.03, 0.01). The mechanism is the **`distinct a*`** count — distinct argmax tokens
+emitted: English 264 vs Toki Pona/Finnish ~50–66 (OOD, the model collapses to few outputs). So recoverable rank
+= the **effective rank of the model's OUTPUT (argmax) distribution on the data**, not the language's intrinsic
+entropy and not the model's competence. The **cross-lens** rows nail it: scored against the English-fit lens,
+Toki Pona and Finnish jump to `ρ/d=1.00` — cheapness is entirely lens-relative. *Honest caveat:* the OOD collapse
+confounds "language entropy" with "the model emits few distinct tokens on text it can't model"; the clean,
+deployment-relevant statement is that the forge tax = the effective rank of the output distribution on the
+*target data*, so richly-generating in-distribution use pays the tax while constrained / small-output-vocabulary
+deployment (structured output, tool grammars, classification) is highly compressible.
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
