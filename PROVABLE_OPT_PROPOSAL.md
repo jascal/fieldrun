@@ -409,8 +409,30 @@ bound `|p_v−q_v|≤‖(I−P_r)x‖·‖gain⊙U_v‖` ruling out every out-of
 `U` resident, no storage win, not exact), not an exactness recovery — a **fourth** independent route to the same
 `τ*` floor (after the margin gate, cross-rank agreement, and whitening). *(Caveat: both proxies are synthetic;
 neither reaches a real tokenized corpus — but the margin- and distribution-independence of the ~80% ceiling makes
-a real-text escape unlikely. A real-corpus recall sweep and the torch-gated trained head remain the only
-re-openers.)*
+a real-text escape unlikely.)*
+
+**Real-corpus resolution (`lo3a/real_recall.py`, `lo3a/bpe.py`) — the forge/retrievable split is SEMANTIC.**
+Grok's hypothesis was that high-margin *real-text* decisions (which random prompts never reach) might be
+shortlist-cheap (recall → 90%+). Tested directly: a self-contained byte-level BPE (no torch/tokenizers) +
+an all-positions forward, teacher-forcing 21 diverse real passages (prose, encyclopedic, code, dialogue,
+news) = 1190 in-distribution decisions. The hypothesis is **refuted**, and the real signal is **token type,
+not margin**:
+
+| token class | share | R@1 (r=92) | R@32 (r=92) | R@32 (r=256) |
+|---|---|---|---|---|
+| content **word** | 70% | 32% | **56%** | 77% |
+| **punct** | 20% | 71% | 94% | 99% |
+| **space** | 8% | 73% | 98% | 100% |
+| **digit** | 1% | 88% | 100% | 100% |
+
+Margin is a weak, plateauing proxy (R@32 climbs to ~75% by margin∈[1,2) then *flattens*; the ≥4 band is only
+68% — never the predicted 90%+). The clean cut is semantic: **format / structural / syntactic tokens are the
+retrievable fragment** (R@32 94–100% at `r=92`), while **content-word prediction is the forge tax** (`τ*`):
+56% at `r=92`, and only 77% even at `r=256` (which barely compresses). This also **corrects** the synthetic
+numbers upward-biased: random/garbage prompts let the model fall back to recoverable format tokens (inflating
+recall to ~80%); **real text is *harder*, not easier**, because it is ~70% content-word prediction — exactly
+the heavy-tail fragment. So the forge tax has a *meaning-vs-syntax* signature: it is the cost of predicting
+**content**, not structure. The torch-gated decode-targeted trained head is now the sole remaining re-opener.
 
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a

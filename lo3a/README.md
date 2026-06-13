@@ -73,7 +73,9 @@ souffle -D- prcore_head/smollm.prcore.dl     # -> best(28), the factored readout
 | `pr_core.py` | the two-knob operating table (PR-core / span90 / wide) + the margin-gated hybrid, on the readout-aligned basis. |
 | `pr_core_v2.py` | the router-salvage attempts (Q1 second-stage rank-agreement gate, Q3 activation-covariance whitening) — **both fail**; the decode floor is τ\*. |
 | `pr_core_export.py` | **ships the lever**: re-loadable lossy head (`.prcore.npz`+`.json`), held-out verification, and the souffle-runnable factored-readout `.dl`. |
-| `pr_core_spec.py` | **speculative-decoding / shortlist evaluation**: no multi-token speedup (the draft shares the whole stack); the single-position shortlist's top-K recall plateaus at **~80%** (r=92), *flat across margin* and two prompt distributions, **0%** certifiable — a fourth τ\* confirmation. A compute-mode quality bump, not an exactness recovery. |
+| `pr_core_spec.py` | **speculative-decoding / shortlist evaluation**: no multi-token speedup (the draft shares the whole stack); the single-position shortlist's top-K recall plateaus at **~80%** (r=92), *flat across margin* and two synthetic prompt distributions, **0%** certifiable — a fourth τ\* confirmation. A compute-mode quality bump, not an exactness recovery. |
+| `bpe.py` | self-contained byte-level BPE encoder for `smollm.tokenizer.json` (no `torch`/`tokenizers`/`regex` dep) — gives real in-distribution token sequences for `real_recall.py`. |
+| `real_recall.py` | **the forge/retrievable split is SEMANTIC**: teacher-forces 21 real passages (1190 decisions), recall vs margin **and** token type. Content-word prediction = forge tax (R@32 **56%** at r=92, 77% at r=256); format tokens (punct/space/digit) = retrievable (R@32 **94–100%**). Margin plateaus ~70% (refutes the high-margin-rescue hypothesis); real text is *harder* than synthetic (random prompts inflate recall via format-token fallback). |
 | `prcore_head/` | the exported heads + emitted `.dl` (gitignored). |
 
 ## Reproduce
