@@ -489,6 +489,22 @@ tax is the cost of selecting from the open lexicon** — and this aligns with th
 feature): closed-class identity is reconstructible from the low-rank decision geometry; open-class lexical choice
 is the heavy-tailed `τ*` computation.
 
+**The information-theoretic floor (`lo3a/info_rank.py`) — recoverable rank ≈ token self-information; `τ*` is
+entropy.** Define a token's *recoverable rank* as the minimal `r` at which the core's top-1 recovers the full
+argmax. It rises strongly and **monotonically** with the token's self-information: Spearman **+0.83** vs the
+model-intrinsic baseline-logit rarity, **+0.67** vs corpus `−log₂` unigram frequency. By frequency band the
+median recoverable rank climbs **16 → 256 → 512** (frequent → rare); by class, closed-class function words
+recover at rank ~48 (7.6 bits) while open-class content needs the full `d=576` (10.6 bits; 1% recovered at
+`r≤92`). The mechanism is not circular — it is the point: the *optimal* linear lens (SVD of the decision
+geometry) allocates its rank budget by how often a token participates in decisions, i.e. by frequency, so
+recoverable rank ≈ token information *by construction of the optimal lens*. This **unifies the whole arc**: the
+heavy-tailed decision spectrum (`α≈0.97`, the scale-stable forge-tax invariant from the spectral triple) is the
+**Zipfian frequency tail of language**. `τ*` is therefore the text's **entropy** viewed through the readout —
+closed-class grammatical scaffolding is low-entropy and compresses; open-class lexis carries the Shannon
+information and is incompressible by *any* fixed low-rank lens. The forge tax is not the transformer's fault;
+it is Zipf's law. (Caveat: a single 135M model and a modest real corpus; the trend is strong and monotonic but
+the absolute ranks are model/corpus-specific.)
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
