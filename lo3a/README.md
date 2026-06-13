@@ -73,6 +73,7 @@ souffle -D- prcore_head/smollm.prcore.dl     # -> best(28), the factored readout
 | `pr_core.py` | the two-knob operating table (PR-core / span90 / wide) + the margin-gated hybrid, on the readout-aligned basis. |
 | `pr_core_v2.py` | the router-salvage attempts (Q1 second-stage rank-agreement gate, Q3 activation-covariance whitening) — **both fail**; the decode floor is τ\*. |
 | `pr_core_export.py` | **ships the lever**: re-loadable lossy head (`.prcore.npz`+`.json`), held-out verification, and the souffle-runnable factored-readout `.dl`. |
+| `pr_core_spec.py` | **speculative-decoding / shortlist evaluation**: no multi-token speedup (the draft shares the whole stack); the single-position shortlist's top-K recall plateaus at **~80%** (r=92), *flat across margin* and two prompt distributions, **0%** certifiable — a fourth τ\* confirmation. A compute-mode quality bump, not an exactness recovery. |
 | `prcore_head/` | the exported heads + emitted `.dl` (gitignored). |
 
 ## Reproduce

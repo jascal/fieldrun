@@ -392,10 +392,31 @@ the logic export itself*: the dense `vocab×d` embed facts become `proj(i)=Σ_j 
 program runs in Soufflé to `best(28)`, matching the full-model argmax. (Full readout stays the exact default;
 this is the labeled-lossy storage/datalog/embedding mode.)
 
+**Speculative-decoding / shortlist evaluation (`lo3a/pr_core_spec.py`) — a fourth τ\* confirmation.** The
+natural next idea is PR-core as a speculative-decoding draft. Two parts, both measured. (1) *No multi-token
+speedup.* The draft shares the **entire transformer stack** with the target — PR-core only cheapens the final
+projection — so drafting token `k+1` still costs a near-full forward pass (the residual at `k+1` runs the whole
+stack). The classic cheap-autoregressive-draft mechanism is unavailable here; it needs a layer-reduced /
+early-exit draft, an orthogonal lever. (2) *Single-position shortlist* is the surviving win: PR-core proposes a
+top-`K` candidate set (cheap `r·vocab`), the full unembedding scores **only those `K` rows** (`K·d`), exact iff
+`a*∈shortlist` — so the deciding quantity is top-`K` **recall**, not the top-1 (67%). Measured on SmolLM-135M:
+`R@32 ≈ 80%` at `r=92`, and it is **flat across the model's own margin** (thin-margin 80%, thick-margin 80%) and
+across two prompt distributions (random battery + 1600 greedy-rollout decisions; even margin∈[5,15) recall is
+81%). The true argmax sits outside the rank-`r` decision subspace's top-32 ~20% of the time **regardless of
+confidence** — the heavy tail is geometry, not decision-uncertainty. Certified-exact coverage (the residual
+bound `|p_v−q_v|≤‖(I−P_r)x‖·‖gain⊙U_v‖` ruling out every out-of-shortlist token) is **0%**
+(`‖(I−P_r)x‖/‖x‖≈0.99`). So shortlist decoding is a modest **compute-mode** quality bump (67%→80%; needs full
+`U` resident, no storage win, not exact), not an exactness recovery — a **fourth** independent route to the same
+`τ*` floor (after the margin gate, cross-rank agreement, and whitening). *(Caveat: both proxies are synthetic;
+neither reaches a real tokenized corpus — but the margin- and distribution-independence of the ~80% ceiling makes
+a real-text escape unlikely. A real-corpus recall sweep and the torch-gated trained head remain the only
+re-openers.)*
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
-recommendation is now realized in-repo as a shipped, verified, datalog-emitting artifact.*
+recommendation is now realized in-repo as a shipped, verified, datalog-emitting artifact; the speculative
+shortlist route is measured and gives a compute-mode quality bump, not exactness.*
 
 ---
 
