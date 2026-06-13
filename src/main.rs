@@ -828,7 +828,9 @@ fn main() {
                 return;
             }
             eprintln!("[fieldrun] --probe-margin: {} positions (ctx {ctx_window}) — explain forwards…", positions.len());
-            let recs: Vec<(f32, f32, bool)> = positions.par_iter().enumerate().filter_map(|(k, c)| {
+            // also collect each position's dominant (layer,head) DLA circuits, for the R3 circuit-IDENTITY
+            // fingerprint (which circuits consolidate across training — diffed over the late event).
+            let recs: Vec<(f32, f32, bool, Vec<(usize, usize, f32)>)> = positions.par_iter().enumerate().filter_map(|(k, c)| {
                 let ex = lm.explain(c)?;
                 let margin = ex.predicted_logit - ex.runner_up_logit;
                 let d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
@@ -836,7 +838,9 @@ fn main() {
                     let (s, sq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
                     if sq > 0.0 { s * s / sq } else { 1.0 }
                 } else { f32::NAN };
-                Some((margin, pr, ex.model_predicts == ids[ctx_window + k]))
+                let top: Vec<(usize, usize, f32)> = ex.head_circuits.iter().take(3)
+                    .filter(|h| h.dla > 0.0).map(|h| (h.layer, h.head, h.dla)).collect();
+                Some((margin, pr, ex.model_predicts == ids[ctx_window + k], top))
             }).collect();
             let n = recs.len().max(1);
             let frac = |d: f32| 100.0 * recs.iter().filter(|r| r.0 > 2.0 * d).count() as f32 / n as f32;
@@ -850,6 +854,15 @@ fn main() {
             // certifiable-compressible fraction P(m > 2δ) at δ = 0.5/1/2/4 (perturbation a small/medium quant would induce)
             println!("PROBE_MARGIN n={n} acc={acc:.2} margin_med={mmed:.4} pr_med={prmed:.3} cert_d0.5={:.2} cert_d1={:.2} cert_d2={:.2} cert_d4={:.2}",
                 frac(0.5), frac(1.0), frac(2.0), frac(4.0));
+            // PROBE_CIRCUITS: aggregate DLA per (layer,head) over all positions → the dominant-circuit fingerprint.
+            let mut agg: std::collections::HashMap<(usize, usize), f32> = std::collections::HashMap::new();
+            for r in &recs { for &(l, h, dla) in &r.3 { *agg.entry((l, h)).or_insert(0.0) += dla; } }
+            let total: f32 = agg.values().copied().sum::<f32>().max(1e-9);
+            let mut items: Vec<((usize, usize), f32)> = agg.into_iter().collect();
+            items.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let fp = items.iter().take(8)
+                .map(|&((l, h), v)| format!("{l}.{h}:{:.3}", v / total)).collect::<Vec<_>>().join("|");
+            println!("PROBE_CIRCUITS n_circuits={} top={fp}", items.len());
             return;
         }
 

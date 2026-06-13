@@ -285,6 +285,16 @@ as provenance structure vs intervention diffuseness.
   the non-compact dense-Gram wall. So `export --logic-whole` refuses full-scale bundles by default (naming LE-T4) and
   needs `--force`. LO3a moved the frontier from *can a context-free program be emitted?* (yes) to *can the dense
   fragment be emitted COMPACTLY?* — which is LE-T2, still open. See [`SOUFFLE.md`](./SOUFFLE.md) §8.
+  - **Two partial compact-unembed levers exist on the lossy/certified side (R4/R5).** (1) The PR-core
+    *factored* readout (`lo3a/pr_core_export.py --datalog`) replaces the dense `vocab×d` embed facts with the
+    rank-`r` factored pair `proj(i)=Σ_j xraw(j)·sbasis(i,j)`, `corelogit(v)=Σ_i proj(i)·acore(i,v)` —
+    `r(d+vocab)` facts, decode-kept-67% on SmolLM, labeled-lossy. (2) The `--pruned-head` KB-proposed
+    candidate shortlist (~540 tokens) with the PO-T3 margin gate is a **compact *certified* unembed on the
+    tokens where `m > 2δ`**: where the margin clears, the argmax provably equals the full-vocab argmax over
+    just the shortlist, so the dense `vocab×d` emit shrinks to `shortlist×d` with a Soufflé-checkable
+    certificate. Wiring this shortlist into `export --logic` (so the whole-model emit is *compact-and-certified
+    where the margin clears, full only on the thin-margin tail*) is the concrete next step against the LE-T4
+    wall — noted here as the achievable increment; the lossless whole-`vocab×d` emit stays blocked.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank). *Caveat
   (Grok): treewidth `τ` is the load-bearing invariant (the forge tax = the no-compact-sub-conjunction
