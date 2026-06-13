@@ -434,6 +434,19 @@ recall to ~80%); **real text is *harder*, not easier**, because it is ~70% conte
 the heavy-tail fragment. So the forge tax has a *meaning-vs-syntax* signature: it is the cost of predicting
 **content**, not structure. The torch-gated decode-targeted trained head is now the sole remaining re-opener.
 
+**Position-adaptive codec & the cheap gate (`lo3a/pr_core_gate.py`).** The semantic split suggests a two-rate
+readout: cheap rank-`r` (+ top-32 verify) on syntactic positions, full readout on content. The gate must
+decide *before* the full readout. The **free** gate (classify the core's own top-1) **fails** — the lossy core
+*over-predicts* format tokens, so "core says syntax" is only 58% precise and 44% exact-on-routed; the class is
+not in the core's biased argmax. But the class **is** cheaply **decodable from the residual**: a linear probe
+predicts content-vs-syntax at **80% balanced-accuracy from the free `r`-dim core coords `Sx`** and **83% from
+the full residual `x`** (`P(content | says content)` 89–92%). With the probe gate + top-32 verify the codec
+reaches **93% exact @ 1.2× (overall), 95% @ 1.1× on prose, 89% @ 1.7× on code** — a real, honest **compute**
+lever whose win scales with the format-token share (modest on prose, larger on code / structured output), not
+an exactness escape (content-word readout still needs the full head; `τ*` stands). The class is in the residual
+*geometry*, not the lossy core's decision — which is itself the cleanest statement of the forge tax: the model
+*knows* it is about to emit content (linearly, cheaply), but emitting *which* content is the irreducible cost.
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
