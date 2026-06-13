@@ -128,9 +128,23 @@ is therefore exactly the program's **treewidth / dependency sparsity**:
 > demand transform is a **machine-checked, lossless measure of the computed fragment** (the forge tax): the
 > pruned mass is the retrievable fragment, the residual is the dense-`G` / high-treewidth core. It is a fourth
 > instrument for the one wall, beside provenance rank (PR), treewidth, and tropical rank (LE-T4 / LO4 / the
-> Tropical paper). **Status: measured-adjacent** — the profiler already shows the dense matmul aggregates
-> each materialize ~10² × the weight-fact count and survive demand pruning, while the structural
-> (index/retrievable) relations do not.
+> Tropical paper). **Status: measured (the *nothing-to-drop* half), on two ends (R4).**
+>
+> *(i) On the emittable Π* (`lo3a/magic_residual.py`, tiny minted bundle). Soufflé's demand transform
+> (`-m '*'`) is **decode-lossless** (`decide` 29→29 byte-identical, plain vs magic) and prunes the dense
+> matmul/aggregate core by **≈0**: total materialized tuples **131,556 → 136,884** (the transform only adds
+> demand overhead), and **100%** of the *derived* mass is the dense `__agg_subclause*` matmul aggregates
+> (111,108 tuples) vs **352** structural/index tuples. The dense aggregates are universally demanded — every
+> `logit(v)` reads the full residual — so demand cannot prune them, exactly as PO-T2 predicts. The tiny model
+> has random weights / no n-gram or induction structure, so it is the **limiting case** (an all-computed
+> forward, prunable fraction ≈0); the complementary *retrievable-prunes* half needs a model with real
+> retrieval structure, whose Π is **emit-blocked at scale by the LE-T4 vocab×d wall** (no silent cap).
+>
+> *(ii) On a real model* the forge-tax number comes from the certified FFN reducer instead of the (blocked)
+> whole-Π emit: `run_smollm.py` finds a trained dense FFN has **≈0 exactly-dead neurons**, so the
+> losslessly-removable set is ≈0 — the dense computed fragment does not compress losslessly. Same verdict,
+> real weights. So PO-T2's "nothing to drop" face is now a measured number at both ends; the retrievable-mass
+> face on a real model stays open behind the emit wall.
 
 So `--magic-transform` is not just a speedup on `Π`; run with an explicit retrievable-vs-computed split it is a
 **falsifiable probe**: a token whose `decide` survives with the dense strata demand-pruned away is *provably*
@@ -225,7 +239,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
 | PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
-| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested** (Pythia-70m, 28 ckpts): cert fraction rises then *saturates* (confidence-bound); **PR consolidates in TWO events — including a discrete late one (~step 70k) invisible to accuracy/margin/cert** — the dissociation is the certificate's boundedness, empirically |
+| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested + replicated up the ladder** (Pythia-70m **and 160m**, 28 ckpts each): cert fraction rises then *saturates* (confidence-bound); **PR consolidates in a discrete late event invisible to accuracy/margin/cert** (70m ~step 80k; 160m PR 39→26 at 96k→110k) — and the new `PROBE_CIRCUITS` fingerprint shows that late event is a **migration of the dominant DLA circuits onto final-layer (L11) heads** (Jaccard 0.40 across it). The dissociation is the certificate's boundedness, empirically (R3) |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
   Scores FFN neurons over a calibration set; drops the **provably-dead** (a zero `down_proj` row writes
@@ -301,8 +315,26 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
     real structural reorganization with *zero footprint* in any confidence/certificate metric. So NL training
     here is *not* one gradual cleanup but **at least two consolidation events** (the early 56→23 during the
     learning ramp, and a late ~20→12 long after the loss plateaus), the second invisible to the certificate.
-    *Remaining:* characterize *what* consolidates at step ~70k (which heads/circuits), and replicate up the
-    ladder (160m/410m) — same script, change the repo id.
+  - **Replicated up the ladder + the late event characterized (R3; `pythia_grok.py --model …-160m`,
+    `PROBE_CIRCUITS` fingerprint).** On **Pythia-160m** (28 checkpoints, same holdout recipe) the
+    certificate-invisible late consolidation **replicates**: after the learning-phase events, PR holds ~35–39
+    (steps 64k–96k) then drops sharply **39.2 → 26.5 at step 96k→110k** and holds ~26 through 143k — while
+    **accuracy (~49→50%), margin (~1.33→1.41) and cert (~43→44%) are flat**, the same zero-certificate-footprint
+    structural reorganization seen on 70m (there ~20→12 at ~80k). **What consolidates:** the new per-checkpoint
+    dominant-DLA-circuit fingerprint (aggregate `(layer,head)` DLA, emitted by `--probe-margin` as
+    `PROBE_CIRCUITS`) shows the late event is a **migration of the dominant decode circuits onto the FINAL layer.**
+    Across 96k→110k the top-circuit set turns over (Jaccard **0.40**): mid-layer heads `{10.1, 5.0, 5.2, 8.10}`
+    *leave* the top set and the persistent dominant circuits are **all layer-11** (`11.0, 11.5, 11.9, 11.11`, +
+    `11.1/11.6` entering) — the last layer of the 12-layer model. Net over training (step 2k→143k) the dominant
+    set has Jaccard 0.25 with `{11.0, 11.11, 11.9}` persisting throughout. So the late, certificate-invisible PR
+    drop is a **real circuit-identity reorganization — decode attribution concentrating onto final-layer heads —
+    not a magnitude artifact**, and it is *not* the same circuits the early learning-phase consolidation used.
+    Descriptive, per `no-necessity-claims`: this is the measured 160m pattern, not a "grokking = X" claim (the
+    docs already flag grokking-proper as an analogy). Artifacts: `lo3a/pythia_grok_p160m.{json,png}`,
+    `pythia_grok_p160m_lateevent.json`.
+    *Remaining:* the **410m** rung (next ladder step; downloads ~22 GB of checkpoints — not run here, flagged, no
+    silent cap), and a causal test of whether the migrated L11 circuits are the `explain`/DLA forge-tax (COMPOSED)
+    carriers.
 
 ---
 
@@ -354,21 +386,64 @@ margin — no compute saving) or the **sound δ-bound** `‖(I−P_r)x‖·‖ga
 So PR-core is a **lossy compression with a known coverage**, not a free decode-exact speedup; PO-T3's
 certificate requires the full margin, not the core's.
 
-**Both router-salvage routes fail (`lo3a/pr_core_v2.py`) — the heavy tail is intrinsic, not fixable.**
+**No *cheap-signal* router recovers decode-exactness (`lo3a/pr_core_v2.py`).**
 (a) *Second-stage self-consistency gate* (accept the rank-`r` decode iff it agrees with rank-`2r`): they
 agree on 87% of decisions, but among agreements only **76%** match the full model — the tail *beyond* 2r
 still flips ~24%, so cross-rank agreement ≠ correctness (the hybrid reaches 79% at 2.2×, a fidelity/size
 point, not an exact router). (b) *Whitening `x` by the activation covariance* (to relatively boost the
 decision subspace): it **hurts** (67%→50%) and barely moves `‖discarded‖/‖x‖` (0.99→0.96) — the decision
-spread is **intrinsic, not a normalization artifact**. Conclusion: no cheap signal (core margin, cross-rank
-agreement, or whitening) recovers decode-exactness. PR-core is a **tunable lossy size dial**
-(6.2×@67% … 2.2×@79%); the heavy-tailed decode geometry is the `τ*` floor, confirmed against three salvage
-attempts. *(A decode-targeted trained head remains the one untested re-opener — torch-gated.)*
+spread is **not a normalization artifact**. Conclusion: no cheap signal (core margin, cross-rank
+agreement, or whitening) recovers decode-exactness on the *frozen* basis. PR-core is a **tunable lossy size
+dial** (6.2×@67% … 2.2×@79%) for those methods. Whether the heavy tail is intrinsic to *all* rank-`r`
+lenses or only the *frozen-SVD* one is the **decode-targeted trained-head** question — now run (R2, below),
+not assumed.
 
-**Why linear, for now.** The Volterra/polynomial probe on the PR core was **flat** (degree 1/2/3 ≈ 68/68/64%
-vs 65% linear) — low-order interactions don't reach the `α≈1` heavy tail. A non-linear series re-opens only
-if a **decode-targeted trained head** (not L2 reconstruction; torch-gated) recovers tail mass. Until then the
-two-knob *linear* policy is the cheapest, most robust, verification- and MPS-compatible lever.
+**Frozen vs trained — the re-opener, now run (R2; `lo3a/tau_star_trained.py`, `tau_star_budget.py`).** The
+LO1 floor is always measured with a *frozen* SVD lens; #142 (a *retrained* rank-8 update is lossless ~30×
+below the frozen ⅓d core floor) is the standing reason to suspect the frozen plateau isn't the function's
+floor. We test the direct analogue on the decode: at matched rank, a **trained projection** — train only the
+`d×r` subspace `B` by cross-entropy to the model's own argmax, readout tied to the true geometry `C = BᵀUᵀ`
+(so capacity equals the frozen lens's; its only free choice is also the rank-`r` subspace) — vs frozen SVD,
+scored on held-out open-class R@32. Findings, descriptive:
+
+- **A trained projection beats frozen SVD at the compressed (PR-core) operating point.** GPT-2 at r≈PR:
+  open-class R@32 **15% → 28% (+13pp)**, and the gain is **converged by 150 steps** (27–28% at 150/400/800
+  — `tau_star_budget.json`), so it is a real lens-suboptimality, not under-training. SmolLM (400 steps) beats
+  frozen at **every** rank (+5…+7pp). So the frozen SVD projection is **not optimal**, and "the heavy tail is
+  intrinsic" overstates it — a better same-capacity lens recovers a real slice of the open-class tail.
+- **The win is training-budget-sensitive at higher rank.** At a fixed 150 steps the larger `d·r` head
+  under-fits, so the tied head loses to frozen at r≈span90 (GPT-2 −22pp, Pythia-160m −30pp); SmolLM at 400
+  steps, with comparable `d·r`, wins at high rank — i.e. the high-rank shortfall is under-fitting, not a
+  frozen advantage. The **over-capacity** free head (training the full `r×V` readout) **over-fits**
+  catastrophically (GPT-2 open R@32 79%→25% at r=295), which is why the matched-capacity tied head is the
+  fair test and why the binding constraint reads as *supervision/data*, not lens form.
+- **But training does not CLOSE the tail.** Best trained open-class R@32 is ≈57–62% vs closed-class
+  ~95–100%; the bulk of the open-class forge tax survives a trained *linear* lens at this supervision budget
+  (~600 held-out decisions). So the `τ*` decode tail is **harder than the #142 composition core** (which
+  retrained losslessly): there, retraining closed it; here it only dents it.
+
+**Net (honoring `no-necessity-claims`).** The `τ*` floor is **partly a frozen-linear artifact** — a trained
+projection beats frozen SVD at the operating point that matters (the compressed PR-core), mirroring #142
+directionally — but the open-class content tail is **not closed** by a trained linear lens within this
+budget; full achievability (more data/steps, or non-linearity) remains **OPEN**. The Volterra/polynomial
+probe on the *frozen* core was flat (degree 1/2/3 ≈ 68/68/64% vs 65% linear), consistent with the tail being
+hard for low-order interactions too. So the two-knob *linear* policy stays the cheapest, most robust,
+verification- and MPS-compatible default; the trained head is a **measured, partial re-opener at the
+compressed end**, not a free win and not a closed door.
+
+**Cross-architecture validation of the `τ*` basis (R1; `lo3a/tau_star_xarch.py`).** The whole two-knob
+policy rests on `τ* ≈ min(exp(H_output), d)` and the open-class-tail forge tax, both established on SmolLM
+only. `exp(H_output)` is tokenizer-dependent, so this was the load-bearing single-family risk. Re-running the
+recoverable-rank battery on **nine real models across four tokenizer families** (GPT-2 BPE, NeoX BPE, Qwen
+BPE, Gemma SentencePiece) and 70m→2.4B params — with each model's own tokenizer over a fixed corpus, capturing
+the readout-input residual via a unembed forward-pre-hook (arch-generic) — the law replicates everywhere:
+per-token `Spearman(recoverable_rank, self-info)` **+0.84…+0.91**, the aggregate geometric law
+`Spearman(median rank, min(exp(H),d))` **+0.95…+0.99** on every model's *own* readout matrix (the decisive
+"geometry not BPE" control), and the open-class collapse / closed-class recovery split on every tokenizer.
+Even Gemma-2-2b — the operator-catalog outlier that breaks nearly every other cross-model regularity — obeys
+`τ*` tightly. So the PR-core lever is **not SmolLM-specific**; the readout-aligned decision geometry is the
+right first-class input on every architecture tested. Full table in `FINDINGS_PYTHIA.md` (R1);
+`lo3a/tau_star_xarch.json` + regenerable `lo3a/tau_star_table.py`.
 
 **Serves the size goal directly.** Default at the small stable PR-core ⇒ the `d/PR` win on the dense
 embed/unembed (LE-T4) fragment, *growing* with scale; pay the sublinear `span90` cost only when coverage
