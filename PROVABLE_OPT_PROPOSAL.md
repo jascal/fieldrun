@@ -306,7 +306,47 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 
 ---
 
-## 7. Related work
+## 7. The two-knob linear policy — the practical recommendation (PR-core mode)
+
+The engineering output of the LO1 investigation (token/circuit/decision/scale/polynomial/spectral axes).
+**One sentence:** instead of a single fixed rank, keep **two operating points on the same readout-aligned
+linear basis**, chosen by goal — a small scale-stable core for the bulk, a modestly larger rank for high
+coverage. Both are pure linear context-free projections, so they compose with the Datalog export,
+polygram/sae-forge dictionaries, q-orca/MPS encodings, and the margin certificate.
+
+| knob | rank | size (135M) | scaling | use |
+|---|---|---|---|---|
+| **1 — PR / hard-rank core** | `≈ PR` (energy concentration) | ~18–90 | **flat** with scale | default/fast path, the compact datalog core, small circuits — baseline ~60–70% of decodes |
+| **2 — span90 / soft-rank coverage** | `≈ span90` (decode-faithful) | ~65–100 | **sublinear** (65→96) | high-fidelity / critical / final decode — closer to the measured peak |
+
+**The spectral reason two knobs are needed.** The decision-direction spectrum is asymmetric (Spectral
+Scaling Laws regime): a concentrated head (`hard_rank`/PR ≈ 18 at 135M) plus a heavy power-law tail
+(`α ≈ 0.97`), so `soft_rank ≈ 58 ≫ hard_rank`. Widening inflates the **tail**, not the head — so the
+energy core (PR) stays flat while the rank for high cumulative coverage (`span90`) grows. A single fixed-PR
+core therefore gives **great compression but eroding fidelity** with scale (measured: `d/PR` 6×→11×→**22×**
+at 1.7B, while fixed-rank peak preservation falls **74%→58%** and `span90` grows 65→96). Two knobs respond
+to the spreading without jumping to full `d`.
+
+**Operational flow.** (1) Project the residual onto the readout-aligned basis (fixed linear step).
+(2) Default = top-`PR` components (the compact PR-core). (3) Gate on coverage — **the margin is the gate**
+(`m > 2δ` = PO-T3 ≡ this policy's router, for free at decode time). (4) If thin-margin, promote that
+decision to the top-`span90` components — still linear, still `≪ d`. (5) Log the spectral triple
+(`hard_rank`, `soft_rank`, `α`) to set/adapt the knobs per model.
+
+**Why linear, for now.** The Volterra/polynomial probe on the PR core was **flat** (degree 1/2/3 ≈ 68/68/64%
+vs 65% linear) — low-order interactions don't reach the `α≈1` heavy tail. A non-linear series re-opens only
+if a **decode-targeted trained head** (not L2 reconstruction; torch-gated) recovers tail mass. Until then the
+two-knob *linear* policy is the cheapest, most robust, verification- and MPS-compatible lever.
+
+**Serves the size goal directly.** Default at the small stable PR-core ⇒ the `d/PR` win on the dense
+embed/unembed (LE-T4) fragment, *growing* with scale; pay the sublinear `span90` cost only when coverage
+demands it; the spectral triple is the offline/runtime diagnostic. *Status: evidence-backed engineering
+recommendation, validated within the fixed-linear class (Grok, continuing the LO1 collaboration); the
+ladder spectral triple and a decode-targeted head are the two confirming experiments.*
+
+---
+
+## 8. Related work
 
 - **Magic sets / demand transformation** (Bancilhon–Maier–Sagiv–Ullman; Beeri–Ramakrishnan): the lossless,
   query-driven rewrite; proven query-equivalent for positive Datalog, with stratified/stable-model
@@ -328,7 +368,7 @@ incompressibility is no longer a measurement but a theorem (LE-T2/LE-T4).**
 
 ---
 
-## 8. Acknowledgment & provenance
+## 9. Acknowledgment & provenance
 
 The optimization-theory category of a four-category theory with [PIC](./PIC_PROPOSAL.md) (logic),
 [Tropical](./TROPICAL_PROPOSAL.md) (geometry), and [LOGIC_EXPORT](./LOGIC_EXPORT.md) (computation). It adds
