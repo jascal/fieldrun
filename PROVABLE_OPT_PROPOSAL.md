@@ -225,7 +225,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
 | PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
-| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | Open; **directly testable** with built instruments |
+| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested** (Pythia-70m): cert fraction rises then *saturates* (confidence-bound); **PR keeps consolidating after accuracy plateaus** — the dissociation is the certificate's boundedness, empirically |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
   Scores FFN neurons over a calibration set; drops the **provably-dead** (a zero `down_proj` row writes
@@ -278,6 +278,25 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   checkpoints `certified` stays ≈0 even for low-`D_b` blocks while moderate per-block quantization still passes
   re-decode, the a-priori certificate is too loose and PO4 collapses to "verify by re-running the forward" (LE-T4)
   without enlarging the compressible surface.
+
+  **PO6 result — RUN on Pythia-70m (`lo3a/pythia_grok.py`, `--probe-margin`, 21 checkpoints step0→143000 on the
+  real FINDINGS holdout).** Tracking the four order parameters across training (plot `lo3a/pythia_grok.png`):
+  - **Certifiable-compressible fraction `P(m>2δ)` rises 0 → ~37% over steps ~8–2000, then *saturates*** — it
+    tracks accuracy (0 → ~43%) and **plateaus with it**. So Grok's prediction (i) holds *in the growth phase*
+    but the certificate's reach is **confidence-bound**: it stops rising once the model is confident.
+  - **PR (DLA participation ratio — the LO4 concentration/treewidth proxy) shows the grokking shape and the
+    decisive dissociation:** it *rises* 48 → 56 (steps 8–64: diffuse circuit engagement, the "build" phase),
+    then *monotonically consolidates* 56 → 20 → **13** — and **keeps dropping long after accuracy / margin /
+    cert have plateaued** (PR 23 at step 2k → 13 at step 143k, while acc/cert are flat). Genuine **ongoing
+    circuit consolidation that the margin certificate does not see.**
+  - **Reading:** the margin certificate is a *confidence* signal (saturates); PR is the *structure* signal
+    (keeps consolidating) — the **temporal face of the LE-T2 boundedness Grok predicted**: the certifiable
+    surface saturates while the dense circuit structure keeps evolving. NL training is **gradual, not a sharp
+    grok** (prediction iii confirmed: no single transition; a build-then-cleanup over the whole run). Net:
+    PO-T7's cert fraction is a valid order parameter *for the learning phase*; **PR / treewidth is the better
+    grokking progress measure**, and the dissociation is itself the result — you cannot read consolidation off
+    the certificate alone. *Remaining:* the late PR drop to 13 (step 143k) is a single checkpoint — confirm with
+    a denser late tail and the larger ladder (160m/410m).
 
 ---
 

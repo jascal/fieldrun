@@ -28,6 +28,7 @@ Soufflé has only `+ - * / ^` and `sum`/`max` — no `exp`/`sqrt`/`sin`/`cos`. S
 | `to_safetensors.py` | **HF export + complete round trip**: reduced bundle → Hugging-Face `safetensors` + `config.json` (`LlamaForCausalLM`) → `fieldrun convert` → bundle′ → decode-compare. Closes the loop bundle ↔ HF. |
 
 | `run_smollm.py` | the **whole pipeline on a REAL small Llama** (SmolLM-135M): `fieldrun convert` → certified FFN reduce → HF safetensors → `fieldrun convert` → bundle′. Uses real high-margin contexts from a fieldrun greedy trace. |
+| `pythia_grok.py` | **PO-T7 grokking order-parameter experiment** — converts 21 Pythia-70m checkpoints (step0→143k via `@stepN`), runs the new `--probe-margin`, and plots the certifiable-compressible fraction / margin / PR / accuracy across training (`pythia_grok.png`). Finding: cert fraction *saturates* with accuracy, but PR (circuit concentration) *keeps consolidating* after the plateau — the dissociation is the certificate's confidence-boundedness. |
 
 The full pipeline these demonstrate: **fieldrun model → LO3a Datalog (`export --logic-whole`) → lossless optimize (`bench.sh`, ~190×) → certified reduce (`reduce.py`, smaller bundle) → HF safetensors (`to_safetensors.py`, publishable) → round-trips back to fieldrun losslessly.**
 

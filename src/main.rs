@@ -813,6 +813,46 @@ fn main() {
             return;
         }
 
+        // --probe-margin (PROVABLE_OPT PO-T7, the grokking order parameter): per held-out position, the decode margin
+        // m = predicted_logit − runner_up_logit and the full-spectrum DLA participation ratio (PR = circuit concentration,
+        // low = consolidated/retrievable, high = diffuse/forge-tax). Reports the CERTIFIABLE-COMPRESSIBLE FRACTION
+        // P(m > 2δ) at fixed δ — the fraction of tokens a δ-bounded compression provably preserves (the margin certificate
+        // PO-T3) — plus median margin, median PR, and top-1 accuracy. Store-free, arch-agnostic (uses explain) — meant to
+        // be tracked across training checkpoints (Pythia @stepN) to see if the certifiable fraction rises with circuit
+        // consolidation (Grok's grokking prediction). One line of parseable output per run.
+        if has_flag(&args, "--probe-margin") {
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe-margin: no eval positions (need --ids with > ctx_window tokens, matching this model's vocab)");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-margin: {} positions (ctx {ctx_window}) — explain forwards…", positions.len());
+            let recs: Vec<(f32, f32, bool)> = positions.par_iter().enumerate().filter_map(|(k, c)| {
+                let ex = lm.explain(c)?;
+                let margin = ex.predicted_logit - ex.runner_up_logit;
+                let d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                let pr = if !d.is_empty() {
+                    let (s, sq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                    if sq > 0.0 { s * s / sq } else { 1.0 }
+                } else { f32::NAN };
+                Some((margin, pr, ex.model_predicts == ids[ctx_window + k]))
+            }).collect();
+            let n = recs.len().max(1);
+            let frac = |d: f32| 100.0 * recs.iter().filter(|r| r.0 > 2.0 * d).count() as f32 / n as f32;
+            let mut ms: Vec<f32> = recs.iter().map(|r| r.0).collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mmed = ms[ms.len() / 2];
+            let mut prs: Vec<f32> = recs.iter().map(|r| r.1).filter(|x| x.is_finite()).collect();
+            prs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let prmed = if prs.is_empty() { f32::NAN } else { prs[prs.len() / 2] };
+            let acc = 100.0 * recs.iter().filter(|r| r.2).count() as f32 / n as f32;
+            // certifiable-compressible fraction P(m > 2δ) at δ = 0.5/1/2/4 (perturbation a small/medium quant would induce)
+            println!("PROBE_MARGIN n={n} acc={acc:.2} margin_med={mmed:.4} pr_med={prmed:.3} cert_d0.5={:.2} cert_d1={:.2} cert_d2={:.2} cert_d4={:.2}",
+                frac(0.5), frac(1.0), frac(2.0), frac(4.0));
+            return;
+        }
+
         // --probe-dla (combine vs select): for each pick, is the logit DOMINATED by one circuit (disguised selection)
         // or SPREAD over many (genuine superposition/combination)? Per position, take the per-circuit DLA contributions
         // to the predicted token (heads + neurons, from the faithful explain forward) and measure concentration —
