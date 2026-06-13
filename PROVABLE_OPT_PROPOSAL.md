@@ -316,16 +316,25 @@ polygram/sae-forge dictionaries, q-orca/MPS encodings, and the margin certificat
 
 | knob | rank | size (135M) | scaling | use |
 |---|---|---|---|---|
-| **1 — PR / hard-rank core** | `≈ PR` (energy concentration) | ~18–90 | **flat** with scale | default/fast path, the compact datalog core, small circuits — baseline ~60–70% of decodes |
-| **2 — span90 / soft-rank coverage** | `≈ span90` (decode-faithful) | ~65–100 | **sublinear** (65→96) | high-fidelity / critical / final decode — closer to the measured peak |
+| **1 — PR / hard-rank core** | `≈ PR` (energy concentration) | ~18–90 | **sublinear** (`hard_rank` 17.7→23.5, `~d^0.22`) | default/fast path, the compact datalog core, small circuits — baseline ~60–70% of decodes |
+| **2 — span90 / soft-rank coverage** | `≈ span90` (decode-faithful) | ~65–100 | **sublinear, same rate** (`span90` 65→96; `soft_rank` 58→76) | high-fidelity / critical / final decode — closer to the measured peak |
 
 **The spectral reason two knobs are needed.** The decision-direction spectrum is asymmetric (Spectral
-Scaling Laws regime): a concentrated head (`hard_rank`/PR ≈ 18 at 135M) plus a heavy power-law tail
-(`α ≈ 0.97`), so `soft_rank ≈ 58 ≫ hard_rank`. Widening inflates the **tail**, not the head — so the
-energy core (PR) stays flat while the rank for high cumulative coverage (`span90`) grows. A single fixed-PR
-core therefore gives **great compression but eroding fidelity** with scale (measured: `d/PR` 6×→11×→**22×**
-at 1.7B, while fixed-rank peak preservation falls **74%→58%** and `span90` grows 65→96). Two knobs respond
-to the spreading without jumping to full `d`.
+Scaling Laws regime): a concentrated head (`hard_rank`/PR) plus a heavy power-law tail (`α ≈ 1`), so
+`soft_rank ≫ hard_rank`. Measured across the ladder (`lo3a/lo1_spectrum.py`; f32≡f16 verified):
+
+| | 135M (d576) | 360M (d960) | 1.7B (d2048) |
+|---|---|---|---|
+| `hard_rank` (PR) | 17.7 | 18.7 | 23.5 |
+| `soft_rank` (entropy) | 57.9 | 61.4 | 75.9 |
+| soft/hard | 3.3 | 3.3 | 3.2 |
+| `α` (ranks 10–200) | 0.97 | 0.90 | 0.81 |
+
+Both ranks grow **sublinearly and at the same rate** (`~d^0.22`), so the **soft/hard ratio is
+scale-invariant (~3.3)** while the **tail gets heavier with scale** (`α` 0.97→0.81 — widening inflates the
+tail). A single fixed-rank core therefore gives **growing compression but eroding fidelity**: the
+circuit-DLA `d/PR` reaches 6×→11×→**22×** at 1.7B while fixed-rank peak preservation falls **74%→58%** and
+`span90` grows 65→96. Two knobs respond to the spreading without jumping to full `d`.
 
 **Operational flow.** (1) Project the residual onto the readout-aligned basis (fixed linear step).
 (2) Default = top-`PR` components (the compact PR-core). (3) Gate on coverage — **the margin is the gate**
