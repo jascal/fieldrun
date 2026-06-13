@@ -25,6 +25,15 @@ OUT_DIR = ROOT / "docs"
 
 HEADING_RE = re.compile(r"^(\d+\.\d+|\d+\.)\s+[A-Z]|^(Abstract|References|Acknowledgements)\s*$")
 
+# The DRAFT watermark is a Type-3 font overlay with no Unicode map, so pdftotext
+# pulls its diagonal glyphs as standalone, mis-grouped fragments ("D", "RA", "FT"
+# — one set per page) that otherwise scatter through the reader text. They are
+# exactly the contiguous substrings of "DRAFT" and never collide with the paper's
+# own short caps (PR, PIC, DLA, VHL aren't substrings of DRAFT), so any whole line
+# equal to one of them is watermark debris and is dropped in clean_line().
+_WM = "DRAFT"
+WATERMARK_FRAGMENTS = {_WM[i:j] for i in range(len(_WM)) for j in range(i + 1, len(_WM) + 1)}
+
 # pdftotext splits the paper's small-caps route names; undo that.
 CLEANUPS = [
     (re.compile(r"\bR\s+ETRIEVED\b"), "RETRIEVED"),
@@ -43,6 +52,8 @@ def extract_text(pdf: Path) -> str:
 
 def clean_line(line: str) -> str | None:
     s = line.rstrip()
+    if s.strip() in WATERMARK_FRAGMENTS:             # DRAFT watermark glyph fragments
+        return None
     if re.fullmatch(r"\d{1,3}", s.strip()):          # page numbers / figure axis ticks
         return None
     if re.fullmatch(r"[\d.%\s]+", s.strip() or "x") and len(s.strip()) <= 6:
