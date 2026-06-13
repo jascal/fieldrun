@@ -4,8 +4,8 @@
     "t": "What a Transformer Retrieves and What It Computes",
     "target": "sec-abstract",
     "quotes": [
-      "is the model retrieving a symbolic rule, selecting within a rule-proposed set, or computing something new?",
-      "splits roughly 25% retrieved, 60% selected, 15% composed"
+      "the model is retrieving a symbolic rule, selecting within a rule-proposed set, or computing something new",
+      "roughly 25% retrieved, 60% selected, 15% composed"
     ],
     "h": "<p class='big'>A measured theory of the composition core — with <b>incidence calculus</b>, <b>tropical geometry</b>, and <b>semiring Datalog</b> as three interpretations of one object.</p><ul><li>Every next-token decision classified: <b>retrieved</b>, <b>selected</b>, or <b>computed</b>.</li><li>Headline: <span class='num'>~25% / 60% / 15%</span> — and the computed core <b>grows with scale</b>.</li><li>One theory, two temperatures: soft logic at T=1, hard geometry at T=0, one Datalog program under two semirings.</li></ul><p class='dim'>J. Allan Scott — use ←/→ keys or the buttons below. The right pane highlights the matching paper text for each slide.</p>"
   },
@@ -14,7 +14,7 @@
     "t": "Lookup table or genuine computation?",
     "target": "sec-1",
     "quotes": [
-      "how to tell these apart operationally, on a real model, token by token",
+      "how to tell retrieval and computation apart operationally, on a real model, token by token",
       "a flat retrieval store (n-gram successor tables, induction copy-rules, a closed-class grammar skeleton)"
     ],
     "h": "<ul><li>\"The capital of France is\" = <b>retrieval</b>. But many tokens are <b>assembled on the fly</b> from distributed partial contributions.</li><li>This paper makes the distinction <b>operational, per token, on real models</b>.</li><li>Tool: the <b>fieldrun decompiler</b> — splits a transformer into a flat retrieval store (n-grams, induction rules, grammar — reconstructs ~half the predictions with <i>no linear algebra</i>) + a composition kernel.</li><li>Faithful, not approximate: every tier validated by <b>exact top-1 agreement</b> with reference implementations.</li></ul>"
@@ -124,7 +124,7 @@
     "target": "sec-5-2",
     "quotes": [
       "is a tropical polynomial in r over the (max, +) semiring",
-      "the decision cells no lookup table reproduces"
+      "its decision cells are exactly those requiring composed (mixed) monomials that no lookup table reproduces"
     ],
     "h": "<ul><li>The max-logit M(r) = max<sub>v</sub>(⟨r,U<sub>v</sub>⟩+b<sub>v</sub>) is a <b>tropical polynomial</b>; its hypersurface is the decision boundary; its cells are the <b>Laguerre power diagram</b> (Prop. 1).</li><li><b>Prop. 2 — measured:</b> the normalised margin <i>is</i> the exact Euclidean facet distance, computed over all 151,936 tokens.</li><li>Emergence = <b>interior cells</b>: the winning monomial belongs to no single source.</li><li><b>Tropical-rank floor:</b> a lookup table has one monomial per stored key; composition needs monomials <i>not in any table</i> — a gap linear (SVD) rank structurally cannot see.</li></ul>"
   },
@@ -143,7 +143,7 @@
     "t": "One wall, three measures; one kernel, three roles",
     "target": "sec-5-4",
     "quotes": [
-      "One wall, three measures: participation ratio, tropical rank, treewidth"
+      "one wall, we expect, seen through three measures (participation ratio, tropical rank, treewidth)"
     ],
     "h": "<ul><li><b>Maslov dequantization</b> is the bridge: T logΣexp(L/T) → max L, softmax → argmax. The power diagram is the T→0 limit of the softmax cells.</li><li>The <b>same irreducible computation</b> appears as: high PR (logic) = high tropical rank (geometry) = high treewidth (computation).</li><li>The <b>same kernel G</b> is: the non-truth-functionality operator = the facet geometry = the provenance coupling.</li><li>Retrievable fragment: additive / low-rank / low-treewidth → exports compactly. Computed fragment: diffuse / high-rank / dense-G → no compact symbolic form.</li></ul>"
   },
