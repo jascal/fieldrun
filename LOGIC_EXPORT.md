@@ -192,8 +192,19 @@ as provenance structure vs intervention diffuseness.
     — so **the forge tax is NOT in the token-coupling Gram**; it is a constant property of the unembedding
     geometry. The dense fragment therefore lives in the **circuit-coupling** axis (within-block PR≈45), which
     the candidate Gram cannot see — and that is exactly where Grok's "rank-tracks-PR" obstruction would bite.
-    *Next build: a per-component-contribution-vector probe to measure effrank-vs-PR on the circuit axis — the
-    decisive test of whether `Δ_descr` escapes or the obstruction holds.*
+  - **Circuit-axis test — the obstruction HOLDS (`lo3a/lo1_circuit.py`, SmolLM-135M).** Per decision, capture
+    every head's and neuron's residual-write *vector*; for the ~92 effective circuits (scalar `PR_dla`), the
+    **write-energy rank is ≈7** — so the write *geometry* is low-rank and the operator valuation compresses the
+    *bulk*. **But the decode-faithful rank** (the minimal write-subspace that preserves the argmax) **is ≈213** —
+    it *exceeds* the scalar PR, approaches the residual dimension, and **rises as the margin shrinks**
+    (forge-tax 226 vs retrievable 206). The decision lives in the **low-energy tail**, not the high-energy bulk
+    (the geometric face of `μ_t=0`). So the descriptive escape compresses the write *energy* but **not the
+    decision**: Grok's self-defeating obstruction holds on the circuit axis, and its margin-bounded rise is the
+    **PO4 margin certificate seen from the rank side** (LO1 and PO4 are bounded by the *same* margin — one wall).
+    Verdict shift: **`Δ_descr` does NOT dominate the forge tax's decision-relevant geometry** — that part is
+    intrinsic-or-`Δ_repr` (a real wall), not a scalar-lens artifact. *(Caveats: single model; `effrank` =
+    energy PR vs `faithful_r` = a coarse rank sweep truncated to the top-256 components; a margin-aware /
+    non-orthogonal valuation beating SVD-truncation is not yet ruled out — the open refinement.)*
 - **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
   **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
   **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
