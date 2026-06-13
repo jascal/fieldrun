@@ -22,7 +22,9 @@ IDS = os.path.join(HERE, "..", "..", "lm-sae", "pylm", "holdout_pythia-70m.json"
 BDIR = os.path.join(HERE, "..", "pythia")
 os.makedirs(BDIR, exist_ok=True)
 N_EVAL, CTX = 400, 64
-STEPS = [0,1,2,4,8,16,32,64,128,256,512,1000,2000,3000,4000,6000,8000,16000,32000,64000,143000]
+# densified late tail (48k–143k) to confirm the post-plateau PR consolidation is real, not one checkpoint
+STEPS = [0,1,2,4,8,16,32,64,128,256,512,1000,2000,3000,4000,6000,8000,16000,32000,
+         48000,64000,80000,96000,110000,120000,128000,136000,143000]
 
 def run_step(step):
     stem = os.path.join(BDIR, f"p70m_s{step}")
@@ -35,8 +37,8 @@ def run_step(step):
     p = subprocess.run([FR,"--bundle",stem,"--ids",IDS,"--ctx",str(CTX),"--n-eval",str(N_EVAL),"--probe-margin"],
                        capture_output=True, text=True)
     line = next((l for l in (p.stderr+p.stdout).splitlines() if l.startswith("PROBE_MARGIN")), None)
-    # free disk: keep only the bundle's existence flag, drop the blob
-    for ext in (".fieldrun.bin",):
+    # free disk + keep reruns clean: drop both the blob and the manifest (next run re-converts from hub cache)
+    for ext in (".fieldrun.bin", ".fieldrun.json"):
         try: os.remove(stem + ext)
         except OSError: pass
     if not line: print(f"  step{step}: no PROBE_MARGIN ({(p.stderr).strip().splitlines()[-1][:80] if p.stderr else '?'})"); return None

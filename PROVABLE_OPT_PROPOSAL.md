@@ -225,7 +225,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
 | PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
-| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested** (Pythia-70m): cert fraction rises then *saturates* (confidence-bound); **PR keeps consolidating after accuracy plateaus** — the dissociation is the certificate's boundedness, empirically |
+| PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested** (Pythia-70m, 28 ckpts): cert fraction rises then *saturates* (confidence-bound); **PR consolidates in TWO events — including a discrete late one (~step 70k) invisible to accuracy/margin/cert** — the dissociation is the certificate's boundedness, empirically |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
   Scores FFN neurons over a calibration set; drops the **provably-dead** (a zero `down_proj` row writes
@@ -291,12 +291,18 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
     circuit consolidation that the margin certificate does not see.**
   - **Reading:** the margin certificate is a *confidence* signal (saturates); PR is the *structure* signal
     (keeps consolidating) — the **temporal face of the LE-T2 boundedness Grok predicted**: the certifiable
-    surface saturates while the dense circuit structure keeps evolving. NL training is **gradual, not a sharp
-    grok** (prediction iii confirmed: no single transition; a build-then-cleanup over the whole run). Net:
-    PO-T7's cert fraction is a valid order parameter *for the learning phase*; **PR / treewidth is the better
-    grokking progress measure**, and the dissociation is itself the result — you cannot read consolidation off
-    the certificate alone. *Remaining:* the late PR drop to 13 (step 143k) is a single checkpoint — confirm with
-    a denser late tail and the larger ladder (160m/410m).
+    surface saturates while the dense circuit structure keeps evolving. Net: PO-T7's cert fraction is a valid
+    order parameter *for the learning phase*; **PR / treewidth is the better grokking progress measure**, and
+    the dissociation is itself the result — you cannot read consolidation off the certificate alone.
+  - **Densified late tail (28 checkpoints) sharpens it into a DISCRETE second consolidation.** PR is not a slow
+    drift: it holds a **plateau at ~20 (steps 6k–64k)**, then drops sharply (64k: 20.8 → 80k: 14.8 → 96k: 12.1)
+    to a **second stable plateau at ~12.5 (steps 96k–143k, 7 checkpoints — confirmed, not a single point)**.
+    Through that entire second consolidation, **accuracy (~45%), margin (~1.05) and cert (~36%) are flat** — a
+    real structural reorganization with *zero footprint* in any confidence/certificate metric. So NL training
+    here is *not* one gradual cleanup but **at least two consolidation events** (the early 56→23 during the
+    learning ramp, and a late ~20→12 long after the loss plateaus), the second invisible to the certificate.
+    *Remaining:* characterize *what* consolidates at step ~70k (which heads/circuits), and replicate up the
+    ladder (160m/410m) — same script, change the repo id.
 
 ---
 
