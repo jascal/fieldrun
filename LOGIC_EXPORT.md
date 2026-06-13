@@ -221,6 +221,19 @@ as provenance structure vs intervention diffuseness.
     flagged — choose it right and the descriptive escape mostly works; the clean closer is to BUILD the
     fixed-`S` rank-r valuation and measure decode preservation vs r across inputs.* (Caveat: one model;
     random contexts may understate `dim(S)` vs real text.)
+  - **The closer — fixed-`S` decode-preservation curve (`lo3a/lo1_curve.py`, `lo1_curve.png`).** Fit `S`
+    (PCA of the decision directions) on a TRAIN split; on HELD-OUT decisions, project the residual onto the
+    rank-`r` subspace of `S` and re-decode. The genuinely context-free valuation **preserves ~70% of decodes
+    at peak** (ALL 70%, forge-tax 65%, retrievable 72%), at **r ≈ 128–192 — i.e. ≈ the scalar PR (~92)** —
+    and **never reaches 90%**; beyond r≈192 it *crashes* (the low-variance tail of `S` lets the residual's
+    non-decision energy corrupt the argmax, so the decode-relevant subspace is *finite*, ~128–192-dim). **Net,
+    and this is the LO1 landing:** the effrank-16 read was optimistic; the *operational* decode-preservation
+    needs rank **≈ the scalar PR** and **caps at ~70%**. So the descriptive escape is **PARTIAL and
+    PR-bounded** — `Δ_descr` buys ~70% of the decodes with a fixed ~PR-rank subspace, but a **~30% residual +
+    the high-coverage tail is the `τ*`/`Δ_repr` floor**. All four axes converge on the **same scalar-PR /
+    margin wall** as PO4 and the circuit `faithful_r`: *choosing the decision basis helps, but the decode-
+    faithful rank of any fixed valuation is ≈ the participation ratio.* (Open refinement: a non-orthogonal /
+    readout-aligned / margin-weighted basis might lift the 70% ceiling; real-text contexts; multiple models.)
 - **LO2** `--probe-reconstruct` — **DONE** (FINDINGS §5d). Per-block residual decomposition: `Σ_blocks == logit`
   **exact** (mean err 6–7e-6 both models) ⇒ LE-T5 confirmed numerically, the static export is faithful. The decision is
   **block-sparse** (≈8–10 effective of 49 blocks, σ≈1.1–1.6) but **circuit-dense** within a block (PR≈45). So the
