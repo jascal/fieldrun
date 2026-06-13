@@ -354,6 +354,17 @@ margin — no compute saving) or the **sound δ-bound** `‖(I−P_r)x‖·‖ga
 So PR-core is a **lossy compression with a known coverage**, not a free decode-exact speedup; PO-T3's
 certificate requires the full margin, not the core's.
 
+**Both router-salvage routes fail (`lo3a/pr_core_v2.py`) — the heavy tail is intrinsic, not fixable.**
+(a) *Second-stage self-consistency gate* (accept the rank-`r` decode iff it agrees with rank-`2r`): they
+agree on 87% of decisions, but among agreements only **76%** match the full model — the tail *beyond* 2r
+still flips ~24%, so cross-rank agreement ≠ correctness (the hybrid reaches 79% at 2.2×, a fidelity/size
+point, not an exact router). (b) *Whitening `x` by the activation covariance* (to relatively boost the
+decision subspace): it **hurts** (67%→50%) and barely moves `‖discarded‖/‖x‖` (0.99→0.96) — the decision
+spread is **intrinsic, not a normalization artifact**. Conclusion: no cheap signal (core margin, cross-rank
+agreement, or whitening) recovers decode-exactness. PR-core is a **tunable lossy size dial**
+(6.2×@67% … 2.2×@79%); the heavy-tailed decode geometry is the `τ*` floor, confirmed against three salvage
+attempts. *(A decode-targeted trained head remains the one untested re-opener — torch-gated.)*
+
 **Why linear, for now.** The Volterra/polynomial probe on the PR core was **flat** (degree 1/2/3 ≈ 68/68/64%
 vs 65% linear) — low-order interactions don't reach the `α≈1` heavy tail. A non-linear series re-opens only
 if a **decode-targeted trained head** (not L2 reconstruction; torch-gated) recovers tail mass. Until then the
