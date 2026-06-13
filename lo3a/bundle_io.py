@@ -4,15 +4,24 @@ embed/lm_head stored [vocab, d] row-per-token. config = [n_layer,H,nkv,hd,d,ffn,
 import json, os
 import numpy as np
 
-def read_bundle(stem):
+def read_bundle(stem, keep_f16=True):
+    """f32 → float32; f16 → keep big 2D weights as float16 (numpy upcasts in matmul; saves ~2x RAM for
+    large models) and upcast 1D (norms) to float32. Other (int) dtypes: reconvert --dtype f16."""
     with open(stem + ".fieldrun.json") as f: man = json.load(f)
     blob = open(stem + ".fieldrun.bin", "rb").read()
+    dt = {"f32": "<f4", "f16": "<f2"}
     W = {}
     for a in man["arrays"]:
-        assert a["dtype"] == "f32", f"reduce.py handles f32 bundles only (got {a['dtype']} for {a['name']})"
+        d = a["dtype"]
+        if d not in dt:
+            raise ValueError(f"bundle_io: dtype {d!r} for {a['name']} unsupported — reconvert with --dtype f16 or f32")
         n = int(np.prod(a["shape"]))
-        v = np.frombuffer(blob, dtype="<f4", count=n, offset=a["offset"]).reshape(a["shape"]).astype(np.float32)
-        W[a["name"]] = v.copy()
+        v = np.frombuffer(blob, dtype=dt[d], count=n, offset=a["offset"]).reshape(a["shape"])
+        if d == "f16" and keep_f16 and len(a["shape"]) == 2:
+            W[a["name"]] = v.astype(np.float16).copy()
+        else:
+            W[a["name"]] = v.astype(np.float32).copy()
+    del blob
     return man, W
 
 def write_bundle(stem, arch, config, config_f, W, order):
