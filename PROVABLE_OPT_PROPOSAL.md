@@ -439,13 +439,23 @@ readout: cheap rank-`r` (+ top-32 verify) on syntactic positions, full readout o
 decide *before* the full readout. The **free** gate (classify the core's own top-1) **fails** — the lossy core
 *over-predicts* format tokens, so "core says syntax" is only 58% precise and 44% exact-on-routed; the class is
 not in the core's biased argmax. But the class **is** cheaply **decodable from the residual**: a linear probe
-predicts content-vs-syntax at **80% balanced-accuracy from the free `r`-dim core coords `Sx`** and **83% from
-the full residual `x`** (`P(content | says content)` 89–92%). With the probe gate + top-32 verify the codec
-reaches **93% exact @ 1.2× (overall), 95% @ 1.1× on prose, 89% @ 1.7× on code** — a real, honest **compute**
-lever whose win scales with the format-token share (modest on prose, larger on code / structured output), not
-an exactness escape (content-word readout still needs the full head; `τ*` stands). The class is in the residual
-*geometry*, not the lossy core's decision — which is itself the cleanest statement of the forge tax: the model
-*knows* it is about to emit content (linearly, cheaply), but emitting *which* content is the irreducible cost.
+predicts content-vs-syntax at **~83% balanced-accuracy from the free `r`-dim core coords `Sx`** (and from the
+full residual `x`; `P(content | says content)` ~87%). With the probe gate + top-32 verify the codec's **compute
+win scales monotonically with the format-token share**, and Lisp (mostly parens) is the favorable extreme:
+
+| domain | % syntactic | exact | compute | core-routed |
+|---|---|---|---|---|
+| prose | 21% | 97% | 1.0× | 20% |
+| C-style code | 43% | 93% | 1.4× | 43% |
+| **Lisp** | **62%** | **98%** | **1.7×** | **56%** |
+
+Lisp is the codec's *best* domain on every axis — most positions routed to the cheap head, biggest compute win,
+*and* the highest exactness — because parens are the most structurally predictable token there is, so the core
+nails them while content symbols fall back to full. This is a real, honest **compute** lever (domain-sensitive,
+largest on structured / paren-heavy output), not an exactness escape (content-word readout still needs the full
+head; `τ*` stands). The class is in the residual *geometry*, not the lossy core's decision (whose argmax is
+format-biased) — itself the cleanest statement of the forge tax: the model *knows* it is about to emit content
+(linearly, cheaply), but emitting *which* content is the irreducible cost.
 
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a

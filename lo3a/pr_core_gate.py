@@ -22,7 +22,20 @@ from real_recall import forward_all, PASSAGES, classify
 HERE = os.path.dirname(os.path.abspath(__file__))
 def _norm(v): return v / (np.linalg.norm(v) + 1e-30)
 def is_code(t): return bool(re.search(r"\bdef \b|\bfunction \b|\bimport \b|=>|\);|\{\n|self\.", t))
+def is_lisp(t): return bool(re.search(r"\(def(un|ine|macro|method|var|parameter)\b|\(lambda\b|\(let\*?\b|\(cond\b|\(car\b|\(cdr\b|\(cons\b|\(mapcar\b", t))
+def domain(t): return "lisp" if is_lisp(t) else ("code" if is_code(t) else "prose")
 SYN = {"punct", "space", "digit"}
+
+LISP_PASSAGES = [
+  "(defun factorial (n)\n  (if (= n 0)\n      1\n      (* n (factorial (- n 1)))))",
+  "(define (map f lst)\n  (if (null? lst)\n      '()\n      (cons (f (car lst))\n            (map f (cdr lst)))))",
+  "(defun fibonacci (n)\n  (cond ((= n 0) 0)\n        ((= n 1) 1)\n        (t (+ (fibonacci (- n 1))\n              (fibonacci (- n 2))))))",
+  "(let ((x 10)\n      (y 20))\n  (let ((sum (+ x y))\n        (product (* x y)))\n    (list sum product)))",
+  "(define (filter pred lst)\n  (cond ((null? lst) '())\n        ((pred (car lst))\n         (cons (car lst) (filter pred (cdr lst))))\n        (else (filter pred (cdr lst)))))",
+  "(defun tree-sum (tree)\n  (if (atom tree)\n      (if (numberp tree) tree 0)\n      (+ (tree-sum (car tree))\n         (tree-sum (cdr tree)))))",
+  "(define (reverse lst)\n  (if (null? lst)\n      '()\n      (append (reverse (cdr lst))\n              (list (car lst)))))",
+  "(defun count-leaves (tree)\n  (cond ((null tree) 0)\n        ((atom tree) 1)\n        (t (+ (count-leaves (car tree))\n              (count-leaves (cdr tree))))))",
+]
 
 def logreg(Xtr, ytr, Xte, l2=1.0, steps=400, lr=0.5):
     """tiny full-batch logistic regression (no sklearn). standardize on train; return test P(y=1)."""
@@ -38,13 +51,14 @@ def main(stem, r=92):
     bpe=BPE(os.path.join(os.path.dirname(stem), os.path.basename(stem)+".tokenizer.json"))
     U=(W["embed"] if cfg[7] else W["lm_head"]).astype(np.float64); gain=W["norm"].astype(np.float64); gU=gain*U
     decs=[]                                                               # (a*, x, domain)
-    for txt in PASSAGES:
+    for txt in PASSAGES + LISP_PASSAGES:
         ids=bpe.encode(txt)
         if len(ids)<4: continue
-        xall,lg=forward_all(W,cfg,cfg_f,ids); dom="code" if is_code(txt) else "prose"
+        xall,lg=forward_all(W,cfg,cfg_f,ids); dom=domain(txt)
         for i in range(2,len(ids)):
             decs.append((int(np.argmax(lg[i])), xall[i], dom))
-    n=len(decs); tr=decs[:n//2]; te=decs[n//2:]; nte=len(te)
+    n=len(decs); perm=np.random.default_rng(0).permutation(n)            # shuffle so every domain is in tr & te
+    tr=[decs[i] for i in perm[:n//2]]; te=[decs[i] for i in perm[n//2:]]; nte=len(te)
     rows=[_norm(gU[a]-gU[v]) for a,x,_ in tr for v in np.argsort(gU@x)[::-1][1:9]]
     Vt=np.linalg.svd(np.array(rows),full_matrices=False)[2]; A=(Vt[:r]@gU.T)
     Xtr=np.array([x for _,x,_ in tr]); Xte=np.array([x for _,x,_ in te])
@@ -79,14 +93,14 @@ def main(stem, r=92):
         cost=r*V + 32*d + np.mean(~rt)*(V*d)                              # core+shortlist always; full only on content
         return kept,(V*d)/cost,rt.mean()
     print(f"   (2) codec = route to core+top32-verify iff probe(Sx) says syntax, else full readout:")
-    print(f"       {'domain':<7}{'n':>5}{'exact':>8}{'compute':>9}{'core-routed':>13}")
-    for lbl,mask in [("ALL",np.ones(nte,bool)),("prose",dom=="prose"),("code",dom=="code")]:
+    print(f"       {'domain':<7}{'n':>5}{'%syntax':>9}{'exact':>8}{'compute':>9}{'core-routed':>13}")
+    for lbl,mask in [("ALL",np.ones(nte,bool)),("prose",dom=="prose"),("code",dom=="code"),("lisp",dom=="lisp")]:
         if mask.sum()==0: continue
         kept,compr,cov=codec(pred_S,mask)
-        print(f"       {lbl:<7}{mask.sum():>5}{100*kept:>7.0f}%{compr:>8.1f}×{100*cov:>12.0f}%")
-    print(f"\n   reading: class IS partly decodable from the residual, but (a) the cheap Sx probe is imperfect,")
-    print(f"   (b) format share is only ~{100*syn_a.mean():.0f}% on this mix, and (c) even perfect routing caps the")
-    print(f"   win at the format fraction. A real, honest COMPUTE lever (bigger on code), not an exactness escape.")
+        print(f"       {lbl:<7}{mask.sum():>5}{100*syn_a[mask].mean():>8.0f}%{100*kept:>7.0f}%{compr:>8.1f}×{100*cov:>12.0f}%")
+    print(f"\n   reading: the COMPUTE win scales with the format-token (syntactic) share — Lisp, being mostly")
+    print(f"   parens, is the format-heavy extreme. Class is decodable from the residual; content-word readout")
+    print(f"   still needs the full head (τ* stands), so this is a domain-sensitive compute lever, not exactness.")
 
 if __name__=="__main__":
     main(sys.argv[1] if len(sys.argv)>1 else os.path.join(HERE,"smollm","smollm"))
