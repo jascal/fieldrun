@@ -349,9 +349,19 @@ two-knob *linear* policy is the cheapest, most robust, verification- and MPS-com
 
 **Serves the size goal directly.** Default at the small stable PR-core ⇒ the `d/PR` win on the dense
 embed/unembed (LE-T4) fragment, *growing* with scale; pay the sublinear `span90` cost only when coverage
-demands it; the spectral triple is the offline/runtime diagnostic. *Status: evidence-backed engineering
-recommendation, validated within the fixed-linear class (Grok, continuing the LO1 collaboration); the
-ladder spectral triple and a decode-targeted head are the two confirming experiments.*
+demands it; the spectral triple is the offline/runtime diagnostic.
+
+**Operate in the decode basis, not the raw stream (capstone, `lo3a/lo1_spec_compare.py`).** The raw
+residual-activation spectrum is *more concentrated* than the decode geometry (135M: hard 7.8 / α 1.18 —
+the massive-activation regime), while the **readout-aligned decision spectrum is the heavy-tailed object**
+(hard 17.7 / α 0.97). So the forge tax lives in the decode geometry, not the activations — and a generic
+activation SAE / raw-residual dictionary starts from the *wrong, deceptively-compressible* basis. For
+decode-faithful compact representations (this policy, polygram/sae-forge dictionaries, verifiable circuits),
+**the readout-aligned decision directions are the right first-class input**, not raw activations.
+
+*Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
+continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
+decode-targeted trained head is the one experiment that could re-open a non-linear extension.*
 
 ---
 
