@@ -470,6 +470,25 @@ neuron, consistent with the forge tax being a distributed *content* computation 
 *syntax* shortcut. (Q3 is settled in passing: the free `Sx` probe (83%) matched the full-residual `x` probe
 (82%), so the cheap `r`-dim gate is optimal — there is no reason to read the full residual for routing.)
 
+**Grammar-role refinement (`lo3a/grammar_recall.py`) — the axis is open- vs closed-class LEXIS.** Splitting the
+coarse "word" bucket by grammatical class sharpens the split dramatically: closed-class **function** words (the,
+of, is, and) behave exactly like punctuation — R@32 **94%** (function) vs 86% (punct), 100% (digit); closed-class
+overall R@32 **89%** — while open-class **content** words **collapse to R@1 1%, R@32 17%**. So the retrievable
+fragment is *grammatical scaffolding* (closed-class + format) and the forge tax is *open-class lexical content*.
+Two controls (both from the user's probes) rule out the alternatives:
+- **positional grammar is NOT it.** Lisp is verb-first, so the token after `(` is *always* the operator — a
+  positionally-pinned slot — yet it sits at the open-class floor (R@32 **23%**, R@1 0%). Grammar pins the *slot*;
+  choosing *which* operator (`defun`/`cons`/`car`) is open-class lexis, still the tax.
+- **margin is NOT it.** The *highest-confidence* decisions in the whole corpus are Lisp open-class arguments
+  (median margin **1.61** — scope-pinned variables, recursive calls) yet they recover only R@32 **27%**.
+
+So recoverability tracks **lexical category**, not decision confidence and not positional predictability: the
+rank-`r` core carries closed-class grammatical identity (a small, structured set) but not open-class lexical
+identity (the large content vocabulary), however predictable the position or confident the model. **The forge
+tax is the cost of selecting from the open lexicon** — and this aligns with the Q1 localization (a late-layer MLP
+feature): closed-class identity is reconstructible from the low-rank decision geometry; open-class lexical choice
+is the heavy-tailed `τ*` computation.
+
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
 decode-targeted trained head is the one experiment that could re-open a non-linear extension. The
