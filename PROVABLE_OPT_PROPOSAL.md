@@ -543,6 +543,14 @@ frequency over ≥ d equiprobable, decision-distinct word-forms** — *not* "man
 if usage stays uniform AND a model fluent enough emits the full diversity (an English-only model fed such a
 conlang collapses to few outputs, artificially cheap). Final closed form of the forge tax: `τ* = min(exp(H_output),
 d)` — the effective rank of the model's output distribution on the data, capped at the residual width.
+*Confirmed across distribution families* (`lo3a/worst_case2.py`, Grok's controlled-skew construction): over 23
+Dirichlet / Zipf-mixture / power-law output distributions, median recoverable rank correlates **+0.94 with
+`min(exp(H), d)`** vs only +0.86 with the 95%-effective support — so `exp(H_output)` (the perplexity / effective
+vocabulary), *not* raw support, is the controlling functional (they diverge precisely in the mixture cases). The
+mixture head/tail split unifies the two scales: a compressible head is recovered at low `ρ/d` (~0.08 for a
+64-token head) **regardless of a flat tail** (`ρ/d`→1.00), so the per-token law (`info_rank`: rank ∝ token
+rarity) and the aggregate law (`τ* = min(exp(H), d)`) are one phenomenon — the lens allocates rank by per-token
+mass, so the corpus tax is the output distribution's entropy.
 
 *Status: evidence-backed engineering recommendation, validated within the fixed-linear class (Grok,
 continuing the LO1 collaboration); the ladder spectral triple confirms the asymmetric scaling, and a
