@@ -192,8 +192,8 @@ function pickVoice(){
   const vs=enVoices(); if(!vs.length) return null;
   const saved=localStorage.getItem('fr_voice'); if(saved){ const s=vs.find(v=>v.name===saved); if(s) return s; }
   const nat=v=>/Natural|Neural|Online|Enhanced|Premium/i.test(v.name);
-  return vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && isMale(v))                      // Scottish male
-      || vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && !FEMALE.test(v.name))           // Scottish, not female
+  return vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && isMale(v))                      // Scottish male (ideal, rare)
+      || vs.find(v=>/^Google US English$/i.test(v.name))                                       // Google US English (preferred on Chrome)
       || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v) && nat(v))                           // US male, natural
       || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v))                                     // US male
       || vs.find(v=>isMale(v) && nat(v)) || vs.find(v=>isMale(v))                              // any male
@@ -219,11 +219,30 @@ if(TTS){
 
 function cleanSpeak(s){
   return (s||'')
-    .replace(/§\s*/g,'Section ').replace(/·/g,', ').replace(/→/g,' to ')
-    .replace(/≈/g,' approximately ').replace(/×/g,' times ').replace(/[⟨⟩‖]/g,'')
+    .replace(/P\s*\(([^()]*)\)/g,' the probability of $1 ')      // P(A) is the probability of A (not "phosphorus")
+    .replace(/\bi\s*\(([^()]*)\)/g,' incidence of $1 ')          // i(A) is the incidence of A
+    .replace(/_{2,}/g,' blank ').replace(/_/g,' ')               // "___" fill-in -> "blank"
+    .replace(/[()]/g,' ')                                        // some voices read ( ) as emoticon faces
+    .replace(/⟨([^⟨⟩]+)⟩/g,(_,x)=>' inner product of '+x.replace(/,/g,' and ')+' ')   // ⟨a, b⟩ is the inner product
+    .replace(/‖([^‖]+)‖/g,(_,x)=>' norm of '+x+' ')              // ‖x‖ is the norm
+    .replace(/§\s*/g,'Section ').replace(/·/g,', ')
+    .replace(/→/g,' to ').replace(/[≈~]/g,' approximately ')
+    .replace(/[⟨⟩‖|]/g,' ').replace(/×/g,' times ').replace(/÷/g,' over ')
     .replace(/Σ/g,' sum ').replace(/Π/g,' product ').replace(/Δ/g,' delta ')
-    .replace(/[μµ]/g,' mu ').replace(/ρ/g,' rho ').replace(/⊕/g,' plus ').replace(/⊗/g,' times ')
-    .replace(/\.(\s*\.)+/g,'.').replace(/\s+([.,;:?!])/g,'$1').replace(/\s+/g,' ').trim();
+    .replace(/[μµ]/g,' mu ').replace(/ρ/g,' rho ').replace(/θ/g,' theta ').replace(/λ/g,' lambda ')
+    .replace(/⊕/g,' plus ').replace(/⊗/g,' times ')
+    .replace(/∧/g,' and ').replace(/∨/g,' or ')
+    .replace(/∩/g,' intersect ').replace(/∪/g,' union ').replace(/∅/g,' empty set ')
+    .replace(/⊆/g,' subset of ').replace(/∈/g,' in ')
+    .replace(/≫/g,' much greater than ').replace(/≪/g,' much less than ')
+    .replace(/≠/g,' not equal ').replace(/≤/g,' at most ').replace(/≥/g,' at least ')
+    .replace(/√/g,' square root ').replace(/²/g,' squared ').replace(/−/g,' minus ')
+    .replace(/=/g,' equals ').replace(/\s\+\s/g,' plus ').replace(/\bvs\b/gi,'versus')
+    .replace(/\banalyses\b/gi,'analyzes')                         // verb here; British "analyses" is read as the plural noun
+    .replace(/[*∗]/g,' star ').replace(/[{}^]/g,' ').replace(/\//g,' ')
+    .replace(/>/g,' greater than ').replace(/</g,' less than ')
+    .replace(/\.(\s*\.)+/g,'.').replace(/,(\s*,)+/g,',')
+    .replace(/\s+([.,;:?!])/g,'$1').replace(/\s+/g,' ').trim();
 }
 /* Split a slide into sentence-sized chunks. Each block element (heading, list
    item, paragraph, pull-quote) becomes its own sentence so bullets don't run
@@ -240,6 +259,7 @@ function slideSentences(i){
 function advanceMs(){ const w=slideSentences(cur).join(' ').split(' ').length; return Math.max(7000, Math.min(22000, w*330)); }
 function nextOrStop(){ if(cur<slides.length-1) go(cur+1); else { autoplay=false; updateControls(); } }
 function speakSlide(my){
+  speechSynthesis.resume();                    // Chrome can leave the queue paused
   const parts=slideSentences(cur); let idx=0;
   (function next(){
     if(my!==gen) return;                       // a newer slide took over
@@ -256,7 +276,7 @@ function afterChange(){                         // called at the end of every go
   const my=++gen;                              // invalidate any pending callback from a prior slide
   clearTimeout(timer);
   if(TTS) speechSynthesis.cancel();
-  if(reading && TTS) speakSlide(my);
+  if(reading && TTS) setTimeout(()=>speakSlide(my), 60);   // let cancel() settle (Chrome drops a speak() right after cancel)
   else if(autoplay) timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
 }
 function updateControls(){
