@@ -7,7 +7,7 @@
       "makes that distinction precise",
       "a probabilistic logic, a piece of tropical geometry, and an executable Datalog program"
     ],
-    "h": "<p class='big'>A seminar walk-through of the <b>composition core</b> of an autoregressive transformer — the part that doesn't just look things up.</p><ul><li>Built from the ground up for a reader who knows <b>linear algebra and a little probability</b>: no transformers or symbolic AI assumed.</li><li>One object, three views: a <b>probabilistic logic</b> (T=1), a <b>tropical geometry</b> (T=0), and an <b>executable Datalog program</b>.</li><li>The companion to the research paper <i>\"What a Transformer Retrieves and What It Computes\"</i> — every claim is grounded in a real model (Qwen2.5, the Pythia ladder).</li></ul><p class='dim'>Use ←/→ or the buttons. The right pane is the supplement's own text — each slide lights up the passage it draws from. Both PDFs are linked below.</p>"
+    "h": "<p class='big'>A seminar walk-through of the <b>composition core</b> of an autoregressive transformer, the part that doesn't just look things up.</p><ul><li>Built from the ground up for a reader who knows <b>linear algebra and a little probability</b>: no transformers or symbolic AI assumed.</li><li>One object, three views: a <b>probabilistic logic</b> (T=1), a <b>tropical geometry</b> (T=0), and an <b>executable Datalog program</b>.</li><li>The companion to the research paper <i>\"What a Transformer Retrieves and What It Computes\"</i>, every claim is grounded in a real model (Qwen2.5, the Pythia ladder).</li></ul><p class='dim'>Use ←/→ or the buttons. The right pane is the supplement's own text, each slide lights up the passage it draws from. Both PDFs are linked below.</p>"
   },
   {
     "k": "§2 · The question",
@@ -17,7 +17,7 @@
       "Ask a large language model for the capital of France and it answers",
       "Probability is not truth-functional, you cannot get"
     ],
-    "h": "<ul><li>\"The capital of France is ___\" looks like <b>memorised lookup</b>. But under a real prompt the decision is a <b>mixture of many partial contributions</b>, and context can push it off the stored table entirely.</li><li>So, per next-token decision, is the model:<ul><li><b>(a) retrieving</b> — reproducing one symbolic rule (an n-gram, an induction copy, a grammar constraint);</li><li><b>(b) selecting</b> — choosing within a set a rule already proposed; or</li><li><b>(c) composing</b> — producing something <i>no single rule proposed</i>?</li></ul></li></ul><div class='pull'>The one-sentence theory: probability is not truth-functional — and Bundy's 1985 fix was to track <i>incidences</i> and recover probability as overlap. PIC says the transformer's core does exactly this, with the inner product playing \"overlap.\"</div>"
+    "h": "<ul><li>\"The capital of France is ___\" looks like <b>memorised lookup</b>. But under a real prompt the decision is a <b>mixture of many partial contributions</b>, and context can push it off the stored table entirely.</li><li>So, per next-token decision, is the model:<ul><li><b>(a) retrieving</b>, reproducing one symbolic rule (an n-gram, an induction copy, a grammar constraint);</li><li><b>(b) selecting</b>, choosing within a set a rule already proposed; or</li><li><b>(c) composing</b>, producing something <i>no single rule proposed</i>?</li></ul></li></ul><div class='pull'>The one-sentence theory: probability is not truth-functional, and Bundy's 1985 fix was to track <i>incidences</i> and recover probability as overlap. PIC says the transformer's core does exactly this, with the inner product playing \"overlap.\"</div>"
   },
   {
     "k": "§2 · Headline",
@@ -26,7 +26,7 @@
     "quotes": [
       "the labour divides roughly 25% retrieved, 60% selected, 15% composed"
     ],
-    "h": "<ul><li>Across the models studied: <span class='num'>~25%</span> retrieved · <span class='num'>~60%</span> selected · <span class='num'>~15%</span> composed.</li><li>Most apparent \"computation\" is really <b>disambiguation within a retrieved set</b> — retrieval + selection dominate every model.</li><li>The small <b>composed</b> band is the irreducible computation, and it <b>grows monotonically with scale</b> (7.8% → 14.8% up the Pythia ladder against a fixed store). <b>Bigger models compute more.</b></li></ul><p class='dim'>Figure 1 in the supplement (embedded right) shows the stacked split across Qwen 0.5B and Pythia 70M→1B.</p>"
+    "h": "<ul><li>Across the models studied: <span class='num'>~25%</span> retrieved · <span class='num'>~60%</span> selected · <span class='num'>~15%</span> composed.</li><li>Most apparent \"computation\" is really <b>disambiguation within a retrieved set</b>, retrieval + selection dominate every model.</li><li>The small <b>composed</b> band is the irreducible computation, and it <b>grows monotonically with scale</b> (7.8% → 14.8% up the Pythia ladder against a fixed store). <b>Bigger models compute more.</b></li></ul>[[FIG1]]"
   },
   {
     "k": "§1 · Notation",
@@ -35,7 +35,7 @@
     "quotes": [
       "This section collects the notation used throughout"
     ],
-    "h": "<p>Everything is re-explained at first use; this is just the cheat-sheet.</p><ul><li><code>⟨u, v⟩</code> — the <b>inner product</b>: one number for how much two vectors point the same way.</li><li><code>r = Σ<sub>j</sub> d<sub>j</sub></code> — the <b>residual stream</b>: the sum of every component's write d<sub>j</sub>.</li><li><code>U<sub>v</sub></code> — the unembedding direction of token v; <code>L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub></code> its <b>logit</b>.</li><li><code>c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩</code> — source j's <b>vote</b> for token v; <code>G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩</code> — the <b>Gram matrix</b>.</li><li>Diagnostics: <b>PR</b> (effective # of sources), <b>µ<sub>t</sub></b> (how many sources already pick t), <b>Δ</b> (winning margin).</li></ul>"
+    "h": "<p>Everything is re-explained at first use; this is just the cheat-sheet.</p><ul><li><code>⟨u, v⟩</code>, the <b>inner product</b>: one number for how much two vectors point the same way.</li><li><code>r = Σ<sub>j</sub> d<sub>j</sub></code>, the <b>residual stream</b>: the sum of every component's write d<sub>j</sub>.</li><li><code>U<sub>v</sub></code>, the unembedding direction of token v; <code>L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub></code> its <b>logit</b>.</li><li><code>c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩</code>, source j's <b>vote</b> for token v; <code>G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩</code>, the <b>Gram matrix</b>.</li><li>Diagnostics: <b>PR</b> (effective # of sources), <b>µ<sub>t</sub></b> (how many sources already pick t), <b>Δ</b> (winning margin).</li></ul>"
   },
   {
     "k": "§3 · The substrate",
@@ -45,7 +45,7 @@
       "these updates are additive",
       "the residual stream is the internal scratchpad into which that context gets distilled"
     ],
-    "h": "<ul><li>Every attention head and MLP writes into one shared running sum — the <b>residual stream</b> <code>r = Σ d<sub>j</sub></code>. The writes are <b>additive</b>: no nonlinearity sits between them and the readout.</li><li>The model reads out token logits by a <b>linear</b> comparison: <code>L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub></code>, then a softmax.</li></ul><div class='pull'>Mind the trap: the residual stream is <b>not</b> the \"context.\" The context window is the input text; the residual stream is the internal scratchpad that text gets distilled into — and it's that scratchpad the theory analyses.</div>"
+    "h": "<ul><li>Every attention head and MLP writes into one shared running sum, the <b>residual stream</b> <code>r = Σ d<sub>j</sub></code>. The writes are <b>additive</b>: no nonlinearity sits between them and the readout.</li><li>The model reads out token logits by a <b>linear</b> comparison: <code>L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub></code>, then a softmax.</li></ul><div class='pull'>Mind the trap: the residual stream is <b>not</b> the \"context.\" The context window is the input text; the residual stream is the internal scratchpad that text gets distilled into, and it's that scratchpad the theory analyses.</div>"
   },
   {
     "k": "§3.2 · The bridge",
@@ -54,7 +54,7 @@
     "quotes": [
       "This exact, bias-free decomposition"
     ],
-    "h": "<ul><li>Because the readout is linear in <code>r = Σ d<sub>j</sub></code>, the logit itself splits into one contribution per component: <code>L<sub>v</sub> = Σ<sub>j</sub> c<sub>j</sub><sup>v</sup></code>, where <code>c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩</code>.</li><li>This is <b>direct logit attribution (DLA)</b> — exact and bias-free, not an approximation.</li><li>It is the bridge from continuous machinery to a logical reading: each source <b>casts a real-valued vote</b> for each token, and the column sums decide.</li></ul><p class='dim'>This single decomposition is the seed of all three interpretations.</p>"
+    "h": "<ul><li>Because the readout is linear in <code>r = Σ d<sub>j</sub></code>, the logit itself splits into one contribution per component: <code>L<sub>v</sub> = Σ<sub>j</sub> c<sub>j</sub><sup>v</sup></code>, where <code>c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩</code>.</li><li>This is <b>direct logit attribution (DLA)</b>, exact and bias-free, not an approximation.</li><li>It is the bridge from continuous machinery to a logical reading: each source <b>casts a real-valued vote</b> for each token, and the column sums decide.</li></ul><p class='dim'>This single decomposition is the seed of all three interpretations.</p>"
   },
   {
     "k": "§3.3 · The coupling",
@@ -64,7 +64,7 @@
       "is the Gram matrix of the unembedding frame",
       "the whole non-truth-functional story in one number"
     ],
-    "h": "<ul><li>Competing tokens are <b>not independent</b>: near-synonyms (U<sub>t</sub> ≈ U<sub>v</sub>) move together; orthogonal directions don't.</li><li>All these couplings live in the <b>Gram matrix</b> <code>G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩</code> — unnormalised cosine similarity of token directions (the \"king–queen vs bicycle\" intuition).</li><li>Worked miniature: Paris/Lyon/bicycle. The single off-diagonal <span class='num'>0.95</span> coupling Paris↔Lyon is the entire non-truth-functional story in one number.</li></ul><div class='pull'>G is the object that will carry every coupling the rest of the theory needs.</div>"
+    "h": "<ul><li>Competing tokens are <b>not independent</b>: near-synonyms (U<sub>t</sub> ≈ U<sub>v</sub>) move together; orthogonal directions don't.</li><li>All these couplings live in the <b>Gram matrix</b> <code>G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩</code>, unnormalised cosine similarity of token directions (the \"king–queen vs bicycle\" intuition).</li><li>Worked miniature: Paris/Lyon/bicycle. The single off-diagonal <span class='num'>0.95</span> coupling Paris↔Lyon is the entire non-truth-functional story in one number.</li></ul><div class='pull'>G is the object that will carry every coupling the rest of the theory needs.</div>"
   },
   {
     "k": "§4 · The 1985 idea",
@@ -74,7 +74,7 @@
       "The missing information is how the events overlap",
       "Bundy’s move is to stop treating probability as the primitive object and treat overlap as primitive"
     ],
-    "h": "<ul><li><b>The defect:</b> probability isn't truth-functional — P(A) and P(B) don't fix P(A∧B). Same marginals can give three different answers; the missing information is <b>how the events overlap</b>.</li><li><b>Bundy's fix:</b> stop treating probability as primitive; track <b>incidences</b> (possible worlds where a proposition holds) and <i>recover</i> probability as the relative size of an overlap, <code>P(A) = |i(A)| / |I|</code>.</li><li>Connectives become honest set operations (∧ = ∩, ∨ = ∪). Truth-functionality is restored at the level of <b>sets</b>; non-truth-functional probability falls out.</li></ul>"
+    "h": "<ul><li><b>The defect:</b> probability isn't truth-functional, P(A) and P(B) don't fix P(A∧B). Same marginals can give three different answers; the missing information is <b>how the events overlap</b>.</li><li><b>Bundy's fix:</b> stop treating probability as primitive; track <b>incidences</b> (possible worlds where a proposition holds) and <i>recover</i> probability as the relative size of an overlap, <code>P(A) = |i(A)| / |I|</code>.</li><li>Connectives become honest set operations (∧ = ∩, ∨ = ∪). Truth-functionality is restored at the level of <b>sets</b>; non-truth-functional probability falls out.</li></ul>"
   },
   {
     "k": "§4.2 · Worked example",
@@ -84,7 +84,7 @@
       "Let I = {1, 2, 3, 4, 5, 6} be six equally likely worlds",
       "A truth-functional guess would have had no way to produce 1/3"
     ],
-    "h": "<p>Six equally likely worlds; two propositions:</p><ul><li>i(A) = {1,2,3,4}, i(B) = {3,4,5,6} → P(A) = P(B) = <span class='num'>2/3</span>.</li><li>Conjunction <i>from the sets</i>: i(A∧B) = {3,4} → P(A∧B) = <span class='num'>1/3</span>.</li></ul><p>A truth-functional guess can't produce 1/3: <b>independent</b> gives 4/9, <b>mutually exclusive</b> gives 0 — both discard the overlap.</p><div class='pull'>Move the same marginals to a different overlap, i(B′) = i(A), and P(A∧B′) = 2/3. Identical marginals, different conjunction — only the incidences tell them apart.</div>"
+    "h": "<p>Six equally likely worlds; two propositions:</p><ul><li>i(A) = {1,2,3,4}, i(B) = {3,4,5,6} → P(A) = P(B) = <span class='num'>2/3</span>.</li><li>Conjunction <i>from the sets</i>: i(A∧B) = {3,4} → P(A∧B) = <span class='num'>1/3</span>.</li></ul><p>A truth-functional guess can't produce 1/3: <b>independent</b> gives 4/9, <b>mutually exclusive</b> gives 0, both discard the overlap.</p><div class='pull'>Move the same marginals to a different overlap, i(B′) = i(A), and P(A∧B′) = 2/3. Identical marginals, different conjunction, only the incidences tell them apart.</div>"
   },
   {
     "k": "§5.1 · The projective move",
@@ -94,28 +94,28 @@
       "incidence sets are replaced by directions in an inner-product space",
       "PIC is therefore a strict generalisation"
     ],
-    "h": "<p>The single liberalising step (<b>Definition 1</b>, the PIC dictionary):</p><table class='routes'><tr><th>Bundy</th><th>PIC</th><th>in the model</th></tr><tr><td>incidence set i(A)</td><td>direction U<sub>v</sub></td><td>unembedding row</td></tr><tr><td>overlap |i(A)∩i(B)|</td><td>kernel G<sub>vw</sub></td><td>Gram of the frame</td></tr><tr><td>∧, ∨ (set ops)</td><td>weighted threshold</td><td>the composed connective</td></tr><tr><td>P(A)=|i(A)|/|I|</td><td>softmax(L)<sub>v</sub></td><td>output probability</td></tr></table><ul><li>Incidence <b>sets become directions</b> in an inner-product space; overlap becomes the kernel value G<sub>vw</sub>.</li><li>When G is <b>diagonal</b> (mutually exclusive outcomes), PIC collapses to Bundy's classical case — so PIC is a <b>strict generalisation</b> that adds the off-diagonal coupling.</li></ul>"
+    "h": "<p>The single liberalising step (<b>Definition 1</b>, the PIC dictionary):</p><table class='routes'><tr><th>Bundy</th><th>PIC</th><th>in the model</th></tr><tr><td>incidence set i(A)</td><td>direction U<sub>v</sub></td><td>unembedding row</td></tr><tr><td>overlap |i(A)∩i(B)|</td><td>kernel G<sub>vw</sub></td><td>Gram of the frame</td></tr><tr><td>∧, ∨ (set ops)</td><td>weighted threshold</td><td>the composed connective</td></tr><tr><td>P(A)=|i(A)|/|I|</td><td>softmax(L)<sub>v</sub></td><td>output probability</td></tr></table><ul><li>Incidence <b>sets become directions</b> in an inner-product space; overlap becomes the kernel value G<sub>vw</sub>.</li><li>When G is <b>diagonal</b> (mutually exclusive outcomes), PIC collapses to Bundy's classical case, so PIC is a <b>strict generalisation</b> that adds the off-diagonal coupling.</li></ul>"
   },
   {
     "k": "§5.2 · The empirical wall",
-    "t": "It's not about magnitude — PR ≈ 45 for all routes",
+    "t": "It's not about magnitude: PR ≈ 45 for all routes",
     "target": "sec-5-2",
     "quotes": [
       "the split is not a magnitude distinction",
       "the participation ratio PR ≈ 45 is the same for all three routes"
     ],
-    "h": "<ul><li>Tempting hypothesis: \"retrieved = one dominant circuit shouts loudest.\" <b>False.</b></li><li>The <b>participation ratio</b> PR ≈ <span class='num'>45</span> — the effective number of contributing sources — is the <b>same for all three routes</b>. No single circuit ever decides by magnitude; even a perfect n-gram lookup rides a ~45-way additive sum.</li><li>So what <i>does</i> separate the routes? Two other, measurable axes:<ul><li><b>margin</b> (geometry) — distance to the decision boundary;</li><li><b>readout multiplicity µ<sub>t</sub></b> (logic) — does any single source already pick the token?</li></ul></li></ul><p class='dim'>Those two axes are exactly what the three interpretations formalise.</p>"
+    "h": "<ul><li>Tempting hypothesis: \"retrieved = one dominant circuit shouts loudest.\" <b>False.</b></li><li>The <b>participation ratio</b> PR ≈ <span class='num'>45</span>, the effective number of contributing sources, is the <b>same for all three routes</b>. No single circuit ever decides by magnitude; even a perfect n-gram lookup rides a ~45-way additive sum.</li><li>So what <i>does</i> separate the routes? Two other, measurable axes:<ul><li><b>margin</b> (geometry), distance to the decision boundary;</li><li><b>readout multiplicity µ<sub>t</sub></b> (logic), does any single source already pick the token?</li></ul></li></ul><p class='dim'>Those two axes are exactly what the three interpretations formalise.</p>"
   },
   {
     "k": "§5.3 · The unification",
-    "t": "One object, three readings — set by temperature",
+    "t": "One object, three readings, set by temperature",
     "target": "sec-5-3",
     "quotes": [
       "a single mathematical object that can be read three ways",
       "A semiring is a set equipped with two operations",
       "the choice of semiring is exactly the temperature dial"
     ],
-    "h": "<p>The composition core is a <b>single mathematical object</b> read three ways, governed by one knob — the <b>temperature T</b> (equivalently, a choice of <b>semiring</b>).</p><p class='dim'>A <b>semiring</b> has an \"add\" ⊕ (combine alternatives) and a \"multiply\" ⊗ (chain steps) — minus subtraction, which is what lets ⊕ = max count as addition.</p><table class='routes'><tr><th>semiring</th><th>⊕</th><th>yields</th></tr><tr><td>log (T=1)</td><td>log Σ exp</td><td>the <b>softmax</b></td></tr><tr><td>tropical (T=0)</td><td>max</td><td>the greedy <b>arg max</b></td></tr></table><p>Same program <code>L<sub>v</sub> = Σ c<sub>j</sub><sup>v</sup></code> — only the arithmetic changes. <b>The choice of semiring is exactly the temperature dial.</b></p>"
+    "h": "<p>The composition core is a <b>single mathematical object</b> read three ways, governed by one knob, the <b>temperature T</b> (equivalently, a choice of <b>semiring</b>).</p>[[FIG2]]<p class='dim'>A <b>semiring</b> has an \"add\" ⊕ (combine alternatives) and a \"multiply\" ⊗ (chain steps), minus subtraction, which is what lets ⊕ = max count as addition.</p><table class='routes'><tr><th>semiring</th><th>⊕</th><th>yields</th></tr><tr><td>log (T=1)</td><td>log Σ exp</td><td>the <b>softmax</b></td></tr><tr><td>tropical (T=0)</td><td>max</td><td>the greedy <b>arg max</b></td></tr></table><p>Same program <code>L<sub>v</sub> = Σ c<sub>j</sub><sup>v</sup></code>, only the arithmetic changes. <b>The choice of semiring is exactly the temperature dial.</b></p>"
   },
   {
     "k": "§5.3 · Reading I",
@@ -124,7 +124,7 @@
     "quotes": [
       "equivalently a product of experts"
     ],
-    "h": "<ul><li>Sources are vectors d<sub>j</sub>; tokens are propositions U<sub>v</sub>; the vote c<sub>j</sub><sup>v</sup> is DLA. Combination is signed accumulation in the exponent, which is <b>equivalently a product of experts</b>: each source reweights a token's mass by exp(vote).</li><li><b>Theorem 1:</b> the output probabilities come out <i>exactly</i> as Bundy <b>incidence frequencies</b> — the softmax, recovered parameter-free. \"Probability as proportion of worlds,\" forty years on.</li></ul><div class='pull'>Product of experts (AND / intersect / sharpen) — not the gated <i>mixture</i> of experts (OR / hedge). The residual stream tallies a product; an MoE router picks the panel.</div>"
+    "h": "<ul><li>Sources are vectors d<sub>j</sub>; tokens are propositions U<sub>v</sub>; the vote c<sub>j</sub><sup>v</sup> is DLA. Combination is signed accumulation in the exponent, which is <b>equivalently a product of experts</b>: each source reweights a token's mass by exp(vote).</li><li><b>Theorem 1:</b> the output probabilities come out <i>exactly</i> as Bundy <b>incidence frequencies</b>, the softmax, recovered parameter-free. \"Probability as proportion of worlds,\" forty years on.</li></ul><div class='pull'>Product of experts (AND / intersect / sharpen), not the gated <i>mixture</i> of experts (OR / hedge). The residual stream tallies a product; an MoE router picks the panel.</div>"
   },
   {
     "k": "§5.3 · Reading II",
@@ -134,7 +134,7 @@
       "is a tropical polynomial in r",
       "Laguerre power diagram"
     ],
-    "h": "<ul><li>The max-logit <code>M(r) = max<sub>v</sub>(⟨r, U<sub>v</sub>⟩ + b<sub>v</sub>)</code> is a <b>tropical polynomial</b> in r; its linear regions tile residual space into a <b>Laguerre power diagram</b> — a weighted Voronoi diagram whose sites are the token directions.</li><li>The cell a residual lands in <i>is</i> the predicted token.</li><li><b>Retrieved</b> tokens sit deep inside their cell (large margin); <b>composed</b> tokens hug a facet — emergence = landing in an <i>interior</i> cell no single source owns.</li></ul>"
+    "h": "<ul><li>The max-logit <code>M(r) = max<sub>v</sub>(⟨r, U<sub>v</sub>⟩ + b<sub>v</sub>)</code> is a <b>tropical polynomial</b> in r; its linear regions tile residual space into a <b>Laguerre power diagram</b>, a weighted Voronoi diagram whose sites are the token directions.</li><li>The cell a residual lands in <i>is</i> the predicted token.</li><li><b>Retrieved</b> tokens sit deep inside their cell (large margin); <b>composed</b> tokens hug a facet, emergence = landing in an <i>interior</i> cell no single source owns.</li></ul>"
   },
   {
     "k": "§5.4 · Picture",
@@ -144,7 +144,7 @@
       "decision surface is the Laguerre power diagram of the unembedding directions",
       "a composed token sits close to a facet"
     ],
-    "h": "<ul><li>Each token direction U<sub>v</sub> is a <b>site</b>; residual space tiles into <b>cells</b> (a token wins the arg max) separated by <b>facets</b> (two tokens tie).</li><li>The residual vector r lands in one cell — that's the prediction. A <b>retrieved</b> token sits deep inside its cell; a <b>composed</b> token sits close to a facet.</li><li><b>Prop. 2 (measured):</b> the normalised margin Δ/‖U<sub>t</sub>−U<sub>v*</sub>‖ <i>is</i> the exact perpendicular Euclidean distance from r to the nearest facet.</li></ul><p class='dim'>See Figure 3 in the supplement (right) for the labelled diagram.</p>"
+    "h": "<ul><li>Each token direction U<sub>v</sub> is a <b>site</b>; residual space tiles into <b>cells</b> (a token wins the arg max) separated by <b>facets</b> (two tokens tie).</li><li>The residual vector r lands in one cell, that's the prediction. A <b>retrieved</b> token sits deep inside its cell; a <b>composed</b> token sits close to a facet.</li><li><b>Prop. 2 (measured):</b> the normalised margin Δ/‖U<sub>t</sub>−U<sub>v*</sub>‖ <i>is</i> the exact perpendicular Euclidean distance from r to the nearest facet.</li></ul>[[FIG3]]"
   },
   {
     "k": "§5.3 · Reading III",
@@ -153,7 +153,7 @@
     "quotes": [
       "a semiring-weighted Datalog program"
     ],
-    "h": "<ul><li>The core's decode <i>is</i> a <b>semiring-weighted Datalog program</b> Π under a provenance semiring: stratified clauses for the retrievable fragment, a flagged dense aggregate for the computed one.</li><li>Evaluating Π <b>is</b> inference. The log-semiring gives the softmax; the tropical semiring gives the greedy decode — <b>one program, two temperatures</b>.</li><li>Why Datalog, not Prolog: semiring laws survive (no cut/clause-order), bottom-up <b>least fixpoint</b> matches residual accumulation, and it is decidable & statically analysable (<b>PTIME</b> data complexity).</li></ul><p class='dim'>Caveat (see §8): the program's <i>value</i> is exact for any G, but scalar-semiring <i>provenance</i> is exact only on diagonal G.</p>"
+    "h": "<ul><li>The core's decode <i>is</i> a <b>semiring-weighted Datalog program</b> Π under a provenance semiring: stratified clauses for the retrievable fragment, a flagged dense aggregate for the computed one.</li><li>Evaluating Π <b>is</b> inference. The log-semiring gives the softmax; the tropical semiring gives the greedy decode, <b>one program, two temperatures</b>.</li><li>Why Datalog, not Prolog: semiring laws survive (no cut/clause-order), bottom-up <b>least fixpoint</b> matches residual accumulation, and it is decidable & statically analysable (<b>PTIME</b> data complexity).</li></ul><p class='dim'>Caveat (see §8): the program's <i>value</i> is exact for any G, but scalar-semiring <i>provenance</i> is exact only on diagonal G.</p>"
   },
   {
     "k": "§5.3 · The bridge",
@@ -162,7 +162,7 @@
     "quotes": [
       "softmax and arg max are not two algorithms but two ends of one"
     ],
-    "h": "<ul><li>The \"temperature\" in every chat API <i>is</i> this dial. Rescale logits by L/T before the softmax: T=1 is the model's own distribution; T→0 sharpens onto the arg max (greedy decode).</li><li><b>Maslov dequantization</b> is the formal T→0 limit: the smooth log-semiring deforms continuously into the tropical (max,+) semiring, just as a cooling system settles into its ground state.</li></ul><div class='pull'>So softmax and arg max are not two algorithms but two ends of one temperature-controlled deformation — and Theorem 5 makes the limit rigorous (the Maslov sandwich).</div>"
+    "h": "<ul><li>The \"temperature\" in every chat API <i>is</i> this dial. Rescale logits by L/T before the softmax: T=1 is the model's own distribution; T→0 sharpens onto the arg max (greedy decode).</li><li><b>Maslov dequantization</b> is the formal T→0 limit: the smooth log-semiring deforms continuously into the tropical (max,+) semiring, just as a cooling system settles into its ground state.</li></ul><div class='pull'>So softmax and arg max are not two algorithms but two ends of one temperature-controlled deformation, and Theorem 5 makes the limit rigorous (the Maslov sandwich).</div>"
   },
   {
     "k": "§6 · The proofs",
@@ -172,7 +172,7 @@
       "they are recovered as consequences of the single additive",
       "the conceptual leap is in the identification"
     ],
-    "h": "<p>Nothing is assumed — every claim is a consequence of <code>L<sub>v</sub> = Σ c<sub>j</sub><sup>v</sup></code> plus the Gram matrix G. <span class='dim'>The conceptual leap is the identification; after it the mathematics is short.</span></p><p>The next slides walk the six load-bearing results:</p><ul><li><b>Thm 1</b> recovered probability · <b>Thm 2</b> cardinality-inertness</li><li><b>Thm 3</b> non-truth-functionality is a kernel · <b>Thm 4</b> weighted-threshold expressivity</li><li><b>Prop 1/2</b> power diagram & margin-as-distance · <b>Thm 5</b> two temperatures · <b>Thm 6</b> diffuseness</li></ul><p class='dim'>Each is elementary once the identification is made — and each has a transcribed proof skeleton (Appendix A).</p>"
+    "h": "<p>Nothing is assumed, every claim is a consequence of <code>L<sub>v</sub> = Σ c<sub>j</sub><sup>v</sup></code> plus the Gram matrix G. <span class='dim'>The conceptual leap is the identification; after it the mathematics is short.</span></p><p>The next slides walk the six load-bearing results:</p><ul><li><b>Thm 1</b> recovered probability · <b>Thm 2</b> cardinality-inertness</li><li><b>Thm 3</b> non-truth-functionality is a kernel · <b>Thm 4</b> weighted-threshold expressivity</li><li><b>Prop 1/2</b> power diagram & margin-as-distance · <b>Thm 5</b> two temperatures · <b>Thm 6</b> diffuseness</li></ul><p class='dim'>Each is elementary once the identification is made, and each has a transcribed proof skeleton (Appendix A).</p>"
   },
   {
     "k": "§6.1 · Theorem 1",
@@ -181,7 +181,7 @@
     "quotes": [
       "PIC adds no free parameter, the softmax falls out"
     ],
-    "h": "<ul><li>Start from a <b>uniform base measure</b> over propositions, and let each source reweight token v's mass multiplicatively by exp(c<sub>j</sub><sup>v</sup>).</li><li>After all sources act, the normalised mass of v is <i>exactly</i> <code>exp(L<sub>v</sub>) / Σ exp(L<sub>w</sub>)</code> — the <b>softmax</b>. The common base cancels (distributivity only).</li><li>So the Gibbs/softmax distribution <b>is</b> a PIC incidence frequency: \"probability as proportion of worlds,\" parameter-free.</li></ul><div class='pull'>The uniform base is the \"proportion of worlds\" assumption — PIC adds no free parameter, and G is structural, not injected noise, so it shapes the logits with no variance trade-off.</div>"
+    "h": "<ul><li>Start from a <b>uniform base measure</b> over propositions, and let each source reweight token v's mass multiplicatively by exp(c<sub>j</sub><sup>v</sup>).</li><li>After all sources act, the normalised mass of v is <i>exactly</i> <code>exp(L<sub>v</sub>) / Σ exp(L<sub>w</sub>)</code>, the <b>softmax</b>. The common base cancels (distributivity only).</li><li>So the Gibbs/softmax distribution <b>is</b> a PIC incidence frequency: \"probability as proportion of worlds,\" parameter-free.</li></ul><div class='pull'>The uniform base is the \"proportion of worlds\" assumption, PIC adds no free parameter, and G is structural, not injected noise, so it shapes the logits with no variance trade-off.</div>"
   },
   {
     "k": "§6.2 · Theorem 2",
@@ -191,7 +191,7 @@
       "the raw count of voting sources is causally inert",
       "swung from two to zero and the decision did not move at all"
     ],
-    "h": "<ul><li>The worry: maybe a token wins because <i>many</i> sources vote for it. <b>No</b> — the decision is arg max of the column totals L<sub>v</sub> alone; the readout multiplicity µ<sub>t</sub> never enters L.</li><li><b>Worked example</b> — two sources over {A,B,C}, both with column sums L = (10,6,6):<ul><li>Scenario 1: both pick A → µ<sub>A</sub> = 2 (\"retrieved\" look).</li><li>Scenario 2: one picks B, one picks C → µ<sub>A</sub> = 0 (\"composed\" look).</li></ul>Identical winner, identical margin Δ = 4. The count of supporters swung 2 → 0, yet the decision didn't move.</li></ul><div class='pull'>µ<sub>t</sub> is a label read off afterwards, never a cause. The causal variable is the margin.</div>"
+    "h": "<ul><li>The worry: maybe a token wins because <i>many</i> sources vote for it. <b>No</b>, the decision is arg max of the column totals L<sub>v</sub> alone; the readout multiplicity µ<sub>t</sub> never enters L.</li><li><b>Worked example</b>, two sources over {A,B,C}, both with column sums L = (10,6,6):<ul><li>Scenario 1: both pick A → µ<sub>A</sub> = 2 (\"retrieved\" look).</li><li>Scenario 2: one picks B, one picks C → µ<sub>A</sub> = 0 (\"composed\" look).</li></ul>Identical winner, identical margin Δ = 4. The count of supporters swung 2 → 0, yet the decision didn't move.</li></ul><div class='pull'>µ<sub>t</sub> is a label read off afterwards, never a cause. The causal variable is the margin.</div>"
   },
   {
     "k": "§6.3 · Theorem 3",
@@ -211,7 +211,7 @@
       "Outcome 0 wins, although it is nobody’s first choice",
       "the discrete cousin of XOR"
     ],
-    "h": "<ul><li>Two sources over {0,1,2}: c₁=(2,3,0), c₂=(2,0,3) → L=(4,3,3). <b>Outcome 0 wins, although it is nobody's first choice.</b></li><li>As a <b>Boolean rule</b> (∩/∪): source 1 asserts 1, source 2 asserts 2 — no AND/OR can ever output 0. A truth-functional logic is <b>blind</b> to the answer.</li><li>As a <b>weighted threshold</b> (Σ w<sub>j</sub> c<sub>j</sub><sup>v</sup> > θ, a perceptron): modest-but-agreeing support for 0 outweighs strong-but-lonely support for 1 and 2.</li></ul><div class='pull'>This is the discrete cousin of XOR — the µ<sub>t</sub>=0 signature, \"the winner of a sum that is the winner of no summand,\" and exactly the expressive power composition has over retrieval.</div>"
+    "h": "<ul><li>Two sources over {0,1,2}: c₁=(2,3,0), c₂=(2,0,3) → L=(4,3,3). <b>Outcome 0 wins, although it is nobody's first choice.</b></li><li>As a <b>Boolean rule</b> (∩/∪): source 1 asserts 1, source 2 asserts 2, no AND/OR can ever output 0. A truth-functional logic is <b>blind</b> to the answer.</li><li>As a <b>weighted threshold</b> (Σ w<sub>j</sub> c<sub>j</sub><sup>v</sup> > θ, a perceptron): modest-but-agreeing support for 0 outweighs strong-but-lonely support for 1 and 2.</li></ul><div class='pull'>This is the discrete cousin of XOR, the µ<sub>t</sub>=0 signature, \"the winner of a sum that is the winner of no summand,\" and exactly the expressive power composition has over retrieval.</div>"
   },
   {
     "k": "§6.5 · Props 1 & 2",
@@ -221,7 +221,7 @@
       "the cell of minimum power distance is exactly the arg max token",
       "exact signed Euclidean distance from r to the"
     ],
-    "h": "<ul><li><b>Prop 1:</b> the linear regions of the max-logit are the <b>Laguerre power diagram</b> of the sites {U<sub>v</sub>} with weights (b<sub>v</sub>, ‖U<sub>v</sub>‖²). Polarise the squared distances and the ‖r‖² terms cancel: <b>minimum power distance = maximum score = the arg max token</b>.</li><li><b>Prop 2:</b> the normalised margin (L<sub>t</sub>−L<sub>v*</sub>)/‖U<sub>t</sub>−U<sub>v*</sub>‖ is the <b>exact signed Euclidean distance</b> from r to the t–v* facet — a point-to-hyperplane distance, no approximation.</li></ul><p class='dim'>These turn Figure 3 from a picture into two theorems: the geometry is literally true, and the margin is literally measurable.</p>"
+    "h": "<ul><li><b>Prop 1:</b> the linear regions of the max-logit are the <b>Laguerre power diagram</b> of the sites {U<sub>v</sub>} with weights (b<sub>v</sub>, ‖U<sub>v</sub>‖²). Polarise the squared distances and the ‖r‖² terms cancel: <b>minimum power distance = maximum score = the arg max token</b>.</li><li><b>Prop 2:</b> the normalised margin (L<sub>t</sub>−L<sub>v*</sub>)/‖U<sub>t</sub>−U<sub>v*</sub>‖ is the <b>exact signed Euclidean distance</b> from r to the t–v* facet, a point-to-hyperplane distance, no approximation.</li></ul><p class='dim'>These turn Figure 3 from a picture into two theorems: the geometry is literally true, and the margin is literally measurable.</p>"
   },
   {
     "k": "§6.6 · Theorem 5",
@@ -230,7 +230,7 @@
     "quotes": [
       "the same program Π, evaluated under two different semirings"
     ],
-    "h": "<ul><li>Read Π as a semiring functional aggregate query: sources combine by ⊗ along the residual derivation (Σ<sub>j</sub> c<sub>j</sub><sup>v</sup> = L<sub>v</sub>), competing tokens combine by ⊕.</li><li><b>Log-semiring</b> → aggregate is log Σ exp(L<sub>v</sub>), per-token share is the <b>softmax</b> (T=1).</li><li><b>Tropical semiring</b> → aggregate is max<sub>v</sub> L<sub>v</sub>, witness is the greedy <b>arg max</b> (T=0).</li><li>The two are squeezed together by the <b>Maslov sandwich</b>: max L ≤ T log Σ exp(L/T) ≤ max L + T log|V|.</li></ul><div class='pull'>The same program Π under two semirings returns the softmax you sample and the arg max you decode. One program, two temperatures — joined by Maslov dequantization.</div>"
+    "h": "<ul><li>Read Π as a semiring functional aggregate query: sources combine by ⊗ along the residual derivation (Σ<sub>j</sub> c<sub>j</sub><sup>v</sup> = L<sub>v</sub>), competing tokens combine by ⊕.</li><li><b>Log-semiring</b> → aggregate is log Σ exp(L<sub>v</sub>), per-token share is the <b>softmax</b> (T=1).</li><li><b>Tropical semiring</b> → aggregate is max<sub>v</sub> L<sub>v</sub>, witness is the greedy <b>arg max</b> (T=0).</li><li>The two are squeezed together by the <b>Maslov sandwich</b>: max L ≤ T log Σ exp(L/T) ≤ max L + T log|V|.</li></ul><div class='pull'>The same program Π under two semirings returns the softmax you sample and the arg max you decode. One program, two temperatures, joined by Maslov dequantization.</div>"
   },
   {
     "k": "§7.1–7.2 · On a real model",
@@ -240,7 +240,7 @@
       "even this canonical lookup is assembled from a",
       "composition is a genuine non-local divergence from the rule, not a near-miss"
     ],
-    "h": "<ul><li><b>Retrieved</b> (\"…the capital of France is\"): the residual sits <b>deep in the \"Paris\" cell</b> (large margin), µ<sub>t</sub> ≥ 1 — yet even this canonical lookup is assembled from a ~45-way sum, not one circuit.</li><li><b>Composed</b> (µ<sub>t</sub> = 0): the residual <b>hugs a facet</b>, and — the sharper test — for ~85% of composed tokens the nearest facet isn't even the store's own prediction. Composition is a <b>genuine non-local divergence</b>, not a near-miss.</li><li>Roughly <b>80%</b> of composed tokens are strictly emergent (µ<sub>t</sub> = 0).</li></ul>"
+    "h": "<ul><li><b>Retrieved</b> (\"…the capital of France is\"): the residual sits <b>deep in the \"Paris\" cell</b> (large margin), µ<sub>t</sub> ≥ 1, yet even this canonical lookup is assembled from a ~45-way sum, not one circuit.</li><li><b>Composed</b> (µ<sub>t</sub> = 0): the residual <b>hugs a facet</b>, and (the sharper test) for ~85% of composed tokens the nearest facet isn't even the store's own prediction. Composition is a <b>genuine non-local divergence</b>, not a near-miss.</li><li>Roughly <b>80%</b> of composed tokens are strictly emergent (µ<sub>t</sub> = 0).</li></ul>"
   },
   {
     "k": "§7.3 · Causal test",
@@ -250,17 +250,17 @@
       "single-component ablation therefore understates how a prediction is really computed",
       "the repair here is diffuse"
     ],
-    "h": "<p class='dim'><b>Ablation</b> = zero a component's write and rerun; if the prediction changes, call it a <b>flip</b>. Flips tell <i>causes</i> from mere votes.</p><ul><li><b>Route-ordered fragility:</b> single-circuit ablation flips Retrieved ~22% &lt; Selected ~40% &lt; Composed ~54% (~2.4×) — but a margin-matched split shows <b>margin is the governor</b>, not the route label.</li><li><b>Self-repair (\"Hydra\"):</b> downstream blocks rewrite toward the original token, so single-component ablation <i>understates</i> how a prediction is really computed.</li><li><b>Redundancy is non-compensatory:</b> agreement among weak readers is not fault tolerance.</li></ul><div class='pull'>The repair here is diffuse — no single backup unit you could disable to stop it.</div>"
+    "h": "<p class='dim'><b>Ablation</b> = zero a component's write and rerun; if the prediction changes, call it a <b>flip</b>. Flips tell <i>causes</i> from mere votes.</p><ul><li><b>Route-ordered fragility:</b> single-circuit ablation flips Retrieved ~22% &lt; Selected ~40% &lt; Composed ~54% (~2.4×), but a margin-matched split shows <b>margin is the governor</b>, not the route label.</li><li><b>Self-repair (\"Hydra\"):</b> downstream blocks rewrite toward the original token, so single-component ablation <i>understates</i> how a prediction is really computed.</li><li><b>Redundancy is non-compensatory:</b> agreement among weak readers is not fault tolerance.</li></ul><div class='pull'>The repair here is diffuse, no single backup unit you could disable to stop it.</div>"
   },
   {
     "k": "§7.3 · Theorem 6",
-    "t": "Diffuseness — and what it means for deployment",
+    "t": "Diffuseness, and what it means for deployment",
     "target": "sec-7-3",
     "quotes": [
       "no bounded-size formula can localise it",
       "quantise the retrievable tier hard but should protect the computed core"
     ],
-    "h": "<ul><li>If a causal quantity is spread equitably over PR modules (E = Σ e<sub>m</sub>, e<sub>m</sub> = E/PR), single-source influence is <b>1/PR</b> and a bounded coalition captures only |A|/PR. As PR → ∞ the captured fraction → 0.</li><li>So the repair, like the readout, is <b>distributed over ~45 modules</b>: no surgical target, <b>no bounded-size formula can localise it</b>.</li></ul><div class='pull'>Deployment payoff: the retrievable tier is low-PR, the computed core is the high-PR diffuse layer. Quantise the retrievable tier hard but protect the computed core — exactly where int4 error concentrates (composed 5.9–18.8% vs retrieved 3.6–2.4%).</div>"
+    "h": "<ul><li>If a causal quantity is spread equitably over PR modules (E = Σ e<sub>m</sub>, e<sub>m</sub> = E/PR), single-source influence is <b>1/PR</b> and a bounded coalition captures only |A|/PR. As PR → ∞ the captured fraction → 0.</li><li>So the repair, like the readout, is <b>distributed over ~45 modules</b>: no surgical target, <b>no bounded-size formula can localise it</b>.</li></ul><div class='pull'>Deployment payoff: the retrievable tier is low-PR, the computed core is the high-PR diffuse layer. Quantise the retrievable tier hard but protect the computed core, exactly where int4 error concentrates (composed 5.9–18.8% vs retrieved 3.6–2.4%).</div>"
   },
   {
     "k": "§8 · The frontier",
@@ -270,7 +270,7 @@
       "generalisation target is therefore a non-autoregressive model",
       "If the provenance gap and the expressivity separation close, the consequence is a clean, falsifiable picture of a transformer"
     ],
-    "h": "<ul><li><b>Provenance gap (central):</b> the static value is exact under any G; what dense G breaks is the <i>provenance</i> — scalar semirings are exact only on diagonal G. A geometry-valued provenance carrying G would close it.</li><li><b>Tropical-rank floor</b> and <b>treewidth</b>: candidate \"third measures\" of the same wall — does PR = tropical rank = treewidth, or diverge on the dense fragment?</li><li><b>Beyond autoregressive:</b> the static algebra isn't transformer-specific; diffusion LMs are the cleanest generalisation target.</li><li><b>Scale:</b> evidence is sub-billion-parameter — frontier-scale behaviour is untested.</li></ul><div class='pull'>If these close, you get a falsifiable picture: an extractable, auditable retrievable tier vs a diffuse computed core that admits no compact symbolic form.</div>"
+    "h": "<ul><li><b>Provenance gap (central):</b> the static value is exact under any G; what dense G breaks is the <i>provenance</i>, scalar semirings are exact only on diagonal G. A geometry-valued provenance carrying G would close it.</li><li><b>Tropical-rank floor</b> and <b>treewidth</b>: candidate \"third measures\" of the same wall, does PR = tropical rank = treewidth, or diverge on the dense fragment?</li><li><b>Beyond autoregressive:</b> the static algebra isn't transformer-specific; diffusion LMs are the cleanest generalisation target.</li><li><b>Scale:</b> evidence is sub-billion-parameter, frontier-scale behaviour is untested.</li></ul><div class='pull'>If these close, you get a falsifiable picture: an extractable, auditable retrievable tier vs a diffuse computed core that admits no compact symbolic form.</div>"
   },
   {
     "k": "§9 · Conclusion",
@@ -280,6 +280,6 @@
       "spends most of its labour retrieving and selecting",
       "the central idea is Bundy’s"
     ],
-    "h": "<ul><li>A transformer <b>spends most of its labour retrieving and selecting</b>; a small, scale-growing remainder computes something new — now measurable, with an exact geometric and causal characterisation.</li><li>One kernel <b>G</b>, one wall seen three ways (logic / geometry / computation), one homomorphism between temperatures. Not analogies — <b>one theory</b>.</li></ul><div class='pull'>What to remember: the split is about <b>margin</b> and <b>multiplicity</b>, not magnitude; the softmax is recovered, not imposed; softmax and arg max are one program at two temperatures; the computed core is diffuse by theorem, so it resists both localisation and compression.</div><p class='dim'>And the lineage is the point — the central idea is Bundy's, incidence calculus meeting a substrate he could not have had. Full PDFs linked below.</p>"
+    "h": "<ul><li>A transformer <b>spends most of its labour retrieving and selecting</b>; a small, scale-growing remainder computes something new, now measurable, with an exact geometric and causal characterisation.</li><li>One kernel <b>G</b>, one wall seen three ways (logic / geometry / computation), one homomorphism between temperatures. Not analogies, <b>one theory</b>.</li></ul><div class='pull'>What to remember: the split is about <b>margin</b> and <b>multiplicity</b>, not magnitude; the softmax is recovered, not imposed; softmax and arg max are one program at two temperatures; the computed core is diffuse by theorem, so it resists both localisation and compression.</div><p class='dim'>And the lineage is the point: the central idea is Bundy's, incidence calculus meeting a substrate he could not have had. Full PDFs linked below.</p>"
   }
 ]

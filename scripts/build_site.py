@@ -256,6 +256,18 @@ def _paragraphs(lines: list[str], lo: int, hi: int) -> list[str]:
     return out
 
 
+# inline enumerators "(a) … (b) …" / "(i) … (ii) …" that pdftotext flattens into a
+# run-on; we break them onto their own lines, but only when >=2 appear in one
+# paragraph (so a lone "i(v)" or "(v)" in prose is never touched).
+ENUM_RE = re.compile(r" (\((?:[a-e]|i{1,3}|iv|vi?|vii|viii|ix|x)\)) ")
+
+
+def break_enumerations(html_para: str) -> str:
+    if len(ENUM_RE.findall(html_para)) < 2:
+        return html_para
+    return ENUM_RE.sub(r'<br><span class="enum">\1</span> ', html_para)
+
+
 def render_paragraph(text: str, marks: list[tuple[int, int, int]]) -> str:
     """marks: list of (start, end, slide_idx) spans on the raw text."""
     out, pos = [], 0
@@ -275,6 +287,97 @@ def quote_regex(quote: str) -> re.Pattern:
     return re.compile(r"\s+".join(re.escape(w) for w in quote.split()))
 
 
+# ---- recreated figures -----------------------------------------------------
+# The supplement's three figures are TikZ vector graphics that pdftotext cannot
+# extract, so they never reach the reader text. We rebuild faithful HTML/SVG
+# versions (styled by template.html's .fig rules, so they read on both the dark
+# slide pane and the light reader pane), embed them in the relevant slides via
+# [[FIGn]] tokens, and inject them at their "Figure n:" captions in the reader.
+# The full-fidelity originals remain in the embedded supplement PDF.
+
+def _fig1() -> str:
+    # composed % are the measured values (labelled on each bar, as in the
+    # original); the retrieved/selected split is schematic.
+    rows = [("Qwen<br>0.5B", 38, 90, 22, "15"),
+            ("Pythia<br>70M", 54, 84, 12, "7.8"),
+            ("160M", 53, 82, 15, "10.0"),
+            ("410M", 51, 81, 18, "11.6"),
+            ("1B", 50, 78, 22, "14.8")]
+    bars = "".join(
+        f'<div class="fig1-col"><div class="fig1-cval">{c}</div>'
+        f'<div class="fig1-bar"><i class="c" style="height:{ch}px"></i>'
+        f'<i class="s" style="height:{sh}px"></i><i class="r" style="height:{rh}px"></i></div>'
+        f'<div class="fig1-lab">{lab}</div></div>'
+        for lab, rh, sh, ch, c in rows
+    )
+    leg = ('<div class="fig1-leg">'
+           '<span><i style="background:#2c6a9b"></i>retrieved</span>'
+           '<span><i style="background:#b8cce4"></i>selected</span>'
+           '<span><i style="background:#c0504d"></i>composed</span></div>')
+    cap = ('<div class="cap">The measured route split. The composed band (red, labelled %) '
+           'grows with scale, from Qwen2.5-0.5B through the Pythia ladder 70M to 1B; retrieval '
+           'and selection cover the rest. Composed values are measured; the retrieved/selected '
+           'split is schematic.</div>')
+    return f'<div class="fig"><div class="fig1-bars">{bars}</div>{leg}{cap}</div>'
+
+
+FIG1 = _fig1()
+
+FIG2 = (
+    '<div class="fig"><div class="fig2">'
+    '<div class="top"><b>One kernel G</b>'
+    'L<sub>v</sub> = Σ<sub>j</sub> c<sub>j</sub><sup>v</sup> &nbsp;·&nbsp; '
+    'G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩ &nbsp;·&nbsp; a semiring-weighted program Π</div>'
+    '<div class="arrow">↓</div>'
+    '<div class="row">'
+    '<div class="card"><b class="t1">I. Logic (T=1)</b>log-semiring; probabilistic incidence '
+    'calculus; softmax recovered as an incidence frequency</div>'
+    '<div class="card"><b class="t0">II. Geometry (T=0)</b>tropical semiring; the arg max surface '
+    'is the Laguerre power diagram (greedy decode)</div>'
+    '<div class="card"><b>III. Computation</b>any T, one program; a semiring-weighted Datalog Π; '
+    'evaluation is inference</div>'
+    '</div>'
+    '<div class="maslov">↞ Maslov dequantization (T→0) links Logic and Geometry ↠</div>'
+    '<div class="cap">One object, three readings of a single program carrying the Gram kernel G, '
+    'selected by the temperature T.</div>'
+    '</div></div>'
+)
+
+FIG3 = (
+    '<div class="fig fig3">'
+    '<svg viewBox="0 0 360 210" role="img" aria-label="Power-diagram schematic">'
+    '<polygon points="195,108 235,210 0,210 0,80" fill="#f3dede"/>'
+    '<polygon points="195,108 175,0 0,0 0,80" fill="#ffffff"/>'
+    '<polygon points="195,108 175,0 360,0 360,95" fill="#ffffff"/>'
+    '<polygon points="195,108 360,95 360,210 235,210" fill="#ffffff"/>'
+    '<g stroke="#b9b2a3" stroke-width="1.4">'
+    '<line x1="195" y1="108" x2="175" y2="0"/>'
+    '<line x1="195" y1="108" x2="0" y2="80"/>'
+    '<line x1="195" y1="108" x2="235" y2="210"/>'
+    '<line x1="195" y1="108" x2="360" y2="95"/></g>'
+    '<g fill="#1e3a5f">'
+    '<circle cx="90" cy="44" r="3.2"/><circle cx="272" cy="48" r="3.2"/>'
+    '<circle cx="300" cy="162" r="3.2"/><circle cx="92" cy="166" r="3.2"/></g>'
+    '<line x1="172" y1="150" x2="207" y2="138" stroke="#b3541e" stroke-width="1.4" stroke-dasharray="4 3"/>'
+    '<circle cx="172" cy="150" r="4" fill="#c0504d"/>'
+    '<g font-family="Helvetica,Arial,sans-serif" font-size="11" fill="#333">'
+    '<text x="76" y="40">U_b</text><text x="262" y="44">U_a</text>'
+    '<text x="286" y="178">U_v*</text><text x="78" y="186">U_t (winner)</text>'
+    '<text x="158" y="148" fill="#c0504d">r</text></g>'
+    '<text x="118" y="124" font-family="Helvetica,Arial,sans-serif" font-size="9.5" fill="#b3541e">'
+    'margin = Δ / ‖U_t−U_v*‖</text>'
+    '</svg>'
+    '<div class="cap">Schematic of the residual-space power diagram: each cell is where one token '
+    'wins the arg&nbsp;max; the residual r sits in the winning U_t cell, and the normalised margin '
+    'is its perpendicular distance to the nearest facet.</div>'
+    '</div>'
+)
+
+FIGURES = {"[[FIG1]]": FIG1, "[[FIG2]]": FIG2, "[[FIG3]]": FIG3}
+# the reader injects each figure before the paragraph that opens its caption:
+CAPTION_FIGS = [("Figure 1:", FIG1), ("Figure 2:", FIG2), ("Figure 3:", FIG3)]
+
+
 def main() -> None:
     supp = next(iter(sorted(PAPER_DIR.glob("*supplement*.pdf"))), None)
     if not supp:
@@ -286,6 +389,12 @@ def main() -> None:
 
     slides = json.loads((SITE_DIR / "slides.json").read_text())
     template = (SITE_DIR / "template.html").read_text()
+
+    # expand [[FIGn]] tokens in the slides into the recreated figures
+    for slide in slides:
+        for tok, fightml in FIGURES.items():
+            if tok in slide["h"]:
+                slide["h"] = slide["h"].replace(tok, fightml)
 
     preamble, sections = parse_sections(extract_text(supp))
 
@@ -316,11 +425,13 @@ def main() -> None:
             parts.append(f'<div id="pauth">{escape(p)}</div>')
     for si, (sid, level, heading, paras) in enumerate(sections):
         tag = "h2" if level == 1 else "h3"
-        body = "".join(
-            f"<p>{render_paragraph(p, marks.get((si, pi), []))}</p>"
-            for pi, p in enumerate(paras)
-        )
-        parts.append(f'<section id="{sid}"><{tag}>{escape(heading)}</{tag}>{body}</section>')
+        chunks = []
+        for pi, p in enumerate(paras):
+            fig = next((f for pre, f in CAPTION_FIGS if p.startswith(pre)), None)
+            if fig:
+                chunks.append(fig)                       # figure, then its caption paragraph
+            chunks.append(f"<p>{break_enumerations(render_paragraph(p, marks.get((si, pi), [])))}</p>")
+        parts.append(f'<section id="{sid}"><{tag}>{escape(heading)}</{tag}>{"".join(chunks)}</section>')
 
     page = template.replace("__PAPER__", "\n".join(parts)).replace(
         "__SLIDES__", json.dumps(slides, ensure_ascii=False)
