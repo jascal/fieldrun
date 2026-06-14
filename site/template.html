@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>What a Transformer Retrieves and What It Computes — slide reader</title>
+<title>Projective Incidence Calculus — teaching companion (slide reader)</title>
 <style>
   :root{
     --ink:#1a1d23; --paper:#fbfaf7; --accent:#b3541e; --accent2:#1e6fb3;
@@ -34,9 +34,11 @@
   .dot{width:8px;height:8px;border-radius:50%;background:#3a4356;cursor:pointer;}
   .dot.on{background:var(--accent);}
 
-  /* ---------- full-PDF link (figures & tables live in the source PDF) ---------- */
-  #nav a#pdflink{background:#3a2f26;color:#ffd9b3;text-decoration:none;border-radius:6px;padding:8px 14px;font-size:13px;border:1px solid #5a4636;}
-  #nav a#pdflink:hover{background:#4a3a2c;}
+  /* ---------- full-PDF links (figures, tables & equations live in the source PDFs) ---------- */
+  #nav a.pdflink{background:#3a2f26;color:#ffd9b3;text-decoration:none;border-radius:6px;padding:8px 12px;font-size:12.5px;border:1px solid #5a4636;}
+  #nav a.pdflink:hover{background:#4a3a2c;}
+  #nav a.pdflink.alt{background:#26303a;color:#bfe0ff;border-color:#365063;}
+  #nav a.pdflink.alt:hover{background:#2c3c4a;}
   #pdfview{margin-top:46px;border-top:2px solid #e4ded2;padding-top:10px;}
   #pdfview object{border:1px solid #d8d2c4;border-radius:6px;margin-top:8px;background:#fff;}
 
@@ -80,7 +82,8 @@
     <button id="prev">&#8592; Prev</button>
     <button id="next">Next &#8594;</button>
     <div id="dots"></div>
-    <a id="pdflink" href="paper.pdf" target="_blank" rel="noopener">&#128196; Full PDF</a>
+    <a class="pdflink" href="supplement.pdf" target="_blank" rel="noopener">&#128214; Supplement PDF</a>
+    <a class="pdflink alt" href="paper.pdf" target="_blank" rel="noopener">&#128196; Original paper</a>
     <span id="counter"></span>
   </div>
 </div>
@@ -89,10 +92,10 @@
 <div id="right">
 __PAPER__
 <section id="pdfview">
-  <h2>Full paper &mdash; figures &amp; tables</h2>
-  <p class="caption">The reader above is the paper's text. Figures and tables (e.g. Figure&nbsp;1, Table&nbsp;1) are vector graphics in the source PDF &mdash; view or download the full draft below.</p>
-  <object data="paper.pdf" type="application/pdf" width="100%" height="860">
-    <p><a href="paper.pdf">Open the full PDF (figures &amp; tables)</a> &mdash; your browser can't embed it inline.</p>
+  <h2>Supplement &mdash; full PDF (figures, tables &amp; equations)</h2>
+  <p class="caption">The reader above is the supplement's text. Figures (the route split, the unification map, the power diagram), tables, and equations are vector graphics pdftotext can't extract &mdash; view or download the full supplement below. The companion research paper, <i>&ldquo;What a Transformer Retrieves and What It Computes&rdquo;</i>, is available <a href="paper.pdf">here</a>.</p>
+  <object data="supplement.pdf" type="application/pdf" width="100%" height="860">
+    <p><a href="supplement.pdf">Open the full supplement PDF</a> &mdash; your browser can't embed it inline.</p>
   </object>
 </section>
 </div>
