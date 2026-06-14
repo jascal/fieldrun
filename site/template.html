@@ -107,6 +107,7 @@
   #right .refnum{font-weight:600;color:#1e6fb3;margin-right:5px;}
   #nav button.on{background:var(--accent);}
   #nav button.on:hover{background:#c9631f;}
+  #nav select#voice{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:7px 8px;font-size:12px;max-width:150px;font-family:Helvetica,Arial,sans-serif;cursor:pointer;}
   @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
 </style>
 </head>
@@ -120,6 +121,7 @@
     <button id="next">Next &#8594;</button>
     <button id="play" aria-pressed="false" title="Play through the slides (auto-advance); key: p">&#9654; Play</button>
     <button id="read" aria-pressed="false" title="Read the current slide aloud (text-to-speech); key: r">&#128266; Read aloud</button>
+    <select id="voice" title="Narration voice" aria-label="Narration voice" style="display:none"></select>
     <div id="dots"></div>
     <a class="pdflink" href="supplement.pdf" target="_blank" rel="noopener">&#128214; Supplement PDF</a>
     <a class="pdflink alt" href="paper.pdf" target="_blank" rel="noopener">&#128196; Original paper</a>
@@ -176,17 +178,44 @@ const TTS = ('speechSynthesis' in window);
 let autoplay=false, reading=false, gen=0, timer=null;
 const playBtn=document.getElementById('play'), readBtn=document.getElementById('read');
 
-/* pick the most natural available English voice (loads async on some browsers) */
+/* Choose the narration voice. The Web Speech API exposes no gender, so we match
+   known male voice names. Preference: Scottish male (light accent) -> US male ->
+   any male -> natural fallback. A saved pick (the dropdown) always wins. Voices
+   load asynchronously on some browsers, hence onvoiceschanged. */
 let voice=null;
+const FEMALE=/Fiona|Moira|Tessa|Karen|Samantha|Serena|Susan|Veena|Kate|Stephanie|Allison|Ava|Zoe|Catherine|Hazel|Zira|Aria|Jenny|Michelle|Sara|Nicky|female/i;
+const MALE=/\b(Alex|Daniel|Arthur|Aaron|Fred|Tom|Rishi|Gordon|Lee|Oliver|Guy|Eric|Christopher|Roger|Steffan|Ryan|David|Mark|James|George|Stuart|Gavin|male)\b/i;
+const SCOT=/scot|gael/i;
+const isMale=v=>MALE.test(v.name) && !FEMALE.test(v.name);
+const enVoices=()=>(TTS?speechSynthesis.getVoices():[]).filter(v=>/^en/i.test(v.lang));
 function pickVoice(){
-  const vs=(TTS?speechSynthesis.getVoices():[]).filter(v=>/^en/i.test(v.lang));
-  for(const re of [/Natural/i,/Neural/i,/Online/i,/Enhanced/i,/Premium/i,/Google US English/i,
-                   /Samantha/i,/Serena/i,/Daniel/i,/Aria/i,/Jenny/i,/Microsoft/i]){
-    const m=vs.find(v=>re.test(v.name)); if(m) return m;
-  }
-  return vs.find(v=>/en[-_]US/i.test(v.lang)) || vs[0] || null;
+  const vs=enVoices(); if(!vs.length) return null;
+  const saved=localStorage.getItem('fr_voice'); if(saved){ const s=vs.find(v=>v.name===saved); if(s) return s; }
+  const nat=v=>/Natural|Neural|Online|Enhanced|Premium/i.test(v.name);
+  return vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && isMale(v))                      // Scottish male
+      || vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && !FEMALE.test(v.name))           // Scottish, not female
+      || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v) && nat(v))                           // US male, natural
+      || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v))                                     // US male
+      || vs.find(v=>isMale(v) && nat(v)) || vs.find(v=>isMale(v))                              // any male
+      || vs.find(nat) || vs.find(v=>v.default)                                                 // else whatever the browser does best
+      || vs.find(v=>/en[-_]US/i.test(v.lang)) || vs[0];                                        // last resort
 }
-if(TTS){ voice=pickVoice(); speechSynthesis.onvoiceschanged=()=>{ voice=pickVoice(); }; }
+const voiceSel=document.getElementById('voice');
+function refreshVoices(){
+  voice=pickVoice();
+  if(!voiceSel) return;
+  const vs=enVoices();
+  voiceSel.innerHTML=vs.map(v=>`<option${voice&&v.name===voice.name?' selected':''}>${v.name}</option>`).join('');
+  voiceSel.style.display=vs.length?'':'none';
+}
+if(TTS){
+  refreshVoices();
+  speechSynthesis.onvoiceschanged=refreshVoices;
+  if(voiceSel) voiceSel.onchange=()=>{
+    voice=enVoices().find(v=>v.name===voiceSel.value)||voice;
+    if(voice){ localStorage.setItem('fr_voice',voice.name); if(reading) afterChange(); }
+  };
+}
 
 function cleanSpeak(s){
   return (s||'')
