@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Projective Incidence Calculus — teaching companion (slide reader)</title>
+<title>Projective Incidence Calculus: teaching companion (slide reader)</title>
 <style>
   :root{
     --ink:#1a1d23; --paper:#fbfaf7; --accent:#b3541e; --accent2:#1e6fb3;
@@ -47,6 +47,7 @@
   #right h2{font-family:Helvetica,Arial,sans-serif;font-size:17px;margin:34px 0 10px;border-bottom:2px solid #e4ded2;padding-bottom:5px;}
   #right h3{font-family:Helvetica,Arial,sans-serif;font-size:14.5px;margin:22px 0 6px;color:#444;}
   #right p{line-height:1.62;font-size:15px;margin:10px 0;text-align:justify;}
+  #right .enum{font-weight:600;color:#444;display:inline-block;margin:3px 0 0 1.4em;}
   #right .thm{margin:14px 0;padding:10px 16px;background:#f3efe6;border-left:3px solid var(--accent2);font-size:14.5px;line-height:1.55;}
   #right .thm b{font-family:Helvetica,Arial,sans-serif;font-size:13px;}
   #ptitle{font-size:23px;line-height:1.3;font-weight:bold;margin-bottom:4px;}
@@ -57,7 +58,7 @@
   mark.hl.lit{background:var(--hl);box-shadow:0 0 0 2px var(--hl);border-bottom:2px solid var(--hl-border);}
   table.routes{border-collapse:collapse;margin:14px auto;font-size:13.5px;font-family:Helvetica,Arial,sans-serif;}
   table.routes th,table.routes td{border:1px solid #d8d2c4;padding:5px 12px;text-align:center;}
-  table.routes th{background:#efe9db;}
+  table.routes th{background:#efe9db;color:#1a1d23;}
   .caption{font-size:13px;color:#666;font-style:italic;margin:6px 0 18px;text-align:center;}
   /* tiny stacked bar figure */
   #fig1{display:flex;gap:14px;align-items:flex-end;justify-content:center;margin:18px 0 4px;height:170px;font-family:Helvetica,Arial,sans-serif;}
@@ -70,6 +71,27 @@
   pre.repro{background:#23282f;color:#cdd6e3;padding:14px 18px;border-radius:8px;font-size:12px;line-height:1.5;overflow-x:auto;font-family:Menlo,Consolas,monospace;}
   ol.refs{font-size:13px;line-height:1.5;padding-left:26px;}
   ol.refs li{margin:7px 0;}
+  /* ---------- recreated figures (rendered inline; full-fidelity originals are in the PDF) ---------- */
+  .fig{background:#fbfaf7;border:1px solid #d8d2c4;border-radius:8px;padding:14px 16px 11px;margin:16px 0;color:#1a1d23;font-family:Helvetica,Arial,sans-serif;}
+  .fig .cap{font-size:11px;color:#666;font-style:italic;margin-top:9px;line-height:1.45;}
+  .fig1-bars{display:flex;gap:12px;align-items:flex-end;justify-content:center;height:172px;}
+  .fig1-col{display:flex;flex-direction:column;align-items:center;}
+  .fig1-bar{width:40px;display:flex;flex-direction:column;border-radius:3px 3px 0 0;overflow:hidden;box-shadow:0 0 0 1px #c9c2b3;}
+  .fig1-bar i{display:block;}
+  .fig1-bar .c{background:#c0504d;} .fig1-bar .s{background:#b8cce4;} .fig1-bar .r{background:#2c6a9b;}
+  .fig1-cval{font-size:11px;font-weight:bold;color:#b23b38;margin-bottom:3px;}
+  .fig1-lab{font-size:10px;color:#555;margin-top:5px;text-align:center;line-height:1.15;}
+  .fig1-leg{display:flex;gap:14px;justify-content:center;font-size:10.5px;color:#555;margin-top:11px;}
+  .fig1-leg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle;}
+  .fig2{display:flex;flex-direction:column;align-items:center;}
+  .fig2 .top{background:#eef2f7;border:1px solid #9bb6cf;border-radius:6px;padding:7px 12px;text-align:center;font-size:12px;max-width:360px;}
+  .fig2 .arrow{color:#9aa3b5;font-size:15px;line-height:1;margin:4px 0;}
+  .fig2 .row{display:flex;gap:9px;justify-content:center;flex-wrap:wrap;}
+  .fig2 .card{border:1px solid #c9c2b3;border-radius:6px;padding:7px 9px;font-size:10.5px;line-height:1.32;max-width:150px;text-align:center;background:#fff;}
+  .fig2 .card b{display:block;margin-bottom:3px;font-size:11px;}
+  .fig2 .t1{color:#1e6fb3;} .fig2 .t0{color:#b3541e;}
+  .fig2 .maslov{font-size:10px;color:#777;font-style:italic;margin-top:8px;}
+  .fig3 svg{display:block;margin:2px auto 0;max-width:100%;height:auto;}
   @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
 </style>
 </head>
@@ -92,10 +114,10 @@
 <div id="right">
 __PAPER__
 <section id="pdfview">
-  <h2>Supplement &mdash; full PDF (figures, tables &amp; equations)</h2>
-  <p class="caption">The reader above is the supplement's text. Figures (the route split, the unification map, the power diagram), tables, and equations are vector graphics pdftotext can't extract &mdash; view or download the full supplement below. The companion research paper, <i>&ldquo;What a Transformer Retrieves and What It Computes&rdquo;</i>, is available <a href="paper.pdf">here</a>.</p>
+  <h2>Supplement: full PDF (figures, tables &amp; equations)</h2>
+  <p class="caption">The reader above is the supplement's text, and the three figures are recreated inline. Tables and equations remain vector graphics pdftotext can't extract, so view or download the full supplement below. The companion research paper, <i>&ldquo;What a Transformer Retrieves and What It Computes&rdquo;</i>, is available <a href="paper.pdf">here</a>.</p>
   <object data="supplement.pdf" type="application/pdf" width="100%" height="860">
-    <p><a href="supplement.pdf">Open the full supplement PDF</a> &mdash; your browser can't embed it inline.</p>
+    <p><a href="supplement.pdf">Open the full supplement PDF</a> (your browser can't embed it inline).</p>
   </object>
 </section>
 </div>
