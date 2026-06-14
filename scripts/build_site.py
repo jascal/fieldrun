@@ -429,6 +429,31 @@ def _notation_table() -> str:
 
 NOTATION_TABLE = _notation_table()
 
+# Definition 1's "PIC dictionary" (§5.1) is a 3-column table pdftotext scatters
+# column-wise; recreate and inject it.
+_DICT = [
+    ("incidence set i(A) ⊆ I", "direction U<sub>v</sub> in ℝ<sup>d</sup>", "unembedding row of token v"),
+    ("|i(A)| / |I|", "L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub>", "token logit"),
+    ("overlap |i(A) ∩ i(B)|", "G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩", "Gram of the unembedding frame"),
+    ("a source / sample", "d<sub>j</sub>, with vote c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩", "a head / MLP / embedding write"),
+    ("∧, ∨ (set ops)", "weighted threshold Σ<sub>j</sub> w<sub>j</sub> x<sub>j</sub> &gt; θ", "the composed connective"),
+    ("P(A) = |i(A)| / |I|", "softmax(L)<sub>v</sub>", "output probability"),
+]
+
+
+def _dict_table() -> str:
+    head = ("<tr><th>Bundy's incidence calculus</th>"
+            "<th>Projective Incidence Calculus</th><th>in the model</th></tr>")
+    rows = "".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in _DICT)
+    return '<table class="dict">' + head + rows + "</table>"
+
+
+DEFINITION_TABLE = _dict_table()
+
+
+def _is_dict_header(p: str) -> bool:
+    return re.sub(r"['’]", "'", p.strip()) == "Bundy's incidence calculus"
+
 
 # ---- boxed asides ----------------------------------------------------------
 # The supplement's coloured boxes flatten into prose. We can't recover their
@@ -512,11 +537,23 @@ def main() -> None:
     for si, (sid, level, heading, paras) in enumerate(sections):
         tag = "h2" if level == 1 else "h3"
         chunks = []
+        skip_dict = False
         for pi, p in enumerate(paras):
             # §1: replace the mangled symbol table (and the rest of the section is that table)
             if sid == "sec-1" and p.startswith("Meaning (section of first use)"):
                 chunks.append(NOTATION_TABLE)
                 break
+            # §5.1: replace the scattered Definition 1 dictionary table
+            if sid == "sec-5-1":
+                if skip_dict:
+                    if p.startswith("The word") or len(p) > 120:
+                        skip_dict = False            # prose resumes; render this paragraph
+                    else:
+                        continue                     # drop a scattered table fragment
+                elif _is_dict_header(p):
+                    chunks.append(DEFINITION_TABLE)
+                    skip_dict = True
+                    continue
             html_p = break_enumerations(render_paragraph(p, marks.get((si, pi), [])))
             if sid == "sec-10":                          # references: one entry per line
                 chunks.append(format_references(html_p))
