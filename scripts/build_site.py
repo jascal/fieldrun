@@ -378,6 +378,92 @@ FIGURES = {"[[FIG1]]": FIG1, "[[FIG2]]": FIG2, "[[FIG3]]": FIG3}
 CAPTION_FIGS = [("Figure 1:", FIG1), ("Figure 2:", FIG2), ("Figure 3:", FIG3)]
 
 
+# ---- recreated §1 notation table -------------------------------------------
+# pdftotext flattens the symbol table and drops the entire Symbol column; we
+# rebuild it (stable content) and inject it in place of the mangled rows.
+_NOTATION = [
+    ("Spaces and vectors", [
+        ("ℝ<sup>d</sup>", "the d-dimensional real representation space (§3)"),
+        ("⟨u, v⟩", "inner product / generalised dot product of u and v (§3)"),
+        ("‖u‖", "Euclidean length (norm) of u, ‖u‖ = √⟨u, u⟩ (§3)"),
+        ("r", "the residual-stream vector at the final position (§3)"),
+        ("d<sub>j</sub>", "the write of source j into the residual stream, r = Σ<sub>j</sub> d<sub>j</sub> (§3)"),
+        ("U<sub>v</sub>", "the unembedding direction (output direction) of token v (§3)"),
+        ("b<sub>v</sub>", "the (optional) output bias for token v (§3)"),
+    ]),
+    ("The readout", [
+        ("L<sub>v</sub>", "the logit (score) of token v, L<sub>v</sub> = ⟨r, U<sub>v</sub>⟩ + b<sub>v</sub> = Σ<sub>j</sub> c<sub>j</sub><sup>v</sup> (§3)"),
+        ("c<sub>j</sub><sup>v</sup>", "source j's vote for token v, c<sub>j</sub><sup>v</sup> = ⟨d<sub>j</sub>, U<sub>v</sub>⟩ (DLA) (§3)"),
+        ("softmax(L)<sub>v</sub>", "exp(L<sub>v</sub>) / Σ<sub>w</sub> exp(L<sub>w</sub>), the output probability of v (§3)"),
+        ("arg max<sub>v</sub>", "the token attaining the largest value (greedy prediction) (§3)"),
+        ("G<sub>vw</sub>", "Gram matrix of token directions, G<sub>vw</sub> = ⟨U<sub>v</sub>, U<sub>w</sub>⟩ (§3)"),
+    ]),
+    ("Diagnostics", [
+        ("PR", "participation ratio, the effective number of contributing sources (§3)"),
+        ("µ<sub>t</sub>", "readout multiplicity: how many sources' own arg max is t (§3)"),
+        ("Δ", "winning margin L<sub>t</sub> − L<sub>v*</sub> (v* is the runner-up) (§3)"),
+        ("D<sub>j</sub>", "differential incidence c<sub>j</sub><sup>t</sup> − c<sub>j</sub><sup>v*</sup> = ⟨d<sub>j</sub>, U<sub>t</sub> − U<sub>v*</sub>⟩ (§6)"),
+    ]),
+    ("Logic and incidence", [
+        ("I", "a finite set of incidences (possible worlds / samples) (§4)"),
+        ("i(A)", "the incidence set of proposition A, i(A) ⊆ I (§4)"),
+        ("P(A)", "probability of A, recovered as |i(A)| / |I| (§4)"),
+        ("|·|", "cardinality of a set (or absolute value of a number) (§4)"),
+    ]),
+    ("Semiring / temperature", [
+        ("⊕, ⊗", 'the "add" and "multiply" of a semiring (§5)'),
+        ("T", "temperature: T = 1 gives softmax, T → 0 gives greedy arg max (§5)"),
+        ("⊕<sub>v</sub>", "semiring sum over tokens (e.g. max<sub>v</sub> in the tropical case) (§5)"),
+    ]),
+]
+
+
+def _notation_table() -> str:
+    rows = ["<tr><th>Symbol</th><th>Meaning (section of first use)</th></tr>"]
+    for grp, items in _NOTATION:
+        rows.append(f'<tr class="grp"><td colspan="2">{grp}</td></tr>')
+        for sym, mean in items:
+            rows.append(f'<tr><td class="sym">{sym}</td><td>{mean}</td></tr>')
+    return '<table class="notation">' + "".join(rows) + "</table>"
+
+
+NOTATION_TABLE = _notation_table()
+
+
+# ---- boxed asides ----------------------------------------------------------
+# The supplement's coloured boxes flatten into prose. We can't recover their
+# exact extent, but their titles are distinctive, so we set off the paragraph
+# that carries each one as a callout and bold the title. Each pattern occurs
+# ONLY as a box title in the supplement, so matching anywhere is safe.
+ASIDE_RE = re.compile(
+    r"Aside:"
+    r"|What is a semiring\?|What is a kernel\?|What is ablation\?|What is Maslov dequantization\?"
+    r"|Worked example:"
+    r"|Scope of the claims:"
+    r"|Two measured quantities that organise everything"
+    r"|Repair, recovery, and rescue:"
+    r"|Three things make this more than algebra"
+    r"|The one-sentence version\."
+    r"|What to remember\."
+)
+
+# ---- references (§10): split entries at their [SP]/[1]/[F1]/[A1] labels -----
+REF_RE = re.compile(r"(\[(?:SP|\d{1,2}|[A-Z]\d{1,2})\])")
+
+
+def format_references(html_para: str) -> str:
+    parts = REF_RE.split(html_para)        # [lead, label, body, label, body, ...]
+    if len(parts) < 3:                     # no citation label -> ordinary prose
+        return f"<p>{html_para}</p>"
+    out = []
+    lead = parts[0].strip()
+    if lead:                               # a group header glued before the first entry
+        out.append(f'<div class="refgrp">{lead}</div>')
+    for i in range(1, len(parts), 2):
+        out.append(f'<div class="refentry"><span class="refnum">{parts[i]}</span>{parts[i + 1]}</div>')
+    return "".join(out)
+
+
 def main() -> None:
     supp = next(iter(sorted(PAPER_DIR.glob("*supplement*.pdf"))), None)
     if not supp:
@@ -427,10 +513,24 @@ def main() -> None:
         tag = "h2" if level == 1 else "h3"
         chunks = []
         for pi, p in enumerate(paras):
+            # §1: replace the mangled symbol table (and the rest of the section is that table)
+            if sid == "sec-1" and p.startswith("Meaning (section of first use)"):
+                chunks.append(NOTATION_TABLE)
+                break
+            html_p = break_enumerations(render_paragraph(p, marks.get((si, pi), [])))
+            if sid == "sec-10":                          # references: one entry per line
+                chunks.append(format_references(html_p))
+                continue
             fig = next((f for pre, f in CAPTION_FIGS if p.startswith(pre)), None)
             if fig:
                 chunks.append(fig)                       # figure, then its caption paragraph
-            chunks.append(f"<p>{break_enumerations(render_paragraph(p, marks.get((si, pi), [])))}</p>")
+            m = ASIDE_RE.search(p)
+            if m:                                        # set off a boxed aside as a callout
+                title = escape(m.group(0))
+                html_p = html_p.replace(title, f'<span class="lead">{title}</span>', 1)
+                chunks.append(f'<div class="aside">{html_p}</div>')
+            else:
+                chunks.append(f"<p>{html_p}</p>")
         parts.append(f'<section id="{sid}"><{tag}>{escape(heading)}</{tag}>{"".join(chunks)}</section>')
 
     page = template.replace("__PAPER__", "\n".join(parts)).replace(
