@@ -114,7 +114,7 @@
 
 <!-- ============ LEFT: SLIDES ============ -->
 <div id="left">
-  <div id="slidebox"></div>
+  <div id="slidebox" role="region" aria-label="Current slide" aria-live="polite" aria-atomic="true"></div>
   <div id="nav">
     <button id="prev">&#8592; Prev</button>
     <button id="next">Next &#8594;</button>
@@ -212,31 +212,59 @@ const TTS = ('speechSynthesis' in window);
 let autoplay=false, reading=false, gen=0, timer=null;
 const playBtn=document.getElementById('play'), readBtn=document.getElementById('read');
 
-function spokenText(i){
-  const s=slides[i], tmp=document.createElement('div');
-  tmp.innerHTML=s.h; tmp.querySelectorAll('.fig').forEach(f=>f.remove());  // skip figure text
-  const body=(tmp.textContent||'').replace(/\s+/g,' ').trim();
-  return `${s.k}. ${s.t}. ${body}`
+/* pick the most natural available English voice (loads async on some browsers) */
+let voice=null;
+function pickVoice(){
+  const vs=(TTS?speechSynthesis.getVoices():[]).filter(v=>/^en/i.test(v.lang));
+  for(const re of [/Natural/i,/Neural/i,/Online/i,/Enhanced/i,/Premium/i,/Google US English/i,
+                   /Samantha/i,/Serena/i,/Daniel/i,/Aria/i,/Jenny/i,/Microsoft/i]){
+    const m=vs.find(v=>re.test(v.name)); if(m) return m;
+  }
+  return vs.find(v=>/en[-_]US/i.test(v.lang)) || vs[0] || null;
+}
+if(TTS){ voice=pickVoice(); speechSynthesis.onvoiceschanged=()=>{ voice=pickVoice(); }; }
+
+function cleanSpeak(s){
+  return (s||'')
     .replace(/§\s*/g,'Section ').replace(/·/g,', ').replace(/→/g,' to ')
     .replace(/≈/g,' approximately ').replace(/×/g,' times ').replace(/[⟨⟩‖]/g,'')
     .replace(/Σ/g,' sum ').replace(/Π/g,' product ').replace(/Δ/g,' delta ')
     .replace(/[μµ]/g,' mu ').replace(/ρ/g,' rho ').replace(/⊕/g,' plus ').replace(/⊗/g,' times ')
-    .replace(/\s+/g,' ').trim();
+    .replace(/\.(\s*\.)+/g,'.').replace(/\s+([.,;:?!])/g,'$1').replace(/\s+/g,' ').trim();
 }
-function advanceMs(){ const w=spokenText(cur).split(' ').length; return Math.max(7000, Math.min(20000, w*330)); }
+/* Split a slide into sentence-sized chunks. Each block element (heading, list
+   item, paragraph, pull-quote) becomes its own sentence so bullets don't run
+   together; figures and raw tables are skipped. Each chunk is a separate
+   utterance, which is what gives the engine real per-sentence prosody. */
+function slideSentences(i){
+  const root=document.createElement('div');
+  root.innerHTML=`<h1>${slides[i].t}</h1>${slides[i].h}`;
+  root.querySelectorAll('.fig,table').forEach(e=>e.remove());
+  root.querySelectorAll('h1,h2,h3,li,p,div').forEach(el=>el.appendChild(document.createTextNode('. ')));
+  const text=cleanSpeak(slides[i].k)+'. '+cleanSpeak(root.textContent);
+  return text.replace(/([.?!;:])\s+/g,'$1\n').split('\n').map(s=>s.trim()).filter(s=>/[a-z0-9]/i.test(s));
+}
+function advanceMs(){ const w=slideSentences(cur).join(' ').split(' ').length; return Math.max(7000, Math.min(22000, w*330)); }
 function nextOrStop(){ if(cur<slides.length-1) go(cur+1); else { autoplay=false; updateControls(); } }
-function afterChange(){                       // called at the end of every go()
-  const my=++gen;                             // invalidate any pending callback from a prior slide
+function speakSlide(my){
+  const parts=slideSentences(cur); let idx=0;
+  (function next(){
+    if(my!==gen) return;                       // a newer slide took over
+    if(idx>=parts.length){ if(reading && autoplay) nextOrStop(); return; }
+    const u=new SpeechSynthesisUtterance(parts[idx++]);
+    if(voice) u.voice=voice;
+    u.lang=(voice&&voice.lang)||'en-US'; u.rate=0.98; u.pitch=1.0;
+    u.onend=()=>{ if(my===gen) next(); };
+    u.onerror=()=>{ if(my===gen) next(); };
+    speechSynthesis.speak(u);
+  })();
+}
+function afterChange(){                         // called at the end of every go()
+  const my=++gen;                              // invalidate any pending callback from a prior slide
   clearTimeout(timer);
   if(TTS) speechSynthesis.cancel();
-  if(reading && TTS){
-    const u=new SpeechSynthesisUtterance(spokenText(cur));
-    u.rate=1.0; u.lang='en-US';
-    u.onend=()=>{ if(my===gen && reading && autoplay) nextOrStop(); };
-    speechSynthesis.speak(u);
-  } else if(autoplay){
-    timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
-  }
+  if(reading && TTS) speakSlide(my);
+  else if(autoplay) timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
 }
 function updateControls(){
   playBtn.classList.toggle('on',autoplay);
