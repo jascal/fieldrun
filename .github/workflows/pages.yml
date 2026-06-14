@@ -1,11 +1,12 @@
 name: Build & deploy paper site
 
-# The draft paper (paper/*.pdf) is turned into the slide-reader site
-# automatically: scripts/build_site.py extracts the text, places the
-# slide highlights from site/slides.json, renders site/template.html,
-# and the result is deployed to GitHub Pages.
+# The explanatory supplement (paper/*supplement*.pdf) is turned into the
+# slide-reader site automatically: scripts/build_site.py extracts its text,
+# places the slide highlights from site/slides.json, renders
+# site/template.html, and the result is deployed to GitHub Pages. The
+# original research paper ships alongside it as docs/paper.pdf (linked).
 #
-# To publish a new draft: replace the PDF in paper/ and push.
+# To publish a new revision: replace the PDF(s) in paper/ and push.
 
 on:
   push:
@@ -36,7 +37,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install pdftotext
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
-      - name: Build site from the draft PDF
+      - name: Build site from the supplement PDF
         run: python3 scripts/build_site.py
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
