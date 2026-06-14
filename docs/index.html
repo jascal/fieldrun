@@ -105,6 +105,8 @@
   #right .refgrp{font-weight:700;font-family:Helvetica,Arial,sans-serif;font-size:13px;margin:16px 0 6px;color:#333;}
   #right .refentry{font-size:13px;line-height:1.5;margin:5px 0 5px 2.2em;text-indent:-2.2em;}
   #right .refnum{font-weight:600;color:#1e6fb3;margin-right:5px;}
+  #nav button.on{background:var(--accent);}
+  #nav button.on:hover{background:#c9631f;}
   @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
 </style>
 </head>
@@ -116,6 +118,8 @@
   <div id="nav">
     <button id="prev">&#8592; Prev</button>
     <button id="next">Next &#8594;</button>
+    <button id="play" aria-pressed="false" title="Play through the slides (auto-advance); key: p">&#9654; Play</button>
+    <button id="read" aria-pressed="false" title="Read the current slide aloud (text-to-speech); key: r">&#128266; Read aloud</button>
     <div id="dots"></div>
     <a class="pdflink" href="supplement.pdf" target="_blank" rel="noopener">&#128214; Supplement PDF</a>
     <a class="pdflink alt" href="paper.pdf" target="_blank" rel="noopener">&#128196; Original paper</a>
@@ -196,14 +200,68 @@ function go(n){
   marks.forEach(m=>m.classList.add('lit'));
   const first = marks[0] || sec;
   if(first) first.scrollIntoView({behavior:'smooth', block:'center'});
+  afterChange();
 }
+
+/* ===== optional: play-through (auto-advance) + read-aloud (Web Speech API) =====
+   Two independent toggles. On their own: Play auto-advances on a content-paced
+   timer; Read narrates the current slide. Together: each slide is narrated and
+   the deck advances when narration ends. Both are off by default and need a
+   click/keypress to start (browsers gate autoplay + speech behind a gesture). */
+const TTS = ('speechSynthesis' in window);
+let autoplay=false, reading=false, gen=0, timer=null;
+const playBtn=document.getElementById('play'), readBtn=document.getElementById('read');
+
+function spokenText(i){
+  const s=slides[i], tmp=document.createElement('div');
+  tmp.innerHTML=s.h; tmp.querySelectorAll('.fig').forEach(f=>f.remove());  // skip figure text
+  const body=(tmp.textContent||'').replace(/\s+/g,' ').trim();
+  return `${s.k}. ${s.t}. ${body}`
+    .replace(/§\s*/g,'Section ').replace(/·/g,', ').replace(/→/g,' to ')
+    .replace(/≈/g,' approximately ').replace(/×/g,' times ').replace(/[⟨⟩‖]/g,'')
+    .replace(/Σ/g,' sum ').replace(/Π/g,' product ').replace(/Δ/g,' delta ')
+    .replace(/[μµ]/g,' mu ').replace(/ρ/g,' rho ').replace(/⊕/g,' plus ').replace(/⊗/g,' times ')
+    .replace(/\s+/g,' ').trim();
+}
+function advanceMs(){ const w=spokenText(cur).split(' ').length; return Math.max(7000, Math.min(20000, w*330)); }
+function nextOrStop(){ if(cur<slides.length-1) go(cur+1); else { autoplay=false; updateControls(); } }
+function afterChange(){                       // called at the end of every go()
+  const my=++gen;                             // invalidate any pending callback from a prior slide
+  clearTimeout(timer);
+  if(TTS) speechSynthesis.cancel();
+  if(reading && TTS){
+    const u=new SpeechSynthesisUtterance(spokenText(cur));
+    u.rate=1.0; u.lang='en-US';
+    u.onend=()=>{ if(my===gen && reading && autoplay) nextOrStop(); };
+    speechSynthesis.speak(u);
+  } else if(autoplay){
+    timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
+  }
+}
+function updateControls(){
+  playBtn.classList.toggle('on',autoplay);
+  playBtn.innerHTML = autoplay ? '&#10073;&#10073; Pause' : '&#9654; Play';
+  playBtn.setAttribute('aria-pressed', autoplay);
+  readBtn.classList.toggle('on',reading);
+  readBtn.setAttribute('aria-pressed', reading);
+}
+playBtn.onclick=()=>{ autoplay=!autoplay; updateControls(); afterChange(); };
+readBtn.onclick=()=>{
+  if(!TTS){ alert('Sorry, your browser does not support speech synthesis.'); return; }
+  reading=!reading; updateControls(); afterChange();
+};
+window.addEventListener('pagehide',()=>{ if(TTS) speechSynthesis.cancel(); });
+
 document.getElementById('prev').onclick=()=>go(cur-1);
 document.getElementById('next').onclick=()=>go(cur+1);
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT') return;
   if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' ') {e.preventDefault();go(cur+1);}
   if(e.key==='ArrowLeft'||e.key==='PageUp') {e.preventDefault();go(cur-1);}
+  if(e.key==='p'||e.key==='P') playBtn.click();
+  if(e.key==='r'||e.key==='R') readBtn.click();
 });
+if(!TTS) readBtn.style.display='none';        // hide read-aloud where unsupported
 go(0);
 </script>
 </body>
