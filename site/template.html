@@ -107,6 +107,7 @@
   #right .refnum{font-weight:600;color:#1e6fb3;margin-right:5px;}
   #nav button.on{background:var(--accent);}
   #nav button.on:hover{background:#c9631f;}
+  #nav select#voice{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:7px 8px;font-size:12px;max-width:150px;font-family:Helvetica,Arial,sans-serif;cursor:pointer;}
   @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
 </style>
 </head>
@@ -114,12 +115,13 @@
 
 <!-- ============ LEFT: SLIDES ============ -->
 <div id="left">
-  <div id="slidebox"></div>
+  <div id="slidebox" role="region" aria-label="Current slide" aria-live="polite" aria-atomic="true"></div>
   <div id="nav">
     <button id="prev">&#8592; Prev</button>
     <button id="next">Next &#8594;</button>
     <button id="play" aria-pressed="false" title="Play through the slides (auto-advance); key: p">&#9654; Play</button>
     <button id="read" aria-pressed="false" title="Read the current slide aloud (text-to-speech); key: r">&#128266; Read aloud</button>
+    <select id="voice" title="Narration voice" aria-label="Narration voice" style="display:none"></select>
     <div id="dots"></div>
     <a class="pdflink" href="supplement.pdf" target="_blank" rel="noopener">&#128214; Supplement PDF</a>
     <a class="pdflink alt" href="paper.pdf" target="_blank" rel="noopener">&#128196; Original paper</a>
@@ -176,31 +178,86 @@ const TTS = ('speechSynthesis' in window);
 let autoplay=false, reading=false, gen=0, timer=null;
 const playBtn=document.getElementById('play'), readBtn=document.getElementById('read');
 
-function spokenText(i){
-  const s=slides[i], tmp=document.createElement('div');
-  tmp.innerHTML=s.h; tmp.querySelectorAll('.fig').forEach(f=>f.remove());  // skip figure text
-  const body=(tmp.textContent||'').replace(/\s+/g,' ').trim();
-  return `${s.k}. ${s.t}. ${body}`
+/* Choose the narration voice. The Web Speech API exposes no gender, so we match
+   known male voice names. Preference: Scottish male (light accent) -> US male ->
+   any male -> natural fallback. A saved pick (the dropdown) always wins. Voices
+   load asynchronously on some browsers, hence onvoiceschanged. */
+let voice=null;
+const FEMALE=/Fiona|Moira|Tessa|Karen|Samantha|Serena|Susan|Veena|Kate|Stephanie|Allison|Ava|Zoe|Catherine|Hazel|Zira|Aria|Jenny|Michelle|Sara|Nicky|female/i;
+const MALE=/\b(Alex|Daniel|Arthur|Aaron|Fred|Tom|Rishi|Gordon|Lee|Oliver|Guy|Eric|Christopher|Roger|Steffan|Ryan|David|Mark|James|George|Stuart|Gavin|male)\b/i;
+const SCOT=/scot|gael/i;
+const isMale=v=>MALE.test(v.name) && !FEMALE.test(v.name);
+const enVoices=()=>(TTS?speechSynthesis.getVoices():[]).filter(v=>/^en/i.test(v.lang));
+function pickVoice(){
+  const vs=enVoices(); if(!vs.length) return null;
+  const saved=localStorage.getItem('fr_voice'); if(saved){ const s=vs.find(v=>v.name===saved); if(s) return s; }
+  const nat=v=>/Natural|Neural|Online|Enhanced|Premium/i.test(v.name);
+  return vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && isMale(v))                      // Scottish male
+      || vs.find(v=>(SCOT.test(v.lang)||SCOT.test(v.name)) && !FEMALE.test(v.name))           // Scottish, not female
+      || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v) && nat(v))                           // US male, natural
+      || vs.find(v=>/en[-_]US/i.test(v.lang) && isMale(v))                                     // US male
+      || vs.find(v=>isMale(v) && nat(v)) || vs.find(v=>isMale(v))                              // any male
+      || vs.find(nat) || vs.find(v=>v.default)                                                 // else whatever the browser does best
+      || vs.find(v=>/en[-_]US/i.test(v.lang)) || vs[0];                                        // last resort
+}
+const voiceSel=document.getElementById('voice');
+function refreshVoices(){
+  voice=pickVoice();
+  if(!voiceSel) return;
+  const vs=enVoices();
+  voiceSel.innerHTML=vs.map(v=>`<option${voice&&v.name===voice.name?' selected':''}>${v.name}</option>`).join('');
+  voiceSel.style.display=vs.length?'':'none';
+}
+if(TTS){
+  refreshVoices();
+  speechSynthesis.onvoiceschanged=refreshVoices;
+  if(voiceSel) voiceSel.onchange=()=>{
+    voice=enVoices().find(v=>v.name===voiceSel.value)||voice;
+    if(voice){ localStorage.setItem('fr_voice',voice.name); if(reading) afterChange(); }
+  };
+}
+
+function cleanSpeak(s){
+  return (s||'')
     .replace(/§\s*/g,'Section ').replace(/·/g,', ').replace(/→/g,' to ')
     .replace(/≈/g,' approximately ').replace(/×/g,' times ').replace(/[⟨⟩‖]/g,'')
     .replace(/Σ/g,' sum ').replace(/Π/g,' product ').replace(/Δ/g,' delta ')
     .replace(/[μµ]/g,' mu ').replace(/ρ/g,' rho ').replace(/⊕/g,' plus ').replace(/⊗/g,' times ')
-    .replace(/\s+/g,' ').trim();
+    .replace(/\.(\s*\.)+/g,'.').replace(/\s+([.,;:?!])/g,'$1').replace(/\s+/g,' ').trim();
 }
-function advanceMs(){ const w=spokenText(cur).split(' ').length; return Math.max(7000, Math.min(20000, w*330)); }
+/* Split a slide into sentence-sized chunks. Each block element (heading, list
+   item, paragraph, pull-quote) becomes its own sentence so bullets don't run
+   together; figures and raw tables are skipped. Each chunk is a separate
+   utterance, which is what gives the engine real per-sentence prosody. */
+function slideSentences(i){
+  const root=document.createElement('div');
+  root.innerHTML=`<h1>${slides[i].t}</h1>${slides[i].h}`;
+  root.querySelectorAll('.fig,table').forEach(e=>e.remove());
+  root.querySelectorAll('h1,h2,h3,li,p,div').forEach(el=>el.appendChild(document.createTextNode('. ')));
+  const text=cleanSpeak(slides[i].k)+'. '+cleanSpeak(root.textContent);
+  return text.replace(/([.?!;:])\s+/g,'$1\n').split('\n').map(s=>s.trim()).filter(s=>/[a-z0-9]/i.test(s));
+}
+function advanceMs(){ const w=slideSentences(cur).join(' ').split(' ').length; return Math.max(7000, Math.min(22000, w*330)); }
 function nextOrStop(){ if(cur<slides.length-1) go(cur+1); else { autoplay=false; updateControls(); } }
-function afterChange(){                       // called at the end of every go()
-  const my=++gen;                             // invalidate any pending callback from a prior slide
+function speakSlide(my){
+  const parts=slideSentences(cur); let idx=0;
+  (function next(){
+    if(my!==gen) return;                       // a newer slide took over
+    if(idx>=parts.length){ if(reading && autoplay) nextOrStop(); return; }
+    const u=new SpeechSynthesisUtterance(parts[idx++]);
+    if(voice) u.voice=voice;
+    u.lang=(voice&&voice.lang)||'en-US'; u.rate=0.98; u.pitch=1.0;
+    u.onend=()=>{ if(my===gen) next(); };
+    u.onerror=()=>{ if(my===gen) next(); };
+    speechSynthesis.speak(u);
+  })();
+}
+function afterChange(){                         // called at the end of every go()
+  const my=++gen;                              // invalidate any pending callback from a prior slide
   clearTimeout(timer);
   if(TTS) speechSynthesis.cancel();
-  if(reading && TTS){
-    const u=new SpeechSynthesisUtterance(spokenText(cur));
-    u.rate=1.0; u.lang='en-US';
-    u.onend=()=>{ if(my===gen && reading && autoplay) nextOrStop(); };
-    speechSynthesis.speak(u);
-  } else if(autoplay){
-    timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
-  }
+  if(reading && TTS) speakSlide(my);
+  else if(autoplay) timer=setTimeout(()=>{ if(my===gen) nextOrStop(); }, advanceMs());
 }
 function updateControls(){
   playBtn.classList.toggle('on',autoplay);
