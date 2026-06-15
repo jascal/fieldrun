@@ -112,7 +112,15 @@
   #nav button.on{background:var(--accent);}
   #nav button.on:hover{background:#c9631f;}
   #nav select#voice{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:7px 8px;font-size:12px;max-width:150px;font-family:Helvetica,Arial,sans-serif;cursor:pointer;}
-  @media (max-width:900px){body{flex-direction:column}#left{width:100%;height:auto}#right{height:auto}}
+  /* narrow screens / mobile: stack the slides above the reader (not side by side) */
+  @media (max-width:1024px){
+    html,body{height:auto;}
+    body{flex-direction:column;}
+    #left{width:100%;min-width:0;height:auto;}
+    #slidebox{flex:none;overflow:visible;padding:26px 22px 10px;}
+    #nav{flex-wrap:wrap;}
+    #right{flex:none;width:100%;height:auto;overflow:visible;padding:26px 22px 80px;}
+  }
 </style>
 </head>
 <body>
@@ -169,7 +177,9 @@ function go(n){
   const marks = document.querySelectorAll('mark.hl.s'+cur);
   marks.forEach(m=>m.classList.add('lit'));
   const first = marks[0] || sec;
-  if(first) first.scrollIntoView({behavior:'smooth', block:'center'});
+  // on wide screens the reader is its own scroll pane; on stacked/mobile layout
+  // don't yank the page down to the reader every time the slide changes
+  if(first && window.innerWidth>1024) first.scrollIntoView({behavior:'smooth', block:'center'});
   afterChange();
 }
 
