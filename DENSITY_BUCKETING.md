@@ -6,8 +6,30 @@ DLA surface. The goal across three granularities — **per token → per query �
 corpus** — is to decompose each decision into its irreducible deciding core, then
 (longer term) reuse those cores as smaller MoE experts.
 
-This branch lands **Phase 1**: the per-token descent as an analysis probe
-(`--probe-decompose`).
+All three rungs ship here (per-token `--probe-decompose`, per-query
+`--query-decompose`, per-corpus `--corpus-decompose`), plus the faithful Datalog
+decode, interpretability, residency, and recursive sub-bucketing below.
+
+## Quick example (end to end)
+
+```bash
+B="--bundle bundles/Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct --ids holdout.json"
+
+# per-token irreducible atoms (σ(t)) + Route-B necessity confirmation, by route
+fieldrun $B --probe-decompose --n-eval 200
+
+# per-corpus experts: interpretability + runtime residency + the faithful Datalog decode
+fieldrun $B --corpus-decompose --experts 8 --n-eval 300 \
+        --interpret --residency --experts-dl-contrib /tmp/model.dl
+fieldrun eval /tmp/model.dl --semiring max     # → decode == the model's tokens (faithful)
+
+# resolve the residual into the long tail of domain experts
+fieldrun $B --corpus-decompose --experts 6 --recurse-depth 3 --interpret --n-eval 300
+```
+
+Expected (Qwen2.5-0.5B): `--probe-decompose` → σ(t) 1.0/1.7/6.5 and necessity
+27/44/82% across RETRIEVED/SELECTED/COMPOSED; `--experts-dl-contrib` → `fieldrun
+eval` decodes 100% (faithful); `--interpret` → grammar-role experts (e3=verbs, …).
 
 ## The theorem (what we are applying)
 

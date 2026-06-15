@@ -740,6 +740,32 @@ mod tests {
     }
 
     #[test]
+    fn descent_invariants_atom_subset_and_still_decides() {
+        // a deciding full set; the atom must be a SUBSET that still decides (min_slack > 0) and retains ≤ all DLA mass.
+        let sub = DecompSubstrate {
+            predicted: 9,
+            competitors: vec![1, 2],
+            const_v: vec![0.0, 0.0],
+            full_margin: vec![3.0, 2.0],
+            sources: vec![src(1, 2.0, &[2.0, 1.0]), src(1, 1.0, &[1.0, 1.0]), src(1, -1.0, &[-0.5, -0.5])],
+        };
+        let r = decompose_descent(&sub);
+        assert!(r.atom.iter().all(|&i| i < sub.sources.len()), "atom ⊆ sources (valid indices)");
+        assert!(r.atom_size() <= r.n_sources, "atom is never larger than the full coalition");
+        assert!(r.min_slack > 0.0, "the atom still decides every competitor (firing count is the floor, still deciding)");
+        assert!(r.dla_retained <= 1.0 + 1e-6 && r.dla_retained >= 0.0, "retained positive-DLA fraction in [0,1]");
+    }
+
+    #[test]
+    fn descent_handles_empty_sources() {
+        // const_v alone decides and there are no sources to drop ⇒ the atom is empty, no panic.
+        let sub = DecompSubstrate { predicted: 9, competitors: vec![1], const_v: vec![1.0], full_margin: vec![1.0], sources: vec![] };
+        let r = decompose_descent(&sub);
+        assert_eq!(r.atom_size(), 0);
+        assert!(r.min_slack > 0.0);
+    }
+
+    #[test]
     fn rank_of_is_one_based_and_handles_ties_and_oob() {
         let proj = [0.1f32, 5.0, -3.0, 2.0];
         assert_eq!(rank_of(&proj, 1), 1); // 5.0 is the top
