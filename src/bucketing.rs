@@ -389,6 +389,15 @@ impl CorpusBuckets {
 }
 
 /// Core hub-anchored clustering over a given atom list (so it can run on a residual-restricted universe for recursion).
+///
+/// A deterministic, embedding-free heuristic — a SOUND grouping of the (density-min-derived) atoms, not a claim of a
+/// globally optimal partition:
+///   1. count each circuit's frequency across the atoms (a circuit = `(kind, layer, idx)`);
+///   2. the top-`experts` circuits by frequency are the expert ANCHORS (the recurring hubs);
+///   3. every other circuit joins the anchor it CO-FIRES with most (co-fire = appears in the same atom);
+///   4. circuits that never co-fire with any anchor fall into the residual bucket (index `e`).
+/// Every ordering uses a stable sort with a circuit-id tiebreak (freq desc, then id; co-occurrence desc, then expert
+/// id), so the partition is fully reproducible for a given atom set — no randomness, no embedding distance.
 fn cluster_atoms(atoms: &[Vec<Circuit>], experts: usize) -> Option<Cluster> {
     let n = atoms.len();
     if n == 0 {
