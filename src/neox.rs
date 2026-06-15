@@ -295,6 +295,8 @@ impl Neox {
             &x_last,
             &xf_last,
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |l, n| self.b.weight_row(&format!("l{l}.fc_out"), n),
             |l, head| head_raw_contrib(&self.b, &format!("l{l}.dense"), &head_act[l], head, hd),
             |c| self.b.rowdot_f32("lm_head", c),

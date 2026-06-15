@@ -976,6 +976,108 @@ fn main() {
             return;
         }
 
+        // --probe-decompose (Density-Minimization — the per-token bucketing analysis): for each prediction, descend its
+        // deciding source coalition to a locally-minimal irreducible ATOM (the executable minimal_decider realizing
+        // `decomposes`), the firing COUNT non-increasing along the way (Density.total_firing_mono; the density RATIO is
+        // NOT monotone, so it is never the objective). Reports σ(t) = the atom size (the measured support number), the
+        // |S|→|A| reduction, the positive-DLA mass retained, and the atom's margin slack — bucketed by route. Tests PIC
+        // O2 (σ(t) ∼ PR). Route A multi-competitor cone (irreducible ⟹ ≥2 competitors) → --decomp-k (default 4). Needs an
+        // arch exposing the substrate (rope/Qwen via explain_decomp); --store adds the route split (optional).
+        if has_flag(&args, "--probe-decompose") {
+            use retrieval::CandCfg;
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap = (end - ctx_window).min(n_eval); // explain is the expensive faithful forward
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe-decompose: no eval positions (need --ids with > ctx_window tokens)");
+                return;
+            }
+            // probe the arch once: does it populate the descent substrate? (rope/Qwen via explain_decomp; others default).
+            if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                eprintln!("[fieldrun] --probe-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
+                return;
+            }
+            // Route-B faithful confirmation: confirm each linear atom against the REAL ablated forward (predict_ablated).
+            // Available iff the arch implements predict_ablated (rope does). Each token then costs 2 extra forwards.
+            let can_confirm = !has_flag(&args, "--no-confirm") && lm.predict_ablated(positions[0], &[], &[]).is_some();
+            eprintln!("[fieldrun] --probe-decompose: {} positions (ctx {ctx_window}), K={kk} competitors, confirm={can_confirm} — faithful explain forwards…", positions.len());
+            struct Rec { route: u8, n: usize, atom: usize, pr: f32, retained: f32, slack: f32, flip_atom: bool, flip_ctrl: bool }
+            let recs: Vec<Rec> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain_decomp(c, kk)?;
+                let sub = ex.decomp.as_ref()?;
+                let r = explain::decompose_descent(sub);
+                let pick = ex.model_predicts;
+                let route = match &store {
+                    Some(s) => { let (kb, _) = s.predict(c); if kb == pick { 0u8 } else if s.candidates(c, &cfg).contains(&pick) { 1 } else { 2 } }
+                    None => 3u8, // no store ⇒ no route split, everything in one "ALL" bucket
+                };
+                // full-spectrum participation ratio (mirrors --probe-dla) for the σ(t) ∼ PR comparison.
+                let mut d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                d.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                // Confirmation (necessity, the clean non-destructive test): ablate ONLY the atom A (|A| ≪ |S| circuits)
+                // in the real forward → does the prediction flip? A flip ⇒ the irreducible core is causally load-bearing
+                // (the §5c ablation methodology applied to the descent's atom). Control: ablate the |A| highest-DLA scored
+                // sources — if the atom flips MORE than naive top-|A|-by-DLA, the cone descent selected a better core.
+                // (Sufficiency — "keep only A" — is NOT testable this way: zeroing the other ~441 scored circuits is so
+                // destructive that nothing survives, linear DLA ≠ causal; necessity is the faithful confirmation.)
+                let (flip_atom, flip_ctrl) = if can_confirm {
+                    let to_pairs = |idxs: &[usize]| {
+                        let (mut h, mut n) = (Vec::new(), Vec::new());
+                        for &i in idxs { let s = &sub.sources[i]; if s.kind == 0 { h.push((s.layer, s.idx)); } else { n.push((s.layer, s.idx)); } }
+                        (h, n)
+                    };
+                    let (ah, an) = to_pairs(&r.atom);
+                    let mut topk: Vec<usize> = (0..sub.sources.len()).collect();
+                    topk.sort_by(|&a, &b| sub.sources[b].dla.total_cmp(&sub.sources[a].dla));
+                    topk.truncate(r.atom.len());
+                    let (ch, cn) = to_pairs(&topk);
+                    (lm.predict_ablated(c, &ah, &an) != Some(pick), lm.predict_ablated(c, &ch, &cn) != Some(pick))
+                } else {
+                    (false, false)
+                };
+                Some(Rec { route, n: r.n_sources, atom: r.atom_size(), pr, retained: r.dla_retained, slack: r.min_slack, flip_atom, flip_ctrl })
+            }).collect();
+            if recs.is_empty() { eprintln!("[fieldrun] --probe-decompose: no positions produced a substrate"); return; }
+            let meanf = |g: &[&Rec], f: &dyn Fn(&Rec) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== Density-Minimization descent: per-token irreducible ATOM (σ(t)), K={kk} competitors, {} positions ===", recs.len());
+            println!("  the atom is the locally-minimal deciding coalition (minimal_decider; a SOUND poly UNDER-approximation");
+            println!("  of the true irreducible core). σ(t)=|atom|; reduction = 1 − |A|/|S|; retained = positive-DLA mass kept.");
+            let confirm_hdr = if can_confirm { format!("{:>11}{:>10}", "necessary", "ctrl flip") } else { String::new() };
+            println!("{:<12}{:>7}{:>11}{:>10}{:>11}{:>11}{:>11}{:>9}{}", "route", "n", "|S| src", "σ(t)=|A|", "reduction", "retained", "PR eff#", "slack", confirm_hdr);
+            let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2)] } else { vec![("ALL", 3)] };
+            for (lbl, rt) in groups {
+                let g: Vec<&Rec> = recs.iter().filter(|x| x.route == rt).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>7}", 0); continue; }
+                let confirm_row = if can_confirm {
+                    format!("{:>10.0}%{:>9.0}%", 100.0 * meanf(&g, &|x| if x.flip_atom { 1.0 } else { 0.0 }), 100.0 * meanf(&g, &|x| if x.flip_ctrl { 1.0 } else { 0.0 }))
+                } else { String::new() };
+                println!("{lbl:<12}{:>7}{:>11.1}{:>10.1}{:>10.0}%{:>10.0}%{:>11.1}{:>9.2}{}", g.len(),
+                    meanf(&g, &|x| x.n as f32), meanf(&g, &|x| x.atom as f32),
+                    100.0 * meanf(&g, &|x| 1.0 - x.atom as f32 / x.n.max(1) as f32),
+                    100.0 * meanf(&g, &|x| x.retained), meanf(&g, &|x| x.pr), meanf(&g, &|x| x.slack), confirm_row);
+            }
+            // (PIC O2) is the support number σ(t) the participation ratio? Pearson corr(|atom|, PR) over all positions.
+            let corr = {
+                let n = recs.len() as f32;
+                let (mx, my) = (recs.iter().map(|r| r.atom as f32).sum::<f32>() / n, recs.iter().map(|r| r.pr).sum::<f32>() / n);
+                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0, 0.0);
+                for r in &recs { let (dx, dy) = (r.atom as f32 - mx, r.pr - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+                if sxx > 0.0 && syy > 0.0 { sxy / (sxx.sqrt() * syy.sqrt()) } else { f32::NAN }
+            };
+            if can_confirm {
+                let overall = |f: &dyn Fn(&Rec) -> bool| 100.0 * recs.iter().filter(|r| f(r)).count() as f32 / recs.len() as f32;
+                println!("\n(confirm, Route B) ablate ONLY the atom A in the REAL forward → prediction flips: necessary = {:.0}%   (top-|A|-DLA control = {:.0}%).", overall(&|r| r.flip_atom), overall(&|r| r.flip_ctrl));
+                println!("  necessary = the irreducible core is causally load-bearing (§5c methodology on the atom); necessary − ctrl = the cone descent's lift over naive top-|A|-by-DLA.");
+            }
+            println!("\n(PIC O2) σ(t) ∼ PR?  corr(|atom|, PR) = {corr:.3}   (σ(t) = the descent's measured support number)");
+            println!("(theory) irreducible ⟹ ≥2 competitors (single_competitor_reducible); the atom never fires more neurons than S (total_firing_mono).");
+            return;
+        }
+
         // --probe-facet (tighten Q1): the token cells in r-space ARE the Laguerre power diagram of {U_v} (weights
         // ‖U_v‖²+2b_v). Compute the EXACT nearest facet argmin_{v≠t}(L_t−L_v)/‖U_t−U_v‖ (not the logit-runner-up proxy)
         // and (a) how often the nearest facet == the logit runner-up, (b) the killer check: for COMPOSED, is the token

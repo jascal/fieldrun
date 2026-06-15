@@ -235,7 +235,7 @@ impl Rope {
         if self.b.config[7] != 0 { "embed" } else { "lm_head" } // tied embed, else a separate (fp16) head
     }
 
-    fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
+    fn explanation(&self, ids: &[i64], decomp_k: usize) -> crate::explain::Explanation {
         use crate::explain::*;
         let seq = ids.len();
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
@@ -307,6 +307,8 @@ impl Rope {
             &x_last,
             &xf_last,
             &u_pred,
+            decomp_k,
+            &|v: i64| self.b.weight_row(un, v as usize), // competitor unembed rows — the cone the descent intersects
             |l, n| self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
             |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),
             |c| self.b.rowdot_f32(un, c),
@@ -489,7 +491,11 @@ impl Model for Rope {
     }
 
     fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {
-        Some(self.explanation(ids))
+        Some(self.explanation(ids, 0))
+    }
+
+    fn explain_decomp(&self, ids: &[i64], k: usize) -> Option<crate::explain::Explanation> {
+        Some(self.explanation(ids, k)) // Density-Minimization substrate populated (--probe-decompose)
     }
 
     fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
