@@ -652,6 +652,37 @@ mod tests {
         assert_eq!(ex.predicted_logit - ex.runner_up_logit, 9.0);
     }
 
+    #[test]
+    fn assemble_builds_decomp_substrate() {
+        // vocab 3, d=2; predicted = tok1. decomp_k=1 ⇒ one competitor (the top non-predicted by logit).
+        let unembed = [[1.0f32, 0.0], [0.0, 1.0], [-1.0, -1.0]];
+        let ids = [0i64, 1, 2];
+        let gain = [1.0f32, 1.0];
+        let u_pred = unembed[1];
+        let att_last = vec![vec![vec![0.0f32, 0.0, 1.0]]];
+        let head_act = vec![vec![0.0f32, 0.0]];
+        let mlp_h = vec![vec![50.0f32, 1.0]];
+        let writes = [[1.0f32, 0.0], [0.0, 1.0]];
+        let logits = [3.0f32, 9.0, 1.0]; // predicted tok1=9; competitors by logit: tok0=3 > tok2=1
+        let ex = assemble(
+            &ids, &att_last, &head_act, &mlp_h, &logits, 1, &gain, false, &[], &[1.0, 1.0], &[1.0, 1.0], &u_pred,
+            1,                                    // decomp_k = 1
+            &|v| unembed[v as usize].to_vec(),    // unembed_row for the competitor
+            |_l, n| writes[n].to_vec(),
+            |_l, _h| vec![0.0, 0.0],
+            |c| proj(c, &unembed),
+        );
+        let sub = ex.decomp.expect("substrate populated when decomp_k>0");
+        assert_eq!(sub.predicted, 1);
+        assert_eq!(sub.competitors, vec![0]); // top-1 non-predicted by logit = tok0
+        assert!((sub.full_margin[0] - 6.0).abs() < 1e-5, "full_margin = 9 − 3 = 6");
+        // the identity the descent relies on: Σ_sources m_j^v + const_v == full_margin_v.
+        let summ: f32 = sub.sources.iter().map(|s| s.margins[0]).sum();
+        assert!((summ + sub.const_v[0] - sub.full_margin[0]).abs() < 1e-4, "Σ margins + const_v must equal full_margin");
+        // the (0,1)-writing neuron contributes 0 to competitor tok0 ⇒ its margin equals its dla (1.0).
+        assert!(sub.sources.iter().any(|s| s.kind == 1 && (s.margins[0] - 1.0).abs() < 1e-4));
+    }
+
     // Build a SourceMargin with one competitor's margin given (the descent only reads dla + margins).
     fn src(kind: u8, dla: f32, margins: &[f32]) -> SourceMargin {
         SourceMargin { kind, layer: 0, idx: 0, dla, act: dla.abs(), margins: margins.to_vec() }

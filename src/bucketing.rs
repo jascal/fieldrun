@@ -604,6 +604,54 @@ mod tests {
     }
 
     #[test]
+    fn partition_emits_expert_circuit_sets() {
+        let mut b = CorpusBuckets::new();
+        let (h0, n0) = ((0u8, 23, 1), (1u8, 23, 2539)); // two recurring hubs
+        for t in 0..10 {
+            b.ingest(vec![h0, n0, (1u8, t, t)]); // + a per-token private circuit
+        }
+        let p = b.partition(2);
+        assert_eq!(p.experts, 2);
+        assert_eq!(p.n_tokens, 10);
+        assert_eq!(p.distinct_circuits, 12); // 2 hubs + 10 private
+        // every circuit is assigned to exactly one bucket (Σ sizes == distinct).
+        assert_eq!(p.buckets.iter().map(|e| e.size).sum::<usize>(), p.distinct_circuits);
+        // the residual bucket is last and flagged; the anchored experts carry an anchor.
+        assert!(p.buckets.last().unwrap().residual);
+        assert!(p.buckets[0].anchor.is_some());
+        assert!(!p.buckets[0].circuits.is_empty());
+    }
+
+    #[test]
+    fn residency_splits_hot_and_tail() {
+        let mut b = CorpusBuckets::new();
+        let hot = (1u8, 23, 1);
+        for _ in 0..50 {
+            b.ingest(vec![hot]); // a dominant always-on expert
+        }
+        for t in 0..5 {
+            b.ingest(vec![(1u8, 9, t)]); // a few rare singletons → the paged tail
+        }
+        let r = b.residency(8, 0.9);
+        assert!(r.contains("RESIDENT"), "the hot expert must be marked resident:\n{r}");
+        assert!(r.contains("hot resident set"), "a hot/paged summary line is expected:\n{r}");
+    }
+
+    #[test]
+    fn routes_match_expert_map() {
+        let mut b = CorpusBuckets::new();
+        let h = (0u8, 1, 1);
+        for _ in 0..8 {
+            b.ingest(vec![h]); // every atom is the same hub ⇒ all route to the hub's expert
+        }
+        let (_e, map) = b.expert_map(2);
+        assert!(map.contains_key(&h));
+        let (_e2, routes) = b.routes(2);
+        assert_eq!(routes.len(), 8);
+        assert!(routes.iter().all(|&r| r == map[&h]), "hub-only atoms must all route to the hub's expert");
+    }
+
+    #[test]
     fn recursive_splits_the_residual() {
         let mut b = CorpusBuckets::new();
         let hub = (1u8, 23, 1);
