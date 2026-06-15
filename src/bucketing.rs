@@ -151,6 +151,41 @@ impl CorpusBuckets {
         Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
     }
 
+    /// A runtime RESIDENCY profile: experts sorted by token-load (descending) with cumulative coverage. The hot
+    /// high-load experts that together cover `resident_cov` of tokens are the always-resident working set; the long tail
+    /// of low-load buckets pages in on demand — the MoE residency policy. The frequency distribution IS the policy.
+    pub fn residency(&self, experts: usize, resident_cov: f32) -> String {
+        let mut out = String::new();
+        let c = match self.cluster(experts) {
+            Some(c) => c,
+            None => {
+                let _ = writeln!(out, "  (no atoms accumulated yet)");
+                return out;
+            }
+        };
+        let n: usize = c.tok_per_expert.iter().sum();
+        if n == 0 {
+            return out;
+        }
+        let mut v: Vec<(usize, usize, bool)> = (0..=c.e).map(|e| (e, c.tok_per_expert[e], e == c.e)).collect();
+        v.retain(|x| x.1 > 0);
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let thresh = (resident_cov * n as f32).ceil() as usize;
+        let (mut cum, mut resident_set) = (0usize, 0usize);
+        let _ = writeln!(out, "  rank  expert      load   share   cumul   residency");
+        for (rank, &(e, load, is_res)) in v.iter().enumerate() {
+            let resident = cum < thresh; // experts needed to reach resident_cov coverage are the hot resident set
+            cum += load;
+            if resident {
+                resident_set += 1;
+            }
+            let label = if is_res { "residual".to_string() } else { format!("e{e}") };
+            let _ = writeln!(out, "  {:>3}   {:<10} {:>5}  {:>4.0}%   {:>4.0}%   {}", rank + 1, label, load, 100.0 * load as f32 / n as f32, 100.0 * cum as f32 / n as f32, if resident { "RESIDENT" } else { "paged tail" });
+        }
+        let _ = writeln!(out, "  → hot resident set: {resident_set} expert(s) cover ~{:.0}% of tokens; {} buckets are the paged long tail (loaded on demand).", 100.0 * resident_cov, v.len().saturating_sub(resident_set));
+        out
+    }
+
     /// Render the clustering as a human-readable report body (summary stats + the per-expert anchors/sizes/routes).
     pub fn render(&self, experts: usize) -> String {
         let mut out = String::new();

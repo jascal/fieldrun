@@ -1192,6 +1192,12 @@ fn main() {
             println!("  circuit joins the anchor it co-fires with most). A token routes to the expert(s) its atom touches.");
             print!("{}", buckets.render(e_req));
             println!("  (proxy caveat: assumes an oracle router; a real saving needs a learned router + experts mapped to weight chunks.)");
+            if has_flag(&args, "--residency") {
+                // runtime residency: which experts are hot enough to stay resident vs the paged long tail (load distribution).
+                let cov: f32 = flag(&args, "--resident-cov").and_then(|s| s.parse().ok()).unwrap_or(0.9);
+                println!("\n=== Runtime residency profile (experts by token-load; hot set resident, tail paged on demand) ===");
+                print!("{}", buckets.residency(e_req, cov));
+            }
             // --experts-out <path>: emit the CONCRETE partition (each expert's anchor + full circuit list + token routing)
             // as JSON — the build artifact a router / weight-chunk pager consumes, not just the summary above.
             if let Some(path) = flag(&args, "--experts-out") {
