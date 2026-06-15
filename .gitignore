@@ -3,3 +3,4 @@
 *.fieldrun.json
 *.fieldrun.bin
 /bundles
+sweeps/runs/
