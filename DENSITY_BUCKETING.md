@@ -154,14 +154,43 @@ is a small set of **late-layer neurons** (e.g. L23 #2539 in 10/50 atoms, L22 #10
 in 5/50; `d = 10`) — the block-sparse, circuit-dense, late-block decision surface
 (§5d), now surfaced as the query's shared expert seed.
 
+## Per-corpus expert clustering (`--corpus-decompose`)
+
+The endgame: cluster the per-token atoms across the whole corpus into `E`
+**experts** — again **in-memory** from the descent, no `.dl`. The corpus working
+set `C = ⋃_t A_t` is partitioned into hub-anchored buckets: the top-`E` circuits by
+corpus frequency are the expert **anchors** (the recurring hubs), and every other
+circuit joins the anchor-expert it **co-fires with most** (co-fire = same atom);
+circuits that never co-fire with a hub fall into a residual bucket. A token routes
+to the expert(s) its atom touches. The MoE questions it answers:
+
+- **span-1 routability** — does the deciding atom fit inside ONE expert (so top-1
+  routing reproduces the decision)?
+- **active circuits/token** — under routing a token computes only the experts its
+  atom touches; how much smaller than the monolithic working set `|C|`?
+
+Measured (Qwen2.5-0.5B, 200 tokens, K=4, `--experts 8`): `|C| = 256` distinct
+circuits → 8 experts (+119 residual). **52 % of tokens are top-1 routable**, mean
+1.76 experts/token, and **active circuits/token = 81 of 256 → 68 % fewer
+computed**. The anchors are overwhelmingly **late-layer (L21–23) neurons**; the
+dominant expert (anchor L23 #2539 — the same circuit that was the per-query hub)
+routes 26 % of tokens. With `--experts 16` the per-token cost drops to 54/256
+(79 % fewer) at a slightly lower top-1 rate (atoms split across finer experts) —
+the expected `E` tradeoff.
+
+**Proxy caveat.** This is a *static, oracle-router* circuit-count proxy: it assumes
+you already know each token's atom. A real wall-clock saving needs (a) a learned
+router that predicts the expert from the context (not the atom), and (b) the
+circuit-experts mapped onto pageable weight chunks (fieldrun's expert-offload).
+
 ## The ladder
 
 1. **per token** — `decompose_descent` over one decision (`--probe-decompose`).
-2. **per query** — `--query-decompose`: `W = ⋃_t A_t` in-memory (this rung).
-3. **per corpus** — cluster the per-query working-sets / hubs across many queries →
-   recurring buckets = candidate **experts**; route a token to its atom-bucket → a
-   smaller/cheaper MoE. fieldrun already has the expert-offload machinery
-   (`src/bundle.rs`, qwen3moe/gemma4-MoE/mla/minimax) for this to land in.
+2. **per query** — `--query-decompose`: `W = ⋃_t A_t` in-memory.
+3. **per corpus** — `--corpus-decompose`: cluster atoms into `E` hub-anchored
+   experts; route a token to its atom-bucket → a smaller/cheaper MoE. fieldrun
+   already has the expert-offload machinery (`src/bundle.rs`,
+   qwen3moe/gemma4-MoE/mla/minimax) for the routed experts to land in.
 
 ## Status
 
@@ -169,4 +198,6 @@ in 5/50; `d = 10`) — the block-sparse, circuit-dense, late-block decision surf
 - [x] `--probe-decompose` harness; measured on Qwen2.5-0.5B.
 - [x] Faithful necessity-confirmation of atoms (`predict_ablated`, Route B).
 - [x] Per-query atom aggregation (`--query-decompose`, in-memory, no `.dl`).
-- [ ] Per-corpus atom clustering → expert buckets.
+- [x] Per-corpus atom clustering → hub-anchored expert buckets (`--corpus-decompose`).
+- [ ] Learned router (predict the expert from context, not the atom) + experts
+      mapped to pageable weight chunks → a real wall-clock MoE saving.
