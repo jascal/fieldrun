@@ -1162,6 +1162,8 @@ fn main() {
             // Stream the corpus in chunks so the per-position forward working set stays bounded; atoms accumulate into the
             // shared CorpusBuckets (tiny, ~72 bytes/token). --report-every N prints the running clustering at runtime.
             let want_dl = flag(&args, "--experts-dl").is_some(); // also collect the per-token signature + decode for the DL emit
+            let want_interpret = has_flag(&args, "--interpret"); // collect decodes to show what routes to each expert
+            let want_meta = want_dl || want_interpret;
             let dl_order: usize = flag(&args, "--dl-sig").and_then(|s| s.parse().ok()).unwrap_or(1).max(1); // sig = last N ctx tokens
             let lmr = lm.as_ref();
             let mut buckets = bucketing::CorpusBuckets::new();
@@ -1175,7 +1177,8 @@ fn main() {
                     Some((a, sg, p))
                 }).collect();
                 for (a, s, p) in got {
-                    if want_dl { sigs.push(s); preds.push(p); }
+                    if want_dl { sigs.push(s); }
+                    if want_meta { preds.push(p); }
                     buckets.ingest(a);
                 }
                 if report_every > 0 && buckets.n_tokens() >= next_report {
@@ -1207,6 +1210,31 @@ fn main() {
                 match std::fs::write(path, buckets.emit_datalog(e_req, &sigs, &preds, tf)) {
                     Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote Datalog lookup/selection model → {path}  (run: souffle {path} -D-)"),
                     Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                }
+            }
+            // --interpret: what KIND of tokens route to each expert (its specialty) — decode the tokens routed there.
+            if want_interpret {
+                #[cfg(feature = "api")]
+                let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                    Some(tg) => Box::new(move |id| tg.token_label(id)),
+                    None => load_decoder(flag(&args, "--vocab")),
+                };
+                #[cfg(not(feature = "api"))]
+                let dec = load_decoder(flag(&args, "--vocab"));
+                let (e_act, routes) = buckets.routes(e_req);
+                let mut by_e: Vec<HashMap<i64, usize>> = vec![HashMap::new(); e_act + 1];
+                for (i, &r) in routes.iter().enumerate() {
+                    if let Some(&p) = preds.get(i) { *by_e[r].entry(p).or_default() += 1; }
+                }
+                println!("\n=== Per-expert interpretability: the decoded tokens routed to each expert (its 'specialty') ===");
+                for (e, m) in by_e.iter().enumerate() {
+                    if m.is_empty() { continue; }
+                    let mut top: Vec<(i64, usize)> = m.iter().map(|(&t, &c)| (t, c)).collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    let total: usize = m.values().sum();
+                    let label = if e == e_act { "residual".to_string() } else { format!("e{e}") };
+                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                    println!("  {label:<9} {total:>4} tok →  {}", toks.join("  "));
                 }
             }
             return;

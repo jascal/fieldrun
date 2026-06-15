@@ -54,6 +54,18 @@ impl CorpusBuckets {
         self.atoms.len()
     }
 
+    /// The top-1 expert each ingested atom routes to (aligned with ingest order); returns `(e, routes)` where `e` is the
+    /// residual-bucket index (empty / un-anchored atoms route there). For per-expert interpretability + the contrib emit.
+    pub fn routes(&self, experts: usize) -> (usize, Vec<usize>) {
+        match self.cluster(experts) {
+            None => (0, Vec::new()),
+            Some(c) => {
+                let r = self.atoms.iter().map(|a| if a.is_empty() { c.e } else { c.expert_of[a.iter().max_by_key(|x| c.freq[*x]).unwrap()] }).collect();
+                (c.e, r)
+            }
+        }
+    }
+
     /// Compute the clustering: partition the corpus working set into `experts` hub-anchored buckets. The top-`experts`
     /// circuits by frequency are the expert ANCHORS (the recurring hubs); each other circuit joins the anchor-expert it
     /// co-fires with most (co-fire = same atom); circuits that never co-fire with a hub fall into the residual bucket

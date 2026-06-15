@@ -215,11 +215,27 @@ chunks (fieldrun's expert-offload).
       runnable Soufflé program + per-expert pick-entropy (lookup-exact vs computed).
 - [x] Incremental bucketing in serve/REPL (`--bucket`: per-reply atom ingest +
       running clustering; `/bucket on|off|experts N|k N|reset|dump`).
+- [x] Per-expert interpretability (`--interpret`): the decoded tokens routed to
+      each expert reveal **grammatical-role specialization** (see below).
 - [ ] contrib-over-expert Datalog (faithful composition decode + catchall `rest`),
       replacing the bigram lookup — the runtime-MoE blueprint.
-- [ ] Per-expert interpretability: what tokens/contexts route to each expert.
 - [ ] Realize the partition as a runtime MoE: experts = pageable weight modules
-      (fieldrun expert-offload), loaded on correlated work.
+      (fieldrun expert-offload), loaded on correlated work. Compactness is a
+      RUNTIME property (resident working set), not `.dl` size; the catchall `rest`
+      is the always-resident shared core.
+
+## Interpretability (`--interpret`)
+
+`--interpret` decodes the tokens routed to each expert (its "specialty"). Measured
+(Qwen2.5-0.5B, 300 tokens, E=8): the partition recovers **closed-class grammatical
+roles** — e0 = punctuation + sentence-initial pronouns, e1 = auxiliaries, e2 =
+determiners/adjectives, **e3 = verbs**, e5/e7 = `"And"`/future conjunctions — while
+**content words fall into the residual catchall** (the largest bucket, and the
+highest per-expert decision entropy). This echoes the open- vs closed-class lexis
+split in the LO findings: the closed/structural lexicon buckets into legible
+experts; the open lexicon is the computed residue (the forge tax). The `.dl`
+`obs(pos,sig,route,pred,split)` facts also let you query "what routes to e3"
+directly.
 
 ## Datalog lookup/selection export (`--experts-dl`)
 
