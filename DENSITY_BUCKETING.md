@@ -178,10 +178,19 @@ routes 26 % of tokens. With `--experts 16` the per-token cost drops to 54/256
 (79 % fewer) at a slightly lower top-1 rate (atoms split across finer experts) —
 the expected `E` tradeoff.
 
-**Proxy caveat.** This is a *static, oracle-router* circuit-count proxy: it assumes
-you already know each token's atom. A real wall-clock saving needs (a) a learned
-router that predicts the expert from the context (not the atom), and (b) the
-circuit-experts mapped onto pageable weight chunks (fieldrun's expert-offload).
+**Scaling + the emitted partition.** The corpus streams in chunks (`CorpusBuckets`
+in `bucketing.rs`), so a much bigger corpus is bounded by forward-pass time, not
+memory (atoms are ~72 bytes/token). `--report-every N` prints the running
+clustering at runtime; the final report lands at the end. `--experts-out <path>`
+dumps the **concrete partition** as JSON — each expert's anchor + the full circuit
+list (kind/layer/idx) + token routing, residual bucket last — i.e. the build
+artifact a router / weight-chunk pager consumes, not just the summary stats.
+
+**Proxy caveat.** The active-circuit figure is a *static, oracle-router*
+circuit-count proxy: it assumes you already know each token's atom. A real
+wall-clock saving needs (a) a learned router that predicts the expert from the
+context (not the atom), and (b) the circuit-experts mapped onto pageable weight
+chunks (fieldrun's expert-offload).
 
 ## The ladder
 
@@ -199,5 +208,10 @@ circuit-experts mapped onto pageable weight chunks (fieldrun's expert-offload).
 - [x] Faithful necessity-confirmation of atoms (`predict_ablated`, Route B).
 - [x] Per-query atom aggregation (`--query-decompose`, in-memory, no `.dl`).
 - [x] Per-corpus atom clustering → hub-anchored expert buckets (`--corpus-decompose`).
+- [x] Streaming over a bigger corpus + `--report-every` incremental runtime reports.
+- [x] Concrete partition export (`--experts-out <path>`, JSON: expert→circuit sets).
+- [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
+- [ ] Datalog export of the partition (`--experts-dl`): routing/selection as a
+      runnable program + per-expert pick-entropy (lookup-exact vs computed-remainder).
 - [ ] Learned router (predict the expert from context, not the atom) + experts
       mapped to pageable weight chunks → a real wall-clock MoE saving.

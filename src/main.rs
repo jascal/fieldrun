@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 mod api;
+mod bucketing;
 mod bundle;
 #[cfg(feature = "jit")]
 mod jit;
@@ -1155,74 +1156,39 @@ fn main() {
                 eprintln!("[fieldrun] --corpus-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
                 return;
             }
-            eprintln!("[fieldrun] --corpus-decompose: {} tokens, clustering atoms into {e_req} experts (K={kk}) — in-memory, no .dl…", positions.len());
-            let atoms: Vec<Vec<(u8, usize, usize)>> = positions.par_iter().filter_map(|c| {
-                let ex = lm.explain_decomp(c, kk)?;
-                let sub = ex.decomp.as_ref()?;
-                let r = explain::decompose_descent(sub);
-                Some(r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect())
-            }).collect();
-            let n = atoms.len();
-            // corpus circuit frequency, then the top-E hubs as expert ANCHORS (deterministic: freq desc, then id).
-            let mut freq: HashMap<(u8, usize, usize), usize> = HashMap::new();
-            for a in &atoms { for &id in a { *freq.entry(id).or_default() += 1; } }
-            let distinct = freq.len();
-            let mut ranked: Vec<((u8, usize, usize), usize)> = freq.iter().map(|(&id, &f)| (id, f)).collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let e = e_req.min(ranked.len());
-            let mut expert_of: HashMap<(u8, usize, usize), usize> = HashMap::new();
-            for (k, &(id, _)) in ranked.iter().take(e).enumerate() { expert_of.insert(id, k); } // anchors seed experts 0..e
-            // each non-anchor circuit joins the anchor-expert it co-occurs with most often (co-fire = same atom).
-            let mut cooc: HashMap<(u8, usize, usize), HashMap<usize, usize>> = HashMap::new();
-            for a in &atoms {
-                let present: Vec<usize> = a.iter().filter_map(|id| expert_of.get(id).copied()).collect();
-                if present.is_empty() { continue; }
-                for &id in a {
-                    if expert_of.contains_key(&id) { continue; } // an anchor — already placed
-                    let m = cooc.entry(id).or_default();
-                    for &ex in &present { *m.entry(ex).or_default() += 1; }
+            let report_every: usize = flag(&args, "--report-every").and_then(|s| s.parse().ok()).unwrap_or(0);
+            eprintln!("[fieldrun] --corpus-decompose: {} tokens → up to {e_req} experts (K={kk}), chunked stream{} — in-memory, no .dl…",
+                positions.len(), if report_every > 0 { format!(", report every {report_every}") } else { String::new() });
+            // Stream the corpus in chunks so the per-position forward working set stays bounded; atoms accumulate into the
+            // shared CorpusBuckets (tiny, ~72 bytes/token). --report-every N prints the running clustering at runtime.
+            let lmr = lm.as_ref();
+            let mut buckets = bucketing::CorpusBuckets::new();
+            let mut next_report = report_every;
+            for chunk in positions.chunks(512) {
+                let atoms: Vec<Vec<bucketing::Circuit>> = chunk.par_iter().filter_map(|c| bucketing::atom_at(lmr, c, kk)).collect();
+                for a in atoms { buckets.ingest(a); }
+                if report_every > 0 && buckets.n_tokens() >= next_report {
+                    println!("\n=== [progress] {} tokens — up to {e_req}-expert clustering so far (K={kk}) ===", buckets.n_tokens());
+                    print!("{}", buckets.render(e_req));
+                    next_report = buckets.n_tokens() + report_every;
                 }
             }
-            let residual = e; // the residual bucket: circuits that never co-fire with any hub anchor
-            for (&id, m) in &cooc {
-                let best = m.iter().max_by(|x, y| x.1.cmp(y.1).then(y.0.cmp(x.0))).map(|(&ex, _)| ex).unwrap_or(residual);
-                expert_of.entry(id).or_insert(best);
-            }
-            for (&id, _) in &freq { expert_of.entry(id).or_insert(residual); } // any leftover → residual
-            let mut size = vec![0usize; e + 1];
-            for (_, &ex) in &expert_of { size[ex] += 1; }
-            // per-token routing: which experts the atom touches (span), the top-1 route, and the computed-circuit cost.
-            let (mut span1, mut spanned, mut span_sum, mut cost_sum) = (0usize, 0usize, 0usize, 0usize);
-            let mut tok_per_expert = vec![0usize; e + 1];
-            for a in &atoms {
-                if a.is_empty() { continue; }
-                let mut touched: std::collections::HashSet<usize> = std::collections::HashSet::new();
-                for &id in a { touched.insert(expert_of[&id]); }
-                span_sum += touched.len();
-                spanned += 1;
-                if touched.len() == 1 { span1 += 1; }
-                cost_sum += touched.iter().map(|&ex| size[ex]).sum::<usize>();
-                let route = a.iter().max_by_key(|id| freq[*id]).map(|id| expert_of[id]).unwrap();
-                tok_per_expert[route] += 1;
-            }
-            let mean_span = if spanned > 0 { span_sum as f32 / spanned as f32 } else { 0.0 };
-            let mean_cost = if spanned > 0 { cost_sum as f32 / spanned as f32 } else { 0.0 };
-            println!("\n=== Per-corpus expert clustering: {e} hub-anchored experts over {n} tokens (K={kk}) ===");
+            println!("\n=== Per-corpus expert clustering (final): up to {e_req} hub-anchored experts over {} tokens (K={kk}) ===", buckets.n_tokens());
             println!("  the corpus working set C is partitioned into E experts (anchor = a corpus-hub circuit; each other");
             println!("  circuit joins the anchor it co-fires with most). A token routes to the expert(s) its atom touches.");
-            println!("  N tokens                  {n}");
-            println!("  |C| distinct circuits     {distinct}");
-            println!("  E experts                 {e}   (+ residual: {} circuits never co-firing with a hub)", size[residual]);
-            println!("  span 1 (top-1 routable)   {:.0}%   ← the deciding atom fits in ONE expert", if spanned > 0 { 100.0 * span1 as f32 / spanned as f32 } else { 0.0 });
-            println!("  mean experts / token      {mean_span:.2}");
-            println!("  active circuits / token   {mean_cost:.1} of {distinct}   → {:.0}% fewer computed (static oracle-router proxy)", if distinct > 0 { 100.0 * (1.0 - mean_cost / distinct as f32) } else { 0.0 });
-            println!("  per expert (anchor = the corpus hub it is built around):");
-            let kind_name = |k: u8| if k == 0 { "head" } else { "neuron" };
-            for k in 0..e {
-                let (ak, al, ai) = ranked[k].0;
-                println!("    e{k:<2} anchor {:<6} L{al:<2} #{ai:<6}  {:>4} circuits  {:>5} tokens ({:.0}%)", kind_name(ak), size[k], tok_per_expert[k], 100.0 * tok_per_expert[k] as f32 / n.max(1) as f32);
-            }
+            print!("{}", buckets.render(e_req));
             println!("  (proxy caveat: assumes an oracle router; a real saving needs a learned router + experts mapped to weight chunks.)");
+            // --experts-out <path>: emit the CONCRETE partition (each expert's anchor + full circuit list + token routing)
+            // as JSON — the build artifact a router / weight-chunk pager consumes, not just the summary above.
+            if let Some(path) = flag(&args, "--experts-out") {
+                match serde_json::to_string_pretty(&buckets.partition(e_req)) {
+                    Ok(j) => match std::fs::write(path, j) {
+                        Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote expert partition ({e_req} experts) → {path}"),
+                        Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                    },
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: serialize failed: {err}"),
+                }
+            }
             return;
         }
 
