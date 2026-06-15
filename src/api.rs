@@ -1484,14 +1484,18 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                 let _ = std::io::stderr().flush();
             }
             let mut added = 0usize;
-            for i in start..full.len() {
-                if let Some(a) = crate::bucketing::atom_at(lm.as_ref(), &full[..i], bkt.k) {
-                    session.ingest(a);
-                    session_sig.push(if i > 0 { full[i - 1] } else { -1 }); // signature = the previous token
-                    session_pred.push(full[i]); // decode = the model's own generated token
+            // KV-cached stream: ONE growing forward over the whole reply instead of a full forward per token (the
+            // O(seq) vs O(seq²) win that makes long --bucket sessions practical). Byte-identical to the per-token path.
+            lm.explain_stream(&full, bkt.k, start, &mut |pos, ex| {
+                if let Some(sub) = ex.decomp.as_ref() {
+                    let r = crate::explain::decompose_descent(sub);
+                    let atom: Vec<crate::bucketing::Circuit> = r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect();
+                    session.ingest(atom);
+                    session_sig.push(if pos > 0 { full[pos - 1] } else { -1 }); // signature = the previous token
+                    session_pred.push(ex.model_predicts); // the model's decode at this position
                     added += 1;
                 }
-            }
+            });
             eprint!("\r\x1b[2K");
             if added == 0 && session.n_tokens() == 0 {
                 eprintln!("[fieldrun] [bucket] arch {arch} exposes no descent substrate (rope/Qwen only) — bucket OFF");
