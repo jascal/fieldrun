@@ -1141,6 +1141,35 @@ fn main() {
         // --corpus-decompose (per-CORPUS clustering, the ladder's endgame): cluster the per-token irreducible atoms across
         // the whole corpus into E **experts** — partition the corpus working set C into hub-anchored buckets (anchor = a
         // corpus-frequent hub circuit; each other circuit joins the anchor-expert it co-fires with most), then ask the MoE
+        // --verify-cache: the byte-identity gate for the KV-cached explain stream. Compares the cached-stream atom at
+        // each position against the uncached explain on the same growing prefix; 0 mismatches ⇒ caching is faithful.
+        if has_flag(&args, "--verify-cache") {
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let cap = (end - ctx_window).min(n_eval).min(60);
+            if cap == 0 { eprintln!("[fieldrun] --verify-cache: need --ids with > ctx_window tokens"); return; }
+            let atom_of = |ex: &explain::Explanation| -> Option<Vec<bucketing::Circuit>> {
+                let sub = ex.decomp.as_ref()?;
+                let r = explain::decompose_descent(sub);
+                Some(r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect())
+            };
+            let mut cached: std::collections::BTreeMap<usize, (i64, Vec<bucketing::Circuit>)> = Default::default();
+            lm.explain_stream(&ids[..ctx_window + cap], kk, ctx_window, &mut |pos, ex| {
+                if let Some(a) = atom_of(&ex) { cached.insert(pos, (ex.model_predicts, a)); }
+            });
+            if cached.is_empty() { eprintln!("[fieldrun] --verify-cache: arch exposes no substrate (rope/Qwen only)"); return; }
+            let (mut checked, mut pred_mm, mut atom_mm) = (0usize, 0usize, 0usize);
+            for (&pos, (cpred, catom)) in &cached {
+                if let Some(ex) = lm.explain_decomp(&ids[..pos], kk) {
+                    checked += 1;
+                    if ex.model_predicts != *cpred { pred_mm += 1; }
+                    if atom_of(&ex).as_ref() != Some(catom) { atom_mm += 1; }
+                }
+            }
+            println!("--verify-cache: {checked} positions · {pred_mm} prediction mismatch · {atom_mm} atom mismatch (cached vs uncached) → {}",
+                if pred_mm == 0 && atom_mm == 0 { "PASS — KV-cached explain is byte-identical" } else { "FAIL" });
+            return;
+        }
+
         // question: does a token's deciding atom fit inside ONE expert (top-1 routable)? and how many circuits does routing
         // actually compute vs the monolithic working set? In-memory from the descent (no `.dl` export/stitch). Rope/Qwen.
         if has_flag(&args, "--corpus-decompose") {

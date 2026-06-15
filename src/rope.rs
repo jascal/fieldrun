@@ -365,6 +365,116 @@ impl Rope {
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }
 
+    /// `forward_block` that also CAPTURES the last new row's per-layer (attention rows, attn_out, mlp hidden) + the
+    /// pre/post-final-norm residual — the explain substrate, computed under the KV cache. Byte-identical to the full
+    /// forward by causality (each token's K/V depends only on earlier tokens). Uses `b.mm` for down_proj to match
+    /// `explanation()` exactly (== `down()` in the default non-routed case). Returns
+    /// (att_last[layer][head][klen], head_act[layer][h*hd], mlp_h[layer][inter], x_last[d], xf_last[d]).
+    #[allow(clippy::type_complexity)]
+    fn forward_block_capture(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> (Vec<Vec<Vec<f32>>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let last = m - 1;
+        let mut x = emb.clone();
+        let (mut att_last, mut head_act, mut mlp_h) = (Vec::with_capacity(self.n_layer), Vec::with_capacity(self.n_layer), Vec::with_capacity(self.n_layer));
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, cur);
+            self.rope(&mut k, nkv, cur);
+            kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
+            vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            let mut layer_att = Vec::with_capacity(h);
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = kc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let vh = vc[l].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..m {
+                    for j in (cur + i + 1)..klen {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                layer_att.push(scores.row(last).to_vec());
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            att_last.push(layer_att);
+            head_act.push(attn_out.row(last).to_vec());
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            mlp_h.push(hidden.row(last).to_vec());
+            x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        let xf = rmsnorm(&x, self.b.arr1("norm"), self.eps);
+        (att_last, head_act, mlp_h, x.row(last).to_vec(), xf.row(last).to_vec())
+    }
+
+    /// Build the Explanation for the LAST token of `ids` from already-captured per-layer rows (shared by the cached
+    /// stream and a byte-identity check). `att_last`/`head_act`/`mlp_h` are the last-position captures, `x_last`/`xf_last`
+    /// the residual either side of the final norm.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_from_capture(&self, ids: &[i64], att_last: &[Vec<Vec<f32>>], head_act: &[Vec<f32>], mlp_h: &[Vec<f32>], x_last: &[f32], xf_last: &[f32], decomp_k: usize) -> crate::explain::Explanation {
+        use crate::explain::*;
+        let hd = self.hd;
+        let lg = self.b.rowdot_f32(self.unembed_name(), xf_last);
+        let model_predicts = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+        let un = self.unembed_name();
+        let gain = self.b.arr1("norm").to_vec();
+        let u_pred = self.b.weight_row(un, model_predicts as usize);
+        assemble(
+            ids, att_last, head_act, mlp_h, &lg, model_predicts, &gain, false, &[], x_last, xf_last, &u_pred,
+            decomp_k,
+            &|v: i64| self.b.weight_row(un, v as usize),
+            |l, n| self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
+            |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),
+            |c| self.b.rowdot_f32(un, c),
+        )
+    }
+
+    /// KV-CACHED explain stream: process `ids` once through a single growing KV cache (O(seq) attention work instead of
+    /// one full forward per position) and call `f(pos, Explanation)` for every position `pos` in `start..ids.len()` — the
+    /// decision predicting `ids[pos]` from context `ids[..pos]`. Byte-identical to looping `explanation(&ids[..pos])`.
+    fn explanation_stream(&self, ids: &[i64], decomp_k: usize, start: usize, f: &mut dyn FnMut(usize, crate::explain::Explanation)) {
+        let seq = ids.len();
+        if seq == 0 {
+            return;
+        }
+        let kvdim = self.nkv * self.hd;
+        let mut kc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((seq, kvdim))).collect();
+        let mut vc: Vec<Array2<f32>> = (0..self.n_layer).map(|_| Array2::zeros((seq, kvdim))).collect();
+        // prefill ids[..start] (cur=0, m=start) so the cache is warm, then decode one token at a time.
+        if start > 1 {
+            let emb = self.b.rows_f32("embed", &ids[..start - 1]);
+            let _ = self.forward_block_capture(&emb, 0, &mut kc, &mut vc); // warm the cache for ids[..start-1]
+        }
+        // each step appends token ids[pos-1] (cur = pos-1) → the cache now covers ids[..pos]; explain that last position.
+        let lo = start.max(1);
+        for pos in lo..=seq {
+            let emb = self.b.rows_f32("embed", &ids[pos - 1..pos]); // the single new token
+            let (att_last, head_act, mlp_h, x_last, xf_last) = self.forward_block_capture(&emb, pos - 1, &mut kc, &mut vc);
+            let ex = self.assemble_from_capture(&ids[..pos], &att_last, &head_act, &mlp_h, &x_last, &xf_last, decomp_k);
+            f(pos, ex);
+        }
+    }
+
     /// `forward_block` with an int8 KV cache (GQA width, per-kv-head scale): quantise post-RoPE K and V on write,
     /// dequantise on read. ~4x smaller cache; per-head quant error keeps tokens ~identical.
     #[allow(clippy::too_many_arguments)]
@@ -496,6 +606,10 @@ impl Model for Rope {
 
     fn explain_decomp(&self, ids: &[i64], k: usize) -> Option<crate::explain::Explanation> {
         Some(self.explanation(ids, k)) // Density-Minimization substrate populated (--probe-decompose)
+    }
+
+    fn explain_stream(&self, ids: &[i64], decomp_k: usize, start: usize, f: &mut dyn FnMut(usize, crate::explain::Explanation)) {
+        self.explanation_stream(ids, decomp_k, start, f); // KV-cached growing-prefix explain — byte-identical, O(seq)
     }
 
     fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
