@@ -211,7 +211,26 @@ chunks (fieldrun's expert-offload).
 - [x] Streaming over a bigger corpus + `--report-every` incremental runtime reports.
 - [x] Concrete partition export (`--experts-out <path>`, JSON: expert→circuit sets).
 - [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
-- [ ] Datalog export of the partition (`--experts-dl`): routing/selection as a
-      runnable program + per-expert pick-entropy (lookup-exact vs computed-remainder).
+- [x] Datalog export of the partition (`--experts-dl`): routing/selection as a
+      runnable Soufflé program + per-expert pick-entropy (lookup-exact vs computed).
+- [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
 - [ ] Learned router (predict the expert from context, not the atom) + experts
       mapped to pageable weight chunks → a real wall-clock MoE saving.
+
+## Datalog lookup/selection export (`--experts-dl`)
+
+`--experts-dl <path>` emits the partition as a **Soufflé-compatible Datalog
+lookup/selection model**: the expert partition is RELATIONS (`expert`/`anchor`),
+routing `selected(sig,e)` and decision `predict(sig,tok)` are LOOKUP tables over a
+context signature (the previous token id) compiled from the corpus, and rules apply
+the lookup (`decode`) and check it reproduces the model's decode (`hit`). The header
+reports per-expert decision entropy `H(pred|expert)` — ≈0 marks a **lookup-exact
+(retrievable)** expert, >0 the **computed residue** (the forge tax). This is a
+corpus-derived lookup model (generalizes by signature match), *not* the dense
+forward-pass-as-Datalog (that is `logic_whole.rs` / LO3a — exact but non-compact);
+the partition is the instrument that isolates the compactly-lookup-able fragment.
+
+Validated end-to-end (Qwen2.5-0.5B, 120 tokens, E=6): the emitted program **runs in
+Soufflé** and `hit` = **82 %** of positions — the lookup reproduces the model's
+decode on 82 %, matching the in-Rust stat; the residual bucket carries the highest
+`H(pred|expert)` (the computed core). `souffle <path>.dl -D-` to run.

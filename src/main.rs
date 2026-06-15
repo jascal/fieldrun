@@ -1161,12 +1161,21 @@ fn main() {
                 positions.len(), if report_every > 0 { format!(", report every {report_every}") } else { String::new() });
             // Stream the corpus in chunks so the per-position forward working set stays bounded; atoms accumulate into the
             // shared CorpusBuckets (tiny, ~72 bytes/token). --report-every N prints the running clustering at runtime.
+            let want_dl = flag(&args, "--experts-dl").is_some(); // also collect the per-token signature + decode for the DL emit
             let lmr = lm.as_ref();
             let mut buckets = bucketing::CorpusBuckets::new();
+            let (mut sigs, mut preds): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
             let mut next_report = report_every;
             for chunk in positions.chunks(512) {
-                let atoms: Vec<Vec<bucketing::Circuit>> = chunk.par_iter().filter_map(|c| bucketing::atom_at(lmr, c, kk)).collect();
-                for a in atoms { buckets.ingest(a); }
+                // sig = the previous token id (the lookup key); pred = the model's decode at this position.
+                let got: Vec<(Vec<bucketing::Circuit>, i64, i64)> = chunk.par_iter().filter_map(|c| {
+                    let (a, p) = bucketing::atom_and_pred_at(lmr, c, kk)?;
+                    Some((a, *c.last().unwrap_or(&-1), p))
+                }).collect();
+                for (a, s, p) in got {
+                    if want_dl { sigs.push(s); preds.push(p); }
+                    buckets.ingest(a);
+                }
                 if report_every > 0 && buckets.n_tokens() >= next_report {
                     println!("\n=== [progress] {} tokens — up to {e_req}-expert clustering so far (K={kk}) ===", buckets.n_tokens());
                     print!("{}", buckets.render(e_req));
@@ -1187,6 +1196,14 @@ fn main() {
                         Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
                     },
                     Err(err) => eprintln!("[fieldrun] --corpus-decompose: serialize failed: {err}"),
+                }
+            }
+            // --experts-dl <path>: emit the partition as a Soufflé Datalog LOOKUP/SELECTION model (routing + decision as
+            // lookup over a context signature, + per-expert pick-entropy marking lookup-exact vs computed experts).
+            if let Some(path) = flag(&args, "--experts-dl") {
+                match std::fs::write(path, buckets.emit_datalog(e_req, &sigs, &preds)) {
+                    Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote Datalog lookup/selection model → {path}  (run: souffle {path} -D-)"),
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
                 }
             }
             return;

@@ -5,19 +5,25 @@
 //! themselves are tiny (~3 small ints each, ~72 bytes/token), so accumulating them is cheap.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 /// A scored source's identity: (kind: 0 = attention head, 1 = MLP neuron, layer, index-within-layer).
 pub type Circuit = (u8, usize, usize);
 
-/// Run the descent at one position and return its irreducible atom as circuit identities. `None` if the arch does not
-/// expose the substrate (rope/Qwen only). The single shared entry point for both the batch and the incremental paths.
-pub fn atom_at(lm: &dyn crate::model::Model, ctx: &[i64], k: usize) -> Option<Vec<Circuit>> {
+/// Run the descent at one position and return its irreducible atom + the model's predicted token. `None` if the arch
+/// does not expose the substrate (rope/Qwen only). The shared entry point for the batch, incremental, and DL paths.
+pub fn atom_and_pred_at(lm: &dyn crate::model::Model, ctx: &[i64], k: usize) -> Option<(Vec<Circuit>, i64)> {
     let ex = lm.explain_decomp(ctx, k)?;
     let sub = ex.decomp.as_ref()?;
     let r = crate::explain::decompose_descent(sub);
-    Some(r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect())
+    let atom = r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect();
+    Some((atom, ex.model_predicts))
+}
+
+/// Just the irreducible atom (the predicted token is dropped). Used by `--corpus-decompose` / `--query-decompose`.
+pub fn atom_at(lm: &dyn crate::model::Model, ctx: &[i64], k: usize) -> Option<Vec<Circuit>> {
+    atom_and_pred_at(lm, ctx, k).map(|(a, _)| a)
 }
 
 /// Online accumulator of per-token atoms over a corpus. `render` clusters the current contents into `experts`
@@ -114,7 +120,7 @@ impl CorpusBuckets {
             let route = a.iter().max_by_key(|id| freq[*id]).map(|id| expert_of[id]).unwrap();
             tok_per_expert[route] += 1;
         }
-        Some(Cluster { e, n, distinct, total, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
+        Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
     }
 
     /// Render the clustering as a human-readable report body (summary stats + the per-expert anchors/sizes/routes).
@@ -182,6 +188,123 @@ impl CorpusBuckets {
             buckets,
         }
     }
+
+    /// Emit a Soufflé-compatible Datalog LOOKUP/SELECTION model derived from the partition. The expert partition is
+    /// RELATIONS (`expert`/`anchor`); routing (`selected(sig,e)`) and decision (`predict(sig,tok)`) are LOOKUP tables
+    /// over a context signature (the previous token id), compiled from the corpus; rules apply the lookup (`decode`)
+    /// and check it reproduces the model's decode (`hit`). The header reports per-expert decision entropy
+    /// `H(pred|expert)` — ≈0 marks a lookup-exact (retrievable) expert, >0 the computed residue (the forge tax). A
+    /// corpus-derived lookup model (generalizes by signature match), NOT the dense forward pass (that is logic_whole.rs
+    /// / LO3a — exact but non-compact). `sig[i]`/`pred[i]` align with the i-th ingested atom (prev token + decode).
+    pub fn emit_datalog(&self, experts: usize, sig: &[i64], pred: &[i64]) -> String {
+        let mut out = String::new();
+        let c = match self.cluster(experts) {
+            None => {
+                out.push_str("// (no atoms accumulated — nothing to emit)\n");
+                return out;
+            }
+            Some(c) => c,
+        };
+        let m = self.atoms.len().min(sig.len()).min(pred.len());
+        // per-token route (top-1 expert), aligned with ingest order.
+        let routes: Vec<usize> = self
+            .atoms
+            .iter()
+            .map(|a| if a.is_empty() { c.e } else { c.expert_of[a.iter().max_by_key(|x| c.freq[*x]).unwrap()] })
+            .collect();
+        // compile the lookup tables: signature → {expert counts}, signature → {pred counts}.
+        let mut sig_e: BTreeMap<i64, HashMap<usize, usize>> = BTreeMap::new();
+        let mut sig_p: BTreeMap<i64, HashMap<i64, usize>> = BTreeMap::new();
+        for i in 0..m {
+            *sig_e.entry(sig[i]).or_default().entry(routes[i]).or_default() += 1;
+            *sig_p.entry(sig[i]).or_default().entry(pred[i]).or_default() += 1;
+        }
+        let plur = |mm: &HashMap<i64, usize>| *mm.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).unwrap().0;
+        let plur_e: BTreeMap<i64, usize> = sig_e.iter().map(|(&s, mm)| (s, *mm.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).unwrap().0)).collect();
+        let plur_p: BTreeMap<i64, i64> = sig_p.iter().map(|(&s, mm)| (s, plur(mm))).collect();
+        // accuracy: does the compiled lookup reproduce the model's decode / routing?
+        let (mut hit, mut rhit) = (0usize, 0usize);
+        for i in 0..m {
+            if plur_p[&sig[i]] == pred[i] {
+                hit += 1;
+            }
+            if plur_e[&sig[i]] == routes[i] {
+                rhit += 1;
+            }
+        }
+        // per-expert decision entropy H(pred|expert): ~0 = lookup-exact, >0 = computed residue.
+        let mut e_pred: Vec<HashMap<i64, usize>> = vec![HashMap::new(); c.e + 1];
+        for i in 0..m {
+            *e_pred[routes[i]].entry(pred[i]).or_default() += 1;
+        }
+        let entropy = |mm: &HashMap<i64, usize>| -> f64 {
+            let t: usize = mm.values().sum();
+            if t == 0 {
+                return 0.0;
+            }
+            mm.values().map(|&x| { let p = x as f64 / t as f64; -p * p.log2() }).sum()
+        };
+        let kind = |k: u8| if k == 0 { "head" } else { "neuron" };
+        let pc = |x: usize, d: usize| if d > 0 { 100.0 * x as f32 / d as f32 } else { 0.0 };
+        // ---- header ------------------------------------------------------------------------------------------
+        let _ = writeln!(out, "// fieldrun EXPERTS-DL — a Datalog LOOKUP/SELECTION model from the density-minimization partition.");
+        let _ = writeln!(out, "// The expert partition is RELATIONS; routing selected(sig,e) and decision predict(sig,tok) are LOOKUP");
+        let _ = writeln!(out, "// tables over a context signature (the previous token id), compiled from the corpus — a corpus-derived");
+        let _ = writeln!(out, "// lookup model (generalizes by signature match), NOT the dense forward pass (logic_whole.rs/LO3a, exact");
+        let _ = writeln!(out, "// but non-compact). Run: souffle <this>.dl -D-   (outputs: selected, predict, decode, routed, hit).");
+        let _ = writeln!(out, "//");
+        let _ = writeln!(out, "// N tokens={}  |C| circuits={}  E experts={} (+residual idx {})  distinct signatures={}", c.n, c.distinct, c.e, c.e, sig_e.len());
+        let _ = writeln!(out, "// lookup accuracy predict(sig)==decode: {:.0}%   routing consistency selected(sig)==route: {:.0}%", pc(hit, m), pc(rhit, m));
+        let _ = writeln!(out, "// per-expert decision entropy H(pred|expert) — ~0 bits = lookup-exact (retrievable); >0 = computed residue:");
+        for e in 0..c.e {
+            let (ak, al, ai) = c.ranked[e].0;
+            let _ = writeln!(out, "//   e{e:<2} anchor {} L{al} #{ai}: H={:.2} bits over {} tokens", kind(ak), entropy(&e_pred[e]), c.tok_per_expert[e]);
+        }
+        let _ = writeln!(out, "//   residual(e{}): H={:.2} bits over {} tokens", c.e, entropy(&e_pred[c.e]), c.tok_per_expert[c.e]);
+        let _ = writeln!(out);
+        // ---- partition relations ------------------------------------------------------------------------------
+        let _ = writeln!(out, ".decl expert(e:number, kind:symbol, layer:number, idx:number)");
+        let mut by_expert: Vec<Vec<Circuit>> = vec![Vec::new(); c.e + 1];
+        for (&id, &ex) in &c.expert_of {
+            by_expert[ex].push(id);
+        }
+        for v in by_expert.iter_mut() {
+            v.sort();
+        }
+        for (ex, v) in by_expert.iter().enumerate() {
+            for &(k, l, i) in v {
+                let _ = writeln!(out, "expert({ex},\"{}\",{l},{i}).", kind(k));
+            }
+        }
+        let _ = writeln!(out, ".decl anchor(e:number, kind:symbol, layer:number, idx:number)");
+        for e in 0..c.e {
+            let (k, l, i) = c.ranked[e].0;
+            let _ = writeln!(out, "anchor({e},\"{}\",{l},{i}).", kind(k));
+        }
+        // ---- corpus observations ------------------------------------------------------------------------------
+        let _ = writeln!(out, ".decl obs(pos:number, sig:number, route:number, pred:number)");
+        for i in 0..m {
+            let _ = writeln!(out, "obs({i},{},{},{}).", sig[i], routes[i], pred[i]);
+        }
+        // ---- compiled lookup / selection ----------------------------------------------------------------------
+        let _ = writeln!(out, ".decl selected(sig:number, e:number)    // SELECTION: the routed expert for a signature");
+        for (&s, &e) in &plur_e {
+            let _ = writeln!(out, "selected({s},{e}).");
+        }
+        let _ = writeln!(out, ".decl predict(sig:number, tok:number)   // LOOKUP: the decided token for a signature");
+        for (&s, &p) in &plur_p {
+            let _ = writeln!(out, "predict({s},{p}).");
+        }
+        // ---- rules: apply the lookup + check it reproduces the model's decode ---------------------------------
+        let _ = writeln!(out, ".decl decode(pos:number, tok:number)");
+        let _ = writeln!(out, "decode(P,Tok) :- obs(P,Sig,_,_), predict(Sig,Tok).");
+        let _ = writeln!(out, ".decl routed(pos:number, e:number)");
+        let _ = writeln!(out, "routed(P,E) :- obs(P,Sig,_,_), selected(Sig,E).");
+        let _ = writeln!(out, ".decl hit(pos:number)   // the lookup reproduced the model's decode here");
+        let _ = writeln!(out, "hit(P) :- obs(P,_,_,D), decode(P,T), T=D.");
+        let _ = writeln!(out, ".output selected\n.output predict\n.output decode\n.output routed\n.output hit");
+        out
+    }
 }
 
 /// The computed clustering (internal): every circuit assigned to an expert (0..e) or the residual bucket (index e).
@@ -190,6 +313,7 @@ struct Cluster {
     n: usize,
     distinct: usize,
     total: usize,
+    freq: HashMap<Circuit, usize>,
     ranked: Vec<(Circuit, usize)>,
     expert_of: HashMap<Circuit, usize>,
     size: Vec<usize>,
@@ -278,5 +402,29 @@ mod tests {
     fn empty_render_is_safe() {
         let b = CorpusBuckets::new();
         assert!(b.render(8).contains("no atoms"));
+    }
+
+    #[test]
+    fn emit_datalog_has_relations_rules_and_stats() {
+        let mut b = CorpusBuckets::new();
+        let n0 = (1u8, 23, 2539);
+        for t in 0..6 {
+            b.ingest(vec![n0, (1u8, t, t)]); // a shared hub + a per-token private neuron
+        }
+        let sig: Vec<i64> = (0..6).map(|t| (t % 2) as i64).collect();
+        let pred: Vec<i64> = (0..6).map(|_| 100i64).collect(); // constant decode ⇒ lookup is exact (100%)
+        let dl = b.emit_datalog(2, &sig, &pred);
+        for needle in [
+            ".decl expert(e:number",
+            ".decl selected(sig:number",
+            ".decl predict(sig:number",
+            "decode(P,Tok) :- obs(P,Sig,_,_), predict(Sig,Tok).",
+            "hit(P) :- obs(P,_,_,D), decode(P,T), T=D.",
+            ".output hit",
+        ] {
+            assert!(dl.contains(needle), "emitted Datalog missing: {needle}");
+        }
+        // pred is constant ⇒ predict(sig)==decode everywhere ⇒ the header reports a 100% lookup accuracy.
+        assert!(dl.contains("lookup accuracy predict(sig)==decode: 100%"), "lookup accuracy stat wrong:\n{dl}");
     }
 }
