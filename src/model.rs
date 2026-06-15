@@ -182,6 +182,13 @@ pub trait Model: Sync {
         None
     }
 
+    /// Like `explain`, but also populate the Density-Minimization substrate (`Explanation::decomp`): every scored
+    /// source's margins against the top-`k` competitors, for the `--probe-decompose` descent. Default = plain `explain`
+    /// (no substrate); arches that support the descent override it. See `explain::decompose_descent`.
+    fn explain_decomp(&self, ids: &[i64], _k: usize) -> Option<crate::explain::Explanation> {
+        self.explain(ids)
+    }
+
     /// The final post-norm residual `r(x)` at the predicting position — the exact vector the unembedding dots against
     /// (`logits = U·r`). Exposed for the power-diagram geometry probe (`--probe-facet`): the token cells in r-space are
     /// the Laguerre power diagram of the unembedding rows. Default None; arches implement it where wired.

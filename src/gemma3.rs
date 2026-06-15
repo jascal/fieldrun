@@ -264,6 +264,8 @@ impl Gemma3 {
             &x_last,
             &xf_last,
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |l, n| self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),
             |l, head| head_raw_contrib(&self.b, &format!("l{l}.self_attn.o_proj"), &head_act[l], head, hd),
             |c| self.b.rowdot_f32(un, c),

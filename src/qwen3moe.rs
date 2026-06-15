@@ -303,6 +303,8 @@ impl Qwen3Moe {
             &x_last,
             &xf_last,
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |l, n| match feat_src[l] {
                 Some(e) => self.b.expert_row(&format!("l{l}.experts.{e}.down"), n),
                 None => self.b.weight_row(&format!("l{l}.mlp.down_proj"), n),

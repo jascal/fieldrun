@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 mod api;
+mod bucketing;
 mod bundle;
 #[cfg(feature = "jit")]
 mod jit;
@@ -976,6 +977,328 @@ fn main() {
             return;
         }
 
+        // --probe-decompose (Density-Minimization — the per-token bucketing analysis): for each prediction, descend its
+        // deciding source coalition to a locally-minimal irreducible ATOM (the executable minimal_decider realizing
+        // `decomposes`), the firing COUNT non-increasing along the way (Density.total_firing_mono; the density RATIO is
+        // NOT monotone, so it is never the objective). Reports σ(t) = the atom size (the measured support number), the
+        // |S|→|A| reduction, the positive-DLA mass retained, and the atom's margin slack — bucketed by route. Tests PIC
+        // O2 (σ(t) ∼ PR). Route A multi-competitor cone (irreducible ⟹ ≥2 competitors) → --decomp-k (default 4). Needs an
+        // arch exposing the substrate (rope/Qwen via explain_decomp); --store adds the route split (optional).
+        if has_flag(&args, "--probe-decompose") {
+            use retrieval::CandCfg;
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let cap = (end - ctx_window).min(n_eval); // explain is the expensive faithful forward
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --probe-decompose: no eval positions (need --ids with > ctx_window tokens)");
+                return;
+            }
+            // probe the arch once: does it populate the descent substrate? (rope/Qwen via explain_decomp; others default).
+            if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                eprintln!("[fieldrun] --probe-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
+                return;
+            }
+            // Route-B faithful confirmation: confirm each linear atom against the REAL ablated forward (predict_ablated).
+            // Available iff the arch implements predict_ablated (rope does). Each token then costs 2 extra forwards.
+            let can_confirm = !has_flag(&args, "--no-confirm") && lm.predict_ablated(positions[0], &[], &[]).is_some();
+            eprintln!("[fieldrun] --probe-decompose: {} positions (ctx {ctx_window}), K={kk} competitors, confirm={can_confirm} — faithful explain forwards…", positions.len());
+            struct Rec { route: u8, n: usize, atom: usize, pr: f32, retained: f32, slack: f32, flip_atom: bool, flip_ctrl: bool }
+            let recs: Vec<Rec> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain_decomp(c, kk)?;
+                let sub = ex.decomp.as_ref()?;
+                let r = explain::decompose_descent(sub);
+                let pick = ex.model_predicts;
+                let route = match &store {
+                    Some(s) => { let (kb, _) = s.predict(c); if kb == pick { 0u8 } else if s.candidates(c, &cfg).contains(&pick) { 1 } else { 2 } }
+                    None => 3u8, // no store ⇒ no route split, everything in one "ALL" bucket
+                };
+                // full-spectrum participation ratio (mirrors --probe-dla) for the σ(t) ∼ PR comparison.
+                let mut d: Vec<f32> = ex.all_dla.iter().copied().filter(|&x| x > 0.0).collect();
+                d.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let (sum, sumsq): (f32, f32) = (d.iter().sum(), d.iter().map(|x| x * x).sum());
+                let pr = if sumsq > 0.0 { sum * sum / sumsq } else { 1.0 };
+                // Confirmation (necessity, the clean non-destructive test): ablate ONLY the atom A (|A| ≪ |S| circuits)
+                // in the real forward → does the prediction flip? A flip ⇒ the irreducible core is causally load-bearing
+                // (the §5c ablation methodology applied to the descent's atom). Control: ablate the |A| highest-DLA scored
+                // sources — if the atom flips MORE than naive top-|A|-by-DLA, the cone descent selected a better core.
+                // (Sufficiency — "keep only A" — is NOT testable this way: zeroing the other ~441 scored circuits is so
+                // destructive that nothing survives, linear DLA ≠ causal; necessity is the faithful confirmation.)
+                let (flip_atom, flip_ctrl) = if can_confirm {
+                    let to_pairs = |idxs: &[usize]| {
+                        let (mut h, mut n) = (Vec::new(), Vec::new());
+                        for &i in idxs { let s = &sub.sources[i]; if s.kind == 0 { h.push((s.layer, s.idx)); } else { n.push((s.layer, s.idx)); } }
+                        (h, n)
+                    };
+                    let (ah, an) = to_pairs(&r.atom);
+                    let mut topk: Vec<usize> = (0..sub.sources.len()).collect();
+                    topk.sort_by(|&a, &b| sub.sources[b].dla.total_cmp(&sub.sources[a].dla));
+                    topk.truncate(r.atom.len());
+                    let (ch, cn) = to_pairs(&topk);
+                    (lm.predict_ablated(c, &ah, &an) != Some(pick), lm.predict_ablated(c, &ch, &cn) != Some(pick))
+                } else {
+                    (false, false)
+                };
+                Some(Rec { route, n: r.n_sources, atom: r.atom_size(), pr, retained: r.dla_retained, slack: r.min_slack, flip_atom, flip_ctrl })
+            }).collect();
+            if recs.is_empty() { eprintln!("[fieldrun] --probe-decompose: no positions produced a substrate"); return; }
+            let meanf = |g: &[&Rec], f: &dyn Fn(&Rec) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== Density-Minimization descent: per-token irreducible ATOM (σ(t)), K={kk} competitors, {} positions ===", recs.len());
+            println!("  the atom is the locally-minimal deciding coalition (minimal_decider; a SOUND poly UNDER-approximation");
+            println!("  of the true irreducible core). σ(t)=|atom|; reduction = 1 − |A|/|S|; retained = positive-DLA mass kept.");
+            let confirm_hdr = if can_confirm { format!("{:>11}{:>10}", "necessary", "ctrl flip") } else { String::new() };
+            println!("{:<12}{:>7}{:>11}{:>10}{:>11}{:>11}{:>11}{:>9}{}", "route", "n", "|S| src", "σ(t)=|A|", "reduction", "retained", "PR eff#", "slack", confirm_hdr);
+            let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2)] } else { vec![("ALL", 3)] };
+            for (lbl, rt) in groups {
+                let g: Vec<&Rec> = recs.iter().filter(|x| x.route == rt).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>7}", 0); continue; }
+                let confirm_row = if can_confirm {
+                    format!("{:>10.0}%{:>9.0}%", 100.0 * meanf(&g, &|x| if x.flip_atom { 1.0 } else { 0.0 }), 100.0 * meanf(&g, &|x| if x.flip_ctrl { 1.0 } else { 0.0 }))
+                } else { String::new() };
+                println!("{lbl:<12}{:>7}{:>11.1}{:>10.1}{:>10.0}%{:>10.0}%{:>11.1}{:>9.2}{}", g.len(),
+                    meanf(&g, &|x| x.n as f32), meanf(&g, &|x| x.atom as f32),
+                    100.0 * meanf(&g, &|x| 1.0 - x.atom as f32 / x.n.max(1) as f32),
+                    100.0 * meanf(&g, &|x| x.retained), meanf(&g, &|x| x.pr), meanf(&g, &|x| x.slack), confirm_row);
+            }
+            // (PIC O2) is the support number σ(t) the participation ratio? Pearson corr(|atom|, PR) over all positions.
+            let corr = {
+                let n = recs.len() as f32;
+                let (mx, my) = (recs.iter().map(|r| r.atom as f32).sum::<f32>() / n, recs.iter().map(|r| r.pr).sum::<f32>() / n);
+                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0, 0.0);
+                for r in &recs { let (dx, dy) = (r.atom as f32 - mx, r.pr - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+                if sxx > 0.0 && syy > 0.0 { sxy / (sxx.sqrt() * syy.sqrt()) } else { f32::NAN }
+            };
+            if can_confirm {
+                let overall = |f: &dyn Fn(&Rec) -> bool| 100.0 * recs.iter().filter(|r| f(r)).count() as f32 / recs.len() as f32;
+                println!("\n(confirm, Route B) ablate ONLY the atom A in the REAL forward → prediction flips: necessary = {:.0}%   (top-|A|-DLA control = {:.0}%).", overall(&|r| r.flip_atom), overall(&|r| r.flip_ctrl));
+                println!("  necessary = the irreducible core is causally load-bearing (§5c methodology on the atom); necessary − ctrl = the cone descent's lift over naive top-|A|-by-DLA.");
+            }
+            println!("\n(PIC O2) σ(t) ∼ PR?  corr(|atom|, PR) = {corr:.3}   (σ(t) = the descent's measured support number)");
+            println!("(theory) irreducible ⟹ ≥2 competitors (single_competitor_reducible); the atom never fires more neurons than S (total_firing_mono).");
+            return;
+        }
+
+        // --query-decompose (per-QUERY aggregation, the ladder's middle rung): treat a contiguous run of positions as ONE
+        // query and aggregate the per-token irreducible atoms into the query's circuit working-set W = ⋃_t A_t — entirely
+        // IN-MEMORY from the descent results, with NO `export --logic` → `.dl` → `stitch` disk round-trip. This is the
+        // Hub.thy decomposition of a query: the hub = circuits shared across many tokens (the disentangling core / a
+        // candidate expert), private = per-token; the distinct budget obeys |W| ≥ Σ|A_t| / d (the d-bounded budget,
+        // d = max reuse). Σ|A_t| is the per-token firing-count floor summed over the query. Rope/Qwen only (the substrate).
+        if has_flag(&args, "--query-decompose") {
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let hub_frac: f32 = flag(&args, "--hub-frac").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --query-decompose: no eval positions (need --ids with > ctx_window tokens)");
+                return;
+            }
+            if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                eprintln!("[fieldrun] --query-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
+                return;
+            }
+            eprintln!("[fieldrun] --query-decompose: aggregating {} positions as ONE query (ctx {ctx_window}), K={kk} — in-memory, no .dl export/stitch…", positions.len());
+            // per-position atoms as circuit identities (kind, layer, idx); computed in parallel, then aggregated in-memory.
+            let atoms: Vec<Vec<(u8, usize, usize)>> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain_decomp(c, kk)?;
+                let sub = ex.decomp.as_ref()?;
+                let r = explain::decompose_descent(sub);
+                Some(r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect())
+            }).collect();
+            let q = atoms.len();
+            let total: usize = atoms.iter().map(|a| a.len()).sum(); // Σ|A_t| — total firings (per-token floor, summed)
+            let mut mult: HashMap<(u8, usize, usize), usize> = HashMap::new(); // circuit → # of tokens whose atom uses it
+            for a in &atoms { for &id in a { *mult.entry(id).or_default() += 1; } }
+            let distinct = mult.len(); // |W| — the query's distinct-circuit budget
+            let dmax = mult.values().copied().max().unwrap_or(0); // d — the most-reused circuit's multiplicity
+            let hub_thresh = ((hub_frac * q as f32).ceil() as usize).max(2); // "shared by ≥ hub_frac of the query's tokens"
+            let mut hub: Vec<((u8, usize, usize), usize)> = mult.iter().filter(|(_, &m)| m >= hub_thresh).map(|(&id, &m)| (id, m)).collect();
+            hub.sort_by(|a, b| b.1.cmp(&a.1));
+            let hub_firings: usize = hub.iter().map(|(_, m)| *m).sum();
+            let private = mult.values().filter(|&&m| m == 1).count();
+            let reuse = if total > 0 { 1.0 - distinct as f32 / total as f32 } else { 0.0 };
+            let avg_atom = if q > 0 { total as f32 / q as f32 } else { 0.0 };
+            println!("\n=== Per-query density-minimization working set: {q} tokens aggregated as ONE query (K={kk}) ===");
+            println!("  W = ⋃_t A_t (Hub.thy: hub = shared core, private = per-token) — computed in-memory, no .dl export/stitch.");
+            println!("  tokens (Q)                {q}");
+            println!("  Σ|A_t| total firings      {total}    (avg atom {avg_atom:.2}/token — the per-token floor summed)");
+            println!("  |W| distinct circuits     {distinct}    (the query's circuit budget)");
+            println!("  reuse 1 − |W|/Σ           {:.0}%    (circuit sharing across the query's tokens)", 100.0 * reuse);
+            println!("  hub (≥ {hub_thresh} tokens)         {} circuits   carrying {hub_firings}/{total} firings ({:.0}%)", hub.len(), if total > 0 { 100.0 * hub_firings as f32 / total as f32 } else { 0.0 });
+            println!("  private (1 token)         {private} circuits");
+            println!("  max multiplicity d        {dmax}    (a circuit reused by up to d tokens; distinct |W| ≥ Σ/d = {})", if dmax > 0 { total / dmax } else { 0 });
+            if !hub.is_empty() {
+                println!("  top shared circuits (the query's reusable core — a candidate expert for the corpus phase):");
+                let kind_name = |k: u8| if k == 0 { "head" } else { "neuron" };
+                for ((k, l, i), m) in hub.iter().take(10) {
+                    println!("    {:<6} L{l:<2} #{i:<6}  in {m}/{q} atoms", kind_name(*k));
+                }
+            }
+            return;
+        }
+
+        // --corpus-decompose (per-CORPUS clustering, the ladder's endgame): cluster the per-token irreducible atoms across
+        // the whole corpus into E **experts** — partition the corpus working set C into hub-anchored buckets (anchor = a
+        // corpus-frequent hub circuit; each other circuit joins the anchor-expert it co-fires with most), then ask the MoE
+        // question: does a token's deciding atom fit inside ONE expert (top-1 routable)? and how many circuits does routing
+        // actually compute vs the monolithic working set? In-memory from the descent (no `.dl` export/stitch). Rope/Qwen.
+        if has_flag(&args, "--corpus-decompose") {
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let e_req: usize = flag(&args, "--experts").and_then(|s| s.parse().ok()).unwrap_or(8);
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --corpus-decompose: no eval positions (need --ids with > ctx_window tokens)");
+                return;
+            }
+            if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                eprintln!("[fieldrun] --corpus-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
+                return;
+            }
+            let report_every: usize = flag(&args, "--report-every").and_then(|s| s.parse().ok()).unwrap_or(0);
+            eprintln!("[fieldrun] --corpus-decompose: {} tokens → up to {e_req} experts (K={kk}), chunked stream{} — in-memory, no .dl…",
+                positions.len(), if report_every > 0 { format!(", report every {report_every}") } else { String::new() });
+            // Stream the corpus in chunks so the per-position forward working set stays bounded; atoms accumulate into the
+            // shared CorpusBuckets (tiny, ~72 bytes/token). --report-every N prints the running clustering at runtime.
+            let want_dl = flag(&args, "--experts-dl").is_some(); // also collect the per-token signature + decode for the DL emit
+            let want_interpret = has_flag(&args, "--interpret"); // collect decodes to show what routes to each expert
+            let want_meta = want_dl || want_interpret;
+            let dl_order: usize = flag(&args, "--dl-sig").and_then(|s| s.parse().ok()).unwrap_or(1).max(1); // sig = last N ctx tokens
+            let lmr = lm.as_ref();
+            let mut buckets = bucketing::CorpusBuckets::new();
+            let (mut sigs, mut preds): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+            let mut next_report = report_every;
+            for chunk in positions.chunks(512) {
+                // sig = the last dl_order context tokens (base-encoded; the lookup key); pred = the model's decode.
+                let got: Vec<(Vec<bucketing::Circuit>, i64, i64)> = chunk.par_iter().filter_map(|c| {
+                    let (a, p) = bucketing::atom_and_pred_at(lmr, c, kk)?;
+                    let sg = if dl_order <= 1 { *c.last().unwrap_or(&-1) } else { c.iter().rev().take(dl_order).fold(0i64, |s, &t| s.wrapping_mul(1 << 20).wrapping_add(t + 1)) };
+                    Some((a, sg, p))
+                }).collect();
+                for (a, s, p) in got {
+                    if want_dl { sigs.push(s); }
+                    if want_meta { preds.push(p); }
+                    buckets.ingest(a);
+                }
+                if report_every > 0 && buckets.n_tokens() >= next_report {
+                    println!("\n=== [progress] {} tokens — up to {e_req}-expert clustering so far (K={kk}) ===", buckets.n_tokens());
+                    print!("{}", buckets.render(e_req));
+                    next_report = buckets.n_tokens() + report_every;
+                }
+            }
+            println!("\n=== Per-corpus expert clustering (final): up to {e_req} hub-anchored experts over {} tokens (K={kk}) ===", buckets.n_tokens());
+            println!("  the corpus working set C is partitioned into E experts (anchor = a corpus-hub circuit; each other");
+            println!("  circuit joins the anchor it co-fires with most). A token routes to the expert(s) its atom touches.");
+            print!("{}", buckets.render(e_req));
+            println!("  (proxy caveat: assumes an oracle router; a real saving needs a learned router + experts mapped to weight chunks.)");
+            if has_flag(&args, "--residency") {
+                // runtime residency: which experts are hot enough to stay resident vs the paged long tail (load distribution).
+                let cov: f32 = flag(&args, "--resident-cov").and_then(|s| s.parse().ok()).unwrap_or(0.9);
+                println!("\n=== Runtime residency profile (experts by token-load; hot set resident, tail paged on demand) ===");
+                print!("{}", buckets.residency(e_req, cov));
+            }
+            // --experts-out <path>: emit the CONCRETE partition (each expert's anchor + full circuit list + token routing)
+            // as JSON — the build artifact a router / weight-chunk pager consumes, not just the summary above.
+            if let Some(path) = flag(&args, "--experts-out") {
+                match serde_json::to_string_pretty(&buckets.partition(e_req)) {
+                    Ok(j) => match std::fs::write(path, j) {
+                        Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote expert partition ({e_req} experts) → {path}"),
+                        Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                    },
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: serialize failed: {err}"),
+                }
+            }
+            // --experts-dl <path>: emit the partition as a Soufflé Datalog LOOKUP/SELECTION model (routing + decision as
+            // lookup over a context signature, + per-expert pick-entropy marking lookup-exact vs computed experts).
+            if let Some(path) = flag(&args, "--experts-dl") {
+                let tf: f32 = flag(&args, "--dl-test-frac").and_then(|s| s.parse().ok()).unwrap_or(0.2); // held-out tail for generalization
+                match std::fs::write(path, buckets.emit_datalog(e_req, &sigs, &preds, tf)) {
+                    Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote Datalog lookup/selection model → {path}  (run: souffle {path} -D-)"),
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                }
+            }
+            // --interpret: what KIND of tokens route to each expert (its specialty) — decode the tokens routed there.
+            if want_interpret {
+                #[cfg(feature = "api")]
+                let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                    Some(tg) => Box::new(move |id| tg.token_label(id)),
+                    None => load_decoder(flag(&args, "--vocab")),
+                };
+                #[cfg(not(feature = "api"))]
+                let dec = load_decoder(flag(&args, "--vocab"));
+                let (e_act, routes) = buckets.routes(e_req);
+                let mut by_e: Vec<HashMap<i64, usize>> = vec![HashMap::new(); e_act + 1];
+                for (i, &r) in routes.iter().enumerate() {
+                    if let Some(&p) = preds.get(i) { *by_e[r].entry(p).or_default() += 1; }
+                }
+                println!("\n=== Per-expert interpretability: the decoded tokens routed to each expert (its 'specialty') ===");
+                for (e, m) in by_e.iter().enumerate() {
+                    if m.is_empty() { continue; }
+                    let mut top: Vec<(i64, usize)> = m.iter().map(|(&t, &c)| (t, c)).collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    let total: usize = m.values().sum();
+                    let label = if e == e_act { "residual".to_string() } else { format!("e{e}") };
+                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                    println!("  {label:<9} {total:>4} tok →  {}", toks.join("  "));
+                }
+            }
+            // --experts-dl-contrib: emit the COMPOSITION decode (per-expert Σ contrib + catchall rest), runnable in
+            // `fieldrun eval`. Faithful by construction; the catchall margin-share is the compactness / forge-tax meter.
+            if let Some(path) = flag(&args, "--experts-dl-contrib") {
+                let steps: usize = flag(&args, "--dl-contrib-steps").and_then(|s| s.parse().ok()).unwrap_or(12);
+                let (e_act, emap) = buckets.expert_map(e_req);
+                #[cfg(feature = "api")]
+                let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                    Some(tg) => Box::new(move |id| tg.token_label(id)),
+                    None => load_decoder(flag(&args, "--vocab")),
+                };
+                #[cfg(not(feature = "api"))]
+                let dec = load_decoder(flag(&args, "--vocab"));
+                let take = positions.len().min(steps);
+                let prog = emit_contrib_dl(lm.as_ref(), &positions[..take], kk, e_act, &emap, dec.as_ref());
+                match std::fs::write(path, prog) {
+                    Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote contrib-over-expert model ({take} steps) → {path}  (run: fieldrun eval {path} --semiring max)"),
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                }
+            }
+            // --recurse-depth D: recursively sub-bucket the residual into finer DOMAIN experts (the path toward the long
+            // tail). The flat clustering dumps everything not co-firing with a top-E hub into one residual; recursion
+            // re-clusters that residual, and its residual, D levels deep — resolving the collapsed tail.
+            if let Some(d) = flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1) {
+                let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+                let (leaves, route) = buckets.recursive(e_req, d, min_c);
+                let n: usize = leaves.iter().map(|l| l.tokens).sum();
+                println!("\n=== Recursive sub-bucketing (depth {d}, {} leaf experts) — the residual resolved into domain experts ===", leaves.len());
+                println!("  {:<14}{:>9}{:>9}{:>8}", "leaf", "circuits", "tokens", "share");
+                for l in leaves.iter().filter(|l| l.tokens > 0) {
+                    println!("  {:<14}{:>9}{:>9}{:>7.0}%", l.label, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
+                }
+                if want_interpret {
+                    #[cfg(feature = "api")]
+                    let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                        Some(tg) => Box::new(move |id| tg.token_label(id)),
+                        None => load_decoder(flag(&args, "--vocab")),
+                    };
+                    #[cfg(not(feature = "api"))]
+                    let dec = load_decoder(flag(&args, "--vocab"));
+                    let mut by_l: Vec<HashMap<i64, usize>> = vec![HashMap::new(); leaves.len()];
+                    for (i, &r) in route.iter().enumerate() {
+                        if let Some(&p) = preds.get(i) { *by_l[r].entry(p).or_default() += 1; }
+                    }
+                    println!("\n  per-leaf specialty (top decoded tokens):");
+                    for (li, l) in leaves.iter().enumerate() {
+                        if by_l[li].is_empty() { continue; }
+                        let mut top: Vec<(i64, usize)> = by_l[li].iter().map(|(&t, &c)| (t, c)).collect();
+                        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                        let toks: Vec<String> = top.iter().take(8).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                        println!("    {:<14} {}", l.label, toks.join("  "));
+                    }
+                }
+            }
+            return;
+        }
+
         // --probe-facet (tighten Q1): the token cells in r-space ARE the Laguerre power diagram of {U_v} (weights
         // ‖U_v‖²+2b_v). Compute the EXACT nearest facet argmin_{v≠t}(L_t−L_v)/‖U_t−U_v‖ (not the logit-runner-up proxy)
         // and (a) how often the nearest facet == the logit runner-up, (b) the killer check: for COMPOSED, is the token
@@ -1667,7 +1990,11 @@ fn main() {
                     // without it, routing is induction-only. The candidate set bounds the SELECTED-vs-COMPOSED line.
                     let kb = flag(&args, "--store").and_then(|p| Store::load(p).ok());
                     let cand = retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
-                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch);
+                    let bucket = has_flag(&args, "--bucket").then(|| bucketing::BucketOpts {
+                        k: flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4),
+                        experts: flag(&args, "--experts").and_then(|s| s.parse().ok()).unwrap_or(8),
+                    });
+                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch, bucket);
                 }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),
@@ -1985,6 +2312,87 @@ fn dump_if(args: &[String], preds: &[i64]) {
 
 /// Build an id→string decoder. With a GPT-2 `vocab.json` (token→id), invert it and show the raw BPE token (Ġ→space,
 /// Ċ→newline for readability); without one, fall back to `[id]`.
+/// Emit a step-indexed CONTRIB-OVER-EXPERT Datalog program: each decision's scored circuits' DLA contributions to the
+/// candidate tokens, grouped by their corpus-expert, plus a catchall "rest" so Σ contrib == logit (faithful by
+/// construction). Runs in `fieldrun eval --semiring max` → decode == the model's token at every step (the COMPOSITION,
+/// not a lookup). The header reports the per-expert share of the winning margin + the catchall fraction (the
+/// compactness / forge-tax meter). Recovers c_j^t = dla and c_j^v = dla − margins[v] from the descent substrate.
+fn emit_contrib_dl(lm: &dyn model::Model, positions: &[&[i64]], k: usize, e_act: usize, expert_of: &HashMap<(u8, usize, usize), usize>, dec: &dyn Fn(i64) -> String) -> String {
+    use std::fmt::Write as _;
+    let blk = |e: usize| if e == e_act { "residual".to_string() } else { format!("e{e}") };
+    let (mut steps, mut faithful) = (0usize, 0usize);
+    let mut margin_by_block = vec![0f64; e_act + 1]; // Σ over steps of (contrib(block,t) − contrib(block,v*))
+    let (mut margin_rest, mut margin_total) = (0f64, 0f64);
+    let mut body = String::new();
+    for c in positions {
+        let sub = match lm.explain_decomp(c, k).and_then(|e| e.decomp) {
+            Some(s) if !s.competitors.is_empty() => s,
+            _ => continue,
+        };
+        let t = sub.predicted;
+        let comp_idx: HashMap<i64, usize> = sub.competitors.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        let cands: Vec<i64> = std::iter::once(t).chain(sub.competitors.iter().copied()).collect();
+        let nb = e_act + 1;
+        // contrib[block][cand]: c_j^t = dla, c_j^v = dla − margins[v]; each scored circuit added to its expert's block.
+        let mut contrib = vec![vec![0f64; cands.len()]; nb];
+        for s in &sub.sources {
+            let e = *expert_of.get(&(s.kind, s.layer, s.idx)).unwrap_or(&e_act);
+            for (ci, &u) in cands.iter().enumerate() {
+                contrib[e][ci] += if u == t { s.dla as f64 } else { (s.dla - s.margins[comp_idx[&u]]) as f64 };
+            }
+        }
+        // catchall rest[cand] = logit(u) − Σ_scored, with logit(t)=0, logit(v)=−full_margin[v] ⇒ Σ_block + rest == logit.
+        let rest: Vec<f64> = cands.iter().enumerate().map(|(ci, &u)| {
+            let logit_u = if u == t { 0.0 } else { -(sub.full_margin[comp_idx[&u]] as f64) };
+            logit_u - (0..nb).map(|b| contrib[b][ci]).sum::<f64>()
+        }).collect();
+        // faithful decode check: argmax_cand (Σ_block contrib + rest) must be t.
+        let total: Vec<f64> = (0..cands.len()).map(|ci| (0..nb).map(|b| contrib[b][ci]).sum::<f64>() + rest[ci]).collect();
+        let argmax = (0..cands.len()).max_by(|&a, &b| total[a].partial_cmp(&total[b]).unwrap()).unwrap();
+        if cands[argmax] == t { faithful += 1; }
+        // margin attribution vs the runner-up v* (smallest full_margin = closest competitor).
+        let vstar = (0..sub.competitors.len()).min_by(|&a, &b| sub.full_margin[a].partial_cmp(&sub.full_margin[b]).unwrap()).unwrap();
+        let vci = 1 + vstar;
+        for b in 0..nb {
+            margin_by_block[b] += contrib[b][0] - contrib[b][vci];
+        }
+        margin_rest += rest[0] - rest[vci];
+        margin_total += total[0] - total[vci];
+        let _ = writeln!(body, "// step {steps}: decode {:?} (margin {:+.3} vs {:?})", dec(t), sub.full_margin[vstar], dec(sub.competitors[vstar]));
+        for &u in &cands {
+            let _ = writeln!(body, "candidate({steps},{u}).   // {:?}", dec(u));
+        }
+        for b in 0..nb {
+            for (ci, &u) in cands.iter().enumerate() {
+                if contrib[b][ci].abs() > 1e-6 {
+                    let _ = writeln!(body, "contrib({steps},\"{}\",{u},{:.4}).", blk(b), contrib[b][ci]);
+                }
+            }
+        }
+        for (ci, &u) in cands.iter().enumerate() {
+            let _ = writeln!(body, "contrib({steps},\"rest\",{u},{:.4}).", rest[ci]);
+        }
+        steps += 1;
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "// fieldrun EXPERTS-DL-CONTRIB — composition decode over the partition (NOT a lookup).");
+    let _ = writeln!(out, "// Each step: per-expert Σ contrib to the candidate tokens + a catchall \"rest\" so Σ == logit;");
+    let _ = writeln!(out, "// decode(step) = argmax_token Σ contrib = the model's own token (faithful). Run:");
+    let _ = writeln!(out, "//   fieldrun eval <this>.dl --semiring max   (argmax decode)   |   --semiring log   (softmax dist)");
+    let _ = writeln!(out, "//");
+    let _ = writeln!(out, "// {steps} steps · faithful decode {faithful}/{steps} ({:.0}%)", if steps > 0 { 100.0 * faithful as f32 / steps as f32 } else { 0.0 });
+    if margin_total.abs() > 1e-9 {
+        let _ = writeln!(out, "// per-expert share of the winning margin (t vs runner-up), summed over steps — the compactness meter:");
+        for b in 0..=e_act {
+            let _ = writeln!(out, "//   {:<9} {:+8.2}  ({:>3.0}% of margin)", blk(b), margin_by_block[b], 100.0 * margin_by_block[b] / margin_total);
+        }
+        let _ = writeln!(out, "//   {:<9} {:+8.2}  ({:>3.0}% of margin)  ← catchall: forge-tax / non-compact remainder", "rest", margin_rest, 100.0 * margin_rest / margin_total);
+    }
+    let _ = writeln!(out, "\n.decl candidate(step:number, t:number)\n.decl contrib(step:number, block:symbol, t:number, w:float)");
+    out.push_str(&body);
+    out
+}
+
 fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
     if let Some(path) = vocab {
         if let Ok(txt) = std::fs::read_to_string(path) {

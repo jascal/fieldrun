@@ -30,7 +30,9 @@ pub struct HeadCircuit {
     pub pred_rank: u32,     // where the predicted token sits among this head's writes (1 = its top token) — makes the Δ
     #[serde(skip)]          // legible when the predicted token isn't in the shown top-5 (a cluster / indirect push)
     pub dla_v: f32,         // this head's contribution to the RUNNER-UP's logit (only set for shown circuits); the
-}                           // per-circuit flip pivotality is D = dla - dla_v (ablate it ⇒ margin shifts by -D). Probe aid.
+    #[serde(skip)]          // per-circuit flip pivotality is D = dla - dla_v (ablate it ⇒ margin shifts by -D). Probe aid.
+    pub margins: Vec<f32>,  // per-competitor margins m_j^v = c_j^t − c_j^v over the top-K competitors (the cone-test
+}                           // inputs for the Density-Minimization descent); populated only when decomp_k>0.
 
 #[derive(Serialize)]
 pub struct MlpFeature {
@@ -42,6 +44,8 @@ pub struct MlpFeature {
     pub pred_rank: u32,     // where the predicted token sits among this neuron's promoted tokens (1 = top); a large rank
     #[serde(skip)]          // with a positive Δ flags an indirect / suppressor contribution rather than a direct writer
     pub dla_v: f32,         // this neuron's contribution to the RUNNER-UP's logit (shown circuits only); D = dla - dla_v.
+    #[serde(skip)]          // per-competitor margins m_j^v over the top-K competitors (the Density-Minimization
+    pub margins: Vec<f32>,  // descent's cone-test inputs); populated only when decomp_k>0.
 }
 
 #[derive(Serialize)]
@@ -58,6 +62,104 @@ pub struct Explanation {
     /// top-6+6) — for concentration/participation-ratio analysis (`--probe-dla`). Not serialized (a probe aid).
     #[serde(skip)]
     pub all_dla: Vec<f32>,
+    /// The Density-Minimization substrate: every scored source's margins against the top-K competitors, for the
+    /// `--probe-decompose` descent. `None` unless requested (decomp_k>0) and the arch populates it. Not serialized.
+    #[serde(skip)]
+    pub decomp: Option<DecompSubstrate>,
+}
+
+/// One scored source (an attention head or an MLP neuron) carried into the Density-Minimization descent: its identity,
+/// its DLA to the predicted token, its scalar activation (the firing-gate input), and its margin `m_j^v = c_j^t − c_j^v`
+/// against each of the substrate's competitors. `decides(P) ⟺ ∀v: Σ_{j∈P} margins[j][v] + const_v > 0`.
+#[derive(Clone, Debug)]
+pub struct SourceMargin {
+    pub kind: u8, // 0 = attention head, 1 = MLP neuron
+    pub layer: usize,
+    pub idx: usize, // head index or neuron index within its layer
+    pub dla: f32,   // c_j^t — push on the predicted token (ordering / retained-mass readout)
+    pub act: f32,   // scalar activation magnitude (neuron act, or head attention mass) — the firing gate input
+    pub margins: Vec<f32>, // m_j^v over `DecompSubstrate::competitors`, same order
+}
+
+/// The per-token margin/cone substrate the descent runs over (the measured face of `Density_Minimization.thy`). The
+/// deciding coalition starts as `sources` (the full scored set) and is the cone `⋂_v {Σ_{j∈P} m_j^v + const_v > 0}`.
+/// `const_v` folds in everything NOT in the scored candidate set (embeddings, biases, the un-shortlisted tail), so the
+/// decision test is exact w.r.t. the linear DLA decomposition: `Σ_{all j} m_j^v + const_v == full_margin_v > 0`.
+#[derive(Clone, Debug)]
+pub struct DecompSubstrate {
+    pub predicted: i64,           // the token the model predicts (the decided outcome t)
+    pub competitors: Vec<i64>,    // the top-K competitor token ids (predicted token excluded)
+    pub const_v: Vec<f32>,        // per-competitor non-candidate residual: full_margin_v − Σ_j m_j^v
+    pub full_margin: Vec<f32>,    // predicted_logit − logit[v] per competitor (the full deciding margin)
+    pub sources: Vec<SourceMargin>,
+}
+
+/// The result of descending a token's deciding coalition to a locally-minimal irreducible atom (the executable
+/// `minimal_decider` realizing `decomposes`). `atom` indexes into `DecompSubstrate::sources`. A SOUND poly
+/// UNDER-approximation of the true irreducible core: no single survivor is removable, but a multi-source removal might
+/// still decide (`all_necessary_not_irreducible`, the c4 caveat).
+#[derive(Clone, Debug)]
+pub struct DescentResult {
+    pub n_sources: usize,         // |S| — the full scored coalition
+    pub atom: Vec<usize>,         // indices (into sources) that survive the descent — the irreducible atom A
+    pub dla_retained: f32,        // Σ_{j∈A} max(dla,0) / Σ_{j∈S} max(dla,0) — positive-DLA mass kept
+    pub binding: Vec<(i64, f32)>, // per competitor at the atom: (id, slack = Σ_{j∈A} m_j^v + const_v)
+    pub min_slack: f32,           // the tightest competitor margin at the atom (how close A is to flipping)
+}
+
+impl DescentResult {
+    pub fn atom_size(&self) -> usize {
+        self.atom.len()
+    }
+}
+
+/// Greedy density-minimization descent: drop removable sources (weakest DLA first, to retain the high-pivotal core)
+/// while the coalition still decides every competitor, bottoming out at a locally-minimal irreducible atom. The firing
+/// COUNT is non-increasing along the way (`Density.total_firing_mono`) — the monotone objective; the density *ratio* is
+/// not, so we never optimise the fraction. Removals only shrink the per-competitor margin sums, so once a source is
+/// un-removable it stays un-removable: a single weakest-first pass reaches local minimality (the outer loop is a cheap
+/// guard). Pure over the substrate — no model reads — so it is unit-testable in isolation.
+pub fn decompose_descent(sub: &DecompSubstrate) -> DescentResult {
+    let n = sub.sources.len();
+    let k = sub.competitors.len();
+    // running per-competitor margin sums S_v over the live coalition (init: the full set).
+    let mut s_v = sub.const_v.clone();
+    for src in &sub.sources {
+        for (v, &m) in src.margins.iter().enumerate() {
+            s_v[v] += m;
+        }
+    }
+    let mut live = vec![true; n];
+    // weakest-DLA-first removal order (drop the least-contributing sources first → the atom keeps the core).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| sub.sources[a].dla.total_cmp(&sub.sources[b].dla));
+    loop {
+        let mut removed = false;
+        for &j in &order {
+            if !live[j] {
+                continue;
+            }
+            // removing j keeps the cone non-empty iff every competitor margin stays strictly positive.
+            let still_decides = (0..k).all(|v| s_v[v] - sub.sources[j].margins[v] > 0.0);
+            if still_decides {
+                for v in 0..k {
+                    s_v[v] -= sub.sources[j].margins[v];
+                }
+                live[j] = false;
+                removed = true;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    let atom: Vec<usize> = (0..n).filter(|&j| live[j]).collect();
+    let pos_all: f32 = sub.sources.iter().map(|s| s.dla.max(0.0)).sum();
+    let pos_atom: f32 = atom.iter().map(|&j| sub.sources[j].dla.max(0.0)).sum();
+    let dla_retained = if pos_all > 0.0 { pos_atom / pos_all } else { 1.0 };
+    let binding: Vec<(i64, f32)> = (0..k).map(|v| (sub.competitors[v], s_v[v])).collect();
+    let min_slack = binding.iter().map(|&(_, s)| s).fold(f32::INFINITY, f32::min);
+    DescentResult { n_sources: n, atom, dla_retained, binding, min_slack }
 }
 
 /// How much of the explain trace to render — modelled on a database `EXPLAIN`'s option levels, because the deeper
@@ -223,6 +325,11 @@ pub fn assemble<NW, HR, PV>(
     x_last: &[f32],
     xf_last: &[f32],
     u_pred: &[f32],
+    // Density-Minimization substrate (--probe-decompose): when `decomp_k > 0`, also compute every scored source's margins
+    // against the top-`decomp_k` competitors. `unembed_row(v)` returns competitor v's unembed row (same space as u_pred).
+    // decomp_k == 0 (every path but --probe-decompose) skips this entirely — the explain output is then byte-identical.
+    decomp_k: usize,
+    unembed_row: &dyn Fn(i64) -> Vec<f32>,
     neuron_write: NW,
     head_raw: HR,
     project_vocab: PV,
@@ -243,6 +350,18 @@ where
     // The frozen final-norm scale puts each component's Δ in true logit units: ranking by `dla` is unaffected (a shared
     // positive factor), but the printed Δ now reconciles with `logit`/`margin` and is roughly additive across components.
     let final_scale = final_norm_scale(x_last, xf_last, gain, center, final_bias);
+
+    // ---- decomposition substrate: top-K competitors + their unembed rows (the cone the descent intersects) -------
+    // The predicted token is always logits' argmax, so it heads top_promoted; we ask for K+1 and drop it to get K
+    // competitors. `src_margins(c, dla)` is m_j^v = c_j^t − c_j^v for the source whose post-norm contribution is `c`.
+    let comp_ids: Vec<i64> = if decomp_k > 0 {
+        top_promoted(logits, 1.0, decomp_k + 1).into_iter().filter(|&v| v != model_predicts).take(decomp_k).collect()
+    } else {
+        Vec::new()
+    };
+    let u_comp: Vec<Vec<f32>> = comp_ids.iter().map(|&v| unembed_row(v)).collect();
+    let src_margins = |c: &[f32], dla: f32| -> Vec<f32> { u_comp.iter().map(|uv| dla - dot(c, uv) * final_scale).collect() };
+    let mut decomp_sources: Vec<SourceMargin> = Vec::new();
 
     // ---- attention heads ----------------------------------------------------------------------------------------
     // Pass 1 (no weight reads): classify every head once (kept for the sink/NO-OP count and the displayed label/read
@@ -280,12 +399,17 @@ where
         .map(|&(l, h, role, j, mass, _)| {
             let c = apply_final_norm(head_raw(l, h), gain, center);
             let dla = dot(&c, u_pred) * final_scale;
-            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0 }
+            let margins = if decomp_k > 0 { src_margins(&c, dla) } else { Vec::new() };
+            HeadCircuit { layer: l, head: h, role: role.into(), attends_to: j, attends_tok: ids[j], mass, dla, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0, margins }
         })
         .collect();
     head_circuits.sort_by(|a, b| b.dla.total_cmp(&a.dla));
     // capture every candidate head's DLA before truncating to the shown few (full-spectrum concentration analysis).
     let mut all_dla: Vec<f32> = head_circuits.iter().map(|h| h.dla).collect();
+    if decomp_k > 0 {
+        // harvest the FULL head candidate set (with margins) into the descent substrate before the shown few are kept.
+        decomp_sources.extend(head_circuits.iter().map(|h| SourceMargin { kind: 0, layer: h.layer, idx: h.head, dla: h.dla, act: h.mass, margins: h.margins.clone() }));
+    }
     head_circuits.truncate(HEAD_SHOW);
     // Recompute the post-norm contribution for the few shown heads to fill in their "promotes" (a full-vocab projection,
     // so it's done for HEAD_SHOW heads, not all candidates). The head_raw re-read is intentional: caching every
@@ -323,12 +447,34 @@ where
             let mut w = neuron_write(l, n);
             w.iter_mut().for_each(|v| *v *= act);
             let c = apply_final_norm(w, gain, center);
-            MlpFeature { layer: l, neuron: n, act, dla: dot(&c, u_pred) * final_scale, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0 }
+            let dla = dot(&c, u_pred) * final_scale;
+            let margins = if decomp_k > 0 { src_margins(&c, dla) } else { Vec::new() };
+            MlpFeature { layer: l, neuron: n, act, dla, promotes: Vec::new(), pred_rank: 0, dla_v: 0.0, margins }
         })
         .collect();
     mlp_features.sort_by(|a, b| b.dla.total_cmp(&a.dla));
     all_dla.extend(mlp_features.iter().map(|f| f.dla)); // + every candidate neuron's DLA
+    if decomp_k > 0 {
+        decomp_sources.extend(mlp_features.iter().map(|f| SourceMargin { kind: 1, layer: f.layer, idx: f.neuron, dla: f.dla, act: f.act, margins: f.margins.clone() }));
+    }
     mlp_features.truncate(MLP_SHOW);
+
+    // ---- assemble the descent substrate -------------------------------------------------------------------------
+    // const_v folds in everything NOT in the scored candidate set (embeddings, biases, the un-shortlisted tail) so the
+    // cone test is exact w.r.t. the linear DLA decomposition: Σ_{all scored j} m_j^v + const_v == full_margin_v > 0.
+    let decomp = if decomp_k > 0 && !comp_ids.is_empty() {
+        let full_margin: Vec<f32> = comp_ids.iter().map(|&v| predicted_logit - logits.get(v as usize).copied().unwrap_or(0.0)).collect();
+        let mut sum_m = vec![0f32; comp_ids.len()];
+        for s in &decomp_sources {
+            for (v, &m) in s.margins.iter().enumerate() {
+                sum_m[v] += m;
+            }
+        }
+        let const_v: Vec<f32> = full_margin.iter().zip(&sum_m).map(|(&fm, &sm)| fm - sm).collect();
+        Some(DecompSubstrate { predicted: model_predicts, competitors: comp_ids, const_v, full_margin, sources: decomp_sources })
+    } else {
+        None
+    };
     for f in mlp_features.iter_mut() {
         let mut w = neuron_write(f.layer, f.neuron);
         w.iter_mut().for_each(|v| *v *= f.act);
@@ -350,6 +496,7 @@ where
         sink_heads,
         mlp_features,
         all_dla,
+        decomp,
     }
 }
 
@@ -488,6 +635,8 @@ mod tests {
             &[1.0, 1.0],
             &[1.0, 1.0],
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |_l, n| writes[n].to_vec(),
             |_l, _h| vec![0.0, 0.0],
             |c| proj(c, &unembed),
@@ -501,6 +650,119 @@ mod tests {
         assert_eq!(ex.model_predicts, 1);
         assert_eq!(ex.predicted_logit, 9.0);
         assert_eq!(ex.predicted_logit - ex.runner_up_logit, 9.0);
+    }
+
+    #[test]
+    fn assemble_builds_decomp_substrate() {
+        // vocab 3, d=2; predicted = tok1. decomp_k=1 ⇒ one competitor (the top non-predicted by logit).
+        let unembed = [[1.0f32, 0.0], [0.0, 1.0], [-1.0, -1.0]];
+        let ids = [0i64, 1, 2];
+        let gain = [1.0f32, 1.0];
+        let u_pred = unembed[1];
+        let att_last = vec![vec![vec![0.0f32, 0.0, 1.0]]];
+        let head_act = vec![vec![0.0f32, 0.0]];
+        let mlp_h = vec![vec![50.0f32, 1.0]];
+        let writes = [[1.0f32, 0.0], [0.0, 1.0]];
+        let logits = [3.0f32, 9.0, 1.0]; // predicted tok1=9; competitors by logit: tok0=3 > tok2=1
+        let ex = assemble(
+            &ids, &att_last, &head_act, &mlp_h, &logits, 1, &gain, false, &[], &[1.0, 1.0], &[1.0, 1.0], &u_pred,
+            1,                                    // decomp_k = 1
+            &|v| unembed[v as usize].to_vec(),    // unembed_row for the competitor
+            |_l, n| writes[n].to_vec(),
+            |_l, _h| vec![0.0, 0.0],
+            |c| proj(c, &unembed),
+        );
+        let sub = ex.decomp.expect("substrate populated when decomp_k>0");
+        assert_eq!(sub.predicted, 1);
+        assert_eq!(sub.competitors, vec![0]); // top-1 non-predicted by logit = tok0
+        assert!((sub.full_margin[0] - 6.0).abs() < 1e-5, "full_margin = 9 − 3 = 6");
+        // the identity the descent relies on: Σ_sources m_j^v + const_v == full_margin_v.
+        let summ: f32 = sub.sources.iter().map(|s| s.margins[0]).sum();
+        assert!((summ + sub.const_v[0] - sub.full_margin[0]).abs() < 1e-4, "Σ margins + const_v must equal full_margin");
+        // the (0,1)-writing neuron contributes 0 to competitor tok0 ⇒ its margin equals its dla (1.0).
+        assert!(sub.sources.iter().any(|s| s.kind == 1 && (s.margins[0] - 1.0).abs() < 1e-4));
+    }
+
+    // Build a SourceMargin with one competitor's margin given (the descent only reads dla + margins).
+    fn src(kind: u8, dla: f32, margins: &[f32]) -> SourceMargin {
+        SourceMargin { kind, layer: 0, idx: 0, dla, act: dla.abs(), margins: margins.to_vec() }
+    }
+
+    #[test]
+    fn descent_drops_a_removable_source() {
+        // 2 competitors, 3 sources. const_v = 0. Full sums: v0 = 2+0+(-0.5) = 1.5 > 0; v1 = 0+2+(-0.5) = 1.5 > 0.
+        // Source 2 (margins -0.5,-0.5) hurts both competitors, so it is removable (removing it RAISES both sums).
+        // Sources 0 and 1 each solely carry one competitor (remove either ⇒ that competitor's sum ≤ 0) ⇒ necessary.
+        let sub = DecompSubstrate {
+            predicted: 9,
+            competitors: vec![1, 2],
+            const_v: vec![0.0, 0.0],
+            full_margin: vec![1.5, 1.5],
+            sources: vec![src(0, 2.0, &[2.0, 0.0]), src(1, 2.0, &[0.0, 2.0]), src(1, -1.0, &[-0.5, -0.5])],
+        };
+        let r = decompose_descent(&sub);
+        assert_eq!(r.atom_size(), 2, "the two single-competitor carriers survive; the negative source is dropped");
+        assert!(!r.atom.contains(&2), "the margin-negative source must be removed");
+        assert!(r.min_slack > 0.0, "the atom still decides every competitor");
+        assert!(r.dla_retained > 0.99, "the dropped source had no positive DLA → all positive mass retained");
+    }
+
+    #[test]
+    fn descent_keeps_an_irreducible_coalition() {
+        // 1 competitor, but const_v < 0 so EACH source is needed: const=-3, two sources +2 each ⇒ sum = 1 > 0; drop
+        // either ⇒ -1 ≤ 0. Nothing removable ⇒ the atom is the whole set (the "needs ≥2 competitors/sources" floor).
+        let sub = DecompSubstrate {
+            predicted: 9,
+            competitors: vec![1],
+            const_v: vec![-3.0],
+            full_margin: vec![1.0],
+            sources: vec![src(0, 2.0, &[2.0]), src(1, 2.0, &[2.0])],
+        };
+        let r = decompose_descent(&sub);
+        assert_eq!(r.atom_size(), 2, "no single source is removable ⇒ the full coalition is the atom");
+        assert!((r.min_slack - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn descent_collapses_to_minimal_when_redundant() {
+        // 1 competitor, const_v = 0, three identical +1 sources, full sum = 3. Any two are removable down to a single
+        // source (sum 1 > 0); the weakest-first single pass lands on exactly one survivor.
+        let sub = DecompSubstrate {
+            predicted: 9,
+            competitors: vec![1],
+            const_v: vec![0.0],
+            full_margin: vec![3.0],
+            sources: vec![src(1, 1.0, &[1.0]), src(1, 1.0, &[1.0]), src(1, 1.0, &[1.0])],
+        };
+        let r = decompose_descent(&sub);
+        assert_eq!(r.atom_size(), 1, "redundant coalition collapses to a single deciding source");
+        assert!(r.min_slack > 0.0);
+    }
+
+    #[test]
+    fn descent_invariants_atom_subset_and_still_decides() {
+        // a deciding full set; the atom must be a SUBSET that still decides (min_slack > 0) and retains ≤ all DLA mass.
+        let sub = DecompSubstrate {
+            predicted: 9,
+            competitors: vec![1, 2],
+            const_v: vec![0.0, 0.0],
+            full_margin: vec![3.0, 2.0],
+            sources: vec![src(1, 2.0, &[2.0, 1.0]), src(1, 1.0, &[1.0, 1.0]), src(1, -1.0, &[-0.5, -0.5])],
+        };
+        let r = decompose_descent(&sub);
+        assert!(r.atom.iter().all(|&i| i < sub.sources.len()), "atom ⊆ sources (valid indices)");
+        assert!(r.atom_size() <= r.n_sources, "atom is never larger than the full coalition");
+        assert!(r.min_slack > 0.0, "the atom still decides every competitor (firing count is the floor, still deciding)");
+        assert!(r.dla_retained <= 1.0 + 1e-6 && r.dla_retained >= 0.0, "retained positive-DLA fraction in [0,1]");
+    }
+
+    #[test]
+    fn descent_handles_empty_sources() {
+        // const_v alone decides and there are no sources to drop ⇒ the atom is empty, no panic.
+        let sub = DecompSubstrate { predicted: 9, competitors: vec![1], const_v: vec![1.0], full_margin: vec![1.0], sources: vec![] };
+        let r = decompose_descent(&sub);
+        assert_eq!(r.atom_size(), 0);
+        assert!(r.min_slack > 0.0);
     }
 
     #[test]

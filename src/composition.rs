@@ -161,6 +161,8 @@ impl Gpt2 {
             &x_last,
             &xf_last,
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |l, n| self.b.weight_row(&format!("h{l}.mlp.c_proj.weight"), n), // neuron n's write direction (any dtype)
             |l, head| head_raw_contrib(&self.b, &format!("h{l}.attn.c_proj.weight"), &head_act[l], head, hd),
             |c| self.b.rowdot_f32("wte", c),

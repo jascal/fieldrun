@@ -375,6 +375,8 @@ impl Mla {
             &x_last,
             &xf_last,
             &u_pred,
+            0,
+            &|_v| Vec::new(),
             |l, n| {
                 let name = if l < first_k { format!("l{l}.mlp.down_proj") } else { format!("l{l}.shared.down") };
                 self.b.weight_row(&name, n)
