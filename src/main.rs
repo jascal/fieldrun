@@ -1903,7 +1903,11 @@ fn main() {
                     // without it, routing is induction-only. The candidate set bounds the SELECTED-vs-COMPOSED line.
                     let kb = flag(&args, "--store").and_then(|p| Store::load(p).ok());
                     let cand = retrieval::CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
-                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch);
+                    let bucket = has_flag(&args, "--bucket").then(|| bucketing::BucketOpts {
+                        k: flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4),
+                        experts: flag(&args, "--experts").and_then(|s| s.parse().ok()).unwrap_or(8),
+                    });
+                    api::chat(lm, tg, max_tokens, explain, kb, cand, has_flag(&args, "--raw"), &arch, bucket);
                 }
                 None => eprintln!("[fieldrun] no tokenizer next to {stem} — re-run `convert` (it copies tokenizer.json). \
                                    Meanwhile: --ids <holdout.json> to score, or --serve <PORT>."),

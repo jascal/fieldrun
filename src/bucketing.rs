@@ -11,6 +11,13 @@ use std::fmt::Write;
 /// A scored source's identity: (kind: 0 = attention head, 1 = MLP neuron, layer, index-within-layer).
 pub type Circuit = (u8, usize, usize);
 
+/// Config for the incremental serve/REPL bucketing (`--bucket`): the descent's competitor count + the expert count.
+#[derive(Clone, Copy)]
+pub struct BucketOpts {
+    pub k: usize,
+    pub experts: usize,
+}
+
 /// Run the descent at one position and return its irreducible atom + the model's predicted token. `None` if the arch
 /// does not expose the substrate (rope/Qwen only). The shared entry point for the batch, incremental, and DL paths.
 pub fn atom_and_pred_at(lm: &dyn crate::model::Model, ctx: &[i64], k: usize) -> Option<(Vec<Circuit>, i64)> {

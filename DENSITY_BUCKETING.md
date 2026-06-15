@@ -213,9 +213,13 @@ chunks (fieldrun's expert-offload).
 - [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
 - [x] Datalog export of the partition (`--experts-dl`): routing/selection as a
       runnable Soufflé program + per-expert pick-entropy (lookup-exact vs computed).
-- [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
-- [ ] Learned router (predict the expert from context, not the atom) + experts
-      mapped to pageable weight chunks → a real wall-clock MoE saving.
+- [x] Incremental bucketing in serve/REPL (`--bucket`: per-reply atom ingest +
+      running clustering; `/bucket on|off|experts N|k N|reset|dump`).
+- [ ] contrib-over-expert Datalog (faithful composition decode + catchall `rest`),
+      replacing the bigram lookup — the runtime-MoE blueprint.
+- [ ] Per-expert interpretability: what tokens/contexts route to each expert.
+- [ ] Realize the partition as a runtime MoE: experts = pageable weight modules
+      (fieldrun expert-offload), loaded on correlated work.
 
 ## Datalog lookup/selection export (`--experts-dl`)
 

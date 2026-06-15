@@ -1146,7 +1146,7 @@ impl rustyline::Helper for SlashHelper {}
 /// `arch` names the model for messages.
 #[cfg(feature = "api")]
 #[allow(clippy::too_many_arguments)]
-pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Option<ExplainMode>, store: Option<Store>, cand: CandCfg, raw: bool, arch: &str) {
+pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Option<ExplainMode>, store: Option<Store>, cand: CandCfg, raw: bool, arch: &str, bucket: Option<crate::bucketing::BucketOpts>) {
     use std::io::{IsTerminal, Write};
     // render Markdown→ANSI only when writing to a real terminal (piped output stays raw, for scripts) and not --raw.
     let mut fmt = std::io::stdout().is_terminal() && !raw;
@@ -1171,6 +1171,12 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
     let mut explain_ctx: usize = 10; // how many trailing context tokens explain prints (0 = all); /explain context N
     let mut explain_tk: usize = EXPLAIN_HEAD_TAIL; // deep-explain only the first & last N reply tokens (0 = all); /explain tokens N
     let mut logic_seq: usize = 0; // auto-numbers default `/export-logic` filenames (logic-001.dl, …) when no path is given
+    // --bucket: incremental density-minimization expert clustering over the session corpus (each reply token's atom),
+    // reported after every reply. session_sig/pred align with the ingested atoms (prev token + decode), for /bucket dump.
+    let mut session = crate::bucketing::CorpusBuckets::new();
+    let (mut session_sig, mut session_pred): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+    let mut bucket_on = bucket.is_some();
+    let mut bkt = bucket.unwrap_or(crate::bucketing::BucketOpts { k: 4, experts: 8 });
     // rustyline gives line editing, history (↑/↓), and Tab-completion of slash commands. It only owns the terminal
     // during readline; the generation/streaming below runs in normal mode exactly as before.
     let cfg = rustyline::Config::builder()
@@ -1325,9 +1331,44 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                         }
                     }
                 }
+                // /bucket — incremental expert bucketing over the session corpus (density-minimization atoms). Toggle,
+                // tune E/K, reset, show the current clustering, or dump the partition (.json) / Datalog model (.dl).
+                "bucket" => match parts.next() {
+                    Some("off") | Some("0") | Some("false") => { bucket_on = false; eprintln!("[fieldrun] bucket OFF"); }
+                    Some("on") | Some("1") | Some("true") => { bucket_on = true; eprintln!("[fieldrun] bucket ON (K={}, E={}) — clustering reported after each reply", bkt.k, bkt.experts); }
+                    Some("experts") | Some("e") => { if let Some(n) = parts.next().and_then(|s| s.parse().ok()) { bkt.experts = n; } eprintln!("[fieldrun] bucket experts E = {}", bkt.experts); }
+                    Some("k") => { if let Some(n) = parts.next().and_then(|s| s.parse().ok()) { bkt.k = n; } eprintln!("[fieldrun] bucket competitors K = {}", bkt.k); }
+                    Some("reset") => { session = crate::bucketing::CorpusBuckets::new(); session_sig.clear(); session_pred.clear(); eprintln!("[fieldrun] bucket session reset"); }
+                    Some("dump") => {
+                        let path = parts.next().unwrap_or("session-experts.dl").to_string();
+                        if session.n_tokens() == 0 {
+                            eprintln!("[fieldrun] bucket: nothing to dump yet (turn it on and send a message)");
+                        } else if path.ends_with(".json") {
+                            match serde_json::to_string_pretty(&session.partition(bkt.experts)).ok().and_then(|j| std::fs::write(&path, j).ok()) {
+                                Some(()) => eprintln!("[fieldrun] bucket: wrote partition JSON → {path}"),
+                                None => eprintln!("[fieldrun] bucket: dump failed"),
+                            }
+                        } else {
+                            match std::fs::write(&path, session.emit_datalog(bkt.experts, &session_sig, &session_pred, 0.2)) {
+                                Ok(()) => eprintln!("[fieldrun] bucket: wrote Datalog lookup/selection model → {path}  (run: souffle {path} -D-)"),
+                                Err(e) => eprintln!("[fieldrun] bucket: cannot write {path}: {e}"),
+                            }
+                        }
+                    }
+                    None => {
+                        bucket_on = true;
+                        if session.n_tokens() == 0 {
+                            eprintln!("[fieldrun] bucket ON — no atoms yet; send a message and the clustering reports after the reply");
+                        } else {
+                            eprintln!("[fieldrun] session expert clustering ({} tokens, K={}, E={}):\n{}", session.n_tokens(), bkt.k, bkt.experts, session.render(bkt.experts));
+                        }
+                    }
+                    Some(other) => eprintln!("[fieldrun] /bucket {other}? use: on | off | experts N | k N | reset | dump [path.dl|.json] | (no arg = show)"),
+                },
                 "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
                                      /explain [on|off] (circuits + features) · /explain context <N|all> · \
                                      /export-logic [file.dl] <prompt> (semiring-Datalog export) · \
+                                     /bucket [on|off|experts N|k N|reset|dump path] (incremental expert clustering) · \
                                      /format [on|off] (markdown) · /help"),
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }
@@ -1432,6 +1473,33 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
             }
             let dec = |id: i64| tg.token_label(id);
             eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx, explain_tk));
+        }
+        // --bucket: ingest each reply token's irreducible atom (descend prompt_ids ++ gen_ids[..i]) into the session
+        // corpus, then report the running expert clustering. One descent forward per reply token — heavy, opt-in.
+        if bucket_on {
+            let full: Vec<i64> = gen_out.prompt_ids.iter().chain(&gen_out.gen_ids).copied().collect();
+            let start = gen_out.prompt_ids.len();
+            if start < full.len() {
+                eprint!("[fieldrun] [bucket] analysing {} reply tokens…", full.len() - start);
+                let _ = std::io::stderr().flush();
+            }
+            let mut added = 0usize;
+            for i in start..full.len() {
+                if let Some(a) = crate::bucketing::atom_at(lm.as_ref(), &full[..i], bkt.k) {
+                    session.ingest(a);
+                    session_sig.push(if i > 0 { full[i - 1] } else { -1 }); // signature = the previous token
+                    session_pred.push(full[i]); // decode = the model's own generated token
+                    added += 1;
+                }
+            }
+            eprint!("\r\x1b[2K");
+            if added == 0 && session.n_tokens() == 0 {
+                eprintln!("[fieldrun] [bucket] arch {arch} exposes no descent substrate (rope/Qwen only) — bucket OFF");
+                bucket_on = false;
+            } else {
+                eprintln!("[bucket] session expert clustering — {} tokens ({added} this reply), K={}, E={}:", session.n_tokens(), bkt.k, bkt.experts);
+                eprint!("{}", session.render(bkt.experts));
+            }
         }
         if chatml {
             // only instruct models carry conversation history (base completion is stateless per turn)
