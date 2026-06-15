@@ -230,7 +230,19 @@ corpus-derived lookup model (generalizes by signature match), *not* the dense
 forward-pass-as-Datalog (that is `logic_whole.rs` / LO3a — exact but non-compact);
 the partition is the instrument that isolates the compactly-lookup-able fragment.
 
-Validated end-to-end (Qwen2.5-0.5B, 120 tokens, E=6): the emitted program **runs in
-Soufflé** and `hit` = **82 %** of positions — the lookup reproduces the model's
-decode on 82 %, matching the in-Rust stat; the residual bucket carries the highest
-`H(pred|expert)` (the computed core). `souffle <path>.dl -D-` to run.
+Validated end-to-end (Qwen2.5-0.5B): the emitted program **runs in Soufflé**
+(`souffle <path>.dl -D-`) and `hit_train`/`hit_test` reproduce the in-Rust stats;
+the residual bucket carries the highest `H(pred|expert)` (the computed core).
+
+**In-sample vs held-out (don't trust the in-sample number).** The lookup is
+optimistically in-sample on a small corpus: 120 tokens → 89 signatures → ~74 %
+singletons, each trivially memorised. The in-sample accuracy **falls as the corpus
+grows** and singletons stop dominating — measured: **80 % (150 tok) → 66 % (400) →
+63 % (800)**, flattening near the true bigram-determinism. So `--experts-dl` now
+does a **train/test split** (`--dl-test-frac`, default 0.2): the lookup is compiled
+from the train head and scored on the held-out tail, and the header reports
+IN-SAMPLE vs HELD-OUT `predict==decode` + coverage (fraction of test signatures
+seen in train) + `hit_train`/`hit_test` relations. A richer signature
+(`--dl-sig N` = last N context tokens) raises accuracy at the cost of a bigger
+table (the compactness↔accuracy tradeoff). The held-out miss is the **computed
+fragment** (the forge tax); the covered hits are the **retrievable** fragment.

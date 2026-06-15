@@ -196,7 +196,7 @@ impl CorpusBuckets {
     /// `H(pred|expert)` — ≈0 marks a lookup-exact (retrievable) expert, >0 the computed residue (the forge tax). A
     /// corpus-derived lookup model (generalizes by signature match), NOT the dense forward pass (that is logic_whole.rs
     /// / LO3a — exact but non-compact). `sig[i]`/`pred[i]` align with the i-th ingested atom (prev token + decode).
-    pub fn emit_datalog(&self, experts: usize, sig: &[i64], pred: &[i64]) -> String {
+    pub fn emit_datalog(&self, experts: usize, sig: &[i64], pred: &[i64], test_frac: f32) -> String {
         let mut out = String::new();
         let c = match self.cluster(experts) {
             None => {
@@ -212,25 +212,31 @@ impl CorpusBuckets {
             .iter()
             .map(|a| if a.is_empty() { c.e } else { c.expert_of[a.iter().max_by_key(|x| c.freq[*x]).unwrap()] })
             .collect();
-        // compile the lookup tables: signature → {expert counts}, signature → {pred counts}.
+        // TRAIN/TEST split — held-out generalization vs in-sample memorization. The lookup is compiled from the first
+        // (1−test_frac) of the corpus and evaluated on the held-out tail; test_frac<=0 ⇒ pure in-sample (train==all).
+        let test_frac = test_frac.clamp(0.0, 0.9);
+        let train_n = if test_frac <= 0.0 { m } else { (((1.0 - test_frac) * m as f32).round() as usize).clamp(1, m) };
+        let test_n = m - train_n;
+        // compile the lookup tables from TRAIN positions only: signature → {expert counts}, signature → {pred counts}.
         let mut sig_e: BTreeMap<i64, HashMap<usize, usize>> = BTreeMap::new();
         let mut sig_p: BTreeMap<i64, HashMap<i64, usize>> = BTreeMap::new();
-        for i in 0..m {
+        for i in 0..train_n {
             *sig_e.entry(sig[i]).or_default().entry(routes[i]).or_default() += 1;
             *sig_p.entry(sig[i]).or_default().entry(pred[i]).or_default() += 1;
         }
-        let plur = |mm: &HashMap<i64, usize>| *mm.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).unwrap().0;
         let plur_e: BTreeMap<i64, usize> = sig_e.iter().map(|(&s, mm)| (s, *mm.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).unwrap().0)).collect();
-        let plur_p: BTreeMap<i64, i64> = sig_p.iter().map(|(&s, mm)| (s, plur(mm))).collect();
-        // accuracy: does the compiled lookup reproduce the model's decode / routing?
-        let (mut hit, mut rhit) = (0usize, 0usize);
-        for i in 0..m {
-            if plur_p[&sig[i]] == pred[i] {
-                hit += 1;
-            }
-            if plur_e[&sig[i]] == routes[i] {
-                rhit += 1;
-            }
+        let plur_p: BTreeMap<i64, i64> = sig_p.iter().map(|(&s, mm)| (s, *mm.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).unwrap().0)).collect();
+        // IN-SAMPLE accuracy (train → train) vs HELD-OUT (train → test, with coverage of unseen signatures).
+        let (mut in_hit, mut in_rhit) = (0usize, 0usize);
+        for i in 0..train_n {
+            if plur_p.get(&sig[i]) == Some(&pred[i]) { in_hit += 1; }
+            if plur_e.get(&sig[i]) == Some(&routes[i]) { in_rhit += 1; }
+        }
+        let (mut ho_hit, mut ho_rhit, mut covered) = (0usize, 0usize, 0usize);
+        for i in train_n..m {
+            if plur_p.contains_key(&sig[i]) { covered += 1; } // signature seen in train ⇒ a lookup exists
+            if plur_p.get(&sig[i]) == Some(&pred[i]) { ho_hit += 1; }
+            if plur_e.get(&sig[i]) == Some(&routes[i]) { ho_rhit += 1; }
         }
         // per-expert decision entropy H(pred|expert): ~0 = lookup-exact, >0 = computed residue.
         let mut e_pred: Vec<HashMap<i64, usize>> = vec![HashMap::new(); c.e + 1];
@@ -251,10 +257,16 @@ impl CorpusBuckets {
         let _ = writeln!(out, "// The expert partition is RELATIONS; routing selected(sig,e) and decision predict(sig,tok) are LOOKUP");
         let _ = writeln!(out, "// tables over a context signature (the previous token id), compiled from the corpus — a corpus-derived");
         let _ = writeln!(out, "// lookup model (generalizes by signature match), NOT the dense forward pass (logic_whole.rs/LO3a, exact");
-        let _ = writeln!(out, "// but non-compact). Run: souffle <this>.dl -D-   (outputs: selected, predict, decode, routed, hit).");
+        let _ = writeln!(out, "// but non-compact). Run: souffle <this>.dl -D-   (outputs: selected, predict, decode, routed, hit_train, hit_test).");
         let _ = writeln!(out, "//");
-        let _ = writeln!(out, "// N tokens={}  |C| circuits={}  E experts={} (+residual idx {})  distinct signatures={}", c.n, c.distinct, c.e, c.e, sig_e.len());
-        let _ = writeln!(out, "// lookup accuracy predict(sig)==decode: {:.0}%   routing consistency selected(sig)==route: {:.0}%", pc(hit, m), pc(rhit, m));
+        let _ = writeln!(out, "// N tokens={}  |C| circuits={}  E experts={} (+residual idx {})", c.n, c.distinct, c.e, c.e);
+        let _ = writeln!(out, "// split: train={train_n}  test={test_n} (test_frac={test_frac:.2})  train signatures={}", sig_e.len());
+        let _ = writeln!(out, "// IN-SAMPLE (train): predict==decode {:.0}%   selected==route {:.0}%   [optimistic — memorizes singleton signatures]", pc(in_hit, train_n), pc(in_rhit, train_n));
+        if test_n > 0 {
+            let _ = writeln!(out, "// HELD-OUT (test):  predict==decode {:.0}%   selected==route {:.0}%   (coverage {:.0}% of test sigs seen in train; accuracy among covered {:.0}%)", pc(ho_hit, test_n), pc(ho_rhit, test_n), pc(covered, test_n), pc(ho_hit, covered));
+        } else {
+            let _ = writeln!(out, "// HELD-OUT: none (test_frac=0 → in-sample only; pass --dl-test-frac 0.2 for generalization)");
+        }
         let _ = writeln!(out, "// per-expert decision entropy H(pred|expert) — ~0 bits = lookup-exact (retrievable); >0 = computed residue:");
         for e in 0..c.e {
             let (ak, al, ai) = c.ranked[e].0;
@@ -282,9 +294,10 @@ impl CorpusBuckets {
             let _ = writeln!(out, "anchor({e},\"{}\",{l},{i}).", kind(k));
         }
         // ---- corpus observations ------------------------------------------------------------------------------
-        let _ = writeln!(out, ".decl obs(pos:number, sig:number, route:number, pred:number)");
+        let _ = writeln!(out, ".decl obs(pos:number, sig:number, route:number, pred:number, split:number)   // split: 0=train 1=test");
         for i in 0..m {
-            let _ = writeln!(out, "obs({i},{},{},{}).", sig[i], routes[i], pred[i]);
+            let split = if i < train_n { 0 } else { 1 };
+            let _ = writeln!(out, "obs({i},{},{},{},{split}).", sig[i], routes[i], pred[i]);
         }
         // ---- compiled lookup / selection ----------------------------------------------------------------------
         let _ = writeln!(out, ".decl selected(sig:number, e:number)    // SELECTION: the routed expert for a signature");
@@ -297,12 +310,14 @@ impl CorpusBuckets {
         }
         // ---- rules: apply the lookup + check it reproduces the model's decode ---------------------------------
         let _ = writeln!(out, ".decl decode(pos:number, tok:number)");
-        let _ = writeln!(out, "decode(P,Tok) :- obs(P,Sig,_,_), predict(Sig,Tok).");
+        let _ = writeln!(out, "decode(P,Tok) :- obs(P,Sig,_,_,_), predict(Sig,Tok).");
         let _ = writeln!(out, ".decl routed(pos:number, e:number)");
-        let _ = writeln!(out, "routed(P,E) :- obs(P,Sig,_,_), selected(Sig,E).");
-        let _ = writeln!(out, ".decl hit(pos:number)   // the lookup reproduced the model's decode here");
-        let _ = writeln!(out, "hit(P) :- obs(P,_,_,D), decode(P,T), T=D.");
-        let _ = writeln!(out, ".output selected\n.output predict\n.output decode\n.output routed\n.output hit");
+        let _ = writeln!(out, "routed(P,E) :- obs(P,Sig,_,_,_), selected(Sig,E).");
+        let _ = writeln!(out, ".decl hit_train(pos:number)   // train-derived lookup reproduces the decode (IN-SAMPLE)");
+        let _ = writeln!(out, "hit_train(P) :- obs(P,_,_,D,0), decode(P,T), T=D.");
+        let _ = writeln!(out, ".decl hit_test(pos:number)    // ... on the HELD-OUT tail (generalization)");
+        let _ = writeln!(out, "hit_test(P) :- obs(P,_,_,D,1), decode(P,T), T=D.");
+        let _ = writeln!(out, ".output selected\n.output predict\n.output decode\n.output routed\n.output hit_train\n.output hit_test");
         out
     }
 }
@@ -413,18 +428,33 @@ mod tests {
         }
         let sig: Vec<i64> = (0..6).map(|t| (t % 2) as i64).collect();
         let pred: Vec<i64> = (0..6).map(|_| 100i64).collect(); // constant decode ⇒ lookup is exact (100%)
-        let dl = b.emit_datalog(2, &sig, &pred);
+        let dl = b.emit_datalog(2, &sig, &pred, 0.0); // test_frac=0 ⇒ in-sample only
         for needle in [
             ".decl expert(e:number",
             ".decl selected(sig:number",
             ".decl predict(sig:number",
-            "decode(P,Tok) :- obs(P,Sig,_,_), predict(Sig,Tok).",
-            "hit(P) :- obs(P,_,_,D), decode(P,T), T=D.",
-            ".output hit",
+            "decode(P,Tok) :- obs(P,Sig,_,_,_), predict(Sig,Tok).",
+            "hit_train(P) :- obs(P,_,_,D,0), decode(P,T), T=D.",
+            "hit_test(P) :- obs(P,_,_,D,1), decode(P,T), T=D.",
+            ".output hit_test",
         ] {
             assert!(dl.contains(needle), "emitted Datalog missing: {needle}");
         }
-        // pred is constant ⇒ predict(sig)==decode everywhere ⇒ the header reports a 100% lookup accuracy.
-        assert!(dl.contains("lookup accuracy predict(sig)==decode: 100%"), "lookup accuracy stat wrong:\n{dl}");
+        // pred is constant ⇒ predict(sig)==decode everywhere ⇒ the header reports 100% in-sample accuracy.
+        assert!(dl.contains("IN-SAMPLE (train): predict==decode 100%"), "in-sample accuracy stat wrong:\n{dl}");
+    }
+
+    #[test]
+    fn emit_datalog_holds_out_unseen_signatures() {
+        // train sigs {0,1} all decode to 100; the test tail has an UNSEEN sig 2 ⇒ not covered ⇒ held-out misses it.
+        let mut b = CorpusBuckets::new();
+        for _ in 0..10 { b.ingest(vec![(1u8, 23, 1)]); }
+        let sig: Vec<i64> = vec![0, 1, 0, 1, 0, 1, 0, 1, 2, 2]; // last two positions are the unseen-signature test tail
+        let pred: Vec<i64> = vec![100; 10];
+        let dl = b.emit_datalog(1, &sig, &pred, 0.2); // test_frac 0.2 ⇒ train=8, test=2 (both sig 2, unseen)
+        assert!(dl.contains("split: train=8  test=2"), "split header wrong:\n{dl}");
+        // sig 2 never appears in train ⇒ 0% coverage ⇒ 0% held-out accuracy despite 100% in-sample.
+        assert!(dl.contains("HELD-OUT (test):  predict==decode 0%"), "held-out should miss unseen sigs:\n{dl}");
+        assert!(dl.contains("coverage 0%"), "coverage should be 0 for unseen sigs:\n{dl}");
     }
 }

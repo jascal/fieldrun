@@ -1162,15 +1162,17 @@ fn main() {
             // Stream the corpus in chunks so the per-position forward working set stays bounded; atoms accumulate into the
             // shared CorpusBuckets (tiny, ~72 bytes/token). --report-every N prints the running clustering at runtime.
             let want_dl = flag(&args, "--experts-dl").is_some(); // also collect the per-token signature + decode for the DL emit
+            let dl_order: usize = flag(&args, "--dl-sig").and_then(|s| s.parse().ok()).unwrap_or(1).max(1); // sig = last N ctx tokens
             let lmr = lm.as_ref();
             let mut buckets = bucketing::CorpusBuckets::new();
             let (mut sigs, mut preds): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
             let mut next_report = report_every;
             for chunk in positions.chunks(512) {
-                // sig = the previous token id (the lookup key); pred = the model's decode at this position.
+                // sig = the last dl_order context tokens (base-encoded; the lookup key); pred = the model's decode.
                 let got: Vec<(Vec<bucketing::Circuit>, i64, i64)> = chunk.par_iter().filter_map(|c| {
                     let (a, p) = bucketing::atom_and_pred_at(lmr, c, kk)?;
-                    Some((a, *c.last().unwrap_or(&-1), p))
+                    let sg = if dl_order <= 1 { *c.last().unwrap_or(&-1) } else { c.iter().rev().take(dl_order).fold(0i64, |s, &t| s.wrapping_mul(1 << 20).wrapping_add(t + 1)) };
+                    Some((a, sg, p))
                 }).collect();
                 for (a, s, p) in got {
                     if want_dl { sigs.push(s); preds.push(p); }
@@ -1201,7 +1203,8 @@ fn main() {
             // --experts-dl <path>: emit the partition as a Soufflé Datalog LOOKUP/SELECTION model (routing + decision as
             // lookup over a context signature, + per-expert pick-entropy marking lookup-exact vs computed experts).
             if let Some(path) = flag(&args, "--experts-dl") {
-                match std::fs::write(path, buckets.emit_datalog(e_req, &sigs, &preds)) {
+                let tf: f32 = flag(&args, "--dl-test-frac").and_then(|s| s.parse().ok()).unwrap_or(0.2); // held-out tail for generalization
+                match std::fs::write(path, buckets.emit_datalog(e_req, &sigs, &preds, tf)) {
                     Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote Datalog lookup/selection model → {path}  (run: souffle {path} -D-)"),
                     Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
                 }
