@@ -1078,6 +1078,65 @@ fn main() {
             return;
         }
 
+        // --query-decompose (per-QUERY aggregation, the ladder's middle rung): treat a contiguous run of positions as ONE
+        // query and aggregate the per-token irreducible atoms into the query's circuit working-set W = ⋃_t A_t — entirely
+        // IN-MEMORY from the descent results, with NO `export --logic` → `.dl` → `stitch` disk round-trip. This is the
+        // Hub.thy decomposition of a query: the hub = circuits shared across many tokens (the disentangling core / a
+        // candidate expert), private = per-token; the distinct budget obeys |W| ≥ Σ|A_t| / d (the d-bounded budget,
+        // d = max reuse). Σ|A_t| is the per-token firing-count floor summed over the query. Rope/Qwen only (the substrate).
+        if has_flag(&args, "--query-decompose") {
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let hub_frac: f32 = flag(&args, "--hub-frac").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            let cap = (end - ctx_window).min(n_eval);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() {
+                eprintln!("[fieldrun] --query-decompose: no eval positions (need --ids with > ctx_window tokens)");
+                return;
+            }
+            if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                eprintln!("[fieldrun] --query-decompose: this arch does not expose the descent substrate (rope/Qwen only)");
+                return;
+            }
+            eprintln!("[fieldrun] --query-decompose: aggregating {} positions as ONE query (ctx {ctx_window}), K={kk} — in-memory, no .dl export/stitch…", positions.len());
+            // per-position atoms as circuit identities (kind, layer, idx); computed in parallel, then aggregated in-memory.
+            let atoms: Vec<Vec<(u8, usize, usize)>> = positions.par_iter().filter_map(|c| {
+                let ex = lm.explain_decomp(c, kk)?;
+                let sub = ex.decomp.as_ref()?;
+                let r = explain::decompose_descent(sub);
+                Some(r.atom.iter().map(|&i| { let s = &sub.sources[i]; (s.kind, s.layer, s.idx) }).collect())
+            }).collect();
+            let q = atoms.len();
+            let total: usize = atoms.iter().map(|a| a.len()).sum(); // Σ|A_t| — total firings (per-token floor, summed)
+            let mut mult: HashMap<(u8, usize, usize), usize> = HashMap::new(); // circuit → # of tokens whose atom uses it
+            for a in &atoms { for &id in a { *mult.entry(id).or_default() += 1; } }
+            let distinct = mult.len(); // |W| — the query's distinct-circuit budget
+            let dmax = mult.values().copied().max().unwrap_or(0); // d — the most-reused circuit's multiplicity
+            let hub_thresh = ((hub_frac * q as f32).ceil() as usize).max(2); // "shared by ≥ hub_frac of the query's tokens"
+            let mut hub: Vec<((u8, usize, usize), usize)> = mult.iter().filter(|(_, &m)| m >= hub_thresh).map(|(&id, &m)| (id, m)).collect();
+            hub.sort_by(|a, b| b.1.cmp(&a.1));
+            let hub_firings: usize = hub.iter().map(|(_, m)| *m).sum();
+            let private = mult.values().filter(|&&m| m == 1).count();
+            let reuse = if total > 0 { 1.0 - distinct as f32 / total as f32 } else { 0.0 };
+            let avg_atom = if q > 0 { total as f32 / q as f32 } else { 0.0 };
+            println!("\n=== Per-query density-minimization working set: {q} tokens aggregated as ONE query (K={kk}) ===");
+            println!("  W = ⋃_t A_t (Hub.thy: hub = shared core, private = per-token) — computed in-memory, no .dl export/stitch.");
+            println!("  tokens (Q)                {q}");
+            println!("  Σ|A_t| total firings      {total}    (avg atom {avg_atom:.2}/token — the per-token floor summed)");
+            println!("  |W| distinct circuits     {distinct}    (the query's circuit budget)");
+            println!("  reuse 1 − |W|/Σ           {:.0}%    (circuit sharing across the query's tokens)", 100.0 * reuse);
+            println!("  hub (≥ {hub_thresh} tokens)         {} circuits   carrying {hub_firings}/{total} firings ({:.0}%)", hub.len(), if total > 0 { 100.0 * hub_firings as f32 / total as f32 } else { 0.0 });
+            println!("  private (1 token)         {private} circuits");
+            println!("  max multiplicity d        {dmax}    (a circuit reused by up to d tokens; distinct |W| ≥ Σ/d = {})", if dmax > 0 { total / dmax } else { 0 });
+            if !hub.is_empty() {
+                println!("  top shared circuits (the query's reusable core — a candidate expert for the corpus phase):");
+                let kind_name = |k: u8| if k == 0 { "head" } else { "neuron" };
+                for ((k, l, i), m) in hub.iter().take(10) {
+                    println!("    {:<6} L{l:<2} #{i:<6}  in {m}/{q} atoms", kind_name(*k));
+                }
+            }
+            return;
+        }
+
         // --probe-facet (tighten Q1): the token cells in r-space ARE the Laguerre power diagram of {U_v} (weights
         // ‖U_v‖²+2b_v). Compute the EXACT nearest facet argmin_{v≠t}(L_t−L_v)/‖U_t−U_v‖ (not the logit-runner-up proxy)
         // and (a) how often the nearest facet == the logit runner-up, (b) the killer check: for COMPOSED, is the token

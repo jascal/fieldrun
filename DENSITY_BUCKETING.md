@@ -130,20 +130,43 @@ participation ratio), and composed atoms sit closest to flipping (slack 0.33 vs
 related but `σ(t) ≪ PR` — the minimal irreducible core is far smaller than the
 effective number of participating circuits (a measured, partial answer to PIC O2).
 
+## Per-query aggregation (`--query-decompose`)
+
+The ladder's middle rung: treat a contiguous run of positions as ONE query and
+aggregate the per-token atoms into the query's circuit **working-set**
+`W = ⋃_t A_t` — **entirely in-memory from the descent**, with *no*
+`export --logic → .dl → stitch` disk round-trip (the existing per-step `.dl` emit
++ `fieldrun stitch` path writes N files and merges them; the atoms are already in
+memory, so the union is direct and simpler). This is the **Hub.thy** decomposition
+of a query:
+
+- `Σ|A_t|` — total firings (the per-token floor summed; the monotone objective);
+- `|W|` — distinct circuits (the query's budget);
+- **reuse** `1 − |W|/Σ` — circuit sharing across the query's tokens;
+- **hub** — circuits shared by ≥ `--hub-frac` of the tokens (the disentangling
+  core / a candidate expert); **private** — single-token circuits;
+- the **d-bounded budget** `|W| ≥ Σ|A_t| / d` (`d` = max reuse), i.e.
+  `Hub.d_bounded_private_budget`.
+
+Measured (Qwen2.5-0.5B, 50-token passage, K=4): `Σ|A_t| = 119` (avg atom
+2.38/token) over `|W| = 73` distinct circuits — **39 % reuse**. The reusable core
+is a small set of **late-layer neurons** (e.g. L23 #2539 in 10/50 atoms, L22 #1069
+in 5/50; `d = 10`) — the block-sparse, circuit-dense, late-block decision surface
+(§5d), now surfaced as the query's shared expert seed.
+
 ## The ladder
 
-1. **per token** — `decompose_descent` over one decision (this branch).
-2. **per query** — union the per-token atoms across a prompt → the minimal circuit
-   working-set that reproduces the whole query.
-3. **per corpus** — cluster atoms across many queries → recurring buckets =
-   candidate **experts**; route a token to its atom-bucket → a smaller/cheaper MoE.
-   fieldrun already has the expert-offload machinery (`src/bundle.rs`,
-   qwen3moe/gemma4-MoE/mla/minimax) for this to land in.
+1. **per token** — `decompose_descent` over one decision (`--probe-decompose`).
+2. **per query** — `--query-decompose`: `W = ⋃_t A_t` in-memory (this rung).
+3. **per corpus** — cluster the per-query working-sets / hubs across many queries →
+   recurring buckets = candidate **experts**; route a token to its atom-bucket → a
+   smaller/cheaper MoE. fieldrun already has the expert-offload machinery
+   (`src/bundle.rs`, qwen3moe/gemma4-MoE/mla/minimax) for this to land in.
 
 ## Status
 
 - [x] Per-token descent + multi-competitor substrate (`explain.rs`), unit-tested.
 - [x] `--probe-decompose` harness; measured on Qwen2.5-0.5B.
 - [x] Faithful necessity-confirmation of atoms (`predict_ablated`, Route B).
-- [ ] Per-query atom aggregation.
+- [x] Per-query atom aggregation (`--query-decompose`, in-memory, no `.dl`).
 - [ ] Per-corpus atom clustering → expert buckets.
