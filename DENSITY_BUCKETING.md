@@ -210,7 +210,6 @@ chunks (fieldrun's expert-offload).
 - [x] Per-corpus atom clustering → hub-anchored expert buckets (`--corpus-decompose`).
 - [x] Streaming over a bigger corpus + `--report-every` incremental runtime reports.
 - [x] Concrete partition export (`--experts-out <path>`, JSON: expert→circuit sets).
-- [ ] Incremental bucketing in serve/REPL (per-reply, `--bucket`).
 - [x] Datalog export of the partition (`--experts-dl`): routing/selection as a
       runnable Soufflé program + per-expert pick-entropy (lookup-exact vs computed).
 - [x] Incremental bucketing in serve/REPL (`--bucket`: per-reply atom ingest +
@@ -219,6 +218,12 @@ chunks (fieldrun's expert-offload).
       each expert reveal **grammatical-role specialization** (see below).
 - [x] contrib-over-expert Datalog (`--experts-dl-contrib`): faithful composition
       decode + catchall `rest`, runs in `fieldrun eval` — replaces the bigram lookup.
+- [x] Runtime residency profile (`--residency`): hot resident core vs paged long tail.
+- [x] Multilingual / multi-domain: grammar-role experts recover across EN/DE/code;
+      pooled clustering gives shared universal-structural experts + domain-specific
+      experts (German function words, code syntax) + content residual.
+- [x] Recursive residual sub-bucketing (`--recurse-depth D`): resolve the collapsed
+      tail into hierarchical domain experts (`e3`, `r.e1`, `r.r.e0`) — toward the 10k tail.
 - [ ] Realize the partition as a runtime MoE: experts = pageable weight modules
       (fieldrun expert-offload), loaded on correlated work. Compactness is a
       RUNTIME property (resident working set), not `.dl` size; the catchall `rest`

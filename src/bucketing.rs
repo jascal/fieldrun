@@ -81,74 +81,77 @@ impl CorpusBuckets {
     /// (index `e`). Returns the FULL assignment (`expert_of`) + per-expert sizes/token-routes + routing stats — the
     /// object both `render` (summary) and `partition` (the concrete expert→circuit sets) build from. `None` if empty.
     fn cluster(&self, experts: usize) -> Option<Cluster> {
-        let atoms = &self.atoms;
-        let n = atoms.len();
-        if n == 0 {
-            return None;
+        cluster_atoms(&self.atoms, experts)
+    }
+
+    /// Recursively sub-bucket the residual: cluster, then re-cluster the residual circuits (restricting atoms to them)
+    /// into finer experts, up to `depth` levels or until the residual has < `min_circuits` circuits. Returns the leaf
+    /// experts sorted by token-load (descending) with hierarchical labels (`e3`, `r.e1`, `r.r.e0`, …) + a `route` per
+    /// ingested atom (index into the returned leaves) — the path that resolves the collapsed tail into domain experts.
+    pub fn recursive(&self, experts: usize, depth: usize, min_circuits: usize) -> (Vec<RecExpert>, Vec<usize>) {
+        // leaf_of: every circuit → its final hierarchical leaf label. Built top-down, residual descending each level.
+        let mut leaf_of: HashMap<Circuit, String> = HashMap::new();
+        // universe = the circuits still being clustered at this level; restricted atoms keep only those.
+        let mut universe: Option<HashSet<Circuit>> = None; // None = all circuits (level 0)
+        let mut prefix = String::new();
+        for level in 0..depth.max(1) {
+            let restricted: Vec<Vec<Circuit>> = match &universe {
+                None => self.atoms.clone(),
+                Some(u) => self.atoms.iter().map(|a| a.iter().copied().filter(|c| u.contains(c)).collect()).collect(),
+            };
+            let c = match cluster_atoms(&restricted, experts) {
+                Some(c) => c,
+                None => break,
+            };
+            let mut residual_circuits: Vec<Circuit> = Vec::new();
+            for (&id, &ex) in &c.expert_of {
+                if ex == c.e {
+                    residual_circuits.push(id);
+                } else {
+                    leaf_of.insert(id, format!("{prefix}e{ex}"));
+                }
+            }
+            let last = level + 1 >= depth.max(1) || residual_circuits.len() < min_circuits || c.e == 0;
+            if last {
+                for id in residual_circuits {
+                    leaf_of.insert(id, format!("{prefix}residual"));
+                }
+                break;
+            }
+            universe = Some(residual_circuits.into_iter().collect());
+            prefix.push_str("r.");
         }
+        // assemble leaves + route each original atom to the leaf of its highest-global-frequency circuit.
         let mut freq: HashMap<Circuit, usize> = HashMap::new();
-        for a in atoms {
+        for a in &self.atoms {
             for &id in a {
                 *freq.entry(id).or_default() += 1;
             }
         }
-        let distinct = freq.len();
-        let mut ranked: Vec<(Circuit, usize)> = freq.iter().map(|(&id, &f)| (id, f)).collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let e = experts.min(ranked.len());
-        let mut expert_of: HashMap<Circuit, usize> = HashMap::new();
-        for (k, &(id, _)) in ranked.iter().take(e).enumerate() {
-            expert_of.insert(id, k);
-        }
-        let mut cooc: HashMap<Circuit, HashMap<usize, usize>> = HashMap::new();
-        for a in atoms {
-            let present: Vec<usize> = a.iter().filter_map(|id| expert_of.get(id).copied()).collect();
-            if present.is_empty() {
-                continue;
-            }
-            for &id in a {
-                if expert_of.contains_key(&id) {
-                    continue;
-                }
-                let m = cooc.entry(id).or_default();
-                for &ex in &present {
-                    *m.entry(ex).or_default() += 1;
-                }
+        let mut idx_of: HashMap<String, usize> = HashMap::new();
+        let mut leaves: Vec<RecExpert> = Vec::new();
+        for lab in leaf_of.values() {
+            if !idx_of.contains_key(lab) {
+                idx_of.insert(lab.clone(), leaves.len());
+                leaves.push(RecExpert { label: lab.clone(), n_circuits: 0, tokens: 0 });
             }
         }
-        let residual = e;
-        for (&id, m) in &cooc {
-            let best = m.iter().max_by(|x, y| x.1.cmp(y.1).then(y.0.cmp(x.0))).map(|(&ex, _)| ex).unwrap_or(residual);
-            expert_of.entry(id).or_insert(best);
+        for lab in leaf_of.values() {
+            leaves[idx_of[lab]].n_circuits += 1;
         }
-        for (&id, _) in &freq {
-            expert_of.entry(id).or_insert(residual);
+        let route: Vec<usize> = self.atoms.iter().map(|a| {
+            a.iter().max_by_key(|id| freq[*id]).and_then(|id| leaf_of.get(id)).map(|l| idx_of[l]).unwrap_or(0)
+        }).collect();
+        for &r in &route {
+            leaves[r].tokens += 1;
         }
-        let mut size = vec![0usize; e + 1];
-        for (_, &ex) in &expert_of {
-            size[ex] += 1;
-        }
-        let total: usize = atoms.iter().map(|a| a.len()).sum();
-        let (mut span1, mut spanned, mut span_sum, mut cost_sum) = (0usize, 0usize, 0usize, 0usize);
-        let mut tok_per_expert = vec![0usize; e + 1];
-        for a in atoms {
-            if a.is_empty() {
-                continue;
-            }
-            let mut touched: HashSet<usize> = HashSet::new();
-            for &id in a {
-                touched.insert(expert_of[&id]);
-            }
-            span_sum += touched.len();
-            spanned += 1;
-            if touched.len() == 1 {
-                span1 += 1;
-            }
-            cost_sum += touched.iter().map(|&ex| size[ex]).sum::<usize>();
-            let route = a.iter().max_by_key(|id| freq[*id]).map(|id| expert_of[id]).unwrap();
-            tok_per_expert[route] += 1;
-        }
-        Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
+        // sort leaves by load (descending) and remap routes to the sorted order.
+        let mut order: Vec<usize> = (0..leaves.len()).collect();
+        order.sort_by(|&a, &b| leaves[b].tokens.cmp(&leaves[a].tokens).then(leaves[a].label.cmp(&leaves[b].label)));
+        let new_pos: HashMap<usize, usize> = order.iter().enumerate().map(|(np, &old)| (old, np)).collect();
+        let sorted: Vec<RecExpert> = order.iter().map(|&o| leaves[o].clone()).collect();
+        let route2: Vec<usize> = route.iter().map(|r| new_pos[r]).collect();
+        (sorted, route2)
     }
 
     /// A runtime RESIDENCY profile: experts sorted by token-load (descending) with cumulative coverage. The hot
@@ -385,6 +388,85 @@ impl CorpusBuckets {
     }
 }
 
+/// Core hub-anchored clustering over a given atom list (so it can run on a residual-restricted universe for recursion).
+fn cluster_atoms(atoms: &[Vec<Circuit>], experts: usize) -> Option<Cluster> {
+    let n = atoms.len();
+    if n == 0 {
+        return None;
+    }
+    let mut freq: HashMap<Circuit, usize> = HashMap::new();
+    for a in atoms {
+        for &id in a {
+            *freq.entry(id).or_default() += 1;
+        }
+    }
+    let distinct = freq.len();
+    let mut ranked: Vec<(Circuit, usize)> = freq.iter().map(|(&id, &f)| (id, f)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let e = experts.min(ranked.len());
+    let mut expert_of: HashMap<Circuit, usize> = HashMap::new();
+    for (k, &(id, _)) in ranked.iter().take(e).enumerate() {
+        expert_of.insert(id, k);
+    }
+    let mut cooc: HashMap<Circuit, HashMap<usize, usize>> = HashMap::new();
+    for a in atoms {
+        let present: Vec<usize> = a.iter().filter_map(|id| expert_of.get(id).copied()).collect();
+        if present.is_empty() {
+            continue;
+        }
+        for &id in a {
+            if expert_of.contains_key(&id) {
+                continue;
+            }
+            let m = cooc.entry(id).or_default();
+            for &ex in &present {
+                *m.entry(ex).or_default() += 1;
+            }
+        }
+    }
+    let residual = e;
+    for (&id, m) in &cooc {
+        let best = m.iter().max_by(|x, y| x.1.cmp(y.1).then(y.0.cmp(x.0))).map(|(&ex, _)| ex).unwrap_or(residual);
+        expert_of.entry(id).or_insert(best);
+    }
+    for (&id, _) in &freq {
+        expert_of.entry(id).or_insert(residual);
+    }
+    let mut size = vec![0usize; e + 1];
+    for (_, &ex) in &expert_of {
+        size[ex] += 1;
+    }
+    let total: usize = atoms.iter().map(|a| a.len()).sum();
+    let (mut span1, mut spanned, mut span_sum, mut cost_sum) = (0usize, 0usize, 0usize, 0usize);
+    let mut tok_per_expert = vec![0usize; e + 1];
+    for a in atoms {
+        if a.is_empty() {
+            continue;
+        }
+        let mut touched: HashSet<usize> = HashSet::new();
+        for &id in a {
+            touched.insert(expert_of[&id]);
+        }
+        span_sum += touched.len();
+        spanned += 1;
+        if touched.len() == 1 {
+            span1 += 1;
+        }
+        cost_sum += touched.iter().map(|&ex| size[ex]).sum::<usize>();
+        let route = a.iter().max_by_key(|id| freq[*id]).map(|id| expert_of[id]).unwrap();
+        tok_per_expert[route] += 1;
+    }
+    Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
+}
+
+/// One leaf expert from recursive sub-bucketing: a hierarchical label (`e3`, `r.e1`, …), circuit count, token load.
+#[derive(Clone)]
+pub struct RecExpert {
+    pub label: String,
+    pub n_circuits: usize,
+    pub tokens: usize,
+}
+
 /// The computed clustering (internal): every circuit assigned to an expert (0..e) or the residual bucket (index e).
 struct Cluster {
     e: usize,
@@ -519,5 +601,20 @@ mod tests {
         // sig 2 never appears in train ⇒ 0% coverage ⇒ 0% held-out accuracy despite 100% in-sample.
         assert!(dl.contains("HELD-OUT (test):  predict==decode 0%"), "held-out should miss unseen sigs:\n{dl}");
         assert!(dl.contains("coverage 0%"), "coverage should be 0 for unseen sigs:\n{dl}");
+    }
+
+    #[test]
+    fn recursive_splits_the_residual() {
+        let mut b = CorpusBuckets::new();
+        let hub = (1u8, 23, 1);
+        let (a1, a2) = ((1u8, 1, 1), (1u8, 1, 2)); // residual group A (co-fire with each other, not the hub)
+        let (z1, z2) = ((1u8, 2, 1), (1u8, 2, 2)); // residual group B
+        for _ in 0..10 { b.ingest(vec![hub]); } // hub-only atoms ⇒ e0
+        for _ in 0..6 { b.ingest(vec![a1, a2]); } // group A ⇒ residual at L0, its own sub-expert at L1
+        for _ in 0..6 { b.ingest(vec![z1, z2]); } // group B ⇒ residual at L0, its own sub-expert deeper
+        let (leaves, route) = b.recursive(1, 3, 1); // 1 expert/level, depth 3 ⇒ the residual resolves into sub-experts
+        assert!(leaves.len() >= 3, "recursion should resolve the residual into ≥2 sub-experts; got {:?}", leaves.iter().map(|l| &l.label).collect::<Vec<_>>());
+        assert!(leaves.iter().any(|l| l.label.starts_with("r.")), "expected hierarchical r.* leaf labels");
+        assert_eq!(route.len(), b.n_tokens()); // one route per ingested atom
     }
 }
