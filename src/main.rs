@@ -1237,6 +1237,25 @@ fn main() {
                     println!("  {label:<9} {total:>4} tok →  {}", toks.join("  "));
                 }
             }
+            // --experts-dl-contrib: emit the COMPOSITION decode (per-expert Σ contrib + catchall rest), runnable in
+            // `fieldrun eval`. Faithful by construction; the catchall margin-share is the compactness / forge-tax meter.
+            if let Some(path) = flag(&args, "--experts-dl-contrib") {
+                let steps: usize = flag(&args, "--dl-contrib-steps").and_then(|s| s.parse().ok()).unwrap_or(12);
+                let (e_act, emap) = buckets.expert_map(e_req);
+                #[cfg(feature = "api")]
+                let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
+                    Some(tg) => Box::new(move |id| tg.token_label(id)),
+                    None => load_decoder(flag(&args, "--vocab")),
+                };
+                #[cfg(not(feature = "api"))]
+                let dec = load_decoder(flag(&args, "--vocab"));
+                let take = positions.len().min(steps);
+                let prog = emit_contrib_dl(lm.as_ref(), &positions[..take], kk, e_act, &emap, dec.as_ref());
+                match std::fs::write(path, prog) {
+                    Ok(()) => eprintln!("[fieldrun] --corpus-decompose: wrote contrib-over-expert model ({take} steps) → {path}  (run: fieldrun eval {path} --semiring max)"),
+                    Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
+                }
+            }
             return;
         }
 
@@ -2253,6 +2272,87 @@ fn dump_if(args: &[String], preds: &[i64]) {
 
 /// Build an id→string decoder. With a GPT-2 `vocab.json` (token→id), invert it and show the raw BPE token (Ġ→space,
 /// Ċ→newline for readability); without one, fall back to `[id]`.
+/// Emit a step-indexed CONTRIB-OVER-EXPERT Datalog program: each decision's scored circuits' DLA contributions to the
+/// candidate tokens, grouped by their corpus-expert, plus a catchall "rest" so Σ contrib == logit (faithful by
+/// construction). Runs in `fieldrun eval --semiring max` → decode == the model's token at every step (the COMPOSITION,
+/// not a lookup). The header reports the per-expert share of the winning margin + the catchall fraction (the
+/// compactness / forge-tax meter). Recovers c_j^t = dla and c_j^v = dla − margins[v] from the descent substrate.
+fn emit_contrib_dl(lm: &dyn model::Model, positions: &[&[i64]], k: usize, e_act: usize, expert_of: &HashMap<(u8, usize, usize), usize>, dec: &dyn Fn(i64) -> String) -> String {
+    use std::fmt::Write as _;
+    let blk = |e: usize| if e == e_act { "residual".to_string() } else { format!("e{e}") };
+    let (mut steps, mut faithful) = (0usize, 0usize);
+    let mut margin_by_block = vec![0f64; e_act + 1]; // Σ over steps of (contrib(block,t) − contrib(block,v*))
+    let (mut margin_rest, mut margin_total) = (0f64, 0f64);
+    let mut body = String::new();
+    for c in positions {
+        let sub = match lm.explain_decomp(c, k).and_then(|e| e.decomp) {
+            Some(s) if !s.competitors.is_empty() => s,
+            _ => continue,
+        };
+        let t = sub.predicted;
+        let comp_idx: HashMap<i64, usize> = sub.competitors.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        let cands: Vec<i64> = std::iter::once(t).chain(sub.competitors.iter().copied()).collect();
+        let nb = e_act + 1;
+        // contrib[block][cand]: c_j^t = dla, c_j^v = dla − margins[v]; each scored circuit added to its expert's block.
+        let mut contrib = vec![vec![0f64; cands.len()]; nb];
+        for s in &sub.sources {
+            let e = *expert_of.get(&(s.kind, s.layer, s.idx)).unwrap_or(&e_act);
+            for (ci, &u) in cands.iter().enumerate() {
+                contrib[e][ci] += if u == t { s.dla as f64 } else { (s.dla - s.margins[comp_idx[&u]]) as f64 };
+            }
+        }
+        // catchall rest[cand] = logit(u) − Σ_scored, with logit(t)=0, logit(v)=−full_margin[v] ⇒ Σ_block + rest == logit.
+        let rest: Vec<f64> = cands.iter().enumerate().map(|(ci, &u)| {
+            let logit_u = if u == t { 0.0 } else { -(sub.full_margin[comp_idx[&u]] as f64) };
+            logit_u - (0..nb).map(|b| contrib[b][ci]).sum::<f64>()
+        }).collect();
+        // faithful decode check: argmax_cand (Σ_block contrib + rest) must be t.
+        let total: Vec<f64> = (0..cands.len()).map(|ci| (0..nb).map(|b| contrib[b][ci]).sum::<f64>() + rest[ci]).collect();
+        let argmax = (0..cands.len()).max_by(|&a, &b| total[a].partial_cmp(&total[b]).unwrap()).unwrap();
+        if cands[argmax] == t { faithful += 1; }
+        // margin attribution vs the runner-up v* (smallest full_margin = closest competitor).
+        let vstar = (0..sub.competitors.len()).min_by(|&a, &b| sub.full_margin[a].partial_cmp(&sub.full_margin[b]).unwrap()).unwrap();
+        let vci = 1 + vstar;
+        for b in 0..nb {
+            margin_by_block[b] += contrib[b][0] - contrib[b][vci];
+        }
+        margin_rest += rest[0] - rest[vci];
+        margin_total += total[0] - total[vci];
+        let _ = writeln!(body, "// step {steps}: decode {:?} (margin {:+.3} vs {:?})", dec(t), sub.full_margin[vstar], dec(sub.competitors[vstar]));
+        for &u in &cands {
+            let _ = writeln!(body, "candidate({steps},{u}).   // {:?}", dec(u));
+        }
+        for b in 0..nb {
+            for (ci, &u) in cands.iter().enumerate() {
+                if contrib[b][ci].abs() > 1e-6 {
+                    let _ = writeln!(body, "contrib({steps},\"{}\",{u},{:.4}).", blk(b), contrib[b][ci]);
+                }
+            }
+        }
+        for (ci, &u) in cands.iter().enumerate() {
+            let _ = writeln!(body, "contrib({steps},\"rest\",{u},{:.4}).", rest[ci]);
+        }
+        steps += 1;
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "// fieldrun EXPERTS-DL-CONTRIB — composition decode over the partition (NOT a lookup).");
+    let _ = writeln!(out, "// Each step: per-expert Σ contrib to the candidate tokens + a catchall \"rest\" so Σ == logit;");
+    let _ = writeln!(out, "// decode(step) = argmax_token Σ contrib = the model's own token (faithful). Run:");
+    let _ = writeln!(out, "//   fieldrun eval <this>.dl --semiring max   (argmax decode)   |   --semiring log   (softmax dist)");
+    let _ = writeln!(out, "//");
+    let _ = writeln!(out, "// {steps} steps · faithful decode {faithful}/{steps} ({:.0}%)", if steps > 0 { 100.0 * faithful as f32 / steps as f32 } else { 0.0 });
+    if margin_total.abs() > 1e-9 {
+        let _ = writeln!(out, "// per-expert share of the winning margin (t vs runner-up), summed over steps — the compactness meter:");
+        for b in 0..=e_act {
+            let _ = writeln!(out, "//   {:<9} {:+8.2}  ({:>3.0}% of margin)", blk(b), margin_by_block[b], 100.0 * margin_by_block[b] / margin_total);
+        }
+        let _ = writeln!(out, "//   {:<9} {:+8.2}  ({:>3.0}% of margin)  ← catchall: forge-tax / non-compact remainder", "rest", margin_rest, 100.0 * margin_rest / margin_total);
+    }
+    let _ = writeln!(out, "\n.decl candidate(step:number, t:number)\n.decl contrib(step:number, block:symbol, t:number, w:float)");
+    out.push_str(&body);
+    out
+}
+
 fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
     if let Some(path) = vocab {
         if let Ok(txt) = std::fs::read_to_string(path) {

@@ -54,6 +54,15 @@ impl CorpusBuckets {
         self.atoms.len()
     }
 
+    /// The full circuit→expert assignment `(e, expert_of)` (e = residual-bucket index). For the contrib-over-expert emit:
+    /// a decision's scored circuits are grouped by their corpus-expert to sum per-expert contributions.
+    pub fn expert_map(&self, experts: usize) -> (usize, HashMap<Circuit, usize>) {
+        match self.cluster(experts) {
+            None => (0, HashMap::new()),
+            Some(c) => (c.e, c.expert_of),
+        }
+    }
+
     /// The top-1 expert each ingested atom routes to (aligned with ingest order); returns `(e, routes)` where `e` is the
     /// residual-bucket index (empty / un-anchored atoms route there). For per-expert interpretability + the contrib emit.
     pub fn routes(&self, experts: usize) -> (usize, Vec<usize>) {

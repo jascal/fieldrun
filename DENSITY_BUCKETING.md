@@ -217,8 +217,8 @@ chunks (fieldrun's expert-offload).
       running clustering; `/bucket on|off|experts N|k N|reset|dump`).
 - [x] Per-expert interpretability (`--interpret`): the decoded tokens routed to
       each expert reveal **grammatical-role specialization** (see below).
-- [ ] contrib-over-expert Datalog (faithful composition decode + catchall `rest`),
-      replacing the bigram lookup — the runtime-MoE blueprint.
+- [x] contrib-over-expert Datalog (`--experts-dl-contrib`): faithful composition
+      decode + catchall `rest`, runs in `fieldrun eval` — replaces the bigram lookup.
 - [ ] Realize the partition as a runtime MoE: experts = pageable weight modules
       (fieldrun expert-offload), loaded on correlated work. Compactness is a
       RUNTIME property (resident working set), not `.dl` size; the catchall `rest`
@@ -266,3 +266,19 @@ seen in train) + `hit_train`/`hit_test` relations. A richer signature
 (`--dl-sig N` = last N context tokens) raises accuracy at the cost of a bigger
 table (the compactness↔accuracy tradeoff). The held-out miss is the **computed
 fragment** (the forge tax); the covered hits are the **retrievable** fragment.
+
+## Composition decode (`--experts-dl-contrib`) — the faithful model
+
+The bigram lookup above is a *retrievable-floor baseline*; it discards composition
+(the decode is `argmax_v ⟨r,U_v⟩ = argmax_v Σ_j c_j^v`, an additive sum, not a
+token→token table). `--experts-dl-contrib` emits the **composition** instead: a
+step-indexed program where, per decision, each scored circuit's contribution to the
+candidate tokens (`c_j^t = dla`, `c_j^v = dla − margins[v]`, recovered from the
+descent substrate) is summed **per corpus-expert**, plus a catchall `contrib("rest",…)`
+so `Σ == logit`. It runs in the existing `fieldrun eval` (`--semiring max` → argmax
+decode; `log` → softmax) and is **faithful by construction** — verified 12/12
+(100%) decode-matches the model. The header reports the **per-expert share of the
+winning margin** — the compactness meter: measured (Qwen2.5-0.5B), the verb expert
+e3 carries +68% of the margin, the catchall `rest` +36% (the non-compact forge-tax
+remainder). This is the runtime-MoE blueprint: route → load that expert, sum its
+contribution; the `rest` is the always-resident shared core.
