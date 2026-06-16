@@ -19,6 +19,9 @@ sweeps/corpora/pooled_big.json
 /tree.png
 /tree.xlsx
 
+# generated ablation eval sets + raw run outputs (curated summary is ABLATION_FINDINGS.md)
+/ablate/
+
 # local python env / caches
 .venv/
 __pycache__/
