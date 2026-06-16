@@ -1291,15 +1291,27 @@ fn main() {
                     Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
                 }
             }
-            // --recurse-depth D: recursively sub-bucket the residual into finer DOMAIN experts (the path toward the long
-            // tail). The flat clustering dumps everything not co-firing with a top-E hub into one residual; recursion
-            // re-clusters that residual, and its residual, D levels deep — resolving the collapsed tail.
-            if let Some(d) = flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1) {
-                let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+            // --tree-algo / --recurse-depth: build a HIERARCHY of experts and (with --tree) render it. greedy (default) =
+            // recursively sub-bucket the residual (wide, flat); balanced = recursive low-branch co-occurrence bisection
+            // (deep, even — lower routing-depth variance, no hot leaf). tree_metrics compares them on the same corpus.
+            let tree_algo = flag(&args, "--tree-algo").map(String::from);
+            let want_hier = tree_algo.is_some() || flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1).is_some();
+            if want_hier {
+                let algo = tree_algo.as_deref().unwrap_or("greedy");
                 let want_tree = has_flag(&args, "--tree");
-                let (leaves, route) = buckets.recursive(e_req, d, min_c);
+                let (leaves, route) = if algo == "balanced" {
+                    let branch: usize = flag(&args, "--tree-branch").and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let leaf_size: usize = flag(&args, "--leaf-size").and_then(|s| s.parse().ok()).unwrap_or(4);
+                    eprintln!("[fieldrun] tree-algo=balanced (branch={branch}, leaf-size={leaf_size}) — recursive co-occurrence bisection");
+                    buckets.balanced(branch, leaf_size)
+                } else {
+                    let d: usize = flag(&args, "--recurse-depth").and_then(|s| s.parse().ok()).unwrap_or(8).max(2);
+                    let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+                    buckets.recursive(e_req, d, min_c)
+                };
                 let n: usize = leaves.iter().map(|l| l.tokens).sum();
-                // per-leaf top decoded tokens (for --interpret / --tree).
+                println!("\n=== Expert tree [{algo}] ===");
+                println!("{}", bucketing::tree_metrics(&leaves));
                 let by_l: Vec<Vec<(i64, usize)>> = if want_interpret || want_tree {
                     let mut m: Vec<HashMap<i64, usize>> = vec![HashMap::new(); leaves.len()];
                     for (i, &r) in route.iter().enumerate() {
@@ -1318,36 +1330,25 @@ fn main() {
                     Box::new(|id: i64| id.to_string())
                 };
                 if want_tree {
-                    // --tree: render the recursion as an indented tree grouped by depth (the `r.` prefix). Each level
-                    // re-clusters the previous level's residual; within a level, leaves are sorted by token-load.
-                    let depth_of = |l: &str| l.matches("r.").count();
-                    let maxd = leaves.iter().map(|l| depth_of(&l.label)).max().unwrap_or(0);
-                    let shown = leaves.iter().filter(|l| l.tokens > 0).count();
-                    println!("\n=== Expert tree — recursive sub-bucketing (depth {d}, {shown} leaves) ===");
+                    // indented tree grouped by depth (RecExpert.depth); within a level, leaves sorted by load. Cap each
+                    // level to the top --tree-show leaves (default 24) so a deep balanced tree stays readable.
+                    let show: usize = flag(&args, "--tree-show").and_then(|s| s.parse().ok()).unwrap_or(24);
+                    let maxd = leaves.iter().map(|l| l.depth).max().unwrap_or(0);
                     for dd in 0..=maxd {
-                        let mut grp: Vec<(usize, &bucketing::RecExpert)> = leaves.iter().enumerate().filter(|(_, l)| depth_of(&l.label) == dd && l.tokens > 0).collect();
+                        let mut grp: Vec<(usize, &bucketing::RecExpert)> = leaves.iter().enumerate().filter(|(_, l)| l.depth == dd && l.tokens > 0).collect();
                         if grp.is_empty() { continue; }
                         grp.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
-                        let hdr = if dd == 0 { "depth 0 — top hubs of the corpus".to_string() } else { format!("{} residual re-clustered (level {dd})", "r.".repeat(dd)) };
-                        println!("{}{hdr}", "  ".repeat(dd));
-                        for (li, l) in grp {
-                            let toks: Vec<String> = by_l[li].iter().take(6).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
-                            println!("{}{:<16} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
+                        println!("{}── level {dd} ({} leaves) ──", "  ".repeat(dd), grp.len());
+                        for (li, l) in grp.iter().take(show) {
+                            let toks: Vec<String> = by_l[*li].iter().take(6).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            println!("{}{:<18} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
                         }
+                        if grp.len() > show { println!("{}  … +{} more leaves at this level", "  ".repeat(dd + 1), grp.len() - show); }
                     }
                 } else {
-                    println!("\n=== Recursive sub-bucketing (depth {d}, {} leaf experts) — the residual resolved into domain experts ===", leaves.len());
-                    println!("  {:<14}{:>9}{:>9}{:>8}", "leaf", "circuits", "tokens", "share");
+                    println!("  {:<18}{:>7}{:>9}{:>9}{:>8}", "leaf", "depth", "circuits", "tokens", "share");
                     for l in leaves.iter().filter(|l| l.tokens > 0) {
-                        println!("  {:<14}{:>9}{:>9}{:>7.0}%", l.label, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
-                    }
-                    if want_interpret {
-                        println!("\n  per-leaf specialty (top decoded tokens):");
-                        for (li, l) in leaves.iter().enumerate() {
-                            if by_l[li].is_empty() { continue; }
-                            let toks: Vec<String> = by_l[li].iter().take(8).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
-                            println!("    {:<14} {}", l.label, toks.join("  "));
-                        }
+                        println!("  {:<18}{:>7}{:>9}{:>9}{:>7.0}%", l.label, l.depth, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
                     }
                 }
             }
