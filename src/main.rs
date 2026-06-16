@@ -527,6 +527,72 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
+        // ── ablate-eval: causal-ablation specificity battery ────────────────────────────────────────────────
+        // Manifest JSON: {ctx, max_pos?, evals:{name:path}, specs:{name:{neurons:[[L,i]..], heads:[[L,h]..]}}}.
+        // For each (spec × eval set) report baseline vs ZERO-ablated mean next-token loss, mean target-token logit,
+        // and top-1 flip rate — turning "routes-to" cluster labels into causal Δloss/Δlogit claims. rope only.
+        if let Some(mpath) = flag(&args, "--ablate-eval") {
+            let mfst: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(mpath).unwrap_or_else(|e| { eprintln!("[fieldrun] ablate-eval: cannot read {mpath}: {e}"); std::process::exit(1); }))
+                .unwrap_or_else(|e| { eprintln!("[fieldrun] ablate-eval: bad JSON {mpath}: {e}"); std::process::exit(1); });
+            if lm.logits(&[0]).is_none() { eprintln!("[fieldrun] ablate-eval: arch {arch} has no logits hook (rope only)"); std::process::exit(1); }
+            let ctx = mfst["ctx"].as_u64().unwrap_or(64) as usize;
+            let max_pos = mfst["max_pos"].as_u64().map(|x| x as usize);
+            let mut specs: Vec<(String, Vec<(usize, usize)>, Vec<(usize, usize)>)> = Vec::new();
+            if let Some(obj) = mfst["specs"].as_object() {
+                for (name, v) in obj {
+                    let pairs = |key: &str| -> Vec<(usize, usize)> {
+                        v[key].as_array().map(|a| a.iter().filter_map(|p| {
+                            let p = p.as_array()?; Some((p[0].as_u64()? as usize, p[1].as_u64()? as usize))
+                        }).collect()).unwrap_or_default()
+                    };
+                    specs.push((name.clone(), pairs("heads"), pairs("neurons")));
+                }
+            }
+            let (nl, _h) = lm.dims().unwrap_or((0, 0));
+            let n_evals = mfst["evals"].as_object().map(|o| o.len()).unwrap_or(0);
+            eprintln!("[fieldrun] ablate-eval: {} specs × {} eval sets · ctx {ctx} · ZERO-ablation · {nl}L rope", specs.len(), n_evals);
+            println!("# ablate-eval · zero-ablation · ctx={ctx} · {nl}-layer rope · loss=next-token CE (nats), tlogit=target-token logit");
+            println!("spec\teval\tn\tbase_loss\tabl_loss\td_loss\tbase_tlogit\tabl_tlogit\td_tlogit\tflip%");
+            let lse = |v: &[f32]| -> f32 { let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+            let argmax = |v: &[f32]| -> usize { v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 };
+            if let Some(evals) = mfst["evals"].as_object() {
+                for (ename, epath) in evals {
+                    let path = epath.as_str().unwrap_or("");
+                    let ev: serde_json::Value = match std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+                        Some(v) => v, None => { eprintln!("[fieldrun] ablate-eval: skip {ename}: cannot read {path}"); continue; }
+                    };
+                    let eids: Vec<i64> = ev["holdout_ids"].as_array().or_else(|| ev["ids"].as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
+                    if eids.len() <= ctx { eprintln!("[fieldrun] ablate-eval: skip {ename}: only {} ids", eids.len()); continue; }
+                    let last = max_pos.map(|m| (ctx + m).min(eids.len())).unwrap_or(eids.len());
+                    let positions: Vec<usize> = (ctx..last).collect();
+                    let rows: Vec<(f32, f32, Vec<(f32, f32, bool)>)> = positions.par_iter().map(|&p| {
+                        let cx = &eids[p - ctx..p];
+                        let tgt = eids[p] as usize;
+                        let bl = lm.logits(cx).expect("rope logits");
+                        let bam = argmax(&bl);
+                        let per: Vec<(f32, f32, bool)> = specs.iter().map(|(_, h, n)| {
+                            let al = lm.logits_ablated(cx, h, n).expect("rope logits_ablated");
+                            (lse(&al) - al[tgt], al[tgt], argmax(&al) != bam)
+                        }).collect();
+                        (lse(&bl) - bl[tgt], bl[tgt], per)
+                    }).collect();
+                    let n = rows.len() as f32;
+                    let base_loss: f32 = rows.iter().map(|r| r.0).sum::<f32>() / n;
+                    let base_tlogit: f32 = rows.iter().map(|r| r.1).sum::<f32>() / n;
+                    for (si, (sname, _, _)) in specs.iter().enumerate() {
+                        let al: f32 = rows.iter().map(|r| r.2[si].0).sum::<f32>() / n;
+                        let at: f32 = rows.iter().map(|r| r.2[si].1).sum::<f32>() / n;
+                        let fl: f32 = 100.0 * rows.iter().filter(|r| r.2[si].2).count() as f32 / n;
+                        println!("{sname}\t{ename}\t{}\t{base_loss:.4}\t{al:.4}\t{:+.4}\t{base_tlogit:.3}\t{at:.3}\t{:+.3}\t{fl:.1}",
+                                 rows.len(), al - base_loss, at - base_tlogit);
+                    }
+                }
+            }
+            return;
+        }
+
         // --pruned-head: margin-gated retrieval-pruned output head on the DECODE loops (serve/chat/stream). The KB
         // proposes ~540 candidates per step; the unembed scores only those rows; the pick is accepted iff the in-set
         // normalized margin (exact facet distance, FINDINGS §5b) clears --pruned-margin, else the full head runs.

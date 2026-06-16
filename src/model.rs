@@ -214,6 +214,18 @@ pub trait Model: Sync {
         None
     }
 
+    /// Full next-token logit vector at the predicting position (the same vector `predict` argmaxes). For
+    /// per-token loss / target-token-logit measurement (`ablate-eval`). Default None; arches wire it where they can.
+    fn logits(&self, _ids: &[i64]) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Logit vector with the given attention heads + MLP neurons ZEROED — the ablated counterpart of `logits`, so
+    /// Δlogit / Δloss of a causal knockout is measurable, not just the top-1 flip (`predict_ablated`).
+    fn logits_ablated(&self, _ids: &[i64], _heads: &[(usize, usize)], _neurons: &[(usize, usize)]) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Install a margin-gated retrieval-pruned output head (`--pruned-head`) on the DECODE loops — the serve/chat
     /// streaming paths only; `predict` (scoring, probes) always runs the full head. Returns false if the arch doesn't
     /// wire it (default). See `headgate::HeadGate`.
