@@ -189,6 +189,17 @@ pub trait Model: Sync {
         self.explain(ids)
     }
 
+    /// Stream the explain-with-substrate at every position `pos` in `start..=ids.len()` — the decision predicting from
+    /// the growing context `ids[..pos]`. Default: an uncached loop over `explain_decomp` (one full forward per position).
+    /// KV-cache arches override this to reuse ONE growing cache — O(seq) attention work, byte-identical by causality.
+    fn explain_stream(&self, ids: &[i64], decomp_k: usize, start: usize, f: &mut dyn FnMut(usize, crate::explain::Explanation)) {
+        for pos in start.max(1)..=ids.len() {
+            if let Some(ex) = self.explain_decomp(&ids[..pos], decomp_k) {
+                f(pos, ex);
+            }
+        }
+    }
+
     /// The final post-norm residual `r(x)` at the predicting position — the exact vector the unembedding dots against
     /// (`logits = U·r`). Exposed for the power-diagram geometry probe (`--probe-facet`): the token cells in r-space are
     /// the Laguerre power diagram of the unembedding rows. Default None; arches implement it where wired.
