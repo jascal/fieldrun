@@ -556,6 +556,11 @@ fn main() {
             println!("spec\teval\tn\tbase_loss\tabl_loss\td_loss\tbase_tlogit\tabl_tlogit\td_tlogit\tflip%");
             let lse = |v: &[f32]| -> f32 { let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
             let argmax = |v: &[f32]| -> usize { v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 };
+            // --ablate-rows <path>: also dump PER-POSITION rows (eval,pos,target_id,spec,losses,logit,flip) so the
+            // effect can be sliced by target-token class downstream (e.g. e0 function-word vs content-word split).
+            let rows_path = flag(&args, "--ablate-rows");
+            let mut rowdump = String::new();
+            if rows_path.is_some() { rowdump.push_str("eval\tpos\ttarget_id\tspec\tbase_loss\tabl_loss\tbase_tlogit\tabl_tlogit\tflip\n"); }
             if let Some(evals) = mfst["evals"].as_object() {
                 for (ename, epath) in evals {
                     let path = epath.as_str().unwrap_or("");
@@ -578,6 +583,15 @@ fn main() {
                         }).collect();
                         (lse(&bl) - bl[tgt], bl[tgt], per)
                     }).collect();
+                    if rows_path.is_some() {
+                        for (i, &p) in positions.iter().enumerate() {
+                            let (bl, bt, per) = &rows[i];
+                            for (si, (sname, _, _)) in specs.iter().enumerate() {
+                                let (al, at, fl) = per[si];
+                                rowdump.push_str(&format!("{ename}\t{p}\t{}\t{sname}\t{bl:.5}\t{al:.5}\t{bt:.4}\t{at:.4}\t{}\n", eids[p], fl as u8));
+                            }
+                        }
+                    }
                     let n = rows.len() as f32;
                     let base_loss: f32 = rows.iter().map(|r| r.0).sum::<f32>() / n;
                     let base_tlogit: f32 = rows.iter().map(|r| r.1).sum::<f32>() / n;
@@ -588,6 +602,12 @@ fn main() {
                         println!("{sname}\t{ename}\t{}\t{base_loss:.4}\t{al:.4}\t{:+.4}\t{base_tlogit:.3}\t{at:.3}\t{:+.3}\t{fl:.1}",
                                  rows.len(), al - base_loss, at - base_tlogit);
                     }
+                }
+            }
+            if let Some(rp) = rows_path {
+                match std::fs::write(rp, &rowdump) {
+                    Ok(()) => eprintln!("[fieldrun] ablate-eval: wrote per-position rows → {rp}"),
+                    Err(e) => eprintln!("[fieldrun] ablate-eval: cannot write {rp}: {e}"),
                 }
             }
             return;

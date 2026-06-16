@@ -64,7 +64,9 @@ Baselines (mean CE, nats): de 2.282 · fr 3.088 · es 3.661 · en 2.179 · pytho
    competitor.** Ablating e0 *raises* the target logit everywhere (+0.06…+0.20) and
    even *helps* Spanish (Δloss −0.0146); it predicts commas/`the`/`de` that compete
    with content targets. It has the broadest reach (only unit above noise on all six
-   sets) but acts as a regularizer, not a scaffold. H3 as stated: **not supported**.
+   sets) but acts as a regularizer, not a scaffold. H3 as stated: **not supported** —
+   now confirmed directly by the function-vs-content split (e0 hurts function-word
+   targets, spares content; see the e0 follow-up section).
 
 5. **Metrics disagree below ~0.01 nats; trust flip%/Δlogit there.** `e19` (Spanish)
    flips **18.8%** of Spanish tokens and drops the Spanish target logit **−0.268**
@@ -81,6 +83,27 @@ Baselines (mean CE, nats): de 2.282 · fr 3.088 · es 3.661 · en 2.179 · pytho
    biggest effect is on French (+0.0116), not code; e107's biggest is on LaTeX
    (−0.0082, largest in its row — direction consistent with specialization) but tiny.
    H4: **not supported (e59) / inconclusive (e107)** — pending full-set ablation.
+
+## e0 follow-up — the competitor test (function vs content targets)
+
+Splitting e0's per-position effect by **target-token class** — function-word/punctuation
+vs content word (`--ablate-rows` + `scripts/analyze_e0_split.py`; de/fr/es/en, n=200/lang,
+ctx=32) — settles the "shared syntactic core vs competitor" question, decisively for
+**competitor**:
+
+| ablate **e0** `n.L22#1222` | function-word targets | content-word targets | gap (fn − content) |
+|---|---|---|---|
+| **mean Δloss, pooled (nats)** | **+0.0394** (n=370) | **−0.0066** (n=428) | **+0.0460** |
+| per-lang Δloss de/fr/es/en | +0.049 / +0.082 / +0.023 / +0.014 | −0.012 / +0.028 / −0.037 / −0.012 | +0.061 / +0.054 / +0.060 / +0.026 |
+| random control `n.L22` (pooled) | −0.0002 | −0.0023 | +0.0021 |
+
+Ablating e0 **hurts function-word prediction** (+0.039) and **spares/helps content-word
+prediction** (−0.007) — a **+0.046-nat swing**, with the function > content gap positive in
+**all four languages**, while the matched random control shows no such divergence (~±0.002).
+e0 is a **function-word promoter / competitor**: it boosts commas, articles, prepositions;
+removing it costs function-word targets and relieves competition for content targets. This
+**refutes the "universal load-bearing syntactic core" reading of e0** — its causal job is to
+predict high-frequency function tokens, not to scaffold syntax across languages.
 
 ## Bottom line
 
@@ -113,9 +136,7 @@ which this pass does not ablate.
    weak for asserting "no effect" on diffuse experts).
 3. **Mean-ablation** alongside zero-ablation (shrinks absolute Δloss, should preserve
    the specificity pattern — confirms the effects aren't a mean-removal artifact).
-4. **e0 token-class breakdown**: split loss into function-word vs content-word targets.
-   The competitor hypothesis predicts e0 ablation *helps* content targets and *hurts*
-   function-word targets — a cheap, decisive check of the "shared core vs competitor"
-   question without a re-cluster.
+4. ~~e0 token-class breakdown (function vs content targets)~~ — **done**, see the e0
+   follow-up section above: competitor confirmed (function +0.039 / content −0.007 pooled).
 5. **ctx=64** to match the clustering regime (magnitudes are ctx-dependent; the
    pattern is not).
