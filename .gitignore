@@ -4,3 +4,6 @@
 *.fieldrun.bin
 /bundles
 sweeps/runs/
+sweeps/*.log
+sweeps/*.txt
+sweeps/*.err
