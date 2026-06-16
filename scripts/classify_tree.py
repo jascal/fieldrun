@@ -112,7 +112,7 @@ def token_function(t):
     if s == '': return 'space'
     if '�' in t: return 'byte'                                  # U+FFFD replacement → broken multibyte
     if ('$' in t) or ('frac' in t) or ('\\\\' in t) or s in {'\\','=','\\\\'}: return 'math'
-    if re.fullmatch(r'[\d.,]+', s): return 'num'
+    if re.fullmatch(r'[\d.,]+', s) and any(c.isdigit() for c in s): return 'num'  # needs a digit; bare ',' / '.' are punct
     if not any(char_script(c) in LETTER for c in s): return 'punct'  # brackets/quotes/marks
     if t.startswith(' ') or (s[:1].isupper() and s.isalpha()): return 'word'  # word-initial
     return 'affix'                                                   # continuation / suffix
