@@ -1268,7 +1268,7 @@ fn main() {
                     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                     let total: usize = m.values().sum();
                     let label = if e == e_act { "residual".to_string() } else { format!("e{e}") };
-                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
                     println!("  {label:<9} {total:>4} tok →  {}", toks.join("  "));
                 }
             }
@@ -1340,7 +1340,7 @@ fn main() {
                         grp.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
                         println!("{}── level {dd} ({} leaves) ──", "  ".repeat(dd), grp.len());
                         for (li, l) in grp.iter().take(show) {
-                            let toks: Vec<String> = by_l[*li].iter().take(6).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            let toks: Vec<String> = by_l[*li].iter().take(6).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
                             println!("{}{:<18} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
                         }
                         if grp.len() > show { println!("{}  … +{} more leaves at this level", "  ".repeat(dd + 1), grp.len() - show); }
@@ -1349,6 +1349,14 @@ fn main() {
                     println!("  {:<18}{:>7}{:>9}{:>9}{:>8}", "leaf", "depth", "circuits", "tokens", "share");
                     for l in leaves.iter().filter(|l| l.tokens > 0) {
                         println!("  {:<18}{:>7}{:>9}{:>9}{:>7.0}%", l.label, l.depth, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
+                    }
+                    if want_interpret {
+                        println!("\n  per-leaf specialty (top decoded tokens):");
+                        for (li, l) in leaves.iter().enumerate() {
+                            if by_l[li].is_empty() { continue; }
+                            let toks: Vec<String> = by_l[li].iter().take(8).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            println!("    {:<14} {}", l.label, toks.join("  "));
+                        }
                     }
                 }
             }
@@ -2449,6 +2457,9 @@ fn emit_contrib_dl(lm: &dyn model::Model, positions: &[&[i64]], k: usize, e_act:
     out
 }
 
+// Returns a DISPLAY-READY token label: `"<text>" [id]` (text is already {:?}-quoted) or `[id]` when
+// the vocab/text is unavailable. Matches api::TextGen::token_label's contract — so callers print it
+// with `{}`, NOT `{:?}` (re-quoting double-escapes it: `"\",\" [11]"` instead of `"," [11]`).
 fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
     if let Some(path) = vocab {
         if let Ok(txt) = std::fs::read_to_string(path) {
