@@ -1,0 +1,8 @@
+# Python deps for the tree / ablation analysis scripts.
+#   python -m venv .venv && . .venv/bin/activate && pip install -r scripts/requirements.txt
+tokenizers>=0.20      # bundle tokenizer — make_monster_corpus.py, make_ablation_evals.py
+datasets>=2.0         # streamed Wikipedia corpora — make_monster_corpus.py, make_ablation_evals.py
+openpyxl>=3.1         # multi-tab workbook — tree_to_xlsx.py
+# Optional: classify_tree.py --render (SVG/PNG) additionally needs mermaid-cli (Node, not pip):
+#   npm i -g @mermaid-js/mermaid-cli
+# Without it, classify_tree.py still writes the .mmd for rendering elsewhere.

@@ -623,6 +623,16 @@ impl Model for Rope {
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
     }
 
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        let xf = self.hidden(ids);
+        Some(self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    fn logits_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<Vec<f32>> {
+        let xf = self.hidden_ab(ids, heads, neurons, &[], &[]);
+        Some(self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
     fn set_head_gate(&mut self, gate: std::sync::Arc<crate::headgate::HeadGate>) -> bool {
         self.gate = Some(gate);
         true

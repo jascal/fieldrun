@@ -121,7 +121,14 @@ impl CorpusBuckets {
             universe = Some(residual_circuits.into_iter().collect());
             prefix.push_str("r.");
         }
-        // assemble leaves + route each original atom to the leaf of its highest-global-frequency circuit.
+        // depth = how many "r." prefixes the leaf label carries (= recursion level it was resolved at).
+        self.finalize_tree(leaf_of, &|l: &str| l.matches("r.").count())
+    }
+
+    /// Build the leaf list (label + depth + circuit count + token load) and the per-atom route from a circuit→leaf-label
+    /// map. `depth_of` computes a leaf's tree depth from its label. A token routes to the leaf of its atom's highest-
+    /// global-frequency circuit. Leaves are returned sorted by token-load (the `--tree` printer regroups them by depth).
+    fn finalize_tree(&self, leaf_of: HashMap<Circuit, String>, depth_of: &dyn Fn(&str) -> usize) -> (Vec<RecExpert>, Vec<usize>) {
         let mut freq: HashMap<Circuit, usize> = HashMap::new();
         for a in &self.atoms {
             for &id in a {
@@ -133,7 +140,7 @@ impl CorpusBuckets {
         for lab in leaf_of.values() {
             if !idx_of.contains_key(lab) {
                 idx_of.insert(lab.clone(), leaves.len());
-                leaves.push(RecExpert { label: lab.clone(), n_circuits: 0, tokens: 0 });
+                leaves.push(RecExpert { label: lab.clone(), depth: depth_of(lab), n_circuits: 0, tokens: 0 });
             }
         }
         for lab in leaf_of.values() {
@@ -145,13 +152,129 @@ impl CorpusBuckets {
         for &r in &route {
             leaves[r].tokens += 1;
         }
-        // sort leaves by load (descending) and remap routes to the sorted order.
         let mut order: Vec<usize> = (0..leaves.len()).collect();
         order.sort_by(|&a, &b| leaves[b].tokens.cmp(&leaves[a].tokens).then(leaves[a].label.cmp(&leaves[b].label)));
         let new_pos: HashMap<usize, usize> = order.iter().enumerate().map(|(np, &old)| (old, np)).collect();
         let sorted: Vec<RecExpert> = order.iter().map(|&o| leaves[o].clone()).collect();
         let route2: Vec<usize> = route.iter().map(|r| new_pos[r]).collect();
         (sorted, route2)
+    }
+
+    /// BALANCED tree: recursive `branch`-way bisection of the circuit set by co-occurrence — pick `branch` mutually-distant
+    /// high-frequency seeds, assign each circuit to the seed it co-fires with most, capped to ~equal group sizes, and
+    /// recurse until a group has ≤ `leaf_size` circuits. Low branching (default binary) + size balance ⇒ a DEEP, even tree
+    /// (depth ~log_branch|C|, routing O(depth)) rather than the flat one-wide-level greedy tree. Returns leaves + routes.
+    pub fn balanced(&self, branch: usize, leaf_size: usize) -> (Vec<RecExpert>, Vec<usize>) {
+        let branch = branch.max(2);
+        let mut freq: HashMap<Circuit, usize> = HashMap::new();
+        for a in &self.atoms {
+            for &id in a {
+                *freq.entry(id).or_default() += 1;
+            }
+        }
+        let all: Vec<Circuit> = {
+            let mut v: Vec<Circuit> = freq.keys().copied().collect();
+            v.sort();
+            v
+        };
+        let mut leaf_of: HashMap<Circuit, String> = HashMap::new();
+        self.split_balanced(&all, branch, leaf_size.max(1), &freq, &mut Vec::new(), &mut leaf_of);
+        self.finalize_tree(leaf_of, &|l: &str| l.len())
+    }
+
+    /// One node of the balanced recursion: split `circuits` into `branch` size-balanced co-occurrence groups, recurse.
+    /// `path` is the current node address (one char per level); the leaf label is the full path string.
+    fn split_balanced(&self, circuits: &[Circuit], branch: usize, leaf_size: usize, freq: &HashMap<Circuit, usize>, path: &mut Vec<u8>, leaf_of: &mut HashMap<Circuit, String>) {
+        if circuits.len() <= leaf_size || circuits.len() < branch {
+            let lab = if path.is_empty() { "root".to_string() } else { String::from_utf8_lossy(path).into_owned() };
+            for &c in circuits {
+                leaf_of.insert(c, lab.clone());
+            }
+            return;
+        }
+        let cset: HashSet<Circuit> = circuits.iter().copied().collect();
+        let seeds = self.pick_seeds(circuits, branch, freq, &cset);
+        let groups = self.assign_balanced(circuits, &seeds, &cset);
+        for (i, g) in groups.into_iter().enumerate() {
+            if g.is_empty() {
+                continue;
+            }
+            path.push(b'0' + i as u8);
+            self.split_balanced(&g, branch, leaf_size, freq, path, leaf_of);
+            path.pop();
+        }
+    }
+
+    /// Pick `branch` seeds: the highest-frequency circuit, then greedily the most frequent circuit that least co-fires
+    /// with the seeds already chosen (frequent AND distant) — so the seeds anchor well-separated regions of the graph.
+    fn pick_seeds(&self, circuits: &[Circuit], branch: usize, freq: &HashMap<Circuit, usize>, cset: &HashSet<Circuit>) -> Vec<Circuit> {
+        let mut seeds: Vec<Circuit> = vec![*circuits.iter().max_by_key(|c| freq[*c]).unwrap()];
+        while seeds.len() < branch.min(circuits.len()) {
+            // co-occurrence of every candidate with the chosen seeds.
+            let seedset: HashSet<Circuit> = seeds.iter().copied().collect();
+            let mut cooc: HashMap<Circuit, u32> = circuits.iter().map(|&c| (c, 0u32)).collect();
+            for a in &self.atoms {
+                let present: Vec<Circuit> = a.iter().copied().filter(|c| cset.contains(c)).collect();
+                let has_seed = present.iter().any(|c| seedset.contains(c));
+                if !has_seed {
+                    continue;
+                }
+                for &c in &present {
+                    if let Some(v) = cooc.get_mut(&c) {
+                        *v += 1;
+                    }
+                }
+            }
+            // maximise freq / (1 + cooc_with_seeds): frequent but distant. Skip already-chosen seeds.
+            let next = circuits.iter().filter(|c| !seedset.contains(c)).max_by(|&&a, &&b| {
+                let sa = freq[&a] as f64 / (1.0 + cooc[&a] as f64);
+                let sb = freq[&b] as f64 / (1.0 + cooc[&b] as f64);
+                sa.partial_cmp(&sb).unwrap().then(a.cmp(&b))
+            });
+            match next {
+                Some(&c) => seeds.push(c),
+                None => break,
+            }
+        }
+        seeds
+    }
+
+    /// Assign each circuit to the seed it co-fires with most, capped to ~equal group sizes (size balance). Circuits with
+    /// the clearest preference are placed first; ties / full groups fall to the next-best group with room.
+    fn assign_balanced(&self, circuits: &[Circuit], seeds: &[Circuit], cset: &HashSet<Circuit>) -> Vec<Vec<Circuit>> {
+        let branch = seeds.len();
+        let seed_idx: HashMap<Circuit, usize> = seeds.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+        let mut cooc: HashMap<Circuit, Vec<u32>> = circuits.iter().map(|&c| (c, vec![0u32; branch])).collect();
+        for a in &self.atoms {
+            let present: Vec<Circuit> = a.iter().copied().filter(|c| cset.contains(c)).collect();
+            let seeds_here: Vec<usize> = present.iter().filter_map(|c| seed_idx.get(c).copied()).collect();
+            if seeds_here.is_empty() {
+                continue;
+            }
+            for &c in &present {
+                let v = cooc.get_mut(&c).unwrap();
+                for &si in &seeds_here {
+                    v[si] += 1;
+                }
+            }
+        }
+        // confidence = top co-occurrence minus the runner-up (place the most decisively-assigned circuits first).
+        let conf = |c: &Circuit| -> i64 {
+            let mut s = cooc[c].clone();
+            s.sort_unstable_by(|a, b| b.cmp(a));
+            s[0] as i64 - *s.get(1).unwrap_or(&0) as i64
+        };
+        let mut order: Vec<Circuit> = circuits.to_vec();
+        order.sort_by(|a, b| conf(b).cmp(&conf(a)).then(a.cmp(b)));
+        let cap = circuits.len().div_ceil(branch);
+        let mut groups: Vec<Vec<Circuit>> = vec![Vec::new(); branch];
+        for c in order {
+            let mut prefs: Vec<usize> = (0..branch).collect();
+            prefs.sort_by(|&x, &y| cooc[&c][y].cmp(&cooc[&c][x]).then(groups[x].len().cmp(&groups[y].len())));
+            let g = prefs.iter().copied().find(|&gi| groups[gi].len() < cap).unwrap_or(prefs[0]);
+            groups[g].push(c);
+        }
+        groups
     }
 
     /// A runtime RESIDENCY profile: experts sorted by token-load (descending) with cumulative coverage. The hot
@@ -468,10 +591,30 @@ fn cluster_atoms(atoms: &[Vec<Circuit>], experts: usize) -> Option<Cluster> {
     Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
 }
 
-/// One leaf expert from recursive sub-bucketing: a hierarchical label (`e3`, `r.e1`, …), circuit count, token load.
+/// Summary metrics for a built tree (leaves carry depth + token-load), for comparing tree algorithms: size, depth (max +
+/// the load-weighted mean ROUTING depth), and load balance (hottest-leaf share + normalized load entropy where 1.0 =
+/// perfectly even). A balanced low-branch tree should show a higher mean-depth but a far lower hottest-leaf and a
+/// load-balance near 1.0 vs the flat greedy tree.
+pub fn tree_metrics(leaves: &[RecExpert]) -> String {
+    let active: Vec<&RecExpert> = leaves.iter().filter(|l| l.tokens > 0).collect();
+    let n: usize = active.iter().map(|l| l.tokens).sum();
+    if n == 0 || active.is_empty() {
+        return "  (no routed tokens)".to_string();
+    }
+    let maxd = active.iter().map(|l| l.depth).max().unwrap_or(0);
+    let mean_depth: f64 = active.iter().map(|l| l.depth as f64 * l.tokens as f64).sum::<f64>() / n as f64;
+    let max_share = active.iter().map(|l| l.tokens).max().unwrap_or(0) as f64 / n as f64;
+    let h: f64 = active.iter().map(|l| { let p = l.tokens as f64 / n as f64; -p * p.log2() }).sum();
+    let balance = h / (active.len() as f64).log2().max(1e-9);
+    let mean_circ: f64 = active.iter().map(|l| l.n_circuits as f64).sum::<f64>() / active.len() as f64;
+    format!("  leaves={}  max-depth={maxd}  mean-routing-depth={mean_depth:.2}  hottest-leaf={:.0}%  load-balance={balance:.2}  mean-circuits/leaf={mean_circ:.1}", active.len(), 100.0 * max_share)
+}
+
+/// One leaf expert from a tree build: a hierarchical label, its recursion depth, circuit count, token load.
 #[derive(Clone)]
 pub struct RecExpert {
     pub label: String,
+    pub depth: usize,
     pub n_circuits: usize,
     pub tokens: usize,
 }
@@ -673,5 +816,33 @@ mod tests {
         assert!(leaves.len() >= 3, "recursion should resolve the residual into ≥2 sub-experts; got {:?}", leaves.iter().map(|l| &l.label).collect::<Vec<_>>());
         assert!(leaves.iter().any(|l| l.label.starts_with("r.")), "expected hierarchical r.* leaf labels");
         assert_eq!(route.len(), b.n_tokens()); // one route per ingested atom
+    }
+
+    #[test]
+    fn balanced_bisects_two_clusters() {
+        let mut b = CorpusBuckets::new();
+        let a = [(1u8, 1, 0), (1u8, 1, 1), (1u8, 1, 2)]; // cluster A: these three co-fire together
+        let bb = [(1u8, 2, 0), (1u8, 2, 1), (1u8, 2, 2)]; // cluster B: co-fire together, never with A
+        for _ in 0..10 { b.ingest(a.to_vec()); }
+        for _ in 0..10 { b.ingest(bb.to_vec()); }
+        let (leaves, route) = b.balanced(2, 1); // binary split, single-circuit leaves
+        assert_eq!(route.len(), 20);
+        // a binary balanced tree over 6 circuits must split the root — every leaf sits below it (depth >= 1).
+        assert!(leaves.iter().all(|l| l.depth >= 1), "balanced tree must split the root");
+        assert!(tree_metrics(&leaves).contains("load-balance="));
+        // the two disjoint co-occurrence clusters must land in DIFFERENT leaves (the bisection separated them).
+        assert_ne!(route[0], route[10], "the two clusters should route to different leaves");
+    }
+
+    #[test]
+    fn balanced_terminates_on_a_clique() {
+        // a single all-co-firing clique (no natural split) must still terminate and partition every circuit.
+        let mut b = CorpusBuckets::new();
+        let clique: Vec<Circuit> = (0..8).map(|i| (1u8, 0, i)).collect();
+        for _ in 0..5 { b.ingest(clique.clone()); }
+        let (leaves, route) = b.balanced(2, 2); // leaf-size 2
+        assert_eq!(route.len(), 5);
+        assert!(!leaves.is_empty());
+        assert_eq!(leaves.iter().map(|l| l.n_circuits).sum::<usize>(), 8); // every circuit assigned exactly once
     }
 }

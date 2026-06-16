@@ -527,6 +527,92 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
         };
 
+        // ── ablate-eval: causal-ablation specificity battery ────────────────────────────────────────────────
+        // Manifest JSON: {ctx, max_pos?, evals:{name:path}, specs:{name:{neurons:[[L,i]..], heads:[[L,h]..]}}}.
+        // For each (spec × eval set) report baseline vs ZERO-ablated mean next-token loss, mean target-token logit,
+        // and top-1 flip rate — turning "routes-to" cluster labels into causal Δloss/Δlogit claims. rope only.
+        if let Some(mpath) = flag(&args, "--ablate-eval") {
+            let mfst: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(mpath).unwrap_or_else(|e| { eprintln!("[fieldrun] ablate-eval: cannot read {mpath}: {e}"); std::process::exit(1); }))
+                .unwrap_or_else(|e| { eprintln!("[fieldrun] ablate-eval: bad JSON {mpath}: {e}"); std::process::exit(1); });
+            if lm.logits(&[0]).is_none() { eprintln!("[fieldrun] ablate-eval: arch {arch} has no logits hook (rope only)"); std::process::exit(1); }
+            let ctx = mfst["ctx"].as_u64().unwrap_or(64) as usize;
+            let max_pos = mfst["max_pos"].as_u64().map(|x| x as usize);
+            let mut specs: Vec<(String, Vec<(usize, usize)>, Vec<(usize, usize)>)> = Vec::new();
+            if let Some(obj) = mfst["specs"].as_object() {
+                for (name, v) in obj {
+                    let pairs = |key: &str| -> Vec<(usize, usize)> {
+                        v[key].as_array().map(|a| a.iter().filter_map(|p| {
+                            let p = p.as_array()?; Some((p[0].as_u64()? as usize, p[1].as_u64()? as usize))
+                        }).collect()).unwrap_or_default()
+                    };
+                    specs.push((name.clone(), pairs("heads"), pairs("neurons")));
+                }
+            }
+            let (nl, _h) = lm.dims().unwrap_or((0, 0));
+            let n_evals = mfst["evals"].as_object().map(|o| o.len()).unwrap_or(0);
+            eprintln!("[fieldrun] ablate-eval: {} specs × {} eval sets · ctx {ctx} · ZERO-ablation · {nl}L rope", specs.len(), n_evals);
+            println!("# ablate-eval · zero-ablation · ctx={ctx} · {nl}-layer rope · loss=next-token CE (nats), tlogit=target-token logit");
+            println!("spec\teval\tn\tbase_loss\tabl_loss\td_loss\tbase_tlogit\tabl_tlogit\td_tlogit\tflip%");
+            let lse = |v: &[f32]| -> f32 { let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+            let argmax = |v: &[f32]| -> usize { v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 };
+            // --ablate-rows <path>: also dump PER-POSITION rows (eval,pos,target_id,spec,losses,logit,flip) so the
+            // effect can be sliced by target-token class downstream (e.g. e0 function-word vs content-word split).
+            let rows_path = flag(&args, "--ablate-rows");
+            let mut rowdump = String::new();
+            if rows_path.is_some() { rowdump.push_str("eval\tpos\ttarget_id\tspec\tbase_loss\tabl_loss\tbase_tlogit\tabl_tlogit\tflip\n"); }
+            if let Some(evals) = mfst["evals"].as_object() {
+                for (ename, epath) in evals {
+                    let path = epath.as_str().unwrap_or("");
+                    let ev: serde_json::Value = match std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+                        Some(v) => v, None => { eprintln!("[fieldrun] ablate-eval: skip {ename}: cannot read {path}"); continue; }
+                    };
+                    let eids: Vec<i64> = ev["holdout_ids"].as_array().or_else(|| ev["ids"].as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
+                    if eids.len() <= ctx { eprintln!("[fieldrun] ablate-eval: skip {ename}: only {} ids", eids.len()); continue; }
+                    let last = max_pos.map(|m| (ctx + m).min(eids.len())).unwrap_or(eids.len());
+                    let positions: Vec<usize> = (ctx..last).collect();
+                    let rows: Vec<(f32, f32, Vec<(f32, f32, bool)>)> = positions.par_iter().map(|&p| {
+                        let cx = &eids[p - ctx..p];
+                        let tgt = eids[p] as usize;
+                        let bl = lm.logits(cx).expect("rope logits");
+                        let bam = argmax(&bl);
+                        let per: Vec<(f32, f32, bool)> = specs.iter().map(|(_, h, n)| {
+                            let al = lm.logits_ablated(cx, h, n).expect("rope logits_ablated");
+                            (lse(&al) - al[tgt], al[tgt], argmax(&al) != bam)
+                        }).collect();
+                        (lse(&bl) - bl[tgt], bl[tgt], per)
+                    }).collect();
+                    if rows_path.is_some() {
+                        for (i, &p) in positions.iter().enumerate() {
+                            let (bl, bt, per) = &rows[i];
+                            for (si, (sname, _, _)) in specs.iter().enumerate() {
+                                let (al, at, fl) = per[si];
+                                rowdump.push_str(&format!("{ename}\t{p}\t{}\t{sname}\t{bl:.5}\t{al:.5}\t{bt:.4}\t{at:.4}\t{}\n", eids[p], fl as u8));
+                            }
+                        }
+                    }
+                    let n = rows.len() as f32;
+                    let base_loss: f32 = rows.iter().map(|r| r.0).sum::<f32>() / n;
+                    let base_tlogit: f32 = rows.iter().map(|r| r.1).sum::<f32>() / n;
+                    for (si, (sname, _, _)) in specs.iter().enumerate() {
+                        let al: f32 = rows.iter().map(|r| r.2[si].0).sum::<f32>() / n;
+                        let at: f32 = rows.iter().map(|r| r.2[si].1).sum::<f32>() / n;
+                        let fl: f32 = 100.0 * rows.iter().filter(|r| r.2[si].2).count() as f32 / n;
+                        println!("{sname}\t{ename}\t{}\t{base_loss:.4}\t{al:.4}\t{:+.4}\t{base_tlogit:.3}\t{at:.3}\t{:+.3}\t{fl:.1}",
+                                 rows.len(), al - base_loss, at - base_tlogit);
+                    }
+                }
+            }
+            if let Some(rp) = rows_path {
+                match std::fs::write(rp, &rowdump) {
+                    Ok(()) => eprintln!("[fieldrun] ablate-eval: wrote per-position rows → {rp}"),
+                    Err(e) => eprintln!("[fieldrun] ablate-eval: cannot write {rp}: {e}"),
+                }
+            }
+            return;
+        }
+
         // --pruned-head: margin-gated retrieval-pruned output head on the DECODE loops (serve/chat/stream). The KB
         // proposes ~540 candidates per step; the unembed scores only those rows; the pick is accepted iff the in-set
         // normalized margin (exact facet distance, FINDINGS §5b) clears --pruned-margin, else the full head runs.
@@ -1268,7 +1354,7 @@ fn main() {
                     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                     let total: usize = m.values().sum();
                     let label = if e == e_act { "residual".to_string() } else { format!("e{e}") };
-                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                    let toks: Vec<String> = top.iter().take(10).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
                     println!("  {label:<9} {total:>4} tok →  {}", toks.join("  "));
                 }
             }
@@ -1291,15 +1377,27 @@ fn main() {
                     Err(err) => eprintln!("[fieldrun] --corpus-decompose: cannot write {path}: {err}"),
                 }
             }
-            // --recurse-depth D: recursively sub-bucket the residual into finer DOMAIN experts (the path toward the long
-            // tail). The flat clustering dumps everything not co-firing with a top-E hub into one residual; recursion
-            // re-clusters that residual, and its residual, D levels deep — resolving the collapsed tail.
-            if let Some(d) = flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1) {
-                let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+            // --tree-algo / --recurse-depth: build a HIERARCHY of experts and (with --tree) render it. greedy (default) =
+            // recursively sub-bucket the residual (wide, flat); balanced = recursive low-branch co-occurrence bisection
+            // (deep, even — lower routing-depth variance, no hot leaf). tree_metrics compares them on the same corpus.
+            let tree_algo = flag(&args, "--tree-algo").map(String::from);
+            let want_hier = tree_algo.is_some() || flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1).is_some();
+            if want_hier {
+                let algo = tree_algo.as_deref().unwrap_or("greedy");
                 let want_tree = has_flag(&args, "--tree");
-                let (leaves, route) = buckets.recursive(e_req, d, min_c);
+                let (leaves, route) = if algo == "balanced" {
+                    let branch: usize = flag(&args, "--tree-branch").and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let leaf_size: usize = flag(&args, "--leaf-size").and_then(|s| s.parse().ok()).unwrap_or(4);
+                    eprintln!("[fieldrun] tree-algo=balanced (branch={branch}, leaf-size={leaf_size}) — recursive co-occurrence bisection");
+                    buckets.balanced(branch, leaf_size)
+                } else {
+                    let d: usize = flag(&args, "--recurse-depth").and_then(|s| s.parse().ok()).unwrap_or(8).max(2);
+                    let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+                    buckets.recursive(e_req, d, min_c)
+                };
                 let n: usize = leaves.iter().map(|l| l.tokens).sum();
-                // per-leaf top decoded tokens (for --interpret / --tree).
+                println!("\n=== Expert tree [{algo}] ===");
+                println!("{}", bucketing::tree_metrics(&leaves));
                 let by_l: Vec<Vec<(i64, usize)>> = if want_interpret || want_tree {
                     let mut m: Vec<HashMap<i64, usize>> = vec![HashMap::new(); leaves.len()];
                     for (i, &r) in route.iter().enumerate() {
@@ -1318,34 +1416,31 @@ fn main() {
                     Box::new(|id: i64| id.to_string())
                 };
                 if want_tree {
-                    // --tree: render the recursion as an indented tree grouped by depth (the `r.` prefix). Each level
-                    // re-clusters the previous level's residual; within a level, leaves are sorted by token-load.
-                    let depth_of = |l: &str| l.matches("r.").count();
-                    let maxd = leaves.iter().map(|l| depth_of(&l.label)).max().unwrap_or(0);
-                    let shown = leaves.iter().filter(|l| l.tokens > 0).count();
-                    println!("\n=== Expert tree — recursive sub-bucketing (depth {d}, {shown} leaves) ===");
+                    // indented tree grouped by depth (RecExpert.depth); within a level, leaves sorted by load. Cap each
+                    // level to the top --tree-show leaves (default 24) so a deep balanced tree stays readable.
+                    let show: usize = flag(&args, "--tree-show").and_then(|s| s.parse().ok()).unwrap_or(24);
+                    let maxd = leaves.iter().map(|l| l.depth).max().unwrap_or(0);
                     for dd in 0..=maxd {
-                        let mut grp: Vec<(usize, &bucketing::RecExpert)> = leaves.iter().enumerate().filter(|(_, l)| depth_of(&l.label) == dd && l.tokens > 0).collect();
+                        let mut grp: Vec<(usize, &bucketing::RecExpert)> = leaves.iter().enumerate().filter(|(_, l)| l.depth == dd && l.tokens > 0).collect();
                         if grp.is_empty() { continue; }
                         grp.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
-                        let hdr = if dd == 0 { "depth 0 — top hubs of the corpus".to_string() } else { format!("{} residual re-clustered (level {dd})", "r.".repeat(dd)) };
-                        println!("{}{hdr}", "  ".repeat(dd));
-                        for (li, l) in grp {
-                            let toks: Vec<String> = by_l[li].iter().take(6).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
-                            println!("{}{:<16} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
+                        println!("{}── level {dd} ({} leaves) ──", "  ".repeat(dd), grp.len());
+                        for (li, l) in grp.iter().take(show) {
+                            let toks: Vec<String> = by_l[*li].iter().take(6).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            println!("{}{:<18} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
                         }
+                        if grp.len() > show { println!("{}  … +{} more leaves at this level", "  ".repeat(dd + 1), grp.len() - show); }
                     }
                 } else {
-                    println!("\n=== Recursive sub-bucketing (depth {d}, {} leaf experts) — the residual resolved into domain experts ===", leaves.len());
-                    println!("  {:<14}{:>9}{:>9}{:>8}", "leaf", "circuits", "tokens", "share");
+                    println!("  {:<18}{:>7}{:>9}{:>9}{:>8}", "leaf", "depth", "circuits", "tokens", "share");
                     for l in leaves.iter().filter(|l| l.tokens > 0) {
-                        println!("  {:<14}{:>9}{:>9}{:>7.0}%", l.label, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
+                        println!("  {:<18}{:>7}{:>9}{:>9}{:>7.0}%", l.label, l.depth, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
                     }
                     if want_interpret {
                         println!("\n  per-leaf specialty (top decoded tokens):");
                         for (li, l) in leaves.iter().enumerate() {
                             if by_l[li].is_empty() { continue; }
-                            let toks: Vec<String> = by_l[li].iter().take(8).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            let toks: Vec<String> = by_l[li].iter().take(8).map(|(t, c)| format!("{}·{c}", dec(*t).replace('\n', "⏎"))).collect();
                             println!("    {:<14} {}", l.label, toks.join("  "));
                         }
                     }
@@ -2448,6 +2543,9 @@ fn emit_contrib_dl(lm: &dyn model::Model, positions: &[&[i64]], k: usize, e_act:
     out
 }
 
+// Returns a DISPLAY-READY token label: `"<text>" [id]` (text is already {:?}-quoted) or `[id]` when
+// the vocab/text is unavailable. Matches api::TextGen::token_label's contract — so callers print it
+// with `{}`, NOT `{:?}` (re-quoting double-escapes it: `"\",\" [11]"` instead of `"," [11]`).
 fn load_decoder(vocab: Option<&str>) -> Box<dyn Fn(i64) -> String> {
     if let Some(path) = vocab {
         if let Ok(txt) = std::fs::read_to_string(path) {
