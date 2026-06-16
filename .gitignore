@@ -7,3 +7,5 @@ sweeps/runs/
 sweeps/*.log
 sweeps/*.txt
 sweeps/*.err
+sweeps/corpora/monster.json
+sweeps/corpora/pooled_big.json
