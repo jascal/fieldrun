@@ -153,18 +153,21 @@ def find_chrome():
     """Locate a Chrome/Chromium binary for mermaid-cli's headless render (puppeteer)."""
     if os.environ.get('PUPPETEER_EXECUTABLE_PATH'):
         return os.environ['PUPPETEER_EXECUTABLE_PATH']
-    for c in ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-              '/Applications/Chromium.app/Contents/MacOS/Chromium'):
+    for c in ('google-chrome', 'chromium', 'chromium-browser', 'google-chrome-stable', 'chrome'):
+        if (p := shutil.which(c)): return p                          # PATH first (portable)
+    for c in ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',  # then common absolute paths
+              '/Applications/Chromium.app/Contents/MacOS/Chromium',
+              '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+              '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'):
         if os.path.exists(c): return c
-    for c in ('google-chrome', 'chromium', 'chromium-browser', 'chrome'):
-        if (p := shutil.which(c)): return p
-    return None
+    return None                                                      # let mermaid-cli fall back to its bundled chromium
 
 def render(mmd_path, fmts=('svg', 'png'), scale=3):
     """Render a (fence-free) .mmd file to the given formats via mermaid-cli (mmdc)."""
     mmdc = shutil.which('mmdc')
-    if not mmdc:
-        print("  [render] mmdc not found — install with: npm i -g @mermaid-js/mermaid-cli", file=sys.stderr)
+    if not mmdc:                                                     # rendering is optional; the .mmd is always written
+        print(f"  [render] mmdc not found — the .mmd is written; render it anywhere, or "
+              f"`npm i -g @mermaid-js/mermaid-cli` to enable --render", file=sys.stderr)
         return []
     env = dict(os.environ)
     if (chrome := find_chrome()): env['PUPPETEER_EXECUTABLE_PATH'] = chrome

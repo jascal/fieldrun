@@ -24,6 +24,23 @@ circuit and measure held-out next-token loss vs baseline. Reproduce with
   full-circuit-set ablation needs the `--experts-out` partition (a 2h40m re-run) —
   so this tests **anchors only**, not each expert's full 21–300 circuits.
 
+## Results (Δloss, nats; n=128/eval, ctx=32)
+
+Rows = ablated anchor, cols = held-out eval set. Diagnostic cells annotated with
+**flip%** and **Δlogit** (target-token). Control block = 5 random matched-type units.
+
+| ablate ↓  eval → | de | fr | es | en | python | latex |
+|---|---|---|---|---|---|---|
+| **e8** German `n.L19#1273` | **+0.2943** (17.2%, −0.524) | −0.0031 | +0.0028 | −0.0018 | +0.0016 | +0.0016 |
+| **e17** Romance det `n.L21#3483` | +0.0053 | −0.0008 | −0.0037 | +0.0001 | +0.0012 | +0.0009 |
+| **e19** Spanish verb `n.L20#35` | −0.0001 | −0.0011 | −0.0139 (18.8%, −0.268) | −0.0005 | +0.0002 | +0.0004 |
+| **e0** xling core `n.L22#1222` | +0.0071 | +0.0496 | −0.0146 | +0.0120 | +0.0046 | +0.0025  · Δlogit +0.06…+0.20 *everywhere* |
+| **e59** code `head L22#2` | −0.0016 | +0.0116 | +0.0056 | +0.0065 | +0.0044 | −0.0002 |
+| **e107** LaTeX `n.L20#661` | +0.0004 | +0.0010 | +0.0041 | −0.0024 | −0.0008 | −0.0082 |
+| *control mean \|Δloss\|* | *0.0014* | *0.0025* | *0.0026* | *0.0019* | *0.0011* | *0.0015* |
+
+Baselines (mean CE, nats): de 2.282 · fr 3.088 · es 3.661 · en 2.179 · python 2.927 · latex 1.038.
+
 ## Headline findings
 
 1. **Causality is real but concentrated, not uniform.** Anchor ablation confirms a
@@ -78,6 +95,27 @@ core" `e0` is a function-word *competitor*, not a load-bearing syntactic scaffol
 
 zero- (not mean-) ablation overstates magnitude but preserves the specificity
 pattern; anchor-only (not full-set); ctx=32 (vs clustering's 64) inflates the German
-effect (+0.20→+0.29); 0.5B model; n=128, single control seed. Tightening: full-set +
-mean-ablation, ctx=64, n≥500, per-token-class loss (function vs content) for e0,
-multiple control seeds.
+effect (+0.20→+0.29); 0.5B model; n=128, single control seed. **A null at the anchor
+is not a null for the expert** — the broad/diffuse experts (e0/e17/e59/e107) are
+under-read here because their function is distributed across the full circuit set,
+which this pass does not ablate.
+
+## Next steps (prioritized)
+
+1. **Full circuit-set ablation** (decisive). Re-run `--corpus-decompose --experts-out`
+   (~2h40m) to recover per-expert circuit membership, then ablate each expert's full
+   21–300 circuits (the `logits_ablated` hook already accepts a circuit list). This is
+   the test that settles H2 (family boundary), H3 (universal core), and H4
+   (formal-language separation) for the diffuse experts — the anchor pass only
+   settled the *concentrated* ones (e8, partly e19).
+2. **Statistical power**: n≥500 per eval set + several control seeds for a proper
+   noise *distribution* (current n=128, single seed, supports the large effects but is
+   weak for asserting "no effect" on diffuse experts).
+3. **Mean-ablation** alongside zero-ablation (shrinks absolute Δloss, should preserve
+   the specificity pattern — confirms the effects aren't a mean-removal artifact).
+4. **e0 token-class breakdown**: split loss into function-word vs content-word targets.
+   The competitor hypothesis predicts e0 ablation *helps* content targets and *hurts*
+   function-word targets — a cheap, decisive check of the "shared core vs competitor"
+   question without a re-cluster.
+5. **ctx=64** to match the clustering regime (magnitudes are ctx-dependent; the
+   pattern is not).
