@@ -1296,32 +1296,58 @@ fn main() {
             // re-clusters that residual, and its residual, D levels deep — resolving the collapsed tail.
             if let Some(d) = flag(&args, "--recurse-depth").and_then(|s| s.parse::<usize>().ok()).filter(|&d| d > 1) {
                 let min_c: usize = flag(&args, "--recurse-min").and_then(|s| s.parse().ok()).unwrap_or(8);
+                let want_tree = has_flag(&args, "--tree");
                 let (leaves, route) = buckets.recursive(e_req, d, min_c);
                 let n: usize = leaves.iter().map(|l| l.tokens).sum();
-                println!("\n=== Recursive sub-bucketing (depth {d}, {} leaf experts) — the residual resolved into domain experts ===", leaves.len());
-                println!("  {:<14}{:>9}{:>9}{:>8}", "leaf", "circuits", "tokens", "share");
-                for l in leaves.iter().filter(|l| l.tokens > 0) {
-                    println!("  {:<14}{:>9}{:>9}{:>7.0}%", l.label, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
-                }
-                if want_interpret {
-                    #[cfg(feature = "api")]
-                    let dec: Box<dyn Fn(i64) -> String> = match api::TextGen::load(&stem, eos.clone()) {
-                        Some(tg) => Box::new(move |id| tg.token_label(id)),
-                        None => load_decoder(flag(&args, "--vocab")),
-                    };
-                    #[cfg(not(feature = "api"))]
-                    let dec = load_decoder(flag(&args, "--vocab"));
-                    let mut by_l: Vec<HashMap<i64, usize>> = vec![HashMap::new(); leaves.len()];
+                // per-leaf top decoded tokens (for --interpret / --tree).
+                let by_l: Vec<Vec<(i64, usize)>> = if want_interpret || want_tree {
+                    let mut m: Vec<HashMap<i64, usize>> = vec![HashMap::new(); leaves.len()];
                     for (i, &r) in route.iter().enumerate() {
-                        if let Some(&p) = preds.get(i) { *by_l[r].entry(p).or_default() += 1; }
+                        if let Some(&p) = preds.get(i) { *m[r].entry(p).or_default() += 1; }
                     }
-                    println!("\n  per-leaf specialty (top decoded tokens):");
-                    for (li, l) in leaves.iter().enumerate() {
-                        if by_l[li].is_empty() { continue; }
-                        let mut top: Vec<(i64, usize)> = by_l[li].iter().map(|(&t, &c)| (t, c)).collect();
-                        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                        let toks: Vec<String> = top.iter().take(8).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
-                        println!("    {:<14} {}", l.label, toks.join("  "));
+                    m.into_iter().map(|hm| { let mut v: Vec<(i64, usize)> = hm.into_iter().collect(); v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0))); v }).collect()
+                } else {
+                    vec![Vec::new(); leaves.len()]
+                };
+                let dec: Box<dyn Fn(i64) -> String> = if want_interpret || want_tree {
+                    #[cfg(feature = "api")]
+                    { match api::TextGen::load(&stem, eos.clone()) { Some(tg) => Box::new(move |id| tg.token_label(id)) as Box<dyn Fn(i64) -> String>, None => load_decoder(flag(&args, "--vocab")) } }
+                    #[cfg(not(feature = "api"))]
+                    { load_decoder(flag(&args, "--vocab")) }
+                } else {
+                    Box::new(|id: i64| id.to_string())
+                };
+                if want_tree {
+                    // --tree: render the recursion as an indented tree grouped by depth (the `r.` prefix). Each level
+                    // re-clusters the previous level's residual; within a level, leaves are sorted by token-load.
+                    let depth_of = |l: &str| l.matches("r.").count();
+                    let maxd = leaves.iter().map(|l| depth_of(&l.label)).max().unwrap_or(0);
+                    let shown = leaves.iter().filter(|l| l.tokens > 0).count();
+                    println!("\n=== Expert tree — recursive sub-bucketing (depth {d}, {shown} leaves) ===");
+                    for dd in 0..=maxd {
+                        let mut grp: Vec<(usize, &bucketing::RecExpert)> = leaves.iter().enumerate().filter(|(_, l)| depth_of(&l.label) == dd && l.tokens > 0).collect();
+                        if grp.is_empty() { continue; }
+                        grp.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
+                        let hdr = if dd == 0 { "depth 0 — top hubs of the corpus".to_string() } else { format!("{} residual re-clustered (level {dd})", "r.".repeat(dd)) };
+                        println!("{}{hdr}", "  ".repeat(dd));
+                        for (li, l) in grp {
+                            let toks: Vec<String> = by_l[li].iter().take(6).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            println!("{}{:<16} {:>4.0}%  ({:>4} circ)  {}", "  ".repeat(dd + 1), l.label, 100.0 * l.tokens as f32 / n.max(1) as f32, l.n_circuits, toks.join("  "));
+                        }
+                    }
+                } else {
+                    println!("\n=== Recursive sub-bucketing (depth {d}, {} leaf experts) — the residual resolved into domain experts ===", leaves.len());
+                    println!("  {:<14}{:>9}{:>9}{:>8}", "leaf", "circuits", "tokens", "share");
+                    for l in leaves.iter().filter(|l| l.tokens > 0) {
+                        println!("  {:<14}{:>9}{:>9}{:>7.0}%", l.label, l.n_circuits, l.tokens, 100.0 * l.tokens as f32 / n.max(1) as f32);
+                    }
+                    if want_interpret {
+                        println!("\n  per-leaf specialty (top decoded tokens):");
+                        for (li, l) in leaves.iter().enumerate() {
+                            if by_l[li].is_empty() { continue; }
+                            let toks: Vec<String> = by_l[li].iter().take(8).map(|(t, c)| format!("{:?}·{c}", dec(*t).replace('\n', "⏎"))).collect();
+                            println!("    {:<14} {}", l.label, toks.join("  "));
+                        }
                     }
                 }
             }
