@@ -16,7 +16,7 @@ Usage:
   python scripts/classify_tree.py [TREE.txt] [-o OUT.mmd]
   python scripts/classify_tree.py tree.txt --no-mermaid     # audit table only
 """
-import re, sys, argparse, collections
+import re, sys, argparse, collections, os, shutil, subprocess, tempfile
 
 # --------------------------------------------------------------------------- parse
 # leaf line, e.g.:  "    r.e212   37%  (   1 circ)  "\",\" [11]"·268  ..."   (indent = 2*(depth+1))
@@ -149,11 +149,49 @@ FUNC_ORDER = ['punct','word','affix','num','math','space','byte']
 LBL = {'nil':'nil · no-lang','X':'X · cross-lang','lat':'lat · undet.','en':'en','de':'de','es':'es',
        'fr':'fr','it':'it','ru':'ru','zh':'zh','ja':'ja','ar':'ar','hi':'hi'}
 
+def find_chrome():
+    """Locate a Chrome/Chromium binary for mermaid-cli's headless render (puppeteer)."""
+    if os.environ.get('PUPPETEER_EXECUTABLE_PATH'):
+        return os.environ['PUPPETEER_EXECUTABLE_PATH']
+    for c in ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+              '/Applications/Chromium.app/Contents/MacOS/Chromium'):
+        if os.path.exists(c): return c
+    for c in ('google-chrome', 'chromium', 'chromium-browser', 'chrome'):
+        if (p := shutil.which(c)): return p
+    return None
+
+def render(mmd_path, fmts=('svg', 'png'), scale=3):
+    """Render a (fence-free) .mmd file to the given formats via mermaid-cli (mmdc)."""
+    mmdc = shutil.which('mmdc')
+    if not mmdc:
+        print("  [render] mmdc not found — install with: npm i -g @mermaid-js/mermaid-cli", file=sys.stderr)
+        return []
+    env = dict(os.environ)
+    if (chrome := find_chrome()): env['PUPPETEER_EXECUTABLE_PATH'] = chrome
+    cfg = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+    cfg.write('{"args":["--no-sandbox"]}'); cfg.close()                # headless sandbox is unavailable here
+    done = []
+    stem = mmd_path.rsplit('.', 1)[0]
+    for fmt in fmts:
+        out = f'{stem}.{fmt}'
+        cmd = [mmdc, '-i', mmd_path, '-o', out, '-p', cfg.name, '-b', 'white']
+        if fmt == 'png': cmd += ['-s', str(scale)]                    # supersample raster for crispness
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(out):
+            done.append(out)
+        else:
+            print(f"  [render] {fmt} failed: {(r.stderr or r.stdout).strip().splitlines()[-1:]}", file=sys.stderr)
+    os.unlink(cfg.name)
+    return done
+
 def main():
     ap = argparse.ArgumentParser(description="Group a fieldrun --tree dump by (language, function) → Mermaid.")
     ap.add_argument('tree', nargs='?', default='tree.txt', help='tree dump (default: tree.txt)')
     ap.add_argument('-o', '--out', help='write Mermaid here (default: <tree>.mmd)')
     ap.add_argument('--no-mermaid', action='store_true', help='audit table only')
+    ap.add_argument('--render', action='store_true', help='also render SVG+PNG via mermaid-cli (mmdc)')
+    ap.add_argument('--formats', default='svg,png', help='formats for --render (default: svg,png)')
+    ap.add_argument('--scale', type=int, default=3, help='PNG supersample factor (default: 3)')
     a = ap.parse_args()
 
     text = open(a.tree, encoding='utf-8').read()
@@ -195,7 +233,7 @@ def main():
     title = (f"monster expert tree<br/>{len(leaves)} leaves" +
              (f" · |C|={stats['C']}" if stats['C'] else "") +
              (f" · {stats['ntok']} decisions" if stats['ntok'] else ""))
-    out = ['```mermaid', 'flowchart LR', f'  R["{title}"]']
+    out = ['flowchart LR', f'  R["{title}"]']
     for lg in LANG_ORDER:
         if not langtot[lg]: continue
         out.append(f'  R --> L_{lg}["{LBL[lg]}<br/>({langtot[lg]})"]')
@@ -207,11 +245,13 @@ def main():
             '  classDef latC fill:#efe,stroke:#7a7;']
     for lg, cl in (('nil','nilC'), ('X','xC'), ('lat','latC')):
         if langtot[lg]: out.append(f'  class L_{lg} {cl};')
-    out.append('```')
-    mmd = '\n'.join(out)
+    body = '\n'.join(out)                                  # raw mermaid (no code fence) — what .mmd / mmdc want
     dst = a.out or (a.tree.rsplit('.', 1)[0] + '.mmd')
-    open(dst, 'w').write(mmd + '\n')
-    print(f"\nwrote {dst}\n\n{mmd}")
+    open(dst, 'w').write(body + '\n')
+    print(f"\nwrote {dst}\n\n```mermaid\n{body}\n```")     # fenced for chat/markdown display
+    if a.render:
+        made = render(dst, tuple(f.strip() for f in a.formats.split(',') if f.strip()), a.scale)
+        for f in made: print(f"rendered {f}")
 
 if __name__ == '__main__':
     main()
