@@ -9,3 +9,17 @@ sweeps/*.txt
 sweeps/*.err
 sweeps/corpora/monster.json
 sweeps/corpora/pooled_big.json
+
+# generated tree dump + its views (root) — describe results, don't check them in
+/tree.txt
+/tree.err
+/tree.wall
+/tree.mmd
+/tree.svg
+/tree.png
+/tree.xlsx
+
+# local python env / caches
+.venv/
+__pycache__/
+.DS_Store

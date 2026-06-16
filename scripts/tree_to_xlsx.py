@@ -10,7 +10,8 @@ Tabs: `all` (every leaf) + one tab per bucket — `nil`, `X`, `lat`, and each la
 present — all with the same columns. Reuses classify_tree.py for token parsing + the
 (language, function) classification.
 
-Usage:  python scripts/tree_to_xlsx.py [TREE.txt] [-o OUT.xlsx]
+Usage:    python scripts/tree_to_xlsx.py [TREE.txt] [-o OUT.xlsx]
+Requires: openpyxl  (pip install openpyxl)
 """
 import os, sys, re, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
