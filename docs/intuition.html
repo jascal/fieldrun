@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Inside a tiny mind — what a language model retrieves, selects, and computes</title>
+<title>Inside a Tiny Language Model — what it retrieves, selects, and computes</title>
 <style>
   :root{
     --ink:#1a1d23; --paper:#fbfaf7; --panel:#fff; --line:#e4ded2;
@@ -90,7 +90,10 @@
   .barrow .fill{height:100%;border-radius:3px}
   .barrow .val{width:54px;font-size:11px;color:#555;font-family:'SF Mono',monospace}
   .attnrow{display:flex;align-items:center;gap:3px;margin:3px 0;font-family:Helvetica,Arial,sans-serif;font-size:11px}
-  .attncell{width:26px;height:26px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'SF Mono',monospace;font-size:13px;color:#fff;flex-shrink:0}
+  .attncell{position:relative;width:26px;height:26px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'SF Mono',monospace;font-size:13px;color:#fff;flex-shrink:0;cursor:help}
+  .attntip{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:#161b24;color:#fff;font-size:10.5px;font-family:Helvetica,Arial,sans-serif;white-space:nowrap;padding:4px 8px;border-radius:5px;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:10;pointer-events:none}
+  .attntip b{font-family:'SF Mono',monospace;font-size:12px}
+  .attncell:hover .attntip{display:block}
   .chip{display:inline-block;font-family:'SF Mono',monospace;font-size:13px;border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:2px;background:#f5f2ec}
   .chip.in{background:#eaf3ea;border-color:#bcd8bc} .chip.miss{background:#fbeceb;border-color:#e6b9b6;color:#a33}
   .verdict{border-radius:10px;padding:16px 18px;margin:6px 0;color:#fff}
@@ -116,6 +119,29 @@
   .resrow .reslab{width:74px;text-align:right;font-family:Helvetica,Arial,sans-serif;font-size:10.5px;color:#777;flex-shrink:0}
   .resrow.on .reslab{color:var(--accent);font-weight:bold}
   .resrow .arrow{font-family:Helvetica,Arial,sans-serif;font-size:11px;color:#bbb}
+  .resrow .matnum{flex:1;min-width:0}
+  /* numeric (2dp) matrix / residual view */
+  .matnum{overflow-x:auto;max-width:100%}
+  .numgrid{border-collapse:collapse;font-family:'SF Mono',Menlo,Consolas,monospace;font-size:9px;width:auto;margin:2px 0}
+  .numgrid td{border:1px solid rgba(0,0,0,.06);padding:1px 3px;text-align:right;white-space:nowrap}
+  #mapweights.vals{flex-direction:column}
+  #mapweights.vals .mat{width:100%;min-width:0}
+  .matvals-toggle{font-family:Helvetica,Arial,sans-serif;font-size:10px;text-transform:none;letter-spacing:0;font-weight:normal;color:#888;margin-left:10px;cursor:pointer;white-space:nowrap}
+  .matvals-toggle input{vertical-align:middle;margin-right:3px}
+  /* output tape — the call the model writes, pulse by pulse */
+  #outtape{margin-top:16px}
+  .tapelab{font-family:Helvetica,Arial,sans-serif;font-size:11px;color:var(--machine-dim);margin-bottom:7px}
+  .tapelab b{color:#e8eaf0}
+  .tape{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+  .tapetok{font-family:'SF Mono',monospace;font-size:17px;padding:6px 10px;border-radius:7px;border:1px solid #2f3a49;background:#1b212c;color:#e8eaf0}
+  .tapetok.given{opacity:.7}
+  .tapetok.gen{background:#3a2a1c;border-color:var(--accent);color:#ffd2b0;cursor:pointer}
+  .tapetok.gen:hover{background:#4a341f}
+  .tapetok.gen.on{background:var(--accent);color:#fff;box-shadow:0 0 0 2px rgba(179,84,30,.4)}
+  .tapearrow{color:var(--accent);font-family:'SF Mono',monospace;font-size:18px;margin:0 2px}
+  /* floating tooltip for architecture-diagram blocks */
+  #blocktip{display:none;position:fixed;z-index:1000;max-width:300px;background:#161b24;color:#e8eaf0;font-family:Helvetica,Arial,sans-serif;font-size:12px;line-height:1.45;padding:9px 12px;border-radius:7px;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none}
+  #blocktip b{color:#fff}
   @media(max-width:720px){.three{grid-template-columns:1fr}.corpus{column-count:1}.barrow .lab{width:92px}}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js"></script>
@@ -124,7 +150,7 @@
 
 <header class="hero"><div class="wrap">
   <div class="kicker">A field guide companion · fieldrun</div>
-  <h1>Inside a tiny mind</h1>
+  <h1>Inside a Tiny Language Model</h1>
   <p class="lede">When a language model answers, is it <b>remembering</b> or <b>thinking</b>? Here is a whole
   language model small enough to watch — one that genuinely <b>retrieves</b>, <b>selects</b>, and <b>computes</b>,
   one pulse at a time.</p>
@@ -176,6 +202,7 @@ verdict: did it retrieve, select, or compute this pulse?</p>
     <button id="clear" class="ghost">clear</button>
   </div>
   <div id="about" style="display:none;margin:12px 0;padding:10px 14px;border-left:3px solid var(--accent);background:rgba(255,255,255,.05);font-size:13.5px;color:#d4dae6"></div>
+  <div id="outtape" style="display:none"></div>
   <div id="stepper" style="display:none">
     <div id="steplist"></div>
     <div id="stepbody"></div>
@@ -188,9 +215,11 @@ verdict: did it retrieve, select, or compute this pulse?</p>
   <div id="modelmap" style="display:none">
     <div class="mapttl">The whole model <span>— the highlighted block is what runs at this step</span></div>
     <div id="mapdiagram"></div>
-    <div class="mapw-ttl">the residual stream at the prediction point — each layer reads it and adds to it</div>
+    <div class="mapw-ttl">the residual stream at the prediction point — each layer reads it and adds to it
+      <label class="matvals-toggle"><input type="checkbox" class="mv-toggle"> show values (2dp)</label></div>
     <div id="mapresid"></div>
-    <div class="mapw-ttl">weights in play this step</div>
+    <div class="mapw-ttl">weights in play this step
+      <label class="matvals-toggle"><input type="checkbox" class="mv-toggle"> show values (2dp)</label></div>
     <div id="mapweights"></div>
   </div>
 </div>
@@ -476,6 +505,8 @@ $('#three').innerHTML = `
 // ---------- the lab ----------
 let prompt = lex.examples[0].prefix.slice();
 let steps = [], stepIx = 0;
+// autoregressive output: the model writes pulse by pulse until the call closes
+let outputSeq = [], genStart = 0, inspectIx = 0;
 
 (function presets(){
   const wrap = $('#presets');
@@ -514,22 +545,70 @@ $('#back').onclick=()=>{ prompt.pop(); renderPrompt(); };
 $('#clear').onclick=()=>{ prompt=[0]; renderPrompt(); };
 $('#run').onclick=run;
 
+const END_CALL = 1;   // the ⟩ pulse — emitting it completes a call
+// autoregressively extend the prompt, one argmax pulse at a time, until the
+// call closes (⟩), the context fills, or a cap is hit — so the reader can watch
+// the model write a whole call end to end, not just a single next pulse.
+function generate(prefix, maxNew=12){
+  const seq = prefix.slice(), out = [];
+  for(let i=0; i<maxNew && seq.length<model.config.ctx; i++){
+    const id = ENG.forward(model, seq).pred;
+    seq.push(id); out.push(id);
+    if(id===END_CALL) break;                                   // call complete
+    const n=out.length;                                        // stop a degenerate stutter
+    if(n>=4 && out[n-1]===out[n-2] && out[n-2]===out[n-3] && out[n-3]===out[n-4]) break;
+  }
+  return out;
+}
+// run the full step-through for one prediction: the model sees `prefix` and
+// predicts the next pulse. Reused for the first answer and every later one.
+function loadPrediction(prefix){
+  const trace = ENG.forward(model, prefix);
+  curTrace = trace;
+  const rinfo = ENG.route(store, prefix, trace.pred);
+  steps = buildSteps(prefix, trace, rinfo);
+  stepIx = 0; mapKey = null;
+  renderStepList(); showStep(0);
+}
 function run(){
   if(prompt.length<2){ alert('Add at least two pulses — start a call with ⟨.'); return; }
-  const trace = ENG.forward(model, prompt);
-  curTrace = trace;
-  const rinfo = ENG.route(store, prompt, trace.pred);
-  steps = buildSteps(prompt, trace, rinfo);
-  stepIx = 0;
+  const gen = generate(prompt);
+  outputSeq = prompt.concat(gen);
+  genStart = prompt.length;
+  inspectIx = genStart;                       // focus the first pulse the model writes
   // narrative blurb if this prompt is one of the featured calls
   const match = lex.examples.find(e=>e.prefix.length===prompt.length && e.prefix.every((v,i)=>v===prompt[i]));
   const about = $('#about');
   if(match){ about.style.display='block'; about.innerHTML = `<b>${match.title}.</b> ${match.blurb}`; }
   else about.style.display='none';
+  $('#outtape').style.display='block';
   $('#stepper').style.display='block';
   $('#modelmap').style.display='block'; mapKey=null;
-  renderStepList(); showStep(0);
+  renderTape();
+  loadPrediction(prompt);
   $('#about').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+// the output tape: the given pulses, then the pulses the model wrote. Click any
+// written pulse to step through exactly how the model produced it.
+function renderTape(){
+  const box = $('#outtape');
+  const wrote = outputSeq.length-genStart;
+  let h = `<div class="tapelab">The model writes the call <b>one pulse at a time</b>, feeding each pulse back in to
+    predict the next — until the call closes. The <b style="color:#ffd2b0">orange</b> pulses are the ${wrote} it wrote.
+    Click any orange pulse to step through how it was produced.</div><div class="tape">`;
+  outputSeq.forEach((id,k)=>{
+    if(k===genStart && genStart>0) h += `<span class="tapearrow">→</span>`;
+    if(k<genStart){
+      h += `<span class="tapetok given" title="${GLOSS[id]}">${GL[id]}</span>`;
+    } else {
+      h += `<span class="tapetok gen${k===inspectIx?' on':''}" data-k="${k}" title="${GLOSS[id]} — click to inspect">${GL[id]}</span>`;
+    }
+  });
+  box.innerHTML = h+`</div>`;
+  box.querySelectorAll('.tapetok.gen').forEach(s=>{
+    s.onclick = ()=>{ inspectIx=+s.dataset.k; renderTape(); loadPrediction(outputSeq.slice(0,inspectIx));
+      $('#stepper').scrollIntoView({behavior:'smooth',block:'nearest'}); };
+  });
 }
 
 // ---------- vis helpers ----------
@@ -543,11 +622,14 @@ function barChart(rows, opt={}){ // rows: [{lab,val,color}]
   }).join('')+`</div>`;
 }
 const lerp=(a,b,t)=>a+(b-a)*t;
-function heatColor(v,scaleMax){ // diverging blue/white/red
+function heatRGB(v,scaleMax){ // diverging blue/white/red -> [r,g,b]
   const t=Math.max(-1,Math.min(1, v/(scaleMax||1)));
-  if(t>=0) return `rgb(${Math.round(lerp(255,192,t))},${Math.round(lerp(255,80,t))},${Math.round(lerp(255,77,t))})`;
-  return `rgb(${Math.round(lerp(255,44,-t))},${Math.round(lerp(255,106,-t))},${Math.round(lerp(255,155,-t))})`;
+  if(t>=0) return [lerp(255,192,t),lerp(255,80,t),lerp(255,77,t)];
+  return [lerp(255,44,-t),lerp(255,106,-t),lerp(255,155,-t)];
 }
+function heatColor(v,scaleMax){ const c=heatRGB(v,scaleMax); return `rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`; }
+// black or white text, whichever is readable on the given heat background
+const heatInk = (v,scaleMax)=>{ const c=heatRGB(v,scaleMax); return (0.299*c[0]+0.587*c[1]+0.114*c[2])<140?'#fff':'#1a1d23'; };
 
 // ---------- step builders ----------
 function buildSteps(prompt, trace, rinfo){
@@ -633,8 +715,8 @@ function attnView(prompt, lt){
     let cells='';
     for(let j=0;j<L;j++){
       const w=a[j]||0;
-      cells+=`<div class="attncell" title="${GLOSS[prompt[j]]} (${(w*100).toFixed(0)}%)"
-        style="background:rgba(179,84,30,${0.12+0.88*w})">${GL[prompt[j]]}</div>`;
+      cells+=`<div class="attncell" style="background:rgba(179,84,30,${0.12+0.88*w})">${GL[prompt[j]]}`
+        +`<span class="attntip"><b>${GL[prompt[j]]}</b> — ${GLOSS[prompt[j]]} · ${(w*100).toFixed(0)}% attention</span></div>`;
     }
     const note = top===L-1 ? 'mostly itself (a no-op / pass-through here)'
       : `reaches back to <b>${GL[prompt[top]]}</b> <span class="dim">(${GLOSS[prompt[top]]})</span>, ${L-1-top} pulse${L-1-top>1?'s':''} back`;
@@ -648,10 +730,10 @@ function mlpView(trace, layer){
   const neurons = trace.sources.filter(s=>s.kind==='neuron' && s.layer===layer);
   neurons.sort((a,b)=>Math.abs(b.dla)-Math.abs(a.dla));
   const top = neurons.slice(0,5);
-  // promotions: top tokens of each neuron's write, via Utilde
+  // promotions: top tokens of each neuron's write, via Utilde (glyph + English gloss)
   const promo = w=>{
     const sc = trace.Utilde.map((u,v)=>[u.reduce((s,x,i)=>s+x*w[i],0),v]).sort((a,b)=>b[0]-a[0]);
-    return sc.slice(0,4).map(p=>GL[p[1]]).join(' ');
+    return sc.slice(0,4).map(p=>`${GL[p[1]]} <span class="dim">(${GLOSS[p[1]]})</span>`).join(', ');
   };
   let rows = top.map(n=>({lab:`L${layer} neuron ${n.idx}`, val:n.dla, color: n.dla>=0?'#2c6a9b':'#c0504d'}));
   let h = barChart(rows,{fmt:v=>(v>=0?'+':'')+v.toFixed(3)});
@@ -757,6 +839,19 @@ function matHeat(name, mat){
   for(const r of mat) for(const v of r) h+=`<span class="cell" style="height:${cell}px;background:${heatColor(v,mx)}"></span>`;
   return h+`</div></div>`;
 }
+// same matrix as a grid of 2-decimal values (heat-tinted, text kept readable)
+function matVals(name, mat){
+  if(typeof mat[0]==='number') mat=[mat];
+  const rows=mat.length, cols=mat[0].length;
+  let mx=1e-9; for(const r of mat) for(const v of r) mx=Math.max(mx,Math.abs(v));
+  let h=`<div class="mat"><div class="mlab"><b>${name}</b> ${rows}×${cols}</div><div class="matnum"><table class="numgrid"><tbody>`;
+  for(const r of mat){
+    h+='<tr>';
+    for(const v of r) h+=`<td style="background:${heatColor(v,mx)};color:${heatInk(v,mx)}">${v.toFixed(2)}</td>`;
+    h+='</tr>';
+  }
+  return h+'</tbody></table></div></div>';
+}
 function weightView(layer, kind){
   let mats;
   if(kind==='embed') mats=[['embed_tokens',model.embed]];
@@ -766,19 +861,64 @@ function weightView(layer, kind){
   else if(layer>=0 && kind==='mlp'){ const L=model.layers[layer];
     mats=[['post_ln',L.post_ln],['gate_proj',L.gate],['up_proj',L.up],['down_proj',L.down]]; }
   else return '<div class="dim" style="font-size:12px;padding:2px 0">Step into a layer’s attention or neurons (the steps above) to see that layer’s own weight matrices light up.</div>';
-  return mats.map(([n,m])=>matHeat(n,m)).join('');
+  const render = showMatVals ? matVals : matHeat;
+  return mats.map(([n,m])=>render(n,m)).join('');
 }
 function residualView(activeStage){
   if(!curTrace) return '';
   const rs=curTrace.residStream;
   let mx=1e-9; for(const s of rs) for(const v of s.vec) mx=Math.max(mx,Math.abs(v));
   const d=rs[0].vec.length, cell=Math.max(3,Math.min(8,Math.floor(260/d)));
-  return rs.map((s,i)=>`<div class="resrow ${i===activeStage?'on':''}"><div class="reslab">${s.stage}</div>`+
-    `<div class="heat" style="grid-template-columns:repeat(${d},${cell}px)">`+
-    s.vec.map(v=>`<span class="cell" style="height:${cell}px;background:${heatColor(v,mx)}"></span>`).join('')+
-    `</div></div>`).join('');
+  return rs.map((s,i)=>{
+    let body;
+    if(showMatVals){
+      body=`<div class="matnum"><table class="numgrid"><tbody><tr>`+
+        s.vec.map(v=>`<td style="background:${heatColor(v,mx)};color:${heatInk(v,mx)}">${v.toFixed(2)}</td>`).join('')+
+        `</tr></tbody></table></div>`;
+    } else {
+      body=`<div class="heat" style="grid-template-columns:repeat(${d},${cell}px)">`+
+        s.vec.map(v=>`<span class="cell" style="height:${cell}px;background:${heatColor(v,mx)}"></span>`).join('')+`</div>`;
+    }
+    return `<div class="resrow ${i===activeStage?'on':''}"><div class="reslab">${s.stage}</div>${body}</div>`;
+  }).join('');
 }
 let mapKey=null, mapN=0, curTrace=null;
+let showMatVals=false, curMapLayer=-1, curMapKind='none', curMapStage=-1;
+// plain-English explanations for the architecture-diagram blocks (hover tooltips)
+const BLOCK_GLOSS = {
+  emb:  '<b>Embedding table</b> — a lookup that turns each pulse id into a learned vector of numbers. It is the only thing the model knows about a pulse before any reasoning.',
+  attn: '<b>Self-attention (RoPE)</b> — each position looks back at earlier pulses and pulls in information from the ones it decides are relevant. RoPE (rotary position embedding) rotates the query/key vectors so the model can tell <i>where</i> each pulse sat in the call.',
+  mlp:  '<b>MLP / feed-forward (SwiGLU)</b> — a small per-position neural network applied after attention. SwiGLU is its activation: a gate (SiLU(gate)) multiplies an up-projection, choosing how strongly each neuron fires, before a down-projection writes back.',
+  nrm:  '<b>Final RMSNorm</b> — rescales the vector so its values have a consistent size (root-mean-square = 1, times a learned weight). It keeps the final scores well-behaved before read-out.',
+  head: '<b>Unembed (tied)</b> — compares the final vector against every pulse’s embedding to give each possible next pulse a score (logit). “Tied” means it reuses the embedding table rather than learning a separate one.'
+};
+// match a rendered diagram node to a glossary key by its id or visible label,
+// so it keeps working even if Mermaid changes its node-id format
+function blockKey(node){
+  const id=(node.id||''), txt=(node.textContent||'').toLowerCase();
+  if(id.indexOf('emb')>=0  || txt.indexOf('embed_tokens')>=0)  return 'emb';
+  if(id.indexOf('attn')>=0 || txt.indexOf('self-attention')>=0) return 'attn';
+  if(id.indexOf('mlp')>=0  || txt.indexOf('swiglu')>=0)        return 'mlp';
+  if(id.indexOf('nrm')>=0  || txt.indexOf('rmsnorm')>=0)       return 'nrm';
+  if(id.indexOf('head')>=0 || txt.indexOf('unembed')>=0)       return 'head';
+  return null;
+}
+function attachBlockTips(svgRoot){
+  let tip=document.getElementById('blocktip');
+  if(!tip){ tip=el('div'); tip.id='blocktip'; document.body.appendChild(tip); }
+  svgRoot.querySelectorAll('g.node').forEach(n=>{
+    const key=blockKey(n);
+    if(!key) return;
+    n.style.cursor='help';
+    n.addEventListener('mouseenter',()=>{ tip.innerHTML=BLOCK_GLOSS[key]; tip.style.display='block'; });
+    n.addEventListener('mousemove',e=>{
+      const w=tip.offsetWidth||280;
+      tip.style.left=Math.min(e.clientX+16, window.innerWidth-w-12)+'px';
+      tip.style.top=(e.clientY+16)+'px';
+    });
+    n.addEventListener('mouseleave',()=>{ tip.style.display='none'; });
+  });
+}
 function ensureMermaid(){ if(window.mermaid){ if(!window._mm){ try{ mermaid.initialize({startOnLoad:false, theme:'neutral'}); }catch(e){} window._mm=1; } return true; } return false; }
 function renderModelMap(step){
   let layer=-1, kind='none', mm;
@@ -786,19 +926,21 @@ function renderModelMap(step){
   else if((mm=/^MLP (\d+)/.exec(step.tag))){ layer=+mm[1]; kind='mlp'; }
   else if(step.tag==='Embed'||step.tag==='Read') kind='embed';
   else if(step.tag==='Logits'||step.tag==='Pick') kind='head';
-  const key=layer+':'+kind;
-  if(key===mapKey) return; mapKey=key;
-  $('#mapweights').innerHTML = weightView(layer, kind);
   let stage=-1;
   if(kind==='embed') stage=0;
   else if(kind==='attn') stage=1+2*layer;
   else if(kind==='mlp') stage=2+2*layer;
   else if(kind==='head' && curTrace) stage=curTrace.residStream.length-1;
+  curMapLayer=layer; curMapKind=kind; curMapStage=stage;
+  const key=layer+':'+kind;
+  if(key===mapKey) return; mapKey=key;
+  $('#mapweights').classList.toggle('vals', showMatVals);
+  $('#mapweights').innerHTML = weightView(layer, kind);
   $('#mapresid').innerHTML = residualView(stage);
   const dia=$('#mapdiagram');
   if(ensureMermaid()){
     mermaid.render('mg'+(mapN++), modelGraph(layer, kind))
-      .then(r=>{ dia.innerHTML=r.svg; })
+      .then(r=>{ dia.innerHTML=r.svg; attachBlockTips(dia); })
       .catch(()=>{ dia.innerHTML='<div class="dim" style="font-size:12px">(diagram unavailable)</div>'; });
   } else {
     dia.innerHTML='<div class="dim" style="font-size:12px">loading the model diagram…</div>';
@@ -827,6 +969,17 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowRight') showStep(stepIx+1);
   if(e.key==='ArrowLeft') showStep(stepIx-1);
 });
+
+// "show values (2dp)" — switches the residual stream and the weight matrices
+// from heat-map cells to the actual numbers. The two checkboxes stay in sync.
+function setShowVals(on){
+  showMatVals = on;
+  document.querySelectorAll('.mv-toggle').forEach(c=>{ c.checked = on; });
+  $('#mapweights').classList.toggle('vals', showMatVals);
+  $('#mapweights').innerHTML = weightView(curMapLayer, curMapKind);
+  $('#mapresid').innerHTML = residualView(curMapStage);
+}
+document.querySelectorAll('.mv-toggle').forEach(c=>{ c.onchange = e=>setShowVals(e.target.checked); });
 
 // ---------- validation footer ----------
 (function foot(){
