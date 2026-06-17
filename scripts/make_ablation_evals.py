@@ -12,6 +12,13 @@ Specs = the six target-expert ANCHORS (single neuron/head each) + random matched
 (noise floor). Writes ablate/eval/<name>.json and ablate/manifest.json.
 """
 import json, os, sys, inspect, argparse as _ap, random
+
+ap = _ap.ArgumentParser(description="Build held-out eval sets + an ablate-eval manifest (anchors + optional full circuit-set).")
+ap.add_argument("--partition", help="a `--corpus-decompose --experts-out` JSON; emit FULL circuit-set specs for --experts")
+ap.add_argument("--experts", default="8,17,19,0,59,107", help="comma-separated expert ids for the --partition full-set specs")
+ap.add_argument("--seed", type=int, default=20260616, help="RNG seed for size-matched control sampling (reproducibility)")
+ARGS = ap.parse_args()
+
 from tokenizers import Tokenizer
 
 BUNDLE_TOK = "bundles/Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.tokenizer.json"
@@ -74,7 +81,7 @@ anchors = {
     "e107_latex":      {"neurons": [[20, 661]]},
 }
 used = {(19, 1273), (21, 3483), (20, 35), (22, 1222), (20, 661)}
-rng = random.Random(20260616)
+rng = random.Random(ARGS.seed)
 controls = {}
 for layer in (19, 20, 21, 22):                       # one random neuron per anchor layer (matched type)
     while True:
@@ -90,9 +97,8 @@ controls["ctrl_headL22"] = {"heads": [[22, rng.randrange(N_HEADS)]]}   # matched
 # manifest concern. Usage: `--partition ablate/partition.json [--experts 8,17,19,0,59,107]`. Each
 # `e{id}_full` gets a SIZE-matched random control (same #neurons + #heads, same layers) as a noise floor.
 fullset, fullset_ctrl = {}, {}
-av = sys.argv
-PART = av[av.index("--partition") + 1] if "--partition" in av else None
-TARGETS = [int(x) for x in av[av.index("--experts") + 1].split(",")] if "--experts" in av else [8, 17, 19, 0, 59, 107]
+PART = ARGS.partition
+TARGETS = [int(x) for x in ARGS.experts.split(",")]
 if PART:
     by_id = {b["id"]: b for b in json.load(open(PART)).get("buckets", [])}
     for eid in TARGETS:

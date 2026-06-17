@@ -492,3 +492,17 @@ Priority order for a first pass: **E1 → E2 → E4** (cheap, validate the probe
 data), then **E5/E6** (the TT8/TO5 contributions), then **E3/E7/E8/E9** (the cross-validations with PIC,
 quantization, MoE, and the rank ladder). E1–E6 run on a single 0.5B rope model in minutes with the
 KV-cached `explanation_stream`; E7–E9 need the int8/int4 bundles and an MoE bundle respectively.
+
+**Running E1/E2** (implemented; rope/Qwen):
+
+```
+# E1: facet-dist is the same kernel as --probe-facet ⇒ identical distances (validated 2.126/1.593/0.866).
+fieldrun --bundle <b> --ids <corpus.json> --store <store.json> --probe-facet
+fieldrun --bundle <b> --ids <corpus.json> --store <store.json> --probe-tropical --eps 1.0
+# E2: add --interior — descends to the atom and ablates it via logits_ablated (μ_t).
+fieldrun --bundle <b> --ids <corpus.json> --store <store.json> --probe-tropical --interior --decomp-k 4
+```
+
+Expected E2 cross-check: `interior%` (atom>1) and `necessary%` (atom-ablation flip) should rise monotonically
+RETRIEVED → SELECTED → COMPOSED and match `--probe-decompose`'s σ(t) / confirm-flip% on the same positions
+(the ~27/44/82% necessity gradient).
