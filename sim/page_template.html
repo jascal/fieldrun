@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inside a tiny mind — what a language model retrieves, selects, and computes</title>
+<style>
+  :root{
+    --ink:#1a1d23; --paper:#fbfaf7; --panel:#fff; --line:#e4ded2;
+    --retr:#2c6a9b; --sel:#7a9cc6; --comp:#c0504d;
+    --machine:#161b24; --machine-ink:#e8eaf0; --machine-dim:#9aa3b5; --accent:#b3541e;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;font-family:Georgia,'Times New Roman',serif;color:var(--ink);background:var(--paper);line-height:1.6}
+  .wrap{max-width:920px;margin:0 auto;padding:0 22px}
+  h1,h2,h3,.sans{font-family:Helvetica,Arial,sans-serif}
+  h1{font-size:30px;line-height:1.2;margin:0 0 8px}
+  h2{font-size:21px;margin:46px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 6px;color:#444}
+  p{margin:11px 0}
+  a{color:var(--retr)}
+  code,.mono{font-family:'SF Mono',Menlo,Consolas,monospace}
+  .lede{font-size:18px;color:#333}
+  .dim{color:#777}
+  header.hero{background:var(--machine);color:var(--machine-ink);padding:40px 0 34px;border-bottom:4px solid var(--accent)}
+  header.hero h1{color:#fff}
+  header.hero .lede{color:#c4ccda}
+  header.hero .kicker{font-family:Helvetica,Arial,sans-serif;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+  .badge{display:inline-block;font-family:Helvetica,Arial,sans-serif;font-size:11px;background:#1f6b3a;color:#d8f5e2;border-radius:20px;padding:3px 11px;margin-top:14px}
+  /* route palette */
+  .pill{display:inline-block;font-family:Helvetica,Arial,sans-serif;font-size:11px;font-weight:bold;letter-spacing:.05em;border-radius:4px;padding:2px 8px;color:#fff}
+  .pill.retr{background:var(--retr)} .pill.sel{background:var(--sel)} .pill.comp{background:var(--comp)}
+  /* token chips */
+  .tok{display:inline-flex;flex-direction:column;align-items:center;border:1px solid var(--line);border-radius:7px;padding:4px 8px 3px;margin:3px;min-width:40px;background:var(--panel);vertical-align:top}
+  .tok .g{font-size:19px;font-family:'SF Mono',Menlo,monospace}
+  .tok .s{font-size:9.5px;color:#888;font-family:Helvetica,Arial,sans-serif;margin-top:1px}
+  .tok.struct{background:#f2efe8} .tok.who{background:#eef3f8} .tok.verb{background:#f7eee8}
+  .tok.thing{background:#eef7ef} .tok.place{background:#f8f1ee} .tok.bearing{background:#eef0f8} .tok.reply{background:#f3f0f7}
+  .tok.lit{box-shadow:0 0 0 2px var(--accent);border-color:var(--accent)}
+  .tok.pred{box-shadow:0 0 0 2px var(--comp);border-color:var(--comp)}
+  table{border-collapse:collapse;font-size:13.5px;margin:12px 0;width:100%;font-family:Helvetica,Arial,sans-serif}
+  th,td{border:1px solid var(--line);padding:5px 9px;text-align:left}
+  th{background:#efe9db}
+  .grammar{font-family:'SF Mono',Menlo,monospace;font-size:13px;background:#23282f;color:#cdd6e3;padding:14px 16px;border-radius:8px;overflow-x:auto;line-height:1.7;white-space:pre}
+  .three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:14px 0}
+  .three .card{border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--panel)}
+  .three .card.retr{border-top:4px solid var(--retr)} .three .card.sel{border-top:4px solid var(--sel)} .three .card.comp{border-top:4px solid var(--comp)}
+  .three h3{margin:0 0 6px}
+  /* ---- the lab ---- */
+  #lab{background:var(--machine);color:var(--machine-ink);border-radius:12px;padding:20px;margin:18px 0;font-family:Helvetica,Arial,sans-serif}
+  #lab h3{color:#fff;font-size:13px;letter-spacing:.04em;text-transform:uppercase;margin:0 0 8px}
+  #lab .sub{color:var(--machine-dim);font-size:12.5px}
+  .palette button,.presets button,.ctrl button{font-family:Helvetica,Arial,sans-serif;cursor:pointer;border:0;border-radius:6px}
+  .presets button{background:#2a3242;color:#fff;font-size:12.5px;padding:7px 11px;margin:3px 4px 3px 0}
+  .presets button:hover{background:#39435a}
+  .presets button.retr{background:var(--retr)} .presets button.sel{background:#3a5d86} .presets button.comp{background:var(--comp)}
+  .palette{margin:8px 0;display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+  .palette .grp{font-size:10px;color:var(--machine-dim);margin:0 4px 0 8px}
+  .palette button{background:#222a36;color:#dfe6f0;font-size:15px;font-family:'SF Mono',monospace;padding:4px 9px;border:1px solid #313c4c}
+  .palette button:hover{background:#313c4c}
+  .prompt-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+  .prompt-box{flex:1;min-height:48px;background:#0e1218;border:1px solid #2a3242;border-radius:8px;padding:6px;display:flex;flex-wrap:wrap;align-items:center}
+  .prompt-box .tok{background:#1b212c;border-color:#2f3a49;color:#e8eaf0}
+  .prompt-box .tok .s{color:#8b94a6}
+  .prompt-box .next{color:var(--accent);font-size:24px;margin:0 6px;font-family:'SF Mono',monospace}
+  .ctrl button{background:#b3541e;color:#fff;font-size:13px;padding:9px 16px;font-weight:bold}
+  .ctrl button.ghost{background:#2a3242}
+  .ctrl button:disabled{opacity:.4;cursor:default}
+  /* stepper */
+  #stepper{background:var(--panel);color:var(--ink);border-radius:10px;margin-top:14px;overflow:hidden;border:1px solid var(--line)}
+  #steplist{display:flex;flex-wrap:wrap;gap:0;background:#11151c;padding:0}
+  #steplist button{flex:1;min-width:80px;background:transparent;color:#8b94a6;border:0;border-bottom:3px solid transparent;font-family:Helvetica,Arial,sans-serif;font-size:10.5px;padding:8px 4px;cursor:pointer;white-space:nowrap}
+  #steplist button.on{color:#fff;border-bottom-color:var(--accent);background:#1a2029}
+  #stepbody{padding:20px 22px;min-height:300px}
+  #stepbody .kick{font-family:Helvetica,Arial,sans-serif;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+  #stepbody h4{font-family:Helvetica,Arial,sans-serif;font-size:18px;margin:3px 0 10px}
+  #stepbody p{font-size:14.5px}
+  #stepnav{display:flex;align-items:center;gap:10px;padding:12px 22px;border-top:1px solid var(--line);font-family:Helvetica,Arial,sans-serif}
+  #stepnav button{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:13px}
+  #stepnav button:disabled{opacity:.35;cursor:default}
+  #stepnav .count{margin-left:auto;color:#888;font-size:12px}
+  /* vis primitives */
+  .heat{display:grid;gap:1px;font-family:'SF Mono',monospace;font-size:0}
+  .cell{width:100%;height:13px}
+  .bars{display:flex;flex-direction:column;gap:3px;font-family:Helvetica,Arial,sans-serif;font-size:12px}
+  .barrow{display:flex;align-items:center;gap:7px}
+  .barrow .lab{width:130px;text-align:right;color:#555;font-size:11.5px;flex-shrink:0}
+  .barrow .track{flex:1;background:#eee;border-radius:3px;height:15px;position:relative;overflow:hidden}
+  .barrow .fill{height:100%;border-radius:3px}
+  .barrow .val{width:54px;font-size:11px;color:#555;font-family:'SF Mono',monospace}
+  .attnrow{display:flex;align-items:center;gap:3px;margin:3px 0;font-family:Helvetica,Arial,sans-serif;font-size:11px}
+  .attncell{width:26px;height:26px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'SF Mono',monospace;font-size:13px;color:#fff;flex-shrink:0}
+  .chip{display:inline-block;font-family:'SF Mono',monospace;font-size:13px;border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:2px;background:#f5f2ec}
+  .chip.in{background:#eaf3ea;border-color:#bcd8bc} .chip.miss{background:#fbeceb;border-color:#e6b9b6;color:#a33}
+  .verdict{border-radius:10px;padding:16px 18px;margin:6px 0;color:#fff}
+  .verdict.retr{background:var(--retr)} .verdict.sel{background:#46719e} .verdict.comp{background:var(--comp)}
+  .verdict h4{margin:0 0 6px;color:#fff}
+  .kv{font-family:'SF Mono',monospace;font-size:12.5px;color:#444;background:#f5f2ec;border-radius:6px;padding:8px 11px;margin:8px 0}
+  .corpus{font-family:'SF Mono',monospace;font-size:14px;line-height:2;column-count:2;column-gap:24px}
+  .corpus .call{break-inside:avoid;display:block}
+  .foot{margin:40px 0 60px;font-size:13px;color:#777}
+  @media(max-width:720px){.three{grid-template-columns:1fr}.corpus{column-count:1}.barrow .lab{width:92px}}
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="wrap">
+  <div class="kicker">A field guide companion · fieldrun</div>
+  <h1>Inside a tiny mind</h1>
+  <p class="lede">When a language model answers, is it <b>remembering</b> or <b>thinking</b>? Here is a whole
+  language model small enough to watch — one that genuinely <b>retrieves</b>, <b>selects</b>, and <b>computes</b>,
+  one pulse at a time.</p>
+  <span class="badge" id="hero-badge">● validated against the fieldrun binary</span>
+</div></header>
+
+<div class="wrap">
+
+<h2>The question</h2>
+<p class="lede">Ask a model for the capital of France and it answers “Paris.” That looks like memory. Ask it for
+17% of 340 and it has to work the answer out. Most of what a model does sits between those poles — and it turns out
+you can tell which is happening, one word at a time.</p>
+<p>This page builds the smallest possible version of that story. We invent a tiny alien language, train a tiny
+standard transformer on it, and then run it <b>live in your browser</b>, stepping through every stage and labelling
+what each part of the model is doing. Every number is real: the model is validated token-for-token against the
+<a href="https://github.com/jascal/fieldrun">fieldrun</a> runtime, and this page re-runs the exact same arithmetic.</p>
+
+<h2>Meet the Threx</h2>
+<p>The <b>Threx</b> are blind foragers in the dark of an alien sea. They never see one another, so everything they
+coordinate — finding food, warning of danger, splitting a catch — travels as short pulse-strings of sound: a
+<b>call</b>. Calls are terse and grammatical, because a wasted pulse is energy a Threx does not have. Their whole
+language is just 25 pulses:</p>
+<div id="lexicon"></div>
+
+<h2>How the Threx talk</h2>
+<p>A call is a little sentence. Seven patterns cover everything the Threx need to say:</p>
+<div class="grammar" id="grammar"></div>
+<p>Two of those patterns carry real structure, and that is the whole point — predicting the next pulse needs three
+genuinely different kinds of reasoning:</p>
+<div class="three" id="three"></div>
+
+<h2>The corpus and the phrasebook</h2>
+<p>We generate a big pile of Threx calls — the model’s whole world. Here is a slice of it:</p>
+<div class="corpus" id="corpus"></div>
+<p>Alongside the model we also build a <b>phrasebook</b>: the strongest pure-memorisation baseline we can. It is just
+counts — “after this short run of pulses, here is what usually comes next” — plus a recency list and a copy rule. It
+does no reasoning, only lookup. The trick that powers everything below is one question asked of every pulse the model
+produces: <i>would the phrasebook, on its own, have produced the same pulse?</i> If yes, the model added nothing —
+that pulse is <b>retrieved</b> or <b>selected</b>. If the pulse is in no list the phrasebook could produce, the model
+must have <b>composed</b> it.</p>
+
+<h2>The lab — run the model yourself</h2>
+<p>Pick a call below (or build your own from the pulse palette), then press <b>Run</b> and step through the model.
+At each stage you’ll see the real numbers change and a note on what that part of the model is doing — ending in the
+verdict: did it retrieve, select, or compute this pulse?</p>
+
+<div id="lab">
+  <h3>1 · choose a call</h3>
+  <div class="presets" id="presets"></div>
+  <div class="sub" style="margin-top:6px">…or compose one (the model predicts the pulse after the last one):</div>
+  <div class="palette" id="palette"></div>
+  <div class="prompt-row">
+    <div class="prompt-box" id="promptbox"></div>
+  </div>
+  <div class="ctrl">
+    <button id="run">▶ Run the model</button>
+    <button id="back" class="ghost">⌫ delete</button>
+    <button id="clear" class="ghost">clear</button>
+  </div>
+  <div id="about" style="display:none;margin:12px 0;padding:10px 14px;border-left:3px solid var(--accent);background:rgba(255,255,255,.05);font-size:13.5px;color:#d4dae6"></div>
+  <div id="stepper" style="display:none">
+    <div id="steplist"></div>
+    <div id="stepbody"></div>
+    <div id="stepnav">
+      <button id="prev">← Back</button>
+      <button id="next">Next →</button>
+      <span class="count" id="stepcount"></span>
+    </div>
+  </div>
+</div>
+
+<h2>What you just watched</h2>
+<p>Three pulses, three different machines. The danger cry is pure <span class="pill retr">RETRIEVED</span> recall — the
+phrasebook alone produces it. Choosing the prey for a place is <span class="pill sel">SELECTED</span> — the menu is
+remembered, context picks from it. And triangulating prey from two currents is <span class="pill comp">COMPOSED</span>
+— the answer is named nowhere in the call and was never drilled for that exact pair, so no lookup, copy, or n-gram
+offers it. The model adds the two current-strengths and works it out. That computed slice is the small, hard,
+irreducible part — and it is exactly where a model stops remembering and starts thinking.</p>
+
+<div class="foot" id="foot"></div>
+</div>
+
+<script>/*__ENGINE__*/</script>
+<script>
+const THREX = /*__DATA__*/;
+const ENG = window.ThrexEngine;
+const model = ENG.loadModel(THREX.weights);
+const lex = THREX.lexicon, store = THREX.store;
+const GL = lex.tokens.map(t=>t[0]), GLOSS = lex.tokens.map(t=>t[1]), CLS = lex.tokens.map(t=>t[2]);
+const $ = s=>document.querySelector(s);
+const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
+const tokChip = (id,extra='')=>`<span class="tok ${CLS[id]} ${extra}"><span class="g">${GL[id]}</span><span class="s">${GLOSS[id]}</span></span>`;
+const ROUTE_CLASS = {RETRIEVED:'retr',SELECTED:'sel',COMPOSED:'comp'};
+
+// ---------- static sections ----------
+(function lexicon(){
+  const groups = {struct:'structure',who:'who',verb:'verbs',thing:'things',place:'places',reply:'replies',bearing:'currents'};
+  let h='<table><tr><th>kind</th><th>pulses</th></tr>';
+  for(const [cls,label] of Object.entries(groups)){
+    const ids = lex.tokens.map((t,i)=>i).filter(i=>CLS[i]===cls);
+    h+=`<tr><td>${label}</td><td>${ids.map(i=>tokChip(i)).join('')}</td></tr>`;
+  }
+  $('#lexicon').innerHTML = h+'</table>';
+})();
+
+$('#grammar').textContent =
+`ritual       ⟨ who na dø ⟩                       a danger cry: warn → deep
+forage       ⟨ PLACE · who wø THING ⟩            seek the thing that lives at PLACE
+triangulate  ⟨ ∿ CUR CUR THING ⟩                 prey is where two currents meet
+report       ⟨ who gɪ lum ⟩                       the common "found glow"
+echo         ⟨ who wø THING ? ⟩ ⟨ who gɪ THING ⟩  answer repeats the queried thing
+reply        ⟨ who wø THING ? ⟩ ⟨ who ko|ne ⟩     yes / no
+give         ⟨ who ru THING who ⟩                 a handoff`;
+
+$('#three').innerHTML = `
+  <div class="card retr"><h3 class="sans">Retrieved</h3><p style="font-size:13px"><b>The ritual.</b> After
+   <code>na</code> (warn) the only pulse a Threx ever sends is <code>dø</code> (deep). The deciding pulse is one
+   step back, so the simplest phrasebook nails it. Pure recall.</p></div>
+  <div class="card sel"><h3 class="sans">Selected</h3><p style="font-size:13px"><b>The menu.</b> <code>wø</code>
+   (seek) has a known menu {fish, berry, shell}; which one depends on the <code>PLACE</code> four pulses back, past a
+   short phrasebook’s memory. The menu is remembered; context selects from it.</p></div>
+  <div class="card comp"><h3 class="sans">Composed</h3><p style="font-size:13px"><b>Triangulation.</b> Prey lies where
+   two currents cross: <code>thing = things[strength₁ + strength₂]</code>. Real addition — the answer is in the call
+   nowhere, and some current-pairs are held out of training entirely, so the model must <i>compute</i> it.</p></div>`;
+
+(function corpus(){
+  $('#corpus').innerHTML = THREX.corpus.map(call=>
+    `<span class="call">${call.map(id=>`<span title="${GLOSS[id]}">${GL[id]}</span>`).join(' ')}</span>`).join('');
+})();
+
+// ---------- the lab ----------
+let prompt = lex.examples[0].prefix.slice();
+let steps = [], stepIx = 0;
+
+(function presets(){
+  const wrap = $('#presets');
+  for(const ex of lex.examples){
+    const b = el('button', ROUTE_CLASS[ex.key.toUpperCase()]|| '', `${ex.title}`);
+    b.onclick = ()=>{ prompt = ex.prefix.slice(); renderPrompt(); run(); };
+    wrap.appendChild(b);
+  }
+  // a couple of extra "try these" (a trained triangulation, a report)
+  const extras = [
+    {t:'∿ north south (trained)', p:[0,20,21,23]},
+    {t:'found …', p:[0,5,7]},
+    {t:'I give berry to …', p:[0,3,8,11]},
+  ];
+  for(const x of extras){ const b=el('button','',x.t); b.onclick=()=>{prompt=x.p.slice();renderPrompt();run();}; wrap.appendChild(b); }
+})();
+
+(function palette(){
+  const wrap = $('#palette');
+  const order = ['struct','who','verb','thing','place','bearing','reply'];
+  for(const cls of order){
+    wrap.appendChild(el('span','grp',cls));
+    lex.tokens.forEach((t,i)=>{ if(CLS[i]===cls){
+      const b=el('button',null,GL[i]); b.title=GLOSS[i];
+      b.onclick=()=>{ if(prompt.length<20){prompt.push(i);renderPrompt();} };
+      wrap.appendChild(b);
+    }});
+  }
+})();
+
+function renderPrompt(){
+  const box = $('#promptbox');
+  box.innerHTML = prompt.map(id=>tokChip(id)).join('') + '<span class="next">→ ?</span>';
+}
+$('#back').onclick=()=>{ prompt.pop(); renderPrompt(); };
+$('#clear').onclick=()=>{ prompt=[0]; renderPrompt(); };
+$('#run').onclick=run;
+
+function run(){
+  if(prompt.length<2){ alert('Add at least two pulses — start a call with ⟨.'); return; }
+  const trace = ENG.forward(model, prompt);
+  const rinfo = ENG.route(store, prompt, trace.pred);
+  steps = buildSteps(prompt, trace, rinfo);
+  stepIx = 0;
+  // narrative blurb if this prompt is one of the featured calls
+  const match = lex.examples.find(e=>e.prefix.length===prompt.length && e.prefix.every((v,i)=>v===prompt[i]));
+  const about = $('#about');
+  if(match){ about.style.display='block'; about.innerHTML = `<b>${match.title}.</b> ${match.blurb}`; }
+  else about.style.display='none';
+  $('#stepper').style.display='block';
+  renderStepList(); showStep(0);
+  $('#about').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+// ---------- vis helpers ----------
+function barChart(rows, opt={}){ // rows: [{lab,val,color}]
+  const max = Math.max(1e-9, ...rows.map(r=>Math.abs(r.val)));
+  return `<div class="bars">`+rows.map(r=>{
+    const w = 100*Math.abs(r.val)/max;
+    return `<div class="barrow"><div class="lab">${r.lab}</div><div class="track">
+      <div class="fill" style="width:${w}%;background:${r.color||'#7da7d9'}"></div></div>
+      <div class="val">${opt.fmt?opt.fmt(r.val):r.val.toFixed(3)}</div></div>`;
+  }).join('')+`</div>`;
+}
+const lerp=(a,b,t)=>a+(b-a)*t;
+function heatColor(v,scaleMax){ // diverging blue/white/red
+  const t=Math.max(-1,Math.min(1, v/(scaleMax||1)));
+  if(t>=0) return `rgb(${Math.round(lerp(255,192,t))},${Math.round(lerp(255,80,t))},${Math.round(lerp(255,77,t))})`;
+  return `rgb(${Math.round(lerp(255,44,-t))},${Math.round(lerp(255,106,-t))},${Math.round(lerp(255,155,-t))})`;
+}
+
+// ---------- step builders ----------
+function buildSteps(prompt, trace, rinfo){
+  const cfg = model.config, L = prompt.length, steps=[];
+  const predChip = tokChip(trace.pred,'pred');
+
+  steps.push({tag:'Read', title:'The call comes in', kick:'input',
+    html:`<p>The model hears these ${L} pulses and must guess the next one. Each pulse is just an id; the model has
+      no idea what they “mean” beyond the patterns it learned.</p>
+      <div style="margin:10px 0">${prompt.map(id=>tokChip(id)).join('')}<span class="prompt-next" style="font-size:24px;color:var(--accent);margin-left:6px">→ ?</span></div>`});
+
+  steps.push({tag:'Embed', title:'Each pulse becomes a vector', kick:'embedding',
+    html:`<p>Every pulse is looked up as a row of ${cfg.d} numbers — its <b>embedding</b>. This is the only thing the
+      model knows about a pulse to start with. Columns are the ${cfg.d} dimensions; rows are the pulses in the call.</p>
+      ${embedHeat(prompt)}`});
+
+  for(let l=0; l<cfg.n_layer; l++){
+    const lt = trace.layers[l];
+    steps.push({tag:`Attn ${l}`, title:`Layer ${l}: who looks at whom`, kick:'attention',
+      html:`<p>Each of the ${cfg.n_head} attention heads at the <b>last</b> position decides which earlier pulses to
+        read from. A bright cell = strong attention. The note says what each head reached for here.</p>
+        ${attnView(prompt, lt)}`});
+    steps.push({tag:`MLP ${l}`, title:`Layer ${l}: the neurons fire`, kick:'feed-forward',
+      html:`<p>The layer’s ${cfg.ffn} neurons then transform what attention gathered. These are the neurons pushing
+        hardest on the eventual answer, and the pulses each one promotes.</p>
+        ${mlpView(trace, l)}`});
+  }
+
+  steps.push({tag:'Logits', title:'Scores for every possible pulse', kick:'readout',
+    html:`<p>The final vector is compared against every pulse’s embedding, giving a <b>logit</b> (a score) for each of
+      the ${cfg.vocab} pulses. Higher = the model likes it more here.</p>${logitView(trace)}`});
+
+  steps.push({tag:'Pick', title:'The model’s pulse', kick:'argmax / softmax',
+    html:`<p>Soften the scores into probabilities and take the top one. The model predicts:</p>
+      <div style="text-align:center;margin:14px 0">${predChip}
+        <div class="dim sans" style="font-size:12px;margin-top:6px">probability ${(trace.probs[trace.pred]*100).toFixed(1)}% ·
+        logit ${trace.logits[trace.pred].toFixed(2)} · margin over runner-up ${tokChip(trace.runner)} = +${trace.margin.toFixed(2)}</div></div>`});
+
+  steps.push({tag:'Phrasebook', title:'What the phrasebook would say', kick:'the lookup baseline',
+    html:`<p>Now the test. The phrasebook lists every pulse it thinks could come next — from n-gram counts, the recent
+      pulses, an in-call copy rule, and the most common pulses overall. Its own best guess is its top-1.</p>
+      ${phrasebookView(prompt, rinfo, trace)}`});
+
+  steps.push({tag:'Verdict', title:'Retrieved, selected, or composed?', kick:'the decision',
+    html:verdictView(rinfo, trace)});
+
+  steps.push({tag:'The chord', title:'No single voice decides', kick:'attribution',
+    html:`<p>A computed answer is produced like a chord: many tiny contributions add up, and the answer lives in the
+      sum, not in any one part. Here is every source’s push on the chosen pulse’s score — they sum exactly to its
+      logit. <b>Participation ratio ≈ ${trace.PR.toFixed(1)}</b> means about that many sources share the work; no
+      single one decides.</p>${chordView(trace)}
+      <p class="dim" style="font-size:12.5px">In this tiny model the chord is small, and it grows from the retrieved
+      pulse to the composed one — the computed answer leans on more of the model at once. In a real billion-parameter
+      model the same measurement gives a chord of <b>~45</b> contributions on <i>every</i> token, retrieved or
+      composed alike: the decision is always spread out.</p>`});
+
+  steps.push({tag:'Geometry', title:'How close was the call?', kick:'the margin',
+    html:`<p>Geometrically, the chosen pulse won a region of space; the runner-up owns the neighbouring region. The
+      <b>margin</b> is how far inside its own region the decision sits — small means a near-tie, large means decisive.</p>
+      ${geometryView(trace)}`});
+
+  return steps;
+}
+
+function embedHeat(prompt){
+  const d = model.config.d;
+  let mx=0; for(const id of prompt) for(const v of model.embed[id]) mx=Math.max(mx,Math.abs(v));
+  let h=`<div style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:0"><tbody>`;
+  for(const id of prompt){
+    h+=`<tr><td style="border:0;padding:1px 8px 1px 0;text-align:right;font-family:'SF Mono',monospace;font-size:13px">${GL[id]}</td>`;
+    h+=`<td style="border:0;padding:0"><div class="heat" style="grid-template-columns:repeat(${d},6px)">`;
+    for(const v of model.embed[id]) h+=`<span class="cell" style="height:13px;background:${heatColor(v,mx)}"></span>`;
+    h+=`</div></td></tr>`;
+  }
+  return h+`</tbody></table></div>`;
+}
+
+function attnView(prompt, lt){
+  const L=prompt.length;
+  let h='';
+  for(const head of lt.heads){
+    const a=head.attn, top=head.readPos;
+    let cells='';
+    for(let j=0;j<L;j++){
+      const w=a[j]||0;
+      cells+=`<div class="attncell" title="${GLOSS[prompt[j]]} (${(w*100).toFixed(0)}%)"
+        style="background:rgba(179,84,30,${0.12+0.88*w})">${GL[prompt[j]]}</div>`;
+    }
+    const note = top===L-1 ? 'mostly itself (a no-op / pass-through here)'
+      : `reaches back to <b>${GL[prompt[top]]}</b> <span class="dim">(${GLOSS[prompt[top]]})</span>, ${L-1-top} pulse${L-1-top>1?'s':''} back`;
+    h+=`<div style="margin:10px 0"><div class="sans" style="font-size:12px;color:#555;margin-bottom:2px">
+       head ${head.head} — ${note}</div><div class="attnrow">${cells}</div></div>`;
+  }
+  return h;
+}
+
+function mlpView(trace, layer){
+  const neurons = trace.sources.filter(s=>s.kind==='neuron' && s.layer===layer);
+  neurons.sort((a,b)=>Math.abs(b.dla)-Math.abs(a.dla));
+  const top = neurons.slice(0,5);
+  // promotions: top tokens of each neuron's write, via Utilde
+  const promo = w=>{
+    const sc = trace.Utilde.map((u,v)=>[u.reduce((s,x,i)=>s+x*w[i],0),v]).sort((a,b)=>b[0]-a[0]);
+    return sc.slice(0,4).map(p=>GL[p[1]]).join(' ');
+  };
+  let rows = top.map(n=>({lab:`L${layer} neuron ${n.idx}`, val:n.dla, color: n.dla>=0?'#2c6a9b':'#c0504d'}));
+  let h = barChart(rows,{fmt:v=>(v>=0?'+':'')+v.toFixed(3)});
+  h += `<table style="margin-top:10px"><tr><th>neuron</th><th>activation</th><th>push on answer</th><th>promotes</th></tr>`;
+  for(const n of top) h+=`<tr><td>L${layer} n${n.idx}</td><td>${n.act.toFixed(2)}</td>
+     <td>${(n.dla>=0?'+':'')+n.dla.toFixed(3)}</td><td class="mono">${promo(n.write)}</td></tr>`;
+  return h+`</table>`;
+}
+
+function logitView(trace){
+  const rows = trace.logits.map((v,i)=>({lab:`${GL[i]} ${GLOSS[i]}`, val:v,
+    color: i===trace.pred?'#b3541e':(i===trace.runner?'#888':'#9bb6cf')})).sort((a,b)=>b.val-a.val).slice(0,10);
+  return barChart(rows,{fmt:v=>v.toFixed(2)});
+}
+
+function phrasebookView(prompt, rinfo, trace){
+  const s = rinfo.sources, kbid = rinfo.kb;
+  const showSet = (arr)=> arr.length? arr.map(id=>`<span class="chip ${id===trace.pred?'in':''}">${GL[id]}</span>`).join('') : '<span class="dim">— none —</span>';
+  const covered = rinfo.covered;
+  let h = `<div class="kv">phrasebook top-1 (kb) = <b>${kbid>=0?GL[kbid]:'—'}</b> &nbsp;·&nbsp; model picked <b>${GL[trace.pred]}</b></div>`;
+  h += `<table><tr><th>source</th><th>what it offers here</th></tr>
+    <tr><td>4-gram / 3-gram / 2-gram</td><td>${showSet([...new Set([...s.quad,...s.tri,...s.bi])])}</td></tr>
+    <tr><td>recent pulses</td><td>${showSet(s.recent)}</td></tr>
+    <tr><td>copy rule (induction)</td><td>${showSet(s.induction)}</td></tr>
+    <tr><td>most common overall</td><td>${showSet(s.uni)}</td></tr></table>`;
+  h += `<p>Is the model’s pulse <b>${GL[trace.pred]}</b> anywhere in that list?
+     <b style="color:${covered?'#1f6b3a':'#c0504d'}">${covered?'yes — it is covered':'no — it is in no list'}</b>.</p>`;
+  return h;
+}
+
+function verdictView(rinfo, trace){
+  const r = rinfo.route, cls = ROUTE_CLASS[r];
+  const txt = {
+    RETRIEVED:`The phrasebook’s own top-1 is <b>${GL[trace.pred]}</b> — exactly what the model picked. A glorified
+      lookup table reproduces this pulse, so the model added nothing. Pure recall.`,
+    SELECTED:`The model’s pulse <b>${GL[trace.pred]}</b> is in the phrasebook’s list, but it is <i>not</i> the
+      phrasebook’s top-1 (that was ${rinfo.kb>=0?GL[rinfo.kb]:'—'}). The menu was retrieved; the model selected the
+      right item from it using context the short phrasebook can’t see.`,
+    COMPOSED:`The model’s pulse <b>${GL[trace.pred]}</b> is in <i>no</i> list the phrasebook could produce — not an
+      n-gram successor, not a recent or copied pulse, not a common one. The model assembled it. This is the
+      irreducible, computed slice.`
+  }[r];
+  return `<div class="verdict ${cls}"><h4 class="sans">${r}</h4><p style="font-size:14.5px;margin:0">${txt}</p></div>
+    <p class="dim" style="font-size:13px">This is exactly the rule the fieldrun runtime’s <code>--attribute</code> uses,
+    one pulse at a time.</p>`;
+}
+
+function chordView(trace){
+  const top = trace.chord.slice(0,12).map(s=>({lab:s.label, val:s.dla, color: s.dla>=0?'#2c6a9b':'#c0504d'}));
+  let h = barChart(top,{fmt:v=>(v>=0?'+':'')+v.toFixed(3)});
+  h += `<div class="kv">${trace.sources.length} sources in total · they sum to the logit
+     ${trace.logits[trace.pred].toFixed(3)} (recovered ${trace.recoveredLogit.toFixed(3)}) ·
+     participation ratio ≈ ${trace.PR.toFixed(1)}</div>`;
+  return h;
+}
+
+function geometryView(trace){
+  const m = trace.margin, nm = trace.normMargin;
+  const frac = Math.max(0.02, Math.min(1, m/4));
+  return `<div style="margin:14px 0">
+    <div style="position:relative;height:60px;background:linear-gradient(90deg,#e9f0f7,#fff);border:1px solid var(--line);border-radius:8px">
+      <div style="position:absolute;left:50%;top:0;bottom:0;width:2px;background:#bbb"></div>
+      <div style="position:absolute;left:50%;top:50%;width:${frac*45}%;height:3px;background:var(--accent);transform:translateY(-50%)"></div>
+      <div style="position:absolute;left:calc(50% + ${frac*45}%);top:50%;width:11px;height:11px;border-radius:50%;background:var(--comp);transform:translate(-50%,-50%)"></div>
+      <span style="position:absolute;left:6px;top:6px;font-size:10px;color:#888" class="sans">decision boundary</span>
+      <span style="position:absolute;right:6px;bottom:6px;font-size:10px;color:#888" class="sans">deeper into ${GL[trace.pred]}’s region →</span>
+    </div></div>
+    <div class="kv">margin (logit gap) = +${m.toFixed(3)} · normalised margin (distance to the boundary) = ${nm.toFixed(3)}</div>`;
+}
+
+// ---------- stepper nav ----------
+function renderStepList(){
+  const list = $('#steplist'); list.innerHTML='';
+  steps.forEach((s,i)=>{ const b=el('button',i===stepIx?'on':'',s.tag); b.onclick=()=>showStep(i); list.appendChild(b); });
+}
+function showStep(i){
+  stepIx = Math.max(0,Math.min(steps.length-1,i));
+  const s = steps[stepIx];
+  $('#stepbody').innerHTML = `<div class="kick">${s.kick}</div><h4>${s.title}</h4>${s.html}`;
+  [...$('#steplist').children].forEach((b,j)=>b.classList.toggle('on',j===stepIx));
+  $('#prev').disabled = stepIx===0; $('#next').disabled = stepIx===steps.length-1;
+  $('#stepcount').textContent = `step ${stepIx+1} / ${steps.length}`;
+}
+$('#prev').onclick=()=>showStep(stepIx-1);
+$('#next').onclick=()=>showStep(stepIx+1);
+document.addEventListener('keydown',e=>{
+  if(!steps.length||$('#stepper').style.display==='none') return;
+  if(e.key==='ArrowRight') showStep(stepIx+1);
+  if(e.key==='ArrowLeft') showStep(stepIx-1);
+});
+
+// ---------- validation footer ----------
+(function foot(){
+  const v = THREX.validation||{};
+  let badge = '';
+  if(v.examples){
+    const agree = v.examples.filter(e=>e.fieldrun && e.engine && e.fieldrun.argmax===e.engine.pred).length;
+    badge = `${agree}/${v.examples.length} featured examples match the fieldrun binary exactly`;
+    $('#hero-badge').textContent = `● engine validated against the fieldrun binary`;
+  }
+  $('#foot').innerHTML = `<p><b>How this was made.</b> A standard RoPE/Llama-style transformer (d=${model.config.d},
+    ${model.config.n_layer} layers, ${model.config.n_head} heads, vocab ${model.config.vocab}) was trained on the
+    Threx corpus, exported, and converted to a fieldrun bundle. ${badge?badge+'. ':''}The browser engine here
+    reproduces the binary’s logits to floating-point rounding, and the contribution chord sums to the logit exactly.
+    Build it yourself: <code>sim/</code> in the
+    <a href="https://github.com/jascal/fieldrun">fieldrun repo</a>.</p>`;
+})();
+
+renderPrompt();
+</script>
+</body>
+</html>

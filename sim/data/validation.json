@@ -1,0 +1,102 @@
+{
+ "examples": [
+  {
+   "key": "retrieved",
+   "title": "The danger ritual",
+   "prefix": [
+    0,
+    5,
+    9
+   ],
+   "expect": 16,
+   "blurb": "We sound the alarm. After ‘warn’, the only thing a Threx ever says is ‘deep’. Pure ritual — the simplest phrasebook already produces it, so the model adds nothing. Retrieved.",
+   "route": "RETRIEVED",
+   "via": "KB",
+   "fieldrun": {
+    "argmax": 16,
+    "logit": 14.3,
+    "margin": 9.13
+   },
+   "engine": {
+    "key": "retrieved",
+    "pred": 16,
+    "logit": 14.29717357801788,
+    "margin": 9.129408111181014,
+    "normMargin": 3.186320674467939,
+    "PR": 2.76106689568724,
+    "route": "RETRIEVED",
+    "idiom": "quad",
+    "covered": true
+   }
+  },
+  {
+   "key": "selected",
+   "title": "Choosing from the menu",
+   "prefix": [
+    0,
+    15,
+    19,
+    4,
+    6
+   ],
+   "expect": 11,
+   "blurb": "A hunt announced out FAR. ‘Seek’ has a known menu {fish, berry, shell}; which one depends on ‘far’ — four beats back, past the phrasebook’s short memory. The menu is retrieved; the pick is selected from it by context.",
+   "route": "SELECTED",
+   "via": "KB",
+   "fieldrun": {
+    "argmax": 11,
+    "logit": 11.9,
+    "margin": 8.65
+   },
+   "engine": {
+    "key": "selected",
+    "pred": 11,
+    "logit": 11.897683776734853,
+    "margin": 8.648215967553565,
+    "normMargin": 3.3016869661587696,
+    "PR": 6.46604776956375,
+    "route": "SELECTED",
+    "idiom": "quad",
+    "covered": true
+   }
+  },
+  {
+   "key": "composed",
+   "title": "Triangulating the prey",
+   "prefix": [
+    0,
+    20,
+    25,
+    25,
+    19,
+    19,
+    7
+   ],
+   "expect": 30,
+   "blurb": "Two strong south currents — strength 4 and 4. The prey lies where they cross, at rank 4 + 4 = 8: the EEL, the rarest catch. The currents sit five pulses back, beyond the phrasebook’s short memory, and eel is the one prey it drops from its ‘found’ list, so the phrasebook has no entry for it here. The model reaches back, reads both currents, and adds them. Composed.",
+   "route": "COMPOSED",
+   "via": "KB",
+   "fieldrun": {
+    "argmax": 30,
+    "logit": 12.07,
+    "margin": 8.22
+   },
+   "engine": {
+    "key": "composed",
+    "pred": 30,
+    "logit": 12.06997509160178,
+    "margin": 8.22480559397779,
+    "normMargin": 3.2877373001081702,
+    "PR": 8.945502776205265,
+    "route": "COMPOSED",
+    "idiom": "quad",
+    "covered": false
+   }
+  }
+ ],
+ "caps": {
+  "uni": 6,
+  "quad": 8,
+  "bi": 8
+ }
+}

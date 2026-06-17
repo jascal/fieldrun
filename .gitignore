@@ -26,3 +26,13 @@ sweeps/corpora/pooled_big.json
 .venv/
 __pycache__/
 .DS_Store
+
+# sim/ tiny-model intuition build — keep the source + small page inputs
+# (weights/lexicon/store/validation/corpus/holdout); ignore temp + regenerable bundles
+sim/__pycache__/
+sim/data/__pycache__/
+sim/data/_one.json
+sim/data/train_ids.json
+sim/data/probes.json
+sim/data/hf/
+sim/data/threx.fieldrun.*

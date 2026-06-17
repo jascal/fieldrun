@@ -592,6 +592,15 @@ def main() -> None:
     else:
         print("  [warn] no original paper PDF found; the 'Original paper' link will 404")
 
+    # The interactive intuition-builder (a standalone, self-contained page built by
+    # sim/build_page.py from the trained tiny model) ships alongside the reader.
+    intuition = SITE_DIR / "intuition.html"
+    if intuition.exists():
+        shutil.copyfile(intuition, OUT_DIR / "intuition.html")
+        print(f"  copied {intuition.name} -> docs/intuition.html")
+    else:
+        print("  [warn] site/intuition.html not found; run sim/build_page.py")
+
     found = sum(len(v) for v in marks.values())
     print(f"built docs/index.html from {supp.name}: {len(sections)} sections, "
           f"{found} highlights placed, {len(missing)} quotes unmatched")
