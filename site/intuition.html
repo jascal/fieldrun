@@ -404,7 +404,7 @@ const lex = THREX.lexicon, store = THREX.store;
 const GL = lex.tokens.map(t=>t[0]), GLOSS = lex.tokens.map(t=>t[1]), CLS = lex.tokens.map(t=>t[2]);
 const $ = s=>document.querySelector(s);
 const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
-const tokChip = (id,extra='')=>`<span class="tok ${CLS[id]} ${extra}"><span class="g">${GL[id]}</span><span class="s">${GLOSS[id]}</span></span>`;
+const tokChip = (id,extra='')=>`<span class="tok ${CLS[id]} ${extra}"><span class="g">${GL[id]}</span><span class="s">(${GLOSS[id]})</span></span>`;
 const ROUTE_CLASS = {RETRIEVED:'retr',SELECTED:'sel',COMPOSED:'comp'};
 
 // ---------- static sections ----------
@@ -630,7 +630,7 @@ function mlpView(trace, layer){
 }
 
 function logitView(trace){
-  const rows = trace.logits.map((v,i)=>({lab:`${GL[i]} ${GLOSS[i]}`, val:v,
+  const rows = trace.logits.map((v,i)=>({lab:`${GL[i]} (${GLOSS[i]})`, val:v,
     color: i===trace.pred?'#b3541e':(i===trace.runner?'#888':'#9bb6cf')})).sort((a,b)=>b.val-a.val).slice(0,10);
   return barChart(rows,{fmt:v=>v.toFixed(2)});
 }
