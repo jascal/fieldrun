@@ -43,6 +43,17 @@
   th,td{border:1px solid var(--line);padding:5px 9px;text-align:left}
   th{background:#efe9db}
   .grammar{font-family:'SF Mono',Menlo,monospace;font-size:13px;background:#23282f;color:#cdd6e3;padding:14px 16px;border-radius:8px;overflow-x:auto;line-height:1.7;white-space:pre}
+  /* interactive grammar: 3-column grid, hover any pulse/type for its encoding */
+  #grammar{display:grid;grid-template-columns:auto auto 1fr;gap:3px 20px;white-space:normal;align-items:baseline}
+  .gramname{color:#7fb0e6}
+  .grampat{color:#cdd6e3;white-space:nowrap}
+  .gramdesc{color:#8b94a6;font-family:Helvetica,Arial,sans-serif;font-size:12px}
+  .gpulse,.gtype{border-radius:4px;padding:0 3px;cursor:help;transition:background .1s}
+  .gpulse:hover{background:#3a4a5e;color:#fff}
+  .gtype{color:#e0b270;font-style:italic}
+  .gtype:hover{background:#4a3a1f;color:#fff}
+  .lexids-toggle{display:inline-block;font-family:Helvetica,Arial,sans-serif;font-size:12px;color:#777;margin:0 0 9px;cursor:pointer}
+  .lexids-toggle input{vertical-align:middle;margin-right:5px}
   .three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:14px 0}
   .three .card{border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--panel)}
   .three .card.retr{border-top:4px solid var(--retr)} .three .card.sel{border-top:4px solid var(--sel)} .three .card.comp{border-top:4px solid var(--comp)}
@@ -474,25 +485,72 @@ const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h
 const tokChip = (id,extra='')=>`<span class="tok ${CLS[id]} ${extra}"><span class="g">${GL[id]}</span><span class="s">(${GLOSS[id]})</span></span>`;
 const ROUTE_CLASS = {RETRIEVED:'retr',SELECTED:'sel',COMPOSED:'comp'};
 
+// glyph -> token id, and a shared floating tooltip (reuses #blocktip)
+const ID = {}; GL.forEach((g,i)=>{ ID[g]=i; });
+function bindTip(node, html){
+  let tip=document.getElementById('blocktip');
+  if(!tip){ tip=el('div'); tip.id='blocktip'; document.body.appendChild(tip); }
+  node.style.cursor='help';
+  node.addEventListener('mouseenter',()=>{ tip.innerHTML=html; tip.style.display='block'; });
+  node.addEventListener('mousemove',e=>{ const w=tip.offsetWidth||280;
+    tip.style.left=Math.min(e.clientX+16, window.innerWidth-w-12)+'px'; tip.style.top=(e.clientY+16)+'px'; });
+  node.addEventListener('mouseleave',()=>{ tip.style.display='none'; });
+}
+
 // ---------- static sections ----------
-(function lexicon(){
+// the lexicon / encoding table, with a toggle to show each pulse's token id
+let showLexIds = false;
+function lexChip(id){
+  const head = showLexIds ? `#${id}` : GL[id];
+  return `<span class="tok ${CLS[id]}"><span class="g">${head}</span><span class="s">(${GLOSS[id]})</span></span>`;
+}
+function renderLexicon(){
   const groups = {struct:'structure',who:'who',verb:'verbs',thing:'things',place:'places',reply:'replies',bearing:'currents'};
   let h='<table><tr><th>kind</th><th>pulses</th></tr>';
   for(const [cls,label] of Object.entries(groups)){
     const ids = lex.tokens.map((t,i)=>i).filter(i=>CLS[i]===cls);
-    h+=`<tr><td>${label}</td><td>${ids.map(i=>tokChip(i)).join('')}</td></tr>`;
+    h+=`<tr><td>${label}</td><td>${ids.map(i=>lexChip(i)).join('')}</td></tr>`;
   }
-  $('#lexicon').innerHTML = h+'</table>';
-})();
+  $('#lexicon').innerHTML =
+    `<label class="lexids-toggle"><input type="checkbox" id="lexids"${showLexIds?' checked':''}> show numeric encoding (the token id the model actually sees)</label>`
+    + h + '</table>';
+  $('#lexids').onchange = e=>{ showLexIds=e.target.checked; renderLexicon(); };
+}
+renderLexicon();
 
-$('#grammar').textContent =
-`ritual       ⟨ who na dø ⟩                       a danger cry: warn → deep
-forage       ⟨ PLACE · who wø THING ⟩            seek the thing that lives at PLACE
-triangulate  ⟨ ∿ CUR CUR THING ⟩                 prey is where two currents meet
-report       ⟨ who gɪ lum ⟩                       the common "found glow"
-echo         ⟨ who wø THING ? ⟩ ⟨ who gɪ THING ⟩  answer repeats the queried thing
-reply        ⟨ who wø THING ? ⟩ ⟨ who ko|ne ⟩     yes / no
-give         ⟨ who ru THING who ⟩                 a handoff`;
+// the grammar, made interactive: every pulse and every TYPE placeholder is a
+// hover target that reveals its numerical encoding (token id, or the id set)
+const GTYPES = { who:'who', PLACE:'place', THING:'thing', CUR:'bearing' };
+const PATTERNS = [
+  ['ritual',      ['⟨','who','na','dø','⟩'],                                   'a danger cry: warn → deep'],
+  ['forage',      ['⟨','PLACE','·','who','wø','THING','⟩'],                     'seek the thing that lives at PLACE'],
+  ['triangulate', ['⟨','∿','CUR','CUR','THING','⟩'],                           'prey is where two currents meet'],
+  ['report',      ['⟨','who','gɪ','lum','⟩'],                                   'the common "found glow"'],
+  ['echo',        ['⟨','who','wø','THING','?','⟩','⟨','who','gɪ','THING','⟩'],  'answer repeats the queried thing'],
+  ['reply',       ['⟨','who','wø','THING','?','⟩','⟨','who','ko','|','ne','⟩'], 'yes / no'],
+  ['give',        ['⟨','who','ru','THING','who','⟩'],                           'a handoff'],
+];
+let grammarTips = [];
+function grammarTok(s){
+  if(GTYPES[s]){
+    const cls = GTYPES[s], m = lex.tokens.map((t,i)=>i).filter(i=>CLS[i]===cls);
+    grammarTips.push(`<b>${s}</b> — any ${cls} pulse: ` + m.map(i=>`${GL[i]} <span style="opacity:.6">#${i}</span>`).join(' · '));
+    return `<span class="gtype" data-ti="${grammarTips.length-1}">${s}</span>`;
+  }
+  if(ID[s]!==undefined){
+    const i=ID[s];
+    grammarTips.push(`<b>${GL[i]}</b> — ${GLOSS[i]} · encodes to <b>#${i}</b>`);
+    return `<span class="gpulse" data-ti="${grammarTips.length-1}">${GL[i]}</span>`;
+  }
+  return s;   // a bare literal (e.g. the "|" in ko | ne)
+}
+(function renderGrammar(){
+  grammarTips = [];
+  $('#grammar').innerHTML = PATTERNS.map(([name,seq,desc])=>
+    `<div class="gramname">${name}</div><div class="grampat">${seq.map(grammarTok).join(' ')}</div><div class="gramdesc">${desc}</div>`
+  ).join('');
+  $('#grammar').querySelectorAll('.gpulse,.gtype').forEach(n=> bindTip(n, grammarTips[+n.dataset.ti]));
+})();
 
 $('#three').innerHTML = `
   <div class="card retr"><h3 class="sans">Retrieved</h3><p style="font-size:13px"><b>The ritual.</b> After
