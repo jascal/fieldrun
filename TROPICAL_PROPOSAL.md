@@ -133,15 +133,17 @@ This is exactly the two-semiring picture LOGIC_EXPORT already runs:
 > `T=1`, sum-product); under the **tropical** semiring (`⊕ = max`, `⊗ = +`) to the MAP decode (this
 > paper, `T=0`, max-product / Viterbi). Maslov dequantization is the homomorphism between them.
 
-- **TT7 (decode = polytope propagation).** fieldrun's `export --logic` (LO3, one-decision partial
-  evaluation, `(max,+)` argmax decode) and `export --logic-whole` (LO3a, context-free whole-model emit)
-  are the **tropicalization of Pachter–Sturmfels polytope propagation** specialized to the unembedding
-  layer. The Newton polytope that P–S propagate *is* `conv{U_v}` of §2 at the final layer; the
-  high-treewidth "dense-Gram wall" (LOGIC_EXPORT LE-T4: the `vocab × d` embed-fact blow-up) is the
-  statement that this terminal Newton polytope has no compact propagation, which is the geometric face
-  of the forge tax (§5). *Status: structural/exact (a restatement, not a new claim); its value is that
-  it gives the logic export a **named prior-art algorithm** and makes the `T=0`/`T=1` duality a semiring
-  homomorphism on one polytope-propagation recurrence.*
+- **TT7 (decode = polytope propagation).** The max-product evaluation in `export --logic` (LO3,
+  one-decision partial evaluation, `(max,+)` argmax decode) — and `export --logic-whole` (LO3a, the
+  context-free whole-model emit) — is the **tropicalization (max-plus semiring) of the polytope-propagation
+  algorithm of Pachter–Sturmfels, applied to the terminal Newton polytope `conv{(U_v, b_v)}`** of §2. P–S
+  propagate a Newton polytope through the model with `×` replaced by **Minkowski sum** and `+` by **convex
+  hull** (the classical, numbers-free dynamic program); tropicalizing it (`⊗ = +`, `⊕ = max`) collapses
+  each propagated polytope to its supporting vertex/value and yields the MAP decode. The high-treewidth
+  "dense-Gram wall" (LOGIC_EXPORT LE-T4: the `vocab × d` embed-fact blow-up) is the statement that this
+  terminal Newton polytope has no compact propagation — the geometric face of the forge tax (§5). *Status:
+  structural/exact (a restatement, not a new claim); its value is a **named prior-art algorithm** for the
+  export, making the `T=0`/`T=1` duality a semiring homomorphism on one polytope-propagation recurrence.*
 
 ---
 
@@ -197,12 +199,21 @@ and `b` as the core's logits:
 
 - **TT8 (sparse max-plus residual = forge tax, *constructive*).** The greatest-subsolution residual of
   the best max-plus retrieval table is a *computable* lower bound on the forge tax — the per-position
-  logit mass that no lookup over the dictionary can reproduce. This makes TT5 testable without computing
-  a full tropical rank: fit the table by the closed-form principal solution, measure the residual, and
-  correlate it with the COMPOSED / `μ_t=0` fraction (§11, E5). It also connects directly to the
-  density-minimization expert work ([`DENSITY_BUCKETING.md`](./DENSITY_BUCKETING.md)): the
-  irreducible-atom buckets are a *learned* dictionary `A`, and the residual expert (the catch-all that no
-  hub absorbs) is exactly the max-plus residual — the forge tax that no number of buckets dissolves.
+  logit mass that no lookup over the dictionary can reproduce.
+  *How it is computed (no optimization — closed form):* the principal subsolution is residuation,
+  `x̂_j = min_i (b_i − A_{ij})`; reconstruct `(A ⊗ x̂)_i = max_j (A_{ij} + x̂_j)`; because `x̂` is the
+  *greatest* subsolution, `A ⊗ x̂ ≤ b` pointwise, so the residual `e_i = b_i − (A ⊗ x̂)_i ≥ 0` is a vector
+  of non-negative per-token shortfalls. Report `‖e‖₁` (total un-expressible mass) or `‖e‖_∞` (worst token)
+  per route class. This makes TT5 testable without computing a full tropical rank: fit the table in one
+  `(min,+)`/`(max,+)` matmul pair, measure `e`, and correlate it with the COMPOSED / `μ_t=0` fraction
+  (§11, E5).
+  *Relation to the density-bucketing residual expert* ([`DENSITY_BUCKETING.md`](./DENSITY_BUCKETING.md)):
+  same phenomenon at two resolutions, not two objects. The bucketing residual is the **discrete /
+  combinatorial** catch-all — circuits that never co-fire with a hub, an integer count of un-bucketed
+  atoms. The max-plus residual `e` is its **continuous, logit-space refinement** — a real-valued
+  un-expressible mass *per position*, which recovers the bucketing notion exactly when `A` is taken to be
+  the learned bucket dictionary (its rows = the hub/expert keys). So `e` grades the forge tax that the
+  buckets leave behind, rather than merely counting it.
 
 **Tie to the program's rank-`r` findings.** This connects the tropical rank to the *measured* entangled-
 core results (the `min_to_run` rank ladder; the finding that a frozen-linear core plateaus at a Θ(d)
@@ -309,18 +320,20 @@ choice of `K` *is* the temperature. They cite each other across this limit; none
 ## 9. Related work
 
 - **Tropical geometry of neural networks** — **L. Zhang, G. Naitzat, L.-H. Lim**, "Tropical Geometry of
-  Deep Neural Networks," *Proc. ICML 2018*, PMLR 80:5824–5832. ReLU nets ⟺ tropical rational maps
+  Deep Neural Networks," *Proc. ICML 2018*, PMLR 80:5824–5832 ([PMLR](http://proceedings.mlr.press/v80/zhang18i.html);
+  arXiv:1805.07091). ReLU nets ⟺ tropical rational maps
   (**Thm. 5.4**); tropical rational function = difference of tropical polynomials (**Def. 2.4**);
   tropical hypersurface = decision boundary (**Def. 3.1**, **Prop. 6.1**); linear-region counts via
   Newton-polytope upper-hull vertices (**Def. 3.2**, **Thm. 6.3**) and zonotopes (**Cor. 3.4**, **Lemma
   6.2**); depth is exponentially more expressive. *The structural backbone of §2/§3/TT3.*
 - **Tropical geometry of statistical models** — **L. Pachter, B. Sturmfels**, *PNAS* 101(46):16132–16137,
-  2004. Graphical models as algebraic varieties; the sum-product algorithm evaluates a coordinate;
+  2004 (doi:10.1073/pnas.0406010101; arXiv:q-bio/0311009). Graphical models as algebraic varieties; the
+  sum-product algorithm evaluates a coordinate;
   **polytope propagation** (Minkowski-sum/convex-hull dynamic program) as the geometric sum-product, and
   its tropicalization = MAP/Viterbi; the Newton polytope of a statistical model governs parametric
   inference. *The backbone of §3b/TT7 and the logic-export bridge.*
 - **Tropical geometry and machine learning** — **P. Maragos, V. Charisopoulos, E. Theodosis**, "Tropical
-  Geometry and Machine Learning," *Proc. IEEE* 109(5):728–755, 2021 (and **P. Maragos**, *Tropical
+  Geometry and Machine Learning," *Proc. IEEE* 109(5):728–755, 2021, doi:10.1109/JPROC.2021.3065238 (and **P. Maragos**, *Tropical
   Algebra and Geometry for ML / Optimization*, ICASSP 2024 tutorial). Morphological (max-plus) perceptrons
   and networks; tropical/convex regression with optimal solution and efficient algorithm; Newton-polytope
   and zonotope methods for NN pruning/approximation (minimizing linear-region count); sparse / greatest
@@ -336,6 +349,9 @@ choice of `K` *is* the temperature. They cite each other across this limit; none
 `polygram`'s hierarchical polysemantic-dictionary geometry is a candidate *factored* tropical dictionary
 (its Q-Orca machines a structured `A` for the TT8 max-plus fit); `n-orca`'s typed-DAG architecture specs
 are where a tropical-rank capacity budget (TT3) would attach as a verifiable per-layer constraint.
+Concretely, the probe outputs that would feed those feature-geometry experiments are `--tropical-vertices`'
+retrievable-vocab map (which tokens are dictionary-expressible) and the TO9 PWL surrogate (a compact
+tropical model whose monomials are candidate polygram dictionary atoms).
 
 ---
 
@@ -432,6 +448,29 @@ CLI flags to add: `--probe-tropical`, `--tropical-vertices`, `--tropical-cells`,
 `--samples`, `--exact` (LP calibration), reusing `--store`/`--vocab`/`--ctx`/`--n-eval` as `--probe-facet`
 does. `headgate.rs` already implements the nearest-facet geometry for head gating — `nearest_facets`
 should be factored out of it and `headgate`/`--probe-facet`/`--probe-tropical` should share it.
+
+### 11.5 Implementation notes (for the follow-up implementation PR)
+
+- **Scale.** At `|V| ≥ 128k` there is no exact power-diagram construction and no full per-token
+  active-monomial enumeration — both are `O(|V|²)`/`O(|V| d)` per position. Start with what `--probe-facet`
+  already does cheaply: a single `O(|V| d)` `rowdot_f32` for the logits, then a local nearest-facet scan;
+  `local_rank` is a count over that one logit vector (free). Reserve sampling estimators for the *global*
+  quantities (`--tropical-cells` distinct-cell count, `--tropical-vertices` won-set) and gate `--exact`
+  (per-token LP feasibility) behind an explicit token-subset cap for calibration only.
+- **Numerical stability.** `facet_angle = cos(U_t, U_v*)` and the `local_rank` "within `ε`" threshold both
+  need care near degenerate facets (`‖U_t − U_v‖² ≤ 1e-4` — already special-cased to `−∞` in `headgate.rs`)
+  and under **int8/int4** quantization, where logit noise is `O(scale)`. This is not just a nuisance — it
+  is the **falsifiable hypothesis of TO7/E7**: tokens with small tropical margin (`facet_dist`) are exactly
+  the ones predicted to flip under quantization. So the probe should *record* `facet_dist` alongside the
+  quantized-vs-f32 prediction flip, turning the numerical-stability concern into the measurement.
+- **Reuse & refactoring.** Beyond extracting `nearest_facets` from `headgate.rs`, expose a small
+  `PowerDiagram` / `TropicalPolynomial` struct in `src/tropical.rs` (holding `{U_v}`, `b_v`, the cached
+  `‖U_v‖²`) with `argmax`, `nearest_facets`, `active_monomials`, `maxplus_principal` methods. This is the
+  reusable surface for MoE-router analysis (TO7/E8) and the TO9 PWL-surrogate fit, not just the probe.
+- **Validation priority.** `E1 → E2` first (the probe must reproduce `--probe-facet` distances bit-for-bit
+  and the `--probe-ablate` `μ_t=0` fraction — pure regression checks). Then **E5** (TT8 residual vs
+  COMPOSED / `μ_t=0`) and **E7/E8** (quantization / MoE stability) for the quickest wins on the *new*
+  claims; E3/E6/E9 (PIC-`ρ` cross-validation, vocab map, rank ladder) follow.
 
 ---
 
