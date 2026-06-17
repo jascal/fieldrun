@@ -1561,7 +1561,7 @@ fn main() {
             }).collect();
             let meanf = |g: &[&T], f: &dyn Fn(&T) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
             println!("\n=== --probe-tropical: power-diagram facet geometry ({} positions, {vocab} tokens, eps={eps}) ===", recs.len());
-            println!("  facet-dist = normalized margin = exact distance to T(M) (TT2) · angle = cos∠(U_t,U_v*) (TT6) · local-rank = #monomials within eps of the max");
+            println!("  facet-dist = normalized margin = exact distance to T(M) (TT2) · angle = cos∠(U_t,U_v*) (TT6) · local-rank = #monomials (logit-space) within eps of the max");
             println!("{:<12}{:>6}{:>16}{:>14}{:>14}", "route", "n", "facet-dist", "facet-angle", "local-rank");
             for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
                 let g: Vec<&T> = recs.iter().filter(|x| x.route == r).collect();

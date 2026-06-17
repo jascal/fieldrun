@@ -9,6 +9,12 @@
 //! adopt it next). Inputs are precomputed elsewhere: the logits `l[v] = ⟨U_v, r⟩`, the squared norms
 //! `unorm[v] = ‖U_v‖²`, and a single Gram row for the winner `g[v] = ⟨U_v, U_t⟩`, so that
 //! `‖U_t − U_v‖² = ‖U_t‖² + ‖U_v‖² − 2⟨U_v, U_t⟩` needs no extra `weight_row` calls.
+//!
+//! Reading guide: [`Facet::dist`] is the normalized margin (TT2); [`Facet::angle`] is the `T→0` image
+//! of PIC's `ρ` (TT6); [`local_rank`] is a *logit-space* count of near-max monomials (a cheap proxy,
+//! not a geometric rank on the hypersurface). This module is also the intended home for the richer
+//! tropical helpers sketched in TROPICAL_PROPOSAL §11.4 (`PowerDiagram` / `TropicalPolynomial` /
+//! tropical-rank estimators) — for now it is just the shared nearest-facet kernel.
 
 /// Parallel/degenerate-facet guard: `‖U_t − U_v‖² ≤ DEGEN` ⇒ no facet (matches `--probe-facet` and
 /// `headgate.rs`, where degenerate rows are sent to `−∞`).
@@ -23,7 +29,8 @@ pub struct Facet {
     pub dist: f32,
     /// logit runner-up `argmax_{v≠t} l[v]` (the cheap proxy `v*` usually — but not always — equals).
     pub ru: usize,
-    /// `cos∠(U_t, U_v*)` — the crossing sharpness, the `T→0` image of PIC's `ρ` (TT6); `NaN` if undefined.
+    /// `cos∠(U_t, U_v*)` — the crossing sharpness, the `T→0` image of PIC's `ρ` (TT6). `NaN` when no
+    /// facet was found (`vstar == t`, e.g. every competitor is degenerate) or `U_t`/`U_v*` is ~zero-norm.
     pub angle: f32,
 }
 
@@ -60,6 +67,7 @@ pub fn nearest_facet(l: &[f32], t: usize, unorm: &[f32], g: &[f32]) -> Facet {
 
 /// Local active-monomial count near the winning cell: `#{v : L_t − L_v ≤ eps}` (includes the winner).
 /// A cheap local-tropical-rank proxy (TROPICAL_PROPOSAL §11.1) — larger ⇒ more monomials crowd the cell.
+/// NB: this is a *logit-space* count of near-max monomials, not a geometric rank on the hypersurface.
 pub fn local_rank(l: &[f32], t: usize, eps: f32) -> usize {
     let lt = l[t];
     l.iter().filter(|&&lv| lt - lv <= eps).count()
