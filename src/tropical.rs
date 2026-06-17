@@ -73,6 +73,16 @@ pub fn local_rank(l: &[f32], t: usize, eps: f32) -> usize {
     l.iter().filter(|&&lv| lt - lv <= eps).count()
 }
 
+/// Interior-point test (TROPICAL_PROPOSAL TT4 / §11.1, the E2 increment). A position is **interior**
+/// (COMPOSED — the winning cell exists only in the *sum* of monomials, no single source's monomial attains
+/// the max) when its irreducible deciding atom needs more than one circuit; `atom_size == 1` means a single
+/// monomial dominates (RETRIEVED-like), `atom_size == 0` means no atom was found. `atom_size` comes from
+/// `explain::DescentResult::atom_size`; the causal counterpart is ablating that atom via `logits_ablated`
+/// and checking whether the prediction flips (necessity / `μ_t`).
+pub fn is_interior(atom_size: usize) -> bool {
+    atom_size > 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +121,13 @@ mod tests {
         assert_eq!(local_rank(&l, 0, 1.0), 1, "only the winner is within 1.0 of the max");
         assert_eq!(local_rank(&l, 0, 2.0), 2, "winner + token 1 (gap 1.9) within 2.0");
         assert_eq!(local_rank(&l, 0, 100.0), 3, "all three within a wide eps");
+    }
+
+    #[test]
+    fn interior_iff_atom_gt_one() {
+        assert!(!is_interior(0), "no atom ⇒ not interior");
+        assert!(!is_interior(1), "single dominating monomial ⇒ RETRIEVED-like, not interior");
+        assert!(is_interior(2), "two-circuit coalition ⇒ interior (COMPOSED)");
+        assert!(is_interior(7), "large coalition ⇒ interior");
     }
 }

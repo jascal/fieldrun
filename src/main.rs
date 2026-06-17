@@ -1519,12 +1519,13 @@ fn main() {
             return;
         }
 
-        // --probe-tropical (TROPICAL_PROPOSAL §11.1): the MINIMAL power-diagram probe. Reuses --probe-facet's exact
-        // nearest-facet kernel (tropical::nearest_facet) and adds the two cheap tropical quantities the proposal
+        // --probe-tropical (TROPICAL_PROPOSAL §11.1): the power-diagram probe. Reuses --probe-facet's exact
+        // nearest-facet kernel (tropical::nearest_facet) and adds the cheap tropical quantities the proposal
         // calls for: the facet ANGLE cos∠(U_t,U_v*) (the T→0 image of PIC's ρ, TT6) and the LOCAL active-monomial
         // count #{v: L_t−L_v ≤ eps} (a local tropical-rank proxy). facet_dist is the SAME kernel as --probe-facet,
-        // so E1 (identical distances) holds by construction. The interior-point/μ_t test (TT4, E2) needs the
-        // decompose path and is the next increment, not this minimal probe. Rope only (needs final_residual).
+        // so E1 (identical distances) holds by construction. With --interior it also runs the E2 test (TT4): descend
+        // to the irreducible atom and ablate exactly that atom via the shared logits_ablated hook (interior% = atom>1,
+        // necessary% = the ablation flips the prediction = μ_t). Rope only (needs final_residual; --interior adds explain_decomp).
         if has_flag(&args, "--probe-tropical") {
             use retrieval::CandCfg;
             let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
@@ -1532,6 +1533,9 @@ fn main() {
                 None => { eprintln!("[fieldrun] --probe-tropical needs --store"); return; }
             };
             let eps: f32 = flag(&args, "--eps").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            // --interior (E2 / TT4): also descend to the atom and ablate it via the shared logits_ablated hook.
+            let want_interior = has_flag(&args, "--interior");
+            let kk: usize = flag(&args, "--decomp-k").and_then(|s| s.parse().ok()).unwrap_or(4);
             let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
             let b2 = Bundle::load(&stem).expect("reload bundle");
             let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
@@ -1544,8 +1548,18 @@ fn main() {
             let unorm: Vec<f32> = (0..vocab).into_par_iter().map(|v| b2.weight_row(un, v).iter().map(|x| x * x).sum()).collect();
             let cap = (end - ctx_window).min(n_eval).min(300);
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-tropical: no eval positions (need --ids with > ctx_window tokens)"); return; }
             eprintln!("[fieldrun] --probe-tropical: {} positions — facet dist/angle + local rank (eps={eps}) over {vocab} tokens…", positions.len());
-            struct T { route: u8, dist: f32, angle: f32, rank: usize, vstar_is_ru: bool }
+            if want_interior {
+                if lm.explain_decomp(positions[0], kk).and_then(|e| e.decomp).is_none() {
+                    eprintln!("[fieldrun] --probe-tropical --interior: arch {arch} doesn't expose the descent substrate (rope/Qwen only)"); return;
+                }
+                if lm.logits_ablated(positions[0], &[], &[]).is_none() {
+                    eprintln!("[fieldrun] --probe-tropical --interior: arch {arch} has no logits_ablated hook"); return;
+                }
+                eprintln!("[fieldrun] --probe-tropical --interior: + descent (K={kk}) and atom-ablation necessity via logits_ablated");
+            }
+            struct T { route: u8, dist: f32, angle: f32, rank: usize, vstar_is_ru: bool, atom: Option<usize>, flipped: Option<bool> }
             let recs: Vec<T> = positions.par_iter().filter_map(|c| {
                 let r = lm.final_residual(c)?;
                 let l = b2.rowdot_f32(un, &r); // logits L_v = ⟨U_v, r⟩
@@ -1557,7 +1571,23 @@ fn main() {
                 let kb = store.predict(c).0 as usize;
                 let covered = store.candidates(c, &cfg).contains(&(t as i64));
                 let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
-                Some(T { route, dist: f.dist, angle: f.angle, rank, vstar_is_ru: f.vstar == f.ru })
+                // E2 (TT4): descend to the irreducible atom, then ablate exactly that atom via the shared
+                // logits_ablated hook — atom size (>1 ⇒ interior) and whether the ablation flips the prediction (μ_t).
+                let (atom, flipped) = if want_interior {
+                    match lm.explain_decomp(c, kk).and_then(|ex| {
+                        let sub = ex.decomp.as_ref()?;
+                        let dr = explain::decompose_descent(sub);
+                        let (mut ah, mut an) = (Vec::new(), Vec::new());
+                        for &i in &dr.atom { let s = &sub.sources[i]; if s.kind == 0 { ah.push((s.layer, s.idx)); } else { an.push((s.layer, s.idx)); } }
+                        let abl = lm.logits_ablated(c, &ah, &an)?;
+                        let amax = abl.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0 as i64;
+                        Some((dr.atom_size(), amax != ex.model_predicts))
+                    }) {
+                        Some((sz, fl)) => (Some(sz), Some(fl)),
+                        None => (None, None),
+                    }
+                } else { (None, None) };
+                Some(T { route, dist: f.dist, angle: f.angle, rank, vstar_is_ru: f.vstar == f.ru, atom, flipped })
             }).collect();
             let meanf = |g: &[&T], f: &dyn Fn(&T) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
             println!("\n=== --probe-tropical: power-diagram facet geometry ({} positions, {vocab} tokens, eps={eps}) ===", recs.len());
@@ -1574,6 +1604,20 @@ fn main() {
             let ru_pct = if all.is_empty() { f32::NAN } else { 100.0 * all.iter().filter(|x| x.vstar_is_ru).count() as f32 / all.len() as f32 };
             println!("(E1 self-check: facet-dist uses the same tropical::nearest_facet kernel as --probe-facet ⇒ distances identical by construction)");
             println!("(nearest facet == logit runner-up overall: {ru_pct:.0}%  — should match --probe-facet's proxy-fidelity number)");
+            if want_interior {
+                println!("\n=== interior-point / necessity (E2 · TT4, K={kk}) ===");
+                println!("  σ(t)=|atom| (descent) · interior% = atom>1 (no single monomial decides) · necessary% = ablating the atom via logits_ablated flips the prediction (μ_t)");
+                println!("{:<12}{:>6}{:>12}{:>12}{:>13}", "route", "n", "σ(t)=|A|", "interior%", "necessary%");
+                for (lbl, rt) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                    let g: Vec<&T> = recs.iter().filter(|x| x.route == rt && x.atom.is_some()).collect();
+                    if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                    let mean_atom = g.iter().map(|x| x.atom.unwrap() as f32).sum::<f32>() / g.len() as f32;
+                    let int_pct = 100.0 * g.iter().filter(|x| tropical::is_interior(x.atom.unwrap())).count() as f32 / g.len() as f32;
+                    let nec_pct = 100.0 * g.iter().filter(|x| x.flipped == Some(true)).count() as f32 / g.len() as f32;
+                    println!("{lbl:<12}{:>6}{:>12.1}{:>11.0}%{:>12.0}%", g.len(), mean_atom, int_pct, nec_pct);
+                }
+                println!("(E2 cross-check: interior%/necessary% should track --probe-decompose's σ(t) and confirm-flip% on the same positions)");
+            }
             return;
         }
 

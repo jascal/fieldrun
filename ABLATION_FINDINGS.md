@@ -127,7 +127,9 @@ which this pass does not ablate.
 
 1. **Full circuit-set ablation** (decisive). Re-run `--corpus-decompose --experts-out`
    (~2h40m) to recover per-expert circuit membership, then ablate each expert's full
-   21–300 circuits (the `logits_ablated` hook already accepts a circuit list). This is
+   21–300 circuits (the `logits_ablated` hook already accepts a circuit list;
+   `make_ablation_evals.py --partition <experts-out.json>` now emits the full-set specs
+   + size-matched random controls). This is
    the test that settles H2 (family boundary), H3 (universal core), and H4
    (formal-language separation) for the diffuse experts — the anchor pass only
    settled the *concentrated* ones (e8, partly e19).
