@@ -124,6 +124,11 @@ the `t`–`v` bisector). Both models, 300 positions:
   `-ful⟂-y`, `-quent⟂-quence`. The closed-class/grammar regime where the KB is strongest. So: RETRIEVED
   (model=KB, deep cell) / COMPOSED-85% (genuine divergence, KB geometrically far) / near-miss-15% (function-word
   coin-flip the rule also offered — *not* novel computation).
+- **Tropical reading.** This power diagram is the tropical hypersurface `T(M)` of the max-logit, and the
+  facet distances above are exactly TT1/TT2 of [`TROPICAL_PROPOSAL.md`](./TROPICAL_PROPOSAL.md). The
+  RETRIEVED-vs-COMPOSED split is its **Newton-vertex vs interior-point** distinction (TT4); the proposed
+  `--probe-tropical` (§11 there) measures the interior fraction and the facet *angle* (the `T→0` image of
+  PIC's `ρ`) directly against this `μ_t` / `--probe-facet` data.
 
 ## 5c. Causal ablation — composed is fragile, and μ_t-redundancy confers no causal protection (decoupling, margin-matched + confound-controlled)
 

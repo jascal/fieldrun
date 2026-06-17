@@ -24,7 +24,10 @@ sum-product** over a semiring `K`. The two theory papers are then two semirings 
 > `K` = tropical (`⊕ = max`, `⊗ = +`) ⇒ max-product ⇒ the greedy argmax decode (Tropical, `T=0`).**
 
 Maslov dequantization is the semiring homomorphism between them; the temperature knob *is* the semiring
-choice. Two theorems carry the paper: **LE-T5 (soundness)** — `Π` under the log-semiring evaluates to
+choice. This bottom-up polytope/semiring recurrence is exactly **Pachter–Sturmfels polytope propagation**
+(the geometric sum-product; PNAS 2004) specialized to the unembedding layer — see
+[`TROPICAL_PROPOSAL.md`](./TROPICAL_PROPOSAL.md) §3b/TT7, which names the decode's prior-art algorithm.
+Two theorems carry the paper: **LE-T5 (soundness)** — `Π` under the log-semiring evaluates to
 the model's distribution, under (max,+) to its MAP decode — and **LE-T2 (the provenance gap)** — the
 Gram coupling `G_{vw} = ⟨U_v, U_w⟩` forces provenance *valued in the frame geometry*, not scalars; scalar
 semiring Datalog is exact only on diagonal `G`. The retrievable fragment exports to compact stratified

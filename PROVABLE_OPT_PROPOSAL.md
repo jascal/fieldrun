@@ -127,8 +127,10 @@ is therefore exactly the program's **treewidth / dependency sparsity**:
 > **PO-T2 (Lossless residual = forge tax).** The materialized-tuple count of `Π` *after* a maximal lossless
 > demand transform is a **machine-checked, lossless measure of the computed fragment** (the forge tax): the
 > pruned mass is the retrievable fragment, the residual is the dense-`G` / high-treewidth core. It is a fourth
-> instrument for the one wall, beside provenance rank (PR), treewidth, and tropical rank (LE-T4 / LO4 / the
-> Tropical paper). **Status: measured (the *nothing-to-drop* half), on two ends (R4).**
+> instrument for the one wall, beside provenance rank (PR), treewidth, and tropical rank (LE-T4 / LO4 /
+> [`TROPICAL_PROPOSAL.md`](./TROPICAL_PROPOSAL.md) TT5; its constructive **greatest-max-plus-subsolution
+> residual** (TT8, Cuninghame-Green) is the computable forge-tax lower bound that most directly mirrors
+> this PO-T2 demand residual). **Status: measured (the *nothing-to-drop* half), on two ends (R4).**
 >
 > *(i) On the emittable Π* (`lo3a/magic_residual.py`, tiny minted bundle). Soufflé's demand transform
 > (`-m '*'`) is **decode-lossless** (`decide` 29→29 byte-identical, plain vs magic) and prunes the dense
