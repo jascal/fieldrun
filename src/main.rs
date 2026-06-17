@@ -45,6 +45,7 @@ mod retrieval;
 mod rope;
 #[cfg(feature = "api")]
 mod tools;
+mod tropical;
 
 use std::collections::HashMap;
 
@@ -1487,17 +1488,8 @@ fn main() {
                 let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
                 let ut = b2.weight_row(un, t);
                 let g = b2.rowdot_f32(un, &ut); // ⟨U_v, U_t⟩ for all v → ‖U_t−U_v‖² = ‖U_t‖²+‖U_v‖²−2⟨U_v,U_t⟩
-                let (mut best_d, mut vstar) = (f32::INFINITY, t);
-                let (mut best_l, mut ru) = (f32::NEG_INFINITY, t);
-                for v in 0..vocab {
-                    if v == t { continue; }
-                    if l[v] > best_l { best_l = l[v]; ru = v; }
-                    let dvv2 = unorm[t] + unorm[v] - 2.0 * g[v];
-                    if dvv2 > 1e-4 {
-                        let dv = (l[t] - l[v]) / dvv2.sqrt(); // exact Euclidean distance to the t–v bisector facet
-                        if dv < best_d { best_d = dv; vstar = v; }
-                    }
-                }
+                let f = tropical::nearest_facet(&l, t, &unorm, &g); // shared kernel (also used by --probe-tropical)
+                let (best_d, vstar, ru) = (f.dist, f.vstar, f.ru);
                 let kb = store.predict(c).0 as usize;
                 let covered = store.candidates(c, &cfg).contains(&(t as i64));
                 let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
@@ -1524,6 +1516,64 @@ fn main() {
                     println!("    {}   ⟂   KB {}", dec(f.pick), dec(f.kb));
                 }
             }
+            return;
+        }
+
+        // --probe-tropical (TROPICAL_PROPOSAL §11.1): the MINIMAL power-diagram probe. Reuses --probe-facet's exact
+        // nearest-facet kernel (tropical::nearest_facet) and adds the two cheap tropical quantities the proposal
+        // calls for: the facet ANGLE cos∠(U_t,U_v*) (the T→0 image of PIC's ρ, TT6) and the LOCAL active-monomial
+        // count #{v: L_t−L_v ≤ eps} (a local tropical-rank proxy). facet_dist is the SAME kernel as --probe-facet,
+        // so E1 (identical distances) holds by construction. The interior-point/μ_t test (TT4, E2) needs the
+        // decompose path and is the next increment, not this minimal probe. Rope only (needs final_residual).
+        if has_flag(&args, "--probe-tropical") {
+            use retrieval::CandCfg;
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
+                Some(s) => s,
+                None => { eprintln!("[fieldrun] --probe-tropical needs --store"); return; }
+            };
+            let eps: f32 = flag(&args, "--eps").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, _d) = b2.dims(un);
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() {
+                eprintln!("[fieldrun] --probe-tropical: arch {arch} doesn't expose final_residual (rope only)");
+                return;
+            }
+            eprintln!("[fieldrun] --probe-tropical: precomputing ‖U_v‖² for {vocab} unembed rows…");
+            let unorm: Vec<f32> = (0..vocab).into_par_iter().map(|v| b2.weight_row(un, v).iter().map(|x| x * x).sum()).collect();
+            let cap = (end - ctx_window).min(n_eval).min(300);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            eprintln!("[fieldrun] --probe-tropical: {} positions — facet dist/angle + local rank (eps={eps}) over {vocab} tokens…", positions.len());
+            struct T { route: u8, dist: f32, angle: f32, rank: usize, vstar_is_ru: bool }
+            let recs: Vec<T> = positions.par_iter().filter_map(|c| {
+                let r = lm.final_residual(c)?;
+                let l = b2.rowdot_f32(un, &r); // logits L_v = ⟨U_v, r⟩
+                let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
+                let ut = b2.weight_row(un, t);
+                let g = b2.rowdot_f32(un, &ut); // ⟨U_v, U_t⟩ row for the winner
+                let f = tropical::nearest_facet(&l, t, &unorm, &g);
+                let rank = tropical::local_rank(&l, t, eps);
+                let kb = store.predict(c).0 as usize;
+                let covered = store.candidates(c, &cfg).contains(&(t as i64));
+                let route = if kb == t { 0u8 } else if covered { 1 } else { 2 };
+                Some(T { route, dist: f.dist, angle: f.angle, rank, vstar_is_ru: f.vstar == f.ru })
+            }).collect();
+            let meanf = |g: &[&T], f: &dyn Fn(&T) -> f32| if g.is_empty() { f32::NAN } else { g.iter().map(|x| f(x)).sum::<f32>() / g.len() as f32 };
+            println!("\n=== --probe-tropical: power-diagram facet geometry ({} positions, {vocab} tokens, eps={eps}) ===", recs.len());
+            println!("  facet-dist = normalized margin = exact distance to T(M) (TT2) · angle = cos∠(U_t,U_v*) (TT6) · local-rank = #monomials (logit-space) within eps of the max");
+            println!("{:<12}{:>6}{:>16}{:>14}{:>14}", "route", "n", "facet-dist", "facet-angle", "local-rank");
+            for (lbl, r) in [("RETRIEVED", 0u8), ("SELECTED", 1), ("COMPOSED", 2)] {
+                let g: Vec<&T> = recs.iter().filter(|x| x.route == r).collect();
+                if g.is_empty() { println!("{lbl:<12}{:>6}", 0); continue; }
+                let angs: Vec<f32> = g.iter().map(|x| x.angle).filter(|a| !a.is_nan()).collect();
+                let ang_mean = if angs.is_empty() { f32::NAN } else { angs.iter().sum::<f32>() / angs.len() as f32 };
+                println!("{lbl:<12}{:>6}{:>16.3}{:>14.3}{:>14.1}", g.len(), meanf(&g, &|x| x.dist), ang_mean, meanf(&g, &|x| x.rank as f32));
+            }
+            let all: Vec<&T> = recs.iter().collect();
+            let ru_pct = if all.is_empty() { f32::NAN } else { 100.0 * all.iter().filter(|x| x.vstar_is_ru).count() as f32 / all.len() as f32 };
+            println!("(E1 self-check: facet-dist uses the same tropical::nearest_facet kernel as --probe-facet ⇒ distances identical by construction)");
+            println!("(nearest facet == logit runner-up overall: {ru_pct:.0}%  — should match --probe-facet's proxy-fidelity number)");
             return;
         }
 
