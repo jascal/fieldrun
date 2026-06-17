@@ -139,6 +139,14 @@
   .tapetok.gen:hover{background:#4a341f}
   .tapetok.gen.on{background:var(--accent);color:#fff;box-shadow:0 0 0 2px rgba(179,84,30,.4)}
   .tapearrow{color:var(--accent);font-family:'SF Mono',monospace;font-size:18px;margin:0 2px}
+  .taperow{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+  .taperow .tape{flex:1;min-width:0}
+  .tapenav{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+  .tapenav-btns{display:flex;gap:6px}
+  .tapenav button{background:#2a3242;color:#fff;border:0;border-radius:6px;padding:7px 13px;font-size:12px;font-family:Helvetica,Arial,sans-serif;cursor:pointer;white-space:nowrap}
+  .tapenav button:hover{background:#39435a}
+  .tapenav button:disabled{opacity:.35;cursor:default}
+  .tapenav-lab{font-family:Helvetica,Arial,sans-serif;font-size:10.5px;color:var(--machine-dim)}
   /* floating tooltip for architecture-diagram blocks */
   #blocktip{display:none;position:fixed;z-index:1000;max-width:300px;background:#161b24;color:#e8eaf0;font-family:Helvetica,Arial,sans-serif;font-size:12px;line-height:1.45;padding:9px 12px;border-radius:7px;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none}
   #blocktip b{color:#fff}
@@ -590,25 +598,45 @@ function run(){
 }
 // the output tape: the given pulses, then the pulses the model wrote. Click any
 // written pulse to step through exactly how the model produced it.
+// inspect the prediction that produced the written pulse at output index k
+// (clamped to the model-written range). Shared by the tape clicks and prev/next.
+function inspectAt(k){
+  inspectIx = Math.max(genStart, Math.min(outputSeq.length-1, k));
+  renderTape();
+  loadPrediction(outputSeq.slice(0, inspectIx));
+  $('#stepper').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
 function renderTape(){
   const box = $('#outtape');
-  const wrote = outputSeq.length-genStart;
-  let h = `<div class="tapelab">The model writes the call <b>one pulse at a time</b>, feeding each pulse back in to
-    predict the next — until the call closes. The <b style="color:#ffd2b0">orange</b> pulses are the ${wrote} it wrote.
-    Click any orange pulse to step through how it was produced.</div><div class="tape">`;
+  const wrote = outputSeq.length-genStart, at = inspectIx-genStart+1;
+  let tape = '';
   outputSeq.forEach((id,k)=>{
-    if(k===genStart && genStart>0) h += `<span class="tapearrow">→</span>`;
+    if(k===genStart && genStart>0) tape += `<span class="tapearrow">→</span>`;
     if(k<genStart){
-      h += `<span class="tapetok given" title="${GLOSS[id]}">${GL[id]}</span>`;
+      tape += `<span class="tapetok given" title="${GLOSS[id]}">${GL[id]}</span>`;
     } else {
-      h += `<span class="tapetok gen${k===inspectIx?' on':''}" data-k="${k}" title="${GLOSS[id]} — click to inspect">${GL[id]}</span>`;
+      tape += `<span class="tapetok gen${k===inspectIx?' on':''}" data-k="${k}" title="${GLOSS[id]} — click to inspect">${GL[id]}</span>`;
     }
   });
-  box.innerHTML = h+`</div>`;
-  box.querySelectorAll('.tapetok.gen').forEach(s=>{
-    s.onclick = ()=>{ inspectIx=+s.dataset.k; renderTape(); loadPrediction(outputSeq.slice(0,inspectIx));
-      $('#stepper').scrollIntoView({behavior:'smooth',block:'nearest'}); };
-  });
+  const canPrev = inspectIx>genStart, canNext = inspectIx<outputSeq.length-1;
+  box.innerHTML = `
+    <div class="tapelab">The model writes the call <b>one pulse at a time</b>, feeding each pulse back in to
+      predict the next — until the call closes. The <b style="color:#ffd2b0">orange</b> pulses are the ${wrote} it wrote.
+      Step through them with <b>prev / next</b> (or click any orange pulse) to see how each was produced.</div>
+    <div class="taperow">
+      <div class="tape">${tape}</div>
+      <div class="tapenav">
+        <div class="tapenav-btns">
+          <button class="tapeprev"${canPrev?'':' disabled'}>← prev pulse</button>
+          <button class="tapenext"${canNext?'':' disabled'}>next pulse →</button>
+        </div>
+        <div class="tapenav-lab">written pulse ${at} / ${wrote}</div>
+      </div>
+    </div>`;
+  box.querySelectorAll('.tapetok.gen').forEach(s=>{ s.onclick = ()=>inspectAt(+s.dataset.k); });
+  const pb=box.querySelector('.tapeprev'), nb=box.querySelector('.tapenext');
+  if(pb) pb.onclick = ()=>inspectAt(inspectIx-1);
+  if(nb) nb.onclick = ()=>inspectAt(inspectIx+1);
 }
 
 // ---------- vis helpers ----------
