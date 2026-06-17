@@ -64,6 +64,8 @@ function forward(model, ids) {
   const sources = [{ kind: 'embed', label: 'token embedding', layer: -1, idx: -1,
                      write: model.embed[ids[L - 1]].slice() }];
   const layerTrace = [];
+  // the residual stream at the LAST position, snapshotted after each stage
+  const residStream = [{ stage: 'embed', vec: x[L - 1].slice() }];
 
   for (let l = 0; l < cfg.n_layer; l++) {
     const Lw = model.layers[l];
@@ -103,6 +105,7 @@ function forward(model, ids) {
       attnOut[p] = matvec(Lw.o, concat);
     }
     x = x.map((v, p) => add(v, attnOut[p]));
+    residStream.push({ stage: `L${l} · attn`, vec: x[L - 1].slice() });
     for (const hi of headInfo)
       sources.push({ kind: 'head', label: `L${l} head ${hi.head}`, layer: l, idx: hi.head,
                      write: hi.write, attn: hi.attn, readPos: hi.readPos, readTok: hi.readTok });
@@ -125,12 +128,14 @@ function forward(model, ids) {
     for (const ne of neurons)
       sources.push({ kind: 'neuron', label: `L${l} neuron ${ne.neuron}`, layer: l, idx: ne.neuron,
                      write: ne.write, act: ne.act });
+    residStream.push({ stage: `L${l} · MLP`, vec: x[L - 1].slice() });
     layerTrace.push({ heads: headInfo, neurons });
   }
 
   // final norm + tied unembed
   const last = x[L - 1];
   let ms = 0; for (const v of last) ms += v * v; ms = Math.sqrt(ms / d + cfg.eps);
+  residStream.push({ stage: 'final norm', vec: last.map((v, i) => v * model.norm[i] / ms) });
   const Utilde = model.embed.map(row => row.map((v, i) => v * model.norm[i])); // U_v ⊙ norm_weight
   const logits = Utilde.map(u => dot(u, last) / ms);
   const probs = softmax(logits);
@@ -152,7 +157,7 @@ function forward(model, ids) {
 
   return { logits, probs, pred, runner, margin, normMargin, PR, chord: sortedChord,
            sources, layers: layerTrace, residual: last, recoveredLogit: sumc,
-           ms, Utilde };   // ms = final-norm scale; Utilde = U_v ⊙ norm_weight (for projecting writes)
+           ms, Utilde, residStream };   // residStream = last-position residual snapshot per stage
 }
 
 // ---- the phrasebook: n-gram store + recency + in-context induction --------

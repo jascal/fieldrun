@@ -100,8 +100,25 @@
   .corpus{font-family:'SF Mono',monospace;font-size:14px;line-height:2;column-count:2;column-gap:24px}
   .corpus .call{break-inside:avoid;display:block}
   .foot{margin:40px 0 60px;font-size:13px;color:#777}
+  /* ---- whole-model map (Mermaid + live weight matrices) ---- */
+  #modelmap{margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px 16px}
+  #modelmap .mapttl{font-family:Helvetica,Arial,sans-serif;font-size:12px;font-weight:bold;color:#333}
+  #modelmap .mapttl span{font-weight:normal;color:#888}
+  #mapdiagram{overflow-x:auto;text-align:center;margin:10px 0 4px}
+  #mapdiagram svg{max-width:100%;height:auto}
+  .mapw-ttl{font-family:Helvetica,Arial,sans-serif;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:12px 0 7px}
+  #mapweights{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+  .mat .mlab{font-family:Helvetica,Arial,sans-serif;font-size:10.5px;color:#555;margin-bottom:3px}
+  .mat .mlab b{color:#1a1d23}
+  #mapresid{display:flex;flex-direction:column;gap:1px}
+  .resrow{display:flex;align-items:center;gap:9px;padding:2px 5px;border-radius:5px;border:1px solid transparent}
+  .resrow.on{background:rgba(179,84,30,.10);border-color:var(--accent)}
+  .resrow .reslab{width:74px;text-align:right;font-family:Helvetica,Arial,sans-serif;font-size:10.5px;color:#777;flex-shrink:0}
+  .resrow.on .reslab{color:var(--accent);font-weight:bold}
+  .resrow .arrow{font-family:Helvetica,Arial,sans-serif;font-size:11px;color:#bbb}
   @media(max-width:720px){.three{grid-template-columns:1fr}.corpus{column-count:1}.barrow .lab{width:92px}}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js"></script>
 </head>
 <body>
 
@@ -167,6 +184,14 @@ verdict: did it retrieve, select, or compute this pulse?</p>
       <button id="next">Next →</button>
       <span class="count" id="stepcount"></span>
     </div>
+  </div>
+  <div id="modelmap" style="display:none">
+    <div class="mapttl">The whole model <span>— the highlighted block is what runs at this step</span></div>
+    <div id="mapdiagram"></div>
+    <div class="mapw-ttl">the residual stream at the prediction point — each layer reads it and adds to it</div>
+    <div id="mapresid"></div>
+    <div class="mapw-ttl">weights in play this step</div>
+    <div id="mapweights"></div>
   </div>
 </div>
 
@@ -273,6 +298,7 @@ $('#run').onclick=run;
 function run(){
   if(prompt.length<2){ alert('Add at least two pulses — start a call with ⟨.'); return; }
   const trace = ENG.forward(model, prompt);
+  curTrace = trace;
   const rinfo = ENG.route(store, prompt, trace.pred);
   steps = buildSteps(prompt, trace, rinfo);
   stepIx = 0;
@@ -282,6 +308,7 @@ function run(){
   if(match){ about.style.display='block'; about.innerHTML = `<b>${match.title}.</b> ${match.blurb}`; }
   else about.style.display='none';
   $('#stepper').style.display='block';
+  $('#modelmap').style.display='block'; mapKey=null;
   renderStepList(); showStep(0);
   $('#about').scrollIntoView({behavior:'smooth',block:'nearest'});
 }
@@ -476,6 +503,90 @@ function geometryView(trace){
     <div class="kv">margin (logit gap) = +${m.toFixed(3)} · normalised margin (distance to the boundary) = ${nm.toFixed(3)}</div>`;
 }
 
+// ---------- whole-model map: Mermaid diagram + live weight matrices ----------
+function modelGraph(activeL, kind){
+  const c = model.config;
+  let g = 'flowchart TB\n'
+    + 'classDef active fill:#b3541e,color:#fff,stroke:#7a3a14,stroke-width:2px,font-weight:bold;\n';
+  g += `emb["embed_tokens<br/>${c.vocab} × ${c.d}"]\n`;
+  let prev = 'emb';
+  for(let l=0;l<c.n_layer;l++){
+    g += `subgraph L${l}["Layer ${l}"]\ndirection TB\n`;
+    g += `attn${l}["self-attention<br/>q·k·v·o : ${c.n_head*c.head_dim}×${c.d} · RoPE"]\n`;
+    g += `mlp${l}["MLP (SwiGLU)<br/>gate·up : ${c.ffn}×${c.d} · down : ${c.d}×${c.ffn}"]\n`;
+    g += `attn${l} --> mlp${l}\nend\n`;
+    g += `${prev} --> attn${l}\n`;
+    prev = `mlp${l}`;
+  }
+  g += `nrm["final RMSNorm<br/>${c.d}"]\nhead["unembed (tied)<br/>${c.d} × ${c.vocab}"]\n`;
+  g += `${prev} --> nrm --> head\n`;
+  let act = '';
+  if(activeL>=0 && kind==='attn') act = `attn${activeL}`;
+  else if(activeL>=0 && kind==='mlp') act = `mlp${activeL}`;
+  else if(kind==='embed') act = 'emb';
+  else if(kind==='head') act = 'nrm,head';
+  if(act) g += `class ${act} active\n`;
+  return g;
+}
+function matHeat(name, mat){
+  if(typeof mat[0]==='number') mat=[mat];           // a vector -> one row
+  const rows=mat.length, cols=mat[0].length;
+  let mx=1e-9; for(const r of mat) for(const v of r) mx=Math.max(mx,Math.abs(v));
+  const cell=Math.max(2,Math.min(6,Math.floor(150/cols)));
+  let h=`<div class="mat"><div class="mlab"><b>${name}</b> ${rows}×${cols}</div>`;
+  h+=`<div class="heat" style="grid-template-columns:repeat(${cols},${cell}px)">`;
+  for(const r of mat) for(const v of r) h+=`<span class="cell" style="height:${cell}px;background:${heatColor(v,mx)}"></span>`;
+  return h+`</div></div>`;
+}
+function weightView(layer, kind){
+  let mats;
+  if(kind==='embed') mats=[['embed_tokens',model.embed]];
+  else if(kind==='head') mats=[['final norm',model.norm],['unembed = embedᵀ',model.embed]];
+  else if(layer>=0 && kind==='attn'){ const L=model.layers[layer];
+    mats=[['in_ln',L.in_ln],['q_proj',L.q],['k_proj',L.k],['v_proj',L.v],['o_proj',L.o]]; }
+  else if(layer>=0 && kind==='mlp'){ const L=model.layers[layer];
+    mats=[['post_ln',L.post_ln],['gate_proj',L.gate],['up_proj',L.up],['down_proj',L.down]]; }
+  else return '<div class="dim" style="font-size:12px;padding:2px 0">Step into a layer’s attention or neurons (the steps above) to see that layer’s own weight matrices light up.</div>';
+  return mats.map(([n,m])=>matHeat(n,m)).join('');
+}
+function residualView(activeStage){
+  if(!curTrace) return '';
+  const rs=curTrace.residStream;
+  let mx=1e-9; for(const s of rs) for(const v of s.vec) mx=Math.max(mx,Math.abs(v));
+  const d=rs[0].vec.length, cell=Math.max(3,Math.min(8,Math.floor(260/d)));
+  return rs.map((s,i)=>`<div class="resrow ${i===activeStage?'on':''}"><div class="reslab">${s.stage}</div>`+
+    `<div class="heat" style="grid-template-columns:repeat(${d},${cell}px)">`+
+    s.vec.map(v=>`<span class="cell" style="height:${cell}px;background:${heatColor(v,mx)}"></span>`).join('')+
+    `</div></div>`).join('');
+}
+let mapKey=null, mapN=0, curTrace=null;
+function ensureMermaid(){ if(window.mermaid){ if(!window._mm){ try{ mermaid.initialize({startOnLoad:false, theme:'neutral'}); }catch(e){} window._mm=1; } return true; } return false; }
+function renderModelMap(step){
+  let layer=-1, kind='none', mm;
+  if((mm=/^Attn (\d+)/.exec(step.tag))){ layer=+mm[1]; kind='attn'; }
+  else if((mm=/^MLP (\d+)/.exec(step.tag))){ layer=+mm[1]; kind='mlp'; }
+  else if(step.tag==='Embed'||step.tag==='Read') kind='embed';
+  else if(step.tag==='Logits'||step.tag==='Pick') kind='head';
+  const key=layer+':'+kind;
+  if(key===mapKey) return; mapKey=key;
+  $('#mapweights').innerHTML = weightView(layer, kind);
+  let stage=-1;
+  if(kind==='embed') stage=0;
+  else if(kind==='attn') stage=1+2*layer;
+  else if(kind==='mlp') stage=2+2*layer;
+  else if(kind==='head' && curTrace) stage=curTrace.residStream.length-1;
+  $('#mapresid').innerHTML = residualView(stage);
+  const dia=$('#mapdiagram');
+  if(ensureMermaid()){
+    mermaid.render('mg'+(mapN++), modelGraph(layer, kind))
+      .then(r=>{ dia.innerHTML=r.svg; })
+      .catch(()=>{ dia.innerHTML='<div class="dim" style="font-size:12px">(diagram unavailable)</div>'; });
+  } else {
+    dia.innerHTML='<div class="dim" style="font-size:12px">loading the model diagram…</div>';
+    setTimeout(()=>{ if(window.mermaid && steps.length){ mapKey='__'; renderModelMap(steps[stepIx]); } }, 500);
+  }
+}
+
 // ---------- stepper nav ----------
 function renderStepList(){
   const list = $('#steplist'); list.innerHTML='';
@@ -485,6 +596,7 @@ function showStep(i){
   stepIx = Math.max(0,Math.min(steps.length-1,i));
   const s = steps[stepIx];
   $('#stepbody').innerHTML = `<div class="kick">${s.kick}</div><h4>${s.title}</h4>${s.html}`;
+  renderModelMap(s);
   [...$('#steplist').children].forEach((b,j)=>b.classList.toggle('on',j===stepIx));
   $('#prev').disabled = stepIx===0; $('#next').disabled = stepIx===steps.length-1;
   $('#stepcount').textContent = `step ${stepIx+1} / ${steps.length}`;
