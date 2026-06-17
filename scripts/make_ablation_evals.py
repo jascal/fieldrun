@@ -12,6 +12,13 @@ Specs = the six target-expert ANCHORS (single neuron/head each) + random matched
 (noise floor). Writes ablate/eval/<name>.json and ablate/manifest.json.
 """
 import json, os, sys, inspect, argparse as _ap, random
+
+ap = _ap.ArgumentParser(description="Build held-out eval sets + an ablate-eval manifest (anchors + optional full circuit-set).")
+ap.add_argument("--partition", help="a `--corpus-decompose --experts-out` JSON; emit FULL circuit-set specs for --experts")
+ap.add_argument("--experts", default="8,17,19,0,59,107", help="comma-separated expert ids for the --partition full-set specs")
+ap.add_argument("--seed", type=int, default=20260616, help="RNG seed for size-matched control sampling (reproducibility)")
+ARGS = ap.parse_args()
+
 from tokenizers import Tokenizer
 
 BUNDLE_TOK = "bundles/Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.tokenizer.json"
@@ -74,7 +81,7 @@ anchors = {
     "e107_latex":      {"neurons": [[20, 661]]},
 }
 used = {(19, 1273), (21, 3483), (20, 35), (22, 1222), (20, 661)}
-rng = random.Random(20260616)
+rng = random.Random(ARGS.seed)
 controls = {}
 for layer in (19, 20, 21, 22):                       # one random neuron per anchor layer (matched type)
     while True:
@@ -84,10 +91,43 @@ for layer in (19, 20, 21, 22):                       # one random neuron per anc
     controls[f"ctrl_neuronL{layer}"] = {"neurons": [[layer, idx]]}
 controls["ctrl_headL22"] = {"heads": [[22, rng.randrange(N_HEADS)]]}   # matched to e59 (a head)
 
+# ── optional: FULL circuit-set specs from a `--corpus-decompose --experts-out <p>` partition ──────
+# The decisive test (ABLATION_FINDINGS next-step #1): ablate each expert's WHOLE 21–300-circuit set,
+# not just its anchor. The logits_ablated hook already takes a circuit list, so this is purely a
+# manifest concern. Usage: `--partition ablate/partition.json [--experts 8,17,19,0,59,107]`. Each
+# `e{id}_full` gets a SIZE-matched random control (same #neurons + #heads, same layers) as a noise floor.
+fullset, fullset_ctrl = {}, {}
+PART = ARGS.partition
+TARGETS = [int(x) for x in ARGS.experts.split(",")]
+if PART:
+    by_id = {b["id"]: b for b in json.load(open(PART)).get("buckets", [])}
+    for eid in TARGETS:
+        b = by_id.get(eid)
+        if not b:
+            print(f"[warn] expert e{eid} not in {PART}", file=sys.stderr); continue
+        neurons = [[c["layer"], c["idx"]] for c in b["circuits"] if c["kind"] == "neuron"]
+        heads = [[c["layer"], c["idx"]] for c in b["circuits"] if c["kind"] == "head"]
+        fullset[f"e{eid}_full"] = {k: v for k, v in (("neurons", neurons), ("heads", heads)) if v}
+        taken = {(c["layer"], c["idx"]) for c in b["circuits"]}              # size-matched random control
+        cn = []
+        for (L, _i) in neurons:
+            while True:
+                j = rng.randrange(N_NEURONS)
+                if (L, j) not in taken: taken.add((L, j)); cn.append([L, j]); break
+        ch = []
+        for (L, _i) in heads:
+            while True:
+                j = rng.randrange(N_HEADS)
+                if ("h", L, j) not in taken: taken.add(("h", L, j)); ch.append([L, j]); break
+        fullset_ctrl[f"ctrl_e{eid}_full"] = {k: v for k, v in (("neurons", cn), ("heads", ch)) if v}
+        print(f"  e{eid}_full: {len(neurons)} neurons + {len(heads)} heads (partition size {b.get('size')})", file=sys.stderr)
+
 manifest = {"ctx": 64, "max_pos": 320, "bundle": "Qwen2.5-0.5B-Instruct",
             "evals": {n: f"{EVDIR}/{n}.json" for n, _ in prov.items()},
-            "specs": {**anchors, **controls}}
+            "specs": {**anchors, **controls, **fullset, **fullset_ctrl}}
 json.dump(manifest, open(f"{OUT}/manifest.json", "w"), indent=2)
-print(f"\nmanifest: {OUT}/manifest.json — {len(manifest['specs'])} specs "
-      f"({len(anchors)} anchors + {len(controls)} controls), {len(manifest['evals'])} eval sets", file=sys.stderr)
-print("controls:", controls, file=sys.stderr)
+print(f"\nmanifest: {OUT}/manifest.json — {len(manifest['specs'])} specs ({len(anchors)} anchors + "
+      f"{len(controls)} controls + {len(fullset)} full-sets + {len(fullset_ctrl)} size-matched ctrls), "
+      f"{len(manifest['evals'])} eval sets", file=sys.stderr)
+if not PART:
+    print("[note] anchor-only manifest; pass --partition <experts-out.json> for full circuit-set specs.", file=sys.stderr)
