@@ -1811,6 +1811,9 @@ fn main() {
                 codes.iter().map(|&c| { let mut t = ternary::to_trits(c, kfull); for tj in t.iter_mut().take(kfull - kbulk) { *tj = 0; } ternary::from_trits(&t) as f32 * s }).collect::<Vec<f32>>()
             }).collect();
             let unorm: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().map(|x| x * x).sum()).collect();
+            // per-row residual norm ‖r_v‖ = ‖U_int8_v − U_bulk_v‖ (the dropped low trits) — for the dynamic sound gate.
+            let rnorm_row: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&u_bulk[v * d..(v + 1) * d]).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt()).collect();
+            let sd = (d as f32).sqrt();
             let cap = (end - ctx_window).min(n_eval).min(300);
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
             if positions.is_empty() { eprintln!("[fieldrun] --probe-residual: no eval positions"); return; }
@@ -1819,7 +1822,7 @@ fn main() {
             // residual logit swing |l_full[t]−l_bulk[t]| (the per-layer δ). The mask invariant: every row v with
             // l_bulk[v] ≥ l_full[t] is kept exact, which (with t exact) guarantees t stays the argmax — by construction.
             let mut mask: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32, hflip: bool, ta: bool }
+            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32, hflip: bool, ta: bool, sound: bool, calib: bool }
             let mut recs: Vec<RouteRec> = Vec::new();
             for c in &positions {
                 let r = match lm.final_residual(c) { Some(r) => r, None => continue };
@@ -1849,7 +1852,19 @@ fn main() {
                         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0 != t,
                     None => false,
                 };
-                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs(), hflip, ta });
+                // dynamic gate: does the cheap bulk decode provably give the int8 argmax? Cauchy-Schwarz SOUND bound — tb
+                // wins iff its bulk lead beats the worst-case residual swing (‖r_tb‖+‖r_v‖)·‖x‖ over every competitor.
+                // The calibrated bound uses the isotropic /√d (random-rotation argument; high-prob, not guaranteed).
+                let xn: f32 = r.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let (mut opt_cs, mut opt_iso) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for v in 0..vocab {
+                    if v == tb { continue; }
+                    opt_cs = opt_cs.max(l_bulk[v] + rnorm_row[v] * xn);
+                    opt_iso = opt_iso.max(l_bulk[v] + rnorm_row[v] * xn / sd);
+                }
+                let sound = l_bulk[tb] - rnorm_row[tb] * xn > opt_cs;
+                let calib = l_bulk[tb] - rnorm_row[tb] * xn / sd > opt_iso;
+                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs(), hflip, ta, sound, calib });
             }
             if recs.is_empty() { eprintln!("[fieldrun] --probe-residual: no positions produced a residual"); return; }
             let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
@@ -1868,6 +1883,19 @@ fn main() {
             println!("\n  residual mask: {} of {vocab} rows ({frac:.2}%) need the EXACT residual", mask.len());
             println!("  ⇒ keeping those exact (bulk elsewhere) makes ALL {} sampled decisions correct, by construction.", recs.len());
             println!("  (δ swing = |l_full[t] − l_bulk[t]|, the omitted-residual logit error on the winner — the per-layer δ for the gate.)");
+            println!("\n  dynamic gate — fraction where the {kbulk}-trit bulk ALONE provably decides (no residual needed):");
+            println!("{:<11}{:>6}{:>14}{:>15}{:>14}", "route", "n", "sound(C-S)%", "calib(/√d)%", "calib flip%");
+            for (lbl, rt) in &groups {
+                let gg: Vec<&RouteRec> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                if gg.is_empty() { continue; }
+                let snd = 100.0 * gg.iter().filter(|x| x.sound).count() as f32 / gg.len() as f32;
+                let cal = 100.0 * gg.iter().filter(|x| x.calib).count() as f32 / gg.len() as f32;
+                let cg: Vec<&RouteRec> = gg.iter().copied().filter(|x| x.calib).collect();
+                let cflip = if cg.is_empty() { 0.0 } else { 100.0 * cg.iter().filter(|x| x.flip).count() as f32 / cg.len() as f32 };
+                println!("{lbl:<11}{:>6}{snd:>13.1}%{cal:>14.1}%{cflip:>13.1}%", gg.len());
+            }
+            println!("  sound(C-S) ⇒ bulk == int8 GUARANTEED (no residual); calib(/√d) ⇒ high-prob (isotropy), calib-flip% = its error.");
+            println!("  ⇒ an EXACT hybrid decode runs the residual only on the (100−sound)% unsound decisions — no calibration mask.");
             if let Some(path) = flag(&args, "--residual-out") {
                 let dec = load_decoder(flag(&args, "--vocab"));
                 let body: String = mask.iter().map(|&v| format!("{v}\t{}", dec(v))).collect::<Vec<_>>().join("\n");
