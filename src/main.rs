@@ -636,6 +636,60 @@ fn main() {
             }
         }
 
+        // --capture-store <out.json>: build a MODEL-CAPTURED store — the n-gram tables record what the MODEL predicts
+        // (its argmax) at each context, not what the corpus text did. This is the fix for the short-circuit fidelity
+        // ceiling (HYBRID.md §12 remaining (a)): a corpus store answers "what followed in the text" (so the lookup only
+        // matches the model ~31–56% of the time); a captured store answers "what THIS model does", so the lookup
+        // REPRODUCES the model's decision. One forward per position (parallel), keyed on the same quad/tri/bi tails
+        // `predict()` reads, ranked by argmax frequency. Emits retrieval.rs's schema. Capture on a TRAIN slice (--ctx
+        // window, --n-eval count) and evaluate the lift on a held-out slice with --probe-shortcircuit.
+        if let Some(path) = flag(&args, "--capture-store") {
+            use std::collections::HashMap;
+            let positions: Vec<&[i64]> = (ctx_window..end).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --capture-store: no positions (need --ids with > ctx_window tokens)"); return; }
+            eprintln!("[fieldrun] --capture-store: labelling {} positions with the model's argmax (window {ctx_window}) — parallel forwards…", positions.len());
+            let t0 = std::time::Instant::now();
+            let preds: Vec<i64> = positions.par_iter().map(|c| lm.predict(c)).collect();
+            eprintln!("[fieldrun] --capture-store: {} forwards in {:.1}s; tallying n-gram tables…", preds.len(), t0.elapsed().as_secs_f64());
+            let (mut quad, mut tri, mut bi): (HashMap<String, HashMap<i64, u32>>, HashMap<String, HashMap<i64, u32>>, HashMap<String, HashMap<i64, u32>>) = (HashMap::new(), HashMap::new(), HashMap::new());
+            let mut uni: HashMap<i64, u32> = HashMap::new();
+            for (c, &a) in positions.iter().zip(&preds) {
+                let n = c.len();
+                if n >= 3 { *quad.entry(format!("{},{},{}", c[n - 3], c[n - 2], c[n - 1])).or_default().entry(a).or_default() += 1; }
+                if n >= 2 { *tri.entry(format!("{},{}", c[n - 2], c[n - 1])).or_default().entry(a).or_default() += 1; }
+                if n >= 1 { *bi.entry(format!("{}", c[n - 1])).or_default().entry(a).or_default() += 1; }
+                *uni.entry(a).or_default() += 1;
+            }
+            // rank each context's successors by model-argmax frequency (desc), tie-break by id — the rank-1 successor is
+            // the model's most-frequent decision for that n-gram, which is what predict()/the short-circuit will emit.
+            let ranked = |m: &HashMap<String, HashMap<i64, u32>>| -> serde_json::Value {
+                let mut obj = serde_json::Map::new();
+                for (k, succ) in m {
+                    let mut v: Vec<(i64, u32)> = succ.iter().map(|(&t, &c)| (t, c)).collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    obj.insert(k.clone(), serde_json::Value::from(v.into_iter().map(|x| x.0).collect::<Vec<i64>>()));
+                }
+                serde_json::Value::Object(obj)
+            };
+            let mut uni_v: Vec<(i64, u32)> = uni.iter().map(|(&t, &c)| (t, c)).collect();
+            uni_v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let (nq, ntr, nb, nu) = (quad.len(), tri.len(), bi.len(), uni_v.len());
+            let mut root = serde_json::Map::new();
+            root.insert("quad".into(), ranked(&quad));
+            root.insert("tri".into(), ranked(&tri));
+            root.insert("bi".into(), ranked(&bi));
+            root.insert("uni".into(), serde_json::Value::from(uni_v.into_iter().map(|x| x.0).collect::<Vec<i64>>()));
+            root.insert("min_induction_match".into(), serde_json::Value::from(3));
+            root.insert("min_induction_accept".into(), serde_json::Value::from(2));
+            root.insert("closed_ids".into(), serde_json::Value::Array(vec![]));
+            root.insert("skel".into(), serde_json::Value::Object(serde_json::Map::new()));
+            match std::fs::write(path, serde_json::to_string(&serde_json::Value::Object(root)).unwrap()) {
+                Ok(_) => eprintln!("[fieldrun] --capture-store: model-captured store (quad {nq} · tri {ntr} · bi {nb} · uni {nu}) → {path}"),
+                Err(e) => eprintln!("[fieldrun] --capture-store: cannot write {path}: {e}"),
+            }
+            return;
+        }
+
         // --prune-head (Phase 8b): measure the retrieval-pruned output head. The KB proposes a small candidate set per
         // position; the full-vocab unembed collapses to scoring only those. Because the pruned head scores the SAME
         // unembed rows, pruned-argmax == full-argmax exactly when the candidate set contains the full head's argmax — so
