@@ -1,7 +1,8 @@
-# Hybrid Split-Execution: Lookup-in-C++, Composition-in-Ternary, Combine-in-Soufflé
+# Hybrid Split-Execution: Lookup + Ternary Composition in Rust, certified by Datalog
 
-**The retrievable/computed seam as a system architecture — *exact* (not approximate) to the
-fixed-point model, with cost as the only variable to optimize**
+**The retrievable/computed seam as a system architecture — a pure-Rust engine (exact, not approximate, to
+the fixed-point model, with cost the only variable to optimize), with Soufflé/Datalog kept as the *offline
+certificate*, not the runtime glue**
 
 *Status: research proposal / architecture synthesis. The convergence point of five prior threads in
 this repo: [`FINDINGS.md`](./FINDINGS.md) §5 (the measured retrievable/computed split),
@@ -19,22 +20,26 @@ are cited inline and flagged as measured vs conjecture.*
 
 A transformer's next-token decision factors into two tiers that fieldrun **measures**: a **RETRIEVABLE**
 tier (induction / n-gram / grammar — a lookup) and a **COMPUTED** tier (attention + MLP entanglement —
-the "forge tax"). This proposal runs each tier in its natural substrate and glues them declaratively:
+the "forge tax"). This proposal runs each tier in its natural substrate — **all within fieldrun's existing
+framework-free pure-Rust runtime** — and keeps Datalog as the proof, not the plumbing:
 
-> **Lookup → a pure C++ KB facility** (exact, O(1) hash/FST). **Composition → balanced-ternary matmuls**
-> (lossless via expansion, sparse sign-flip-accumulate). **Combine → a Soufflé semiring program**
-> (`argmax` over the summed contributions = the `T=0` tropical decode; `log-sum-exp` for the `T=1`
-> measure).
+> **Lookup → a Rust KB facility** (exact, O(1); `retrieval::Store` today, an `fst`/perfect-hash index for
+> scale). **Composition → balanced-ternary matmuls** (lossless via expansion, sparse sign-flip-accumulate;
+> a Rust kernel mirroring `i4_dot`). **Combine → a trivial Rust join+argmax** over the two tiers' summed
+> contributions (the `T=0` tropical decode; `log-sum-exp` for the `T=1` measure). **Soufflé/Datalog is the
+> *offline certificate*** that proves this engine is faithful (the `LE-T5` round-trip), **not** the runtime.
 
 The key consequence: **both tiers are exact**, so the combine is exact up to the single float→int
 fixed-point step. "Get as close as possible to the original" therefore becomes "**exactly equal to the
 chosen-precision model**," and the cost (the ternary `K×` width blowup) — not accuracy — is the only
-variable to optimize. The split also **sidesteps the dense-Gram wall** (`LOGIC_EXPORT` LE-T4) that blocks
-the whole-model Datalog emit: retrieved logits enter Soufflé as **EDB facts** from the C++ lookup, so the
-Datalog program is the small *combine*, not the dense forward. The lookup **short-circuits** the RETRIEVED
-majority; the ternary tier is the exact **fallback** that carries the COMPOSED tail, gated by the tropical
-**facet margin** (TT2). The hard part is honest and stated (§7, §9): the split is per-*decision*, not a
-static per-*weight* partition.
+variable to optimize. The combine itself is a relational join + aggregate with **no recursion and no
+fixpoint**, so it is a handful of Rust lines, not a Datalog-engine workload — Datalog's value here is
+verification and framing (§6), which are offline. The split also **dissolves the dense-Gram wall**
+(`LOGIC_EXPORT` LE-T4) that blocks the whole-model Datalog *export*: retrieved logits enter as **EDB
+facts** from the lookup, so the certified program is the small *combine*, not the dense forward. The lookup
+**short-circuits** the RETRIEVED majority; the ternary tier is the exact **fallback** that carries the
+COMPOSED tail, gated by the tropical **facet margin** (TT2). The hard part is honest and stated (§7, §9):
+the split is per-*decision*, not a static per-*weight* partition.
 
 ---
 
@@ -53,29 +58,33 @@ The retrievable/computed boundary is **the model's own structure**, not an impos
   compact clauses/facts) and **Tier B** (composition as per-block weighted `contrib` facts), with
   `Σ contrib == logit` (LE-T5) and a max-plus argmax decode.
 
-So "lookup → C++, entangled → ternary" assigns each *measured* tier to the substrate it's actually shaped
-like. The cut is the model's grain.
+So "lookup → table, entangled → ternary" assigns each *measured* tier to the substrate it's actually shaped
+like. The cut is the model's grain — and both substrates are native Rust (a KB index and a sparse integer
+kernel), so the engine never leaves fieldrun's framework-free pure-Rust runtime.
 
 ---
 
 ## 2. The architecture
 
 ```
-context tokens
+context tokens                                            ─── all Rust (one process, no FFI) ───
    │
-   ├─►  [Tier A — C++ lookup facility]       retrieval / selection
+   ├─►  [Tier A — Rust lookup facility]      retrieval / selection
    │      n-gram / induction / grammar KB  →  candidate set + retrieved logits
-   │      hash / FST / perfect-hash;  EXACT (stored values);  no quantization
+   │      retrieval::Store today / fst|perfect-hash for scale;  EXACT (stored values); no quantization
    │      (the tropical-rank-1 table — what a flat KB can express, TT5)
    │
-   ├─►  [Tier B — ternary composition engine]  composition / forge tax
+   ├─►  [Tier B — Rust ternary composition engine]  composition / forge tax
    │      attn + MLP as balanced-ternary matmuls (lossless via expansion;
-   │      sparse sign-flip-accumulate)  →  computed logit contributions
+   │      sparse sign-flip-accumulate; a kernel mirroring i4_dot)  →  computed logit contributions
    │
-   └─►  [Soufflé semiring combine]
-          predict(v) = argmax_v ( retrieved(v) ⊕ computed(v) )      T=0  (decode)
-                     = softmax  ( retrieved(v) ⊕ computed(v) )      T=1  (measure)
-          retrieved(v) arrives as EDB facts; computed(v) as rules; LE-T5 round-trip self-check
+   └─►  [Rust combine — a join + argmax]
+          predict(v) = argmax_v ( retrieved(v) + computed(v) )      T=0  (decode)
+                     = softmax  ( retrieved(v) + computed(v) )      T=1  (measure)
+
+   ┄┄┄ offline ┄┄┄
+   [Soufflé/Datalog certificate]  emit the combine (retrieved as EDB facts, computed as rules) and
+   run it to PROVE the Rust engine is faithful (LE-T5 round-trip) — not in the hot loop.
 ```
 
 ---
@@ -106,7 +115,7 @@ Trading accuracy-loss for amortizable compute is a strictly better place to stan
 
 ---
 
-## 4. Tier A — the C++ lookup facility (retrieval / selection)
+## 4. Tier A — the Rust lookup facility (retrieval / selection)
 
 **What it is.** A function `context → (candidate set, retrieved logits)`. Concretely the n-gram /
 induction / grammar KB: given the recent context, return the tokens a flat table predicts plus their
@@ -114,9 +123,10 @@ stored scores. This is the **tropical-rank-1** fragment (TT5) — the part a loo
 
 **What exists.** `retrieval::Store` already is this KB (quad/tri/bi/uni successor tables keyed on token
 ids, the induction/recency candidates, the grammar skeleton). `candidates()` + the pruned-head already
-produce the per-context candidate set. So Tier A is **largely built**; "pure C++ facility" is a
-packaging/scale choice — a succinct index (FST / perfect hash / sorted-array binary search) for a
-standalone, embeddable, exact lookup with no float arithmetic.
+produce the per-context candidate set. So Tier A is **largely built — in Rust already**; scaling it is a
+data-structure choice *within* Rust (the `fst` crate / perfect hashing / sorted-array binary search) for a
+compact, embeddable, exact lookup. No C++ is needed or wanted — fieldrun is framework-free pure Rust, and a
+key→value table is the last thing that would justify an FFI boundary.
 
 **Why it's exact & cheap.** It returns *stored* values (no matmul, no quantization), `O(1)`–`O(log n)`
 per query. It carries the high-margin decisions (RETRIEVED tokens have the largest facet margins —
@@ -144,12 +154,20 @@ general. This is where the analytical/optimization work lives; existence is the 
 
 ---
 
-## 6. The Soufflé combine
+## 6. The combine — a trivial Rust step, certified by Datalog
 
-The decode is a semiring aggregation over the **sum** of the two tiers:
+**At runtime** the combine is a relational join + aggregate over the **sum** of the two tiers:
+`predict(v) = argmax_v ( retrieved(v) + computed(v) )`. There is **no recursion and no fixpoint** — so in
+Rust it is a hash-join over the candidate set and a `max` (≈ a dozen lines), and the `T=1` measure is the
+same with `log-sum-exp`. A per-token combine over a few hundred candidates is the *last* thing that needs a
+Datalog engine; Soufflé compiling to parallel C++ is for large recursive relational workloads, which this
+is not. **So the runtime combine stays in Rust** alongside Tiers A and B — one process, no FFI.
+
+**Offline**, the *same* combine is emitted as a semiring-Datalog program and run in Soufflé as a
+**certificate** — this is where Datalog earns its place (verification + framing, not throughput):
 
 ```
-.decl retrieved(v:number, logit:float)      // EDB — facts from the C++ lookup (Tier A)
+.decl retrieved(v:number, logit:float)      // EDB — facts handed in from the Rust lookup (Tier A)
 .decl computed(v:number, logit:float)       // from the ternary engine (Tier B): Σ_j 3^j Σ_i t_ij x_i
 .decl score(v:number, s:float)
 score(v, lr + lc) :- retrieved(v, lr), computed(v, lc).
@@ -157,17 +175,21 @@ score(v, lc)      :- computed(v, lc),  !retrieved(v, _).     // computed-only ca
 predict(v)        :- score(v, s), s = max { s2 : score(_, s2) }.   // T=0 argmax (max-plus)
 ```
 
-- This is precisely LOGIC_EXPORT's `LE-T5` (`Σcontrib == logit`) and the tropical `T=0` argmax; swapping
-  the aggregate for `log-sum-exp` gives the `T=1` measure (PIC). Soufflé is the **verifiable spec** — a
-  statically-checkable, terminating, least-fixpoint program — that compiles to parallel C++.
-- **It sidesteps the dense-Gram wall (LE-T4).** The whole-model emit was non-compact because the
+- It is precisely LOGIC_EXPORT's `LE-T5` (`Σcontrib == logit`) and the tropical `T=0` argmax (`log-sum-exp`
+  → the `T=1` measure, PIC) — one **semiring-parameterized** program where the temperature is the semiring
+  choice. Its value is being a *statically-checkable, terminating, least-fixpoint object* that **proves the
+  Rust engine faithful**, and that holds the "model IS a semiring program" claim (larql / LOGIC_EXPORT).
+- **It dissolves the dense-Gram wall (LE-T4).** The whole-model *export* was non-compact because the
   unembedding is `vocab × d` dense weight facts. Here the *retrievable* logits arrive as **EDB facts from
-  the C++ lookup** (no dense Gram emitted for them), and only the *computed* contributions + the combine
-  are rules. The Datalog program is the small combine, not the dense forward — which is exactly the
-  blocker that the split dissolves.
+  the lookup** (no dense Gram emitted), and only the *computed* contributions + the combine are rules — so
+  the certified program is the small combine, not the dense forward.
 - **Round-trip self-check.** As LE-T5 does today: emit, run Soufflé on a held-out context, and confirm
-  `predict` equals the model's decode (exactly, in the fully-lossless setting; within the gate's tolerance
-  otherwise).
+  `predict` equals the Rust engine's decode (exactly, in the fully-lossless setting; within the gate's
+  tolerance otherwise). This is the byte-identity `--verify-*` ethos, expressed as a logic proof.
+
+So: **Rust is the engine, Datalog is the certificate** — the two roles the earlier "use Soufflé to combine"
+framing conflated. Nothing is lost by keeping the runtime pure Rust; the Datalog artifact is produced on
+demand for verification.
 
 ---
 
@@ -216,9 +238,10 @@ These are the questions worth digging into; HY-O1/O2/O4 are the cruxes.
   margin threshold, the false-accept rate, and the coverage (what fraction of tokens safely skip Tier B) as
   functions of the margin and the corpus. Is there a *certified* gate (provably never wrong) vs a
   *calibrated* one (wrong with bounded probability)?
-- **HY-O3 (Soufflé: runtime vs spec).** Is Soufflé in the hot loop, or does it only *generate/verify* the
-  C++ combiner? The per-token combine is small (candidates × contributions); measure whether the Datalog
-  engine is competitive or whether it's best as the statically-checked source of a hand-tunable C++ kernel.
+- **HY-O3 (Soufflé: runtime vs certificate — *resolved*).** Settled toward **certificate**: the combine is
+  a non-recursive join+argmax (no fixpoint), so the runtime is a dozen lines of Rust, and Soufflé/Datalog
+  is the *offline* proof that the Rust engine is faithful (LE-T5 round-trip) — not the hot loop (§6). The
+  residual question is only *cadence*: how often to re-certify (per build / per bundle / per release).
 - **HY-O4 (the cost model).** Quantify `P(retr)·lookup + P(comp)·ternary` on real models: does the COMPOSED
   tail's `K×` ternary cost dominate, and how far does the sparse-trit optimization (HY-O5) push it down?
 - **HY-O5 (minimize the blowup).** The integer-program/MaxSAT for fewest nonzero trits preserving behaviour
@@ -267,7 +290,8 @@ These are the questions worth digging into; HY-O1/O2/O4 are the cruxes.
 - **The combine** — `LOGIC_EXPORT.md` (the model as a semiring-Datalog program); `larql` ("the model IS a
   database" — Tier A is literally that).
 
-The stake: **the model split along its own measured seam — an exact C++ lookup for what's retrievable, a
-lossless ternary engine for what must be computed, and a verifiable Soufflé program as the semiring glue —
-so that the result is not an *approximation* of the original but an *exact* reconstruction of the
-chosen-precision model, with cost the only thing left to minimize.**
+The stake: **the model split along its own measured seam — an exact Rust lookup for what's retrievable, a
+lossless Rust ternary engine for what must be computed, a trivial Rust join+argmax to combine, and a
+Soufflé/Datalog program kept as the offline certificate that the whole thing is faithful — so that the
+result is not an *approximation* of the original but an *exact* reconstruction of the chosen-precision
+model, in one framework-free pure-Rust process, with cost the only thing left to minimize.**
