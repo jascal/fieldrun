@@ -1259,6 +1259,78 @@ fn main() {
             return;
         }
 
+        // --probe-shortcircuit (the deployment dial): the Tier-A short-circuit speed/accuracy frontier. The lookup's
+        // source (induction / quad / tri / bi / uni) is a confidence signal available WITHOUT the forward; gate on it
+        // (short-circuit when the source order ≥ θ, skipping the forward) and measure coverage, accuracy vs the int8
+        // argmax, and the implied speedup. This is THE lever on CPU/no-NPU hardware (skip the memory-bound forward). Rope.
+        if has_flag(&args, "--probe-shortcircuit") {
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) { Some(s) => s, None => { eprintln!("[fieldrun] --probe-shortcircuit: needs --store"); return; } };
+            if lm.logits(&ids[..ctx_window.min(ids.len())]).is_none() { eprintln!("[fieldrun] --probe-shortcircuit: rope only"); return; }
+            let cap = (end - ctx_window).min(n_eval).min(200);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-shortcircuit: no positions"); return; }
+            eprintln!("[fieldrun] --probe-shortcircuit: {} positions — int8 reference forward + lookup…", positions.len());
+            let order = |s: &str| -> u8 { if s.starts_with("induction") { 4 } else if s.starts_with("quad") { 3 } else if s.starts_with("tri") { 2 } else if s.starts_with("bi") { 1 } else { 0 } };
+            // per position: (source order, bucket fan-out, lookup-pred == int8-argmax). The forward is only the reference.
+            let recs: Vec<(u8, usize, bool)> = positions.iter().filter_map(|c| {
+                let (kb, src, fan) = store.predict_conf(c);
+                let l = lm.logits(c)?;
+                let t8 = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0 as i64;
+                Some((order(&src), fan, kb == t8))
+            }).collect();
+            if recs.is_empty() { eprintln!("[fieldrun] --probe-shortcircuit: no positions produced a forward"); return; }
+            let n = recs.len() as f32;
+            println!("\n=== --probe-shortcircuit: lookup confidence vs int8 argmax — {} positions ===", recs.len());
+            println!("{:<14}{:>6}{:>11}{:>11}{:>11}", "source", "n", "coverage%", "accuracy%", "med fan-out");
+            for (lbl, ord) in [("induction", 4u8), ("quad", 3), ("tri", 2), ("bi", 1), ("uni", 0)] {
+                let g: Vec<&(u8, usize, bool)> = recs.iter().filter(|x| x.0 == ord).collect();
+                if g.is_empty() { continue; }
+                let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
+                let mut fans: Vec<usize> = g.iter().map(|x| x.1).collect();
+                fans.sort_unstable();
+                let med = fans[fans.len() / 2];
+                println!("{lbl:<14}{:>6}{:>10.0}%{:>10.0}%{:>11}", g.len(), 100.0 * g.len() as f32 / n, acc, med);
+            }
+            // Knob 1 — source order θ: gate on which idiom fired (induction > quad > tri > bi > uni).
+            println!("\n  knob 1 — source-order gate (short-circuit when source order ≥ θ):");
+            println!("{:<22}{:>11}{:>11}{:>12}", "gate θ", "coverage%", "accuracy%", "~speedup");
+            for (lbl, th) in [("induction only", 4u8), ("≥ quad", 3), ("≥ tri", 2), ("≥ bi", 1), ("any lookup", 0)] {
+                let g: Vec<&(u8, usize, bool)> = recs.iter().filter(|x| x.0 >= th).collect();
+                if g.is_empty() { continue; }
+                let cov = g.len() as f32 / n;
+                let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
+                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+            }
+            // Knob 2 — bucket fan-out c: gate on how peaked the firing rule is (≤ c distinct successors). A singleton
+            // continuation (fan-out 1) is the high-fidelity, deterministic case; large fan-out is an ambiguous context.
+            println!("\n  knob 2 — fan-out gate (short-circuit when the firing rule has ≤ c distinct successors):");
+            println!("{:<22}{:>11}{:>11}{:>12}", "gate c", "coverage%", "accuracy%", "~speedup");
+            for c in [1usize, 2, 3, 5, 10, usize::MAX] {
+                let g: Vec<&(u8, usize, bool)> = recs.iter().filter(|x| x.1 <= c).collect();
+                if g.is_empty() { continue; }
+                let cov = g.len() as f32 / n;
+                let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
+                let lbl = if c == usize::MAX { "any (∞)".to_string() } else { format!("≤ {c}") };
+                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+            }
+            // Both knobs together: the deployment frontier. Each (θ, c) pair is a reachable operating point.
+            println!("\n  both knobs — (source order ≥ θ) AND (fan-out ≤ c): the speed/accuracy frontier:");
+            println!("{:<10}{:>8}{:>11}{:>11}{:>12}", "θ", "c", "coverage%", "accuracy%", "~speedup");
+            for (olbl, th) in [("≥quad", 3u8), ("≥tri", 2), ("any", 0)] {
+                for c in [1usize, 3, 10] {
+                    let g: Vec<&(u8, usize, bool)> = recs.iter().filter(|x| x.0 >= th && x.1 <= c).collect();
+                    if g.is_empty() { continue; }
+                    let cov = g.len() as f32 / n;
+                    let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
+                    println!("{olbl:<10}{c:>8}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+                }
+            }
+            println!("\n  speedup ≈ 1/(1−coverage): short-circuited tokens skip the ~545 ms forward (lookup is ~µs).");
+            println!("  the two knobs trade speed for fidelity: tighten c (peaked rules) or raise θ (stronger idioms) to");
+            println!("  buy accuracy at the cost of coverage. fan-out is the finer dial — source order saturates here.");
+            return;
+        }
+
         // --probe-compute (HY-O1): the compute-tier residual DIAL. Truncate the int8 attn/MLP weights to a coarse
         // K-trit "bulk" (≈int4 at K=3) in a second model, run the full forward, and compare its decode to the int8
         // reference — swept over --bulk-trits (comma list). This is one axis of the speed/accuracy frontier (the other
