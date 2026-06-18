@@ -492,6 +492,33 @@ impl Bundle {
 
     /// Logical row r of a (rows, cols) weight as f32, dtype-agnostic (i8 is dequantised from its transposed store via
     /// the per-column scale). Used for explain's neuron labels so they work on int8 bundles too.
+    /// Raw integer codes for one weight VECTOR of an int8/rowi8 array — the integer domain the
+    /// balanced-ternary expansion is exact over (TERNARY de-risk, `--verify-ternary`). For `RowI8`
+    /// (embed/unembed) index `j` is the contiguous vocab row `U[j,:]`; for `I8` it is output column
+    /// `j`'s input weights. `None` for f32/f16/int4. Symmetric int8 ⇒ `|code| ≤ 127`.
+    pub fn weight_row_int8(&self, name: &str, j: usize) -> Option<Vec<i64>> {
+        match &self.arrays.get(name)?.1 {
+            Arr::RowI8(w) => w.data.get(j * w.d..(j + 1) * w.d).map(|s| s.iter().map(|&c| c as i64).collect()),
+            Arr::I8(w) => w.wt.get(j * w.k..(j + 1) * w.k).map(|s| s.iter().map(|&c| c as i64).collect()),
+            _ => None,
+        }
+    }
+
+    /// `(name, vectors, len)` for every resident int8/rowi8 weight — the ternary-expansion candidates.
+    pub fn int8_weights(&self) -> Vec<(String, usize, usize)> {
+        let mut v: Vec<(String, usize, usize)> = self
+            .arrays
+            .iter()
+            .filter_map(|(name, (_, arr))| match arr {
+                Arr::RowI8(w) => Some((name.clone(), w.data.len() / w.d.max(1), w.d)),
+                Arr::I8(w) => Some((name.clone(), w.n, w.k)),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     pub fn weight_row(&self, name: &str, r: usize) -> Vec<f32> {
         let (shape, arr) = self.get(name);
         let cols = shape[1];
