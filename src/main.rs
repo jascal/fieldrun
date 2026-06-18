@@ -2137,8 +2137,11 @@ fn main() {
                 codes.iter().map(|&c| { let mut t = ternary::to_trits(c, kfull); for tj in t.iter_mut().take(kfull - kbulk) { *tj = 0; } ternary::from_trits(&t) as f32 * s }).collect::<Vec<f32>>()
             }).collect();
             let unorm: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().map(|x| x * x).sum()).collect();
-            // per-row residual norm ‖r_v‖ = ‖U_int8_v − U_bulk_v‖ (the dropped low trits) — for the dynamic sound gate.
+            // per-row residual norms of r_v = U_int8_v − U_bulk_v (the dropped low trits) — the sound-gate / certificate
+            // statistics. ‖·‖₂ for Cauchy–Schwarz; ‖·‖₁ and ‖·‖∞ for the min-Hölder bound (each pairs with the dual x-norm).
             let rnorm_row: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&u_bulk[v * d..(v + 1) * d]).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt()).collect();
+            let rnorm1_row: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&u_bulk[v * d..(v + 1) * d]).map(|(a, b)| (a - b).abs()).sum()).collect();
+            let rnorminf_row: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&u_bulk[v * d..(v + 1) * d]).fold(0f32, |m, (a, b)| m.max((a - b).abs()))).collect();
             let sd = (d as f32).sqrt();
             let cap = (end - ctx_window).min(n_eval).min(300);
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
@@ -2148,7 +2151,12 @@ fn main() {
             // residual logit swing |l_full[t]−l_bulk[t]| (the per-layer δ). The mask invariant: every row v with
             // l_bulk[v] ≥ l_full[t] is kept exact, which (with t exact) guarantees t stays the argmax — by construction.
             let mut mask: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32, hflip: bool, ta: bool, sound: bool, calib: bool }
+            // Sound certificate (exact-head + bounded-tail): compute l_full EXACTLY for the top-m bulk candidates (the only
+            // plausible winners) and bound only the TAIL's residual contribution — tighter than C-S, which also bounds the
+            // leader. Swept over m exact head-dots; tail bound = C-S vs min-Hölder. cert_cs/cert_hold[mi] = certified-exact.
+            const MS: [usize; 6] = [1, 2, 4, 8, 16, 64];
+            let mut sound_violations = 0u64; // when a certificate FIRES, its leader must be the true exact argmax (invariant)
+            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32, hflip: bool, ta: bool, sound: bool, calib: bool, cert_cs: [bool; 6], cert_hold: [bool; 6] }
             let mut recs: Vec<RouteRec> = Vec::new();
             for c in &positions {
                 let r = match lm.final_residual(c) { Some(r) => r, None => continue };
@@ -2190,7 +2198,37 @@ fn main() {
                 }
                 let sound = l_bulk[tb] - rnorm_row[tb] * xn > opt_cs;
                 let calib = l_bulk[tb] - rnorm_row[tb] * xn / sd > opt_iso;
-                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs(), hflip, ta, sound, calib });
+                // Sound certificate: exact top-m head + bounded tail, with BOUND-AWARE head selection (branch-and-bound).
+                // Each token has a sound upper bound on its exact logit: ub_score(v) = l_bulk[v] + UB(v), UB ≥ ⟨r_v,x⟩
+                // (C-S = ‖r_v‖₂‖x‖₂; Hölder = min(‖r_v‖₂‖x‖₂, ‖r_v‖₁‖x‖∞, ‖r_v‖∞‖x‖₁)). Score the top-m by ub_score
+                // EXACTLY (those are the only tokens that could exceed the leader); since the list is sorted by ub_score,
+                // the tail's best possible score is just ub_score of the (m+1)-th token. Certified iff the exact head
+                // leader beats it ⇒ that leader is the global exact argmax (l_full[v]=l_bulk[v]+⟨r_v,x⟩ ≤ ub_score(v)).
+                let (x1, xinf) = (r.iter().map(|v| v.abs()).sum::<f32>(), r.iter().fold(0f32, |m, &v| m.max(v.abs())));
+                let ub_cs = |v: usize| rnorm_row[v] * xn;
+                let ub_hold = |v: usize| (rnorm_row[v] * xn).min(rnorm1_row[v] * xinf).min(rnorminf_row[v] * x1);
+                // certify under a given upper-bound function: returns the [bool; 6] over the MS head sizes.
+                let mut certify = |ub: &dyn Fn(usize) -> f32| -> [bool; 6] {
+                    let mut order: Vec<usize> = (0..vocab).collect();
+                    order.sort_unstable_by(|&a, &b| (l_bulk[b] + ub(b)).partial_cmp(&(l_bulk[a] + ub(a))).unwrap());
+                    let mut out = [false; 6];
+                    let (mut head_best, mut head_arg, mut mi) = (f32::NEG_INFINITY, order[0], 0usize);
+                    for m in 1..=MS[MS.len() - 1] {
+                        let v = order[m - 1];
+                        if l_full[v] > head_best { head_best = l_full[v]; head_arg = v; }
+                        let tail_ub = if m < vocab { l_bulk[order[m]] + ub(order[m]) } else { f32::NEG_INFINITY };
+                        if MS[mi] == m {
+                            out[mi] = head_best > tail_ub;
+                            if out[mi] && head_arg != t { sound_violations += 1; }
+                            mi += 1;
+                            if mi == MS.len() { break; }
+                        }
+                    }
+                    out
+                };
+                let cert_cs = certify(&ub_cs);
+                let cert_hold = certify(&ub_hold);
+                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs(), hflip, ta, sound, calib, cert_cs, cert_hold });
             }
             if recs.is_empty() { eprintln!("[fieldrun] --probe-residual: no positions produced a residual"); return; }
             let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
@@ -2222,6 +2260,29 @@ fn main() {
             }
             println!("  sound(C-S) ⇒ bulk == int8 GUARANTEED (no residual); calib(/√d) ⇒ high-prob (isotropy), calib-flip% = its error.");
             println!("  ⇒ an EXACT hybrid decode runs the residual only on the (100−sound)% unsound decisions — no calibration mask.");
+            // Sound certificate frontier: exact-head + bounded-tail. m exact head-dots buy a GUARANTEED-exact decode on
+            // cert% of decisions (no full residual pass). The leader is exact (vs C-S, which also bounds the leader → 0%).
+            println!("\n  sound certificate — exact top-m head + bounded tail (GUARANTEED bulk+head == int8, no residual pass):");
+            println!("{:<10}{:>14}{:>16}", "head m", "C-S cert%", "Hölder cert%");
+            for (mi, m) in MS.iter().enumerate() {
+                let cs = 100.0 * recs.iter().filter(|x| x.cert_cs[mi]).count() as f32 / recs.len() as f32;
+                let hd = 100.0 * recs.iter().filter(|x| x.cert_hold[mi]).count() as f32 / recs.len() as f32;
+                println!("{m:<10}{cs:>13.1}%{hd:>15.1}%", );
+            }
+            println!("  soundness: {} certificate firings with a wrong leader (MUST be 0 — the bound is a proof, not a heuristic).", sound_violations);
+            if store.is_some() {
+                // headline m: how the tightest tail bound (Hölder) at a modest head fires per route (RETRIEVED fires most).
+                let mhead = MS.len() - 2; // m = 16
+                println!("  Hölder certificate @ m={} by route:", MS[mhead]);
+                for (lbl, rt) in &groups {
+                    let gg: Vec<&RouteRec> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                    if gg.is_empty() { continue; }
+                    let c = 100.0 * gg.iter().filter(|x| x.cert_hold[mhead]).count() as f32 / gg.len() as f32;
+                    println!("    {lbl:<11}{:>6}{c:>10.1}%", gg.len());
+                }
+            }
+            println!("  ⇒ the sound dynamic gate the C-S bound couldn't deliver: bulk + a few exact head-dots certify the int8");
+            println!("    argmax on cert% of tokens with ZERO residual passes — the rest fall back to the exact residual.");
             if let Some(path) = flag(&args, "--residual-out") {
                 let dec = load_decoder(flag(&args, "--vocab"));
                 let body: String = mask.iter().map(|&v| format!("{v}\t{}", dec(v))).collect::<Vec<_>>().join("\n");
