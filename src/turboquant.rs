@@ -264,6 +264,23 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_nonpow2_large_d() {
+        // robustness: d not a power of two (300 → dpad 512), higher bits — len preserved, bound holds.
+        let d = 300;
+        let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.91).cos() * 1.7 + 0.05 * (i as f32 - 150.0)).collect();
+        let denom: f32 = x.iter().map(|v| v * v).sum();
+        for bits in [4u8, 6, 8] {
+            let c = Codec::new(bits, 0xDEAD_BEEF, d);
+            let xh = c.roundtrip(&x);
+            assert_eq!(xh.len(), d, "decode preserves length for non-pow2 d");
+            let err2: f32 = x.iter().zip(&xh).map(|(a, b)| (a - b) * (a - b)).sum();
+            let rel = err2 / denom;
+            let bound = 3f32.sqrt() * PI / 2.0 * 4f32.powi(-(bits as i32));
+            assert!(rel < 3.0 * bound, "d={d} bits={bits}: rel {rel} > 3×bound {bound}");
+        }
+    }
+
+    #[test]
     fn rho_and_dprod_scaling() {
         assert!((rho(5, 100) / rho(6, 100) - 2.0).abs() < 1e-3, "ρ halves per bit");
         assert!((d_prod(5, 100, 1.0) / d_prod(6, 100, 1.0) - 4.0).abs() < 1e-3, "D_prod quarters per bit");

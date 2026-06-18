@@ -1755,6 +1755,16 @@ fn main() {
                 println!("  @ {bits} bits   {row}");
             }
             println!("(prediction: flip% drops sharply as ratio passes ~1; cleanest at higher bits where the perturbation is small)");
+            // gate calibration: the conservative short-circuit threshold — coverage + residual flip at the most-stressed bits.
+            let bi_lo = bits_list.iter().enumerate().min_by_key(|(_, &b)| b).map(|(i, _)| i).unwrap_or(0);
+            println!("\n=== gate calibration @ {} bits (most stress) — short-circuit when margin·√d/‖r̂−r‖ ≥ T ===", bits_list[bi_lo]);
+            for thr in [1.0f32, 2.0, 3.0, 4.0] {
+                let above: Vec<&R> = recs.iter().filter(|x| { let disp = x.per_bits[bi_lo].1 * x.rnorm / sd; disp > 0.0 && x.margin / disp >= thr }).collect();
+                if above.is_empty() { continue; }
+                let flip = 100.0 * above.iter().filter(|x| x.per_bits[bi_lo].0).count() as f32 / above.len() as f32;
+                println!("  T ≥ {thr:.0}: covers {}/{} positions ({:.0}%), residual flip {flip:.2}%", above.len(), recs.len(), 100.0 * above.len() as f32 / recs.len().max(1) as f32);
+            }
+            println!("  ⇒ pick the smallest T with acceptable residual flip as the gate multiplier (the hybrid's δ-gate, §5.1/TQ-T2).");
             return;
         }
 
