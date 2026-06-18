@@ -446,6 +446,7 @@ the live numbers behind the architecture above — kept here so the spec matches
 | Realized short-circuit wall-clock | `--bench-shortcircuit` | ✅ merged | **measured** (scoring mode): forward 520 ms vs lookup gate 0.004 ms (124 000× cheaper); realized speedup tracks `1/(1−cov)` exactly — ≥quad∧fan≤1 **1.36× @26%**, any∧fan≤10 **3.64× @72%** — confirming the µs-vs-forward cost model in a real loop |
 | Generation-mode drift (HY-O2) | `--gen-shortcircuit` | ✅ merged | **token substitution alone derails greedy generation**: 79% per-step substitution fidelity, yet the trajectory forks at **step 13 of 40** (45% match) and tightening the gate (induction-only) doesn't move the fork — compounding dominates. Confirms the short-circuit is a **scoring / single-decision** instrument, not a faithful generation accelerator (the cheap substitution error masks the KV-hole error before it matters) |
 | TurboQuant KV vs int8 (TQ-O6) | `--probe-kv-quant` | ✅ merged | **negative result — keep `--kv-int8`**: per-head MSE turbo at 8-bit has lower logit-L2 (0.196 vs 0.208) but a *higher* flip rate (24% vs **16%**) than per-head int8, and collapses below 8 bits (70–92% flip). Confirms TQ-O6 (small `head_dim` → weak `1/d`); the full-`d` rotation and unbiased `prod`/QJL mode are the untested alternatives. The runtime turbo-KV wiring is **not** worth building |
+| Sound certificate (exact dynamic gate) | `--probe-residual` (certificate frontier) | ✅ merged | **the sound gate C-S couldn't deliver**: a bound-aware exact-head + min-Hölder tail certificate proves bulk == int8 with **0 soundness violations** at **98.3% of decisions with 16 exact head-dots** (0.01% of vocab) at 5-trit bulk (100% @ m=64); 48% even at 4-trit bulk. min-Hölder beats C-S (m=8: 95% vs 73%); RETRIEVED certifies first. Supersedes the 0%-firing C-S gate |
 
 **Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
 mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
@@ -453,11 +454,15 @@ bulk + exact-residual mask, reproducing int8 to ~96–99% on held-out). The unif
 2δ_weight` has **both terms measured** (`ρ_KV` from `--probe-distortion`, `δ_weight` from `--probe-residual`).
 
 **Honest findings folded back into the design.** (i) Lossless ternary is *not* a compression (`K×` bigger);
-its value is exactness + the multiply-free/Datalog-native form + the substrate for truncation. (ii) There is
-**no free *exact* dynamic gate** at the decode tier — Cauchy–Schwarz worst-case is too loose; the exact path
-is the static constructive mask, the dynamic gate is a calibrated (high-probability) speedup (HY-O2). (iii)
-The decode-tier mask is unusually sparse (rows = candidate tokens) and grows with the corpus; the compute
-tier is denser (HY-O1).
+its value is exactness + the multiply-free/Datalog-native form + the substrate for truncation. (ii) ~~There is
+no free *exact* dynamic gate~~ — **superseded.** The naive Cauchy–Schwarz gate bounds the *leader* too and so
+fires 0%, but a **bound-aware exact-head + min-Hölder tail certificate** *is* a sound (provably-exact) dynamic
+gate: score the top-m tokens by upper bound `l_bulk[v] + min(‖r_v‖₂‖x‖₂, ‖r_v‖₁‖x‖∞, ‖r_v‖∞‖x‖₁)` exactly,
+and the sorted tail's best possible score is just the (m+1)-th upper bound — if the exact head-leader beats it,
+that leader is the global exact argmax. Measured: **98.3% of decisions certified exact with 16 exact head-dots**
+(0.01% of vocab) at 5-trit bulk, 0 soundness violations. So the dynamic gate is exact *and* practical; the
+calibrated `/√d` gate is now only needed in the aggressive (≤4-trit) regime. (iii) The decode-tier mask is
+unusually sparse (rows = candidate tokens) and grows with the corpus; the compute tier is denser (HY-O1).
 
 **The two deployment dials (speed/accuracy frontier).** The hybrid exposes two complementary knobs, now both
 measured. (1) **Compute-tier depth** (`--bulk-trits`, HY-O1): how coarse the bulk Tier-B weights are — but the
@@ -487,6 +492,12 @@ isotropy advantage too weak to pay for). So the standalone KV win is the already
 rotation before the head split; the unbiased `prod`/QJL inner-product mode) are a TurboQuant-side research
 fork, not a hybrid wiring task.
 
-**Remaining (forward-path) work.** (a) A **sound certificate tighter than C-S** (a data-dependent bound on
-`⟨r_v, x⟩`). (b) **Broader-corpus mask + short-circuit calibration** — the held-out short-circuit ceiling
-(~56% fidelity) is set by the corpus store; a model-captured store (`pylm` rollouts) should lift it.
+**Sound certificate — done (supersedes the C-S gate).** A bound-aware exact-head + min-Hölder tail certificate
+(`--probe-residual` certificate frontier) is the tighter sound bound the C-S gate lacked: it proves bulk == int8
+on **98.3%** of decisions at 5-trit bulk with 16 exact head-dots (0 soundness violations), and min-Hölder beats
+C-S throughout. The exact dynamic gate is now practical; what remains is wiring it into the streaming decode (it
+is measured, not yet on the live path) and pushing the aggressive ≤4-trit regime (48% certified) higher.
+
+**Remaining (forward-path) work.** (a) **Broader-corpus mask + short-circuit calibration** — the held-out
+short-circuit ceiling (~56% fidelity) is set by the corpus store; a model-captured store (`pylm` rollouts)
+should lift it. (b) **Wire the sound certificate into the live decode** (currently a measured probe).
