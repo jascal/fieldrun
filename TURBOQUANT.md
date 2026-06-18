@@ -109,7 +109,22 @@ TurboQuant path it produces the **unbiased** explain of §6.
 - **Head dimension is small.** `head_dim` (e.g. 64 on Qwen2.5-0.5B) is *not* high-dimensional, so the
   per-head `1/d` advantage is weak. Option: rotate/quantize across the **full hidden `d`** (concatenated
   heads) before the head split, recovering the high-`d` regime — at the cost of doing the rotation before
-  RoPE. This is the main design fork to resolve in a prototype.
+  RoPE. This is the main design fork to resolve in a prototype. Back-of-envelope (`ρ ∝ 1/√d`):
+
+  | rotate over | `d` | relative `ρ` | note |
+  |---|---|---|---|
+  | per-head (0.5B) | 64 | 1.00 (baseline) | quantize post-RoPE K — simplest, weakest concentration |
+  | per-head (7B-class) | 128 | 0.71 | |
+  | full hidden (0.5B) | 896 | **0.27** (≈3.7× lower distortion) | rotation before head split / RoPE |
+  | full hidden (7B) | 3584 | **0.13** (≈5.3× lower) | |
+
+  So full-`d` rotation roughly **quarters** the per-coordinate distortion versus per-head — a real argument
+  for it, weighed against the RoPE-ordering complication (TQ-O5). The prototype resolves this fork first.
+
+**When to use `--kv-quant turbo`** (intended guidance for README/CLI when it lands): long-context or
+many-position explanation workloads where the f32 KV cache dominates memory, and you can accept
+unbiased-in-expectation (not exact) attention/logits. Keep the default f32 path for certificate-grade
+explain (`export --logic`, `--verify-cache`) — see §6.
 
 ---
 
@@ -181,6 +196,22 @@ from **exact + deterministic** to **unbiased + bounded-distortion**.
   margin exceeds the distortion (`m > z·ρ`), i.e. TQ-T2 is also the correct gate condition under
   compression.
 
+**How big is the variance, concretely?** `D_prod = (√3π²·‖y‖²/d)·4⁻ᵇ` with `√3π² ≈ 17.1`. For a
+unit-norm unembedding row (`‖y‖=1`) at `d = 896`: `D_prod ≈ 0.019·4⁻ᵇ`, i.e. **RMS logit error ≈ 5.4e-4
+at 8 bits, ≈ 8.6e-3 at 4 bits, ≈ 3.4e-2 at 2 bits** (variance `2.9e-7 / 7.5e-5 / 1.2e-3`), scaling as
+`2⁻ᵇ/√d`. So at 8 bits the perturbation is far below every measured facet margin (FINDINGS §5b:
+RETRIEVED ≈ 2.1–2.8 … COMPOSED ≈ 0.87–1.2 in the normalized frame); as `b` drops it climbs toward the
+*smallest* COMPOSED margins first — which is exactly the predicted flip frontier. (The exact constant and
+the `r`-normalization are pinned by **E-TQ3**, which measures `D_prod` directly rather than assuming it.)
+- **Ordering is usually preserved.** Because the noise is small relative to typical DLA gaps, the *order*
+  of the top contributors / competitors is preserved with high probability; only near-tied entries (the
+  same near-facet positions that TT2 already flags) reorder. So ranked explanations degrade gracefully
+  even where exact magnitudes acquire variance.
+- **Optional `--strict-explain`.** A policy that *refuses* the TurboQuant path for certificate-grade
+  explain (`export --logic` / LE-T5 byte-checks / `--verify-cache`) and otherwise tags TurboQuant explain
+  output as *estimated* (so a faithful-by-construction consumer never silently reads a sample as a
+  certificate). The exact f32 path remains the default and is unaffected.
+
 ---
 
 ## 7. Implementation surface (sketch)
@@ -207,6 +238,16 @@ is unbiased on synthetic `N(0,1/d)` (mean error ≈ 0); `rho`/`d_prod` scale as 
 Lloyd–Max levels monotone and symmetric. (Pure-geometry tests, no model — same discipline as
 `src/tropical.rs`.)
 
+**Practical notes (for the prototype):**
+- **FWHT** hand-rolled in pure Rust (an in-place radix-2 butterfly, ~15 lines, no dependency); the
+  `O(d log d)` encode is amortised for KV (write once, read many) but still worth a microbench against the
+  f32 path.
+- **Seeding**: mix a **global run seed** with `(layer, head)` so the rotation is reproducible *within* a
+  job and *across* jobs (full determinism), not just per-position.
+- **`KvStore` layout**: flat, contiguous packed arrays (`codes: Vec<u8>` bit-packed, `scales: Vec<f32>`,
+  one `rot_seed`) rather than vec-of-vecs — cache-friendly for the read-heavy attention dot; pad rows to a
+  byte boundary at the chosen `b`.
+
 ---
 
 ## 8. Experiment plan
@@ -220,8 +261,12 @@ Lloyd–Max levels monotone and symmetric. (Pure-geometry tests, no model — sa
 | **E-TQ5** | Margin-adaptive vs uniform bits | bits ∝ `−log m` at matched budget | fewer flips than uniform at equal mean bits (TQ-T4) |
 
 Priority: **E-TQ2 first** (it is the TO7/E7 payoff and needs only the probe + codec, no full-model
-re-quant), then E-TQ1/E-TQ3, then E-TQ4/E-TQ5. All run on a single 0.5B rope model. **Heavy runs deferred
-until the box frees up** (a long job is currently resident).
+re-quant), then E-TQ1/E-TQ3, then E-TQ4/E-TQ5. Run **E-TQ4 (explain stability) early too** — it is a
+user-facing output and shares the codec. A quick **`prod` vs `mse` ablation** (attention-score bias /
+flip rate on the 0.5B model) decides the default per surface (likely `prod` for the unembedding, `mse`
+for the KV — TQ-O3). All run on a single 0.5B rope model; **`head_dim` / model-family variation is
+explicitly future work** (the §3 fork is the first thing to re-test at `head_dim` 128). **Heavy runs
+deferred until the box frees up** (a long job is currently resident).
 
 ---
 
