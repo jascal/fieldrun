@@ -1768,6 +1768,99 @@ fn main() {
             return;
         }
 
+        // --probe-residual (HYBRID §5.1, Stage-2 Phase 1): residual selection for Tier B = int-bulk + small EXACT residual.
+        // Reconstruct a K-trit "bulk" of the int8 unembedding (drop the low 6−K balanced trits), recompute logits, and
+        // measure the decision FLIP vs the int8 reference. Constructive mask: a decision is recoverable by keeping EXACT
+        // only the rows whose bulk logit ≥ the true winner's exact logit ({v: l_bulk[v] ≥ l_full[t]}); the union over
+        // decisions IS the residual mask, and keeping it exact ⇒ all sampled decisions correct by construction. Reports
+        // the bulk flip cost, the per-layer δ (omitted-residual logit swing), and |mask|/vocab; --residual-out dumps it.
+        if has_flag(&args, "--probe-residual") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let kbulk: usize = flag(&args, "--bulk-trits").and_then(|s| s.parse().ok()).unwrap_or(3).clamp(1, 6);
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, d) = b2.dims(un);
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() {
+                eprintln!("[fieldrun] --probe-residual: arch {arch} doesn't expose final_residual (rope only)"); return;
+            }
+            let stored_int8 = b2.weight_row_int8(un, 0).is_some();
+            eprintln!("[fieldrun] --probe-residual: int8 reference + {kbulk}-trit bulk of '{un}' ({vocab}×{d}{}) — full int8 = 6 trits…", if stored_int8 { ", stored int8" } else { ", quantizing f16→int8" });
+            // Per row → (int8 codes, scale). Stored-int8 → the codes directly; f16/f32 → int8-quantize (the fixed-point
+            // reference) so the bulk/residual split is well-defined. ref8 = codes×scale; bulk = top-kbulk-trit recon.
+            let row_cs = |v: usize| -> (Vec<i64>, f32) {
+                let full = b2.weight_row(un, v);
+                match b2.weight_row_int8(un, v) {
+                    Some(codes) => { let s = codes.iter().zip(&full).find(|(&c, _)| c != 0).map(|(&c, &f)| f / c as f32).unwrap_or(0.0); (codes, s) }
+                    None => { let amax = full.iter().fold(0f32, |m, &x| m.max(x.abs())); let s = (amax / 127.0).max(1e-12); (full.iter().map(|&w| (w / s).round().clamp(-127.0, 127.0) as i64).collect(), s) }
+                }
+            };
+            let u_int8: Vec<f32> = (0..vocab).into_par_iter().flat_map(|v| { let (codes, s) = row_cs(v); codes.iter().map(|&c| c as f32 * s).collect::<Vec<f32>>() }).collect();
+            let u_bulk: Vec<f32> = (0..vocab).into_par_iter().flat_map(|v| {
+                let (codes, s) = row_cs(v);
+                codes.iter().map(|&c| { let mut t = ternary::to_trits(c, 6); for tj in t.iter_mut().take(6 - kbulk) { *tj = 0; } ternary::from_trits(&t) as f32 * s }).collect::<Vec<f32>>()
+            }).collect();
+            let unorm: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().map(|x| x * x).sum()).collect();
+            let cap = (end - ctx_window).min(n_eval).min(300);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-residual: no eval positions"); return; }
+            eprintln!("[fieldrun] --probe-residual: {} positions · bulk={kbulk} trits (~int{}) · {vocab} rows…", positions.len(), if kbulk <= 3 { 4 } else { 8 });
+            let mut mask: std::collections::BTreeSet<i64> = Default::default();
+            struct Rr { route: u8, margin: f32, flip: bool, dswing: f32 }
+            let mut recs: Vec<Rr> = Vec::new();
+            for c in &positions {
+                let r = match lm.final_residual(c) { Some(r) => r, None => continue };
+                let l_full: Vec<f32> = (0..vocab).into_par_iter().map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&r).map(|(a, b)| a * b).sum()).collect();
+                let t = match l_full.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()) { Some((i, _)) => i, None => continue };
+                let ut8 = &u_int8[t * d..(t + 1) * d];
+                let g: Vec<f32> = (0..vocab).into_par_iter().map(|v| u_int8[v * d..(v + 1) * d].iter().zip(ut8).map(|(a, b)| a * b).sum()).collect();
+                let f = tropical::nearest_facet(&l_full, t, &unorm, &g);
+                let l_bulk: Vec<f32> = (0..vocab).into_par_iter().map(|v| {
+                    let row = &u_bulk[v * d..(v + 1) * d];
+                    row.iter().zip(&r).map(|(a, b)| a * b).sum()
+                }).collect();
+                let tb = l_bulk.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+                let lft = l_full[t];
+                // constructive exact-set: rows whose bulk logit reaches the true winner's exact score (the false leaders).
+                for v in 0..vocab {
+                    if l_bulk[v] >= lft { mask.insert(v as i64); }
+                }
+                mask.insert(t as i64);
+                let route = match &store {
+                    Some(s) => { let kb = s.predict(c).0 as usize; if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 } }
+                    None => 3u8,
+                };
+                recs.push(Rr { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs() });
+            }
+            if recs.is_empty() { eprintln!("[fieldrun] --probe-residual: no positions produced a residual"); return; }
+            let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
+            println!("\n=== --probe-residual: {kbulk}-trit bulk of '{un}' (drop low {} trits) vs int8 — {} positions ===", 6 - kbulk, recs.len());
+            println!("  bulk-only (no residual) decision flip vs int8, by route:");
+            println!("{:<11}{:>6}{:>9}{:>16}{:>14}", "route", "n", "flip%", "δ swing (logit)", "margin");
+            for (lbl, rt) in &groups {
+                let gg: Vec<&Rr> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                if gg.is_empty() { continue; }
+                let flip = 100.0 * gg.iter().filter(|x| x.flip).count() as f32 / gg.len() as f32;
+                let dsw = gg.iter().map(|x| x.dswing).sum::<f32>() / gg.len() as f32;
+                let mg = gg.iter().map(|x| x.margin).sum::<f32>() / gg.len() as f32;
+                println!("{lbl:<11}{:>6}{flip:>8.1}%{dsw:>16.3}{mg:>14.3}", gg.len());
+            }
+            let frac = 100.0 * mask.len() as f32 / vocab as f32;
+            println!("\n  residual mask: {} of {vocab} rows ({frac:.2}%) need the EXACT residual", mask.len());
+            println!("  ⇒ keeping those exact (bulk elsewhere) makes ALL {} sampled decisions correct, by construction.", recs.len());
+            println!("  (δ swing = |l_full[t] − l_bulk[t]|, the omitted-residual logit error on the winner — the per-layer δ for the gate.)");
+            if let Some(path) = flag(&args, "--residual-out") {
+                let dec = load_decoder(flag(&args, "--vocab"));
+                let body: String = mask.iter().map(|&v| format!("{v}\t{}", dec(v))).collect::<Vec<_>>().join("\n");
+                match std::fs::write(path, format!("# residual mask: {} rows, {kbulk}-trit bulk, {} decisions\n{body}\n", mask.len(), recs.len())) {
+                    Ok(_) => eprintln!("[fieldrun] --probe-residual: mask ({} rows) → {path}", mask.len()),
+                    Err(e) => eprintln!("[fieldrun] --probe-residual: cannot write {path}: {e}"),
+                }
+            }
+            return;
+        }
+
         // export --logic (LOGIC_EXPORT LO3): emit a runnable semiring-Datalog program SPECIALIZED to ONE next-token
         // decision — the retrievable fragment as readable clauses/facts (Tier A), the composition as per-block weighted
         // contrib facts (Tier B, the forge tax), and the decode as a (max,+) argmax aggregate. Tokens are referenced by
