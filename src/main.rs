@@ -1259,6 +1259,52 @@ fn main() {
             return;
         }
 
+        // --bench-decode: per-token latency micro-benchmark of the existing int8 path — full forward (attn+MLP → residual),
+        // the unembedding decode matmul, and the Tier-A n-gram lookup (context-only, no forward) — plus the amortized
+        // projection at a lookup short-circuit fraction. Grounds the hybrid's cost model in wall-clock. Rope only.
+        if has_flag(&args, "--bench-decode") {
+            use retrieval::CandCfg;
+            use std::time::Instant;
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, d) = b2.dims(un);
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() { eprintln!("[fieldrun] --bench-decode: rope only"); return; }
+            let cap = (end - ctx_window).min(n_eval).min(200).max(1);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --bench-decode: no positions"); return; }
+            let _ = lm.final_residual(positions[0]); // warm
+            // 1) full forward (attn+MLP → residual stream r): the dominant per-token cost; a Tier-A short-circuit skips ALL of it.
+            let t = Instant::now();
+            let rs: Vec<Vec<f32>> = positions.iter().filter_map(|c| lm.final_residual(c)).collect();
+            let t_fwd = t.elapsed().as_secs_f64() / rs.len().max(1) as f64;
+            // 2) unembedding decode matmul (vocab×d) given r.
+            let t = Instant::now();
+            for r in &rs { let _ = b2.rowdot_f32(un, r); }
+            let t_un = t.elapsed().as_secs_f64() / rs.len().max(1) as f64;
+            // 3) Tier-A lookup (context-only n-gram; NO forward).
+            let (t_lk, cov) = match &store {
+                Some(s) => { let t = Instant::now(); let mut h = 0usize; for c in &positions { let _ = s.predict(c); if !s.candidates(c, &cfg).is_empty() { h += 1; } } (t.elapsed().as_secs_f64() / positions.len() as f64, 100.0 * h as f32 / positions.len() as f32) }
+                None => (0.0, 0.0),
+            };
+            let us = |x: f64| x * 1e6;
+            let full = t_fwd + t_un;
+            println!("\n=== --bench-decode ({} pos, {un} {vocab}×{d}) — per-token latency ===", positions.len());
+            println!("  full forward (attn+MLP → r):   {:>9.1} µs   [dominant; a sound Tier-A short-circuit skips ALL of it]", us(t_fwd));
+            println!("  unembedding decode (vocab×d):  {:>9.1} µs   [{:.1}% of forward; the decode-tier hybrid optimizes this]", us(t_un), 100.0 * t_un / t_fwd.max(1e-12));
+            if store.is_some() {
+                println!("  Tier-A lookup (n-gram, no fwd):{:>9.1} µs   [{:.0}× cheaper than forward+decode; coverage {cov:.0}%]", us(t_lk), full / t_lk.max(1e-12));
+                for p in [0.32f64, 0.57] {
+                    let amort = (1.0 - p) * full + p * t_lk;
+                    println!("  amortized @ {:.0}% lookup short-circuit: {:>8.1} µs/tok  →  {:.2}× vs full int8 ({:.1} µs)", p * 100.0, us(amort), full / amort.max(1e-12), us(full));
+                }
+            }
+            println!("  NB: micro-bench of the existing int8 path. The decode-tier win is the Tier-A short-circuit (skip the forward);");
+            println!("  the bulk/int4 unembed win is MEMORY BANDWIDTH (not CPU-f32 here) — it lands on the memory-bound 7B / on NPUs.");
+            return;
+        }
+
         // --verify-ternary (TERNARY de-risk): the byte-identical mirror of the "lossless via expansion" lemma. Expand a
         // real int8 weight's integer codes into K balanced trits and check Σ w·x == Σ_j 3^j (Σ t_ij x_i) EXACTLY (i64)
         // over deterministic integer activations, then report the trit sparsity (the optimization baseline — zeros are
