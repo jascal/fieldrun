@@ -447,6 +447,7 @@ the live numbers behind the architecture above — kept here so the spec matches
 | Generation-mode drift (HY-O2) | `--gen-shortcircuit` | ✅ merged | **token substitution alone derails greedy generation**: 79% per-step substitution fidelity, yet the trajectory forks at **step 13 of 40** (45% match) and tightening the gate (induction-only) doesn't move the fork — compounding dominates. Confirms the short-circuit is a **scoring / single-decision** instrument, not a faithful generation accelerator (the cheap substitution error masks the KV-hole error before it matters) |
 | TurboQuant KV vs int8 (TQ-O6) | `--probe-kv-quant` | ✅ merged | **negative result — keep `--kv-int8`**: per-head MSE turbo at 8-bit has lower logit-L2 (0.196 vs 0.208) but a *higher* flip rate (24% vs **16%**) than per-head int8, and collapses below 8 bits (70–92% flip). Confirms TQ-O6 (small `head_dim` → weak `1/d`); the full-`d` rotation and unbiased `prod`/QJL mode are the untested alternatives. The runtime turbo-KV wiring is **not** worth building |
 | Sound certificate (exact dynamic gate) | `--probe-residual` (certificate frontier) | ✅ merged | **the sound gate C-S couldn't deliver**: a bound-aware exact-head + min-Hölder tail certificate proves bulk == int8 with **0 soundness violations** at **98.3% of decisions with 16 exact head-dots** (0.01% of vocab) at 5-trit bulk (100% @ m=64); 48% even at 4-trit bulk. min-Hölder beats C-S (m=8: 95% vs 73%); RETRIEVED certifies first. Supersedes the 0%-firing C-S gate |
+| Model-captured store (the ceiling) | `--capture-store` | ✅ merged | **the short-circuit ceiling is COVERAGE, not fidelity**: label n-grams with the model's argmax instead of the corpus's next token. In-sample (covered keys), the ≥quad gate jumps **36% → 94%** fidelity (quad 34% → **97%**); at equal coverage on held-out, quad accuracy **20% → 40%**. Induction stays 56% (context-copy, store-free). So a corpus store's ~36% was the model's *text*-accuracy; a captured store is a faithful cache of the *model's* decisions — realizing it broadly needs large rollouts (`pylm`) |
 
 **Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
 mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
@@ -498,6 +499,16 @@ on **98.3%** of decisions at 5-trit bulk with 16 exact head-dots (0 soundness vi
 C-S throughout. The exact dynamic gate is now practical; what remains is wiring it into the streaming decode (it
 is measured, not yet on the live path) and pushing the aggressive ≤4-trit regime (48% certified) higher.
 
-**Remaining (forward-path) work.** (a) **Broader-corpus mask + short-circuit calibration** — the held-out
-short-circuit ceiling (~56% fidelity) is set by the corpus store; a model-captured store (`pylm` rollouts)
-should lift it. (b) **Wire the sound certificate into the live decode** (currently a measured probe).
+**The short-circuit ceiling — diagnosed (it's coverage).** `--capture-store` settled *why* the held-out
+short-circuit fidelity topped out: the corpus store's ~36% was the model's text-prediction accuracy, not a
+limit of the lookup. Relabelling n-grams with the model's *own* argmax (a model-captured store) makes the
+lookup a faithful cache of the model's decisions — in-sample the ≥quad gate hits **94%** (quad 97%) where it has
+the key, and at equal coverage on held-out, quad accuracy doubles (20% → 40%). The unmoved part is **induction
+(56%)**, which is context-copy and store-independent — no store changes it. So the deployment lift is purely a
+**coverage** problem: capture the model's argmax over enough tokens (large `pylm` rollouts) to cover the
+routable head, and the high-fidelity (≥quad ∧ low-fan-out) operating point extends from ~12% to most of the
+~57% routable fraction. The in-repo `--capture-store` proves the mechanism; `pylm` scales it.
+
+**Remaining (forward-path) work.** (a) **Scale the capture** — large `pylm` rollouts (cross-repo, `lm-sae`) to
+turn the in-sample 94% into broad held-out coverage; in-repo `--capture-store` is the small-scale proof. (b)
+**Wire the sound certificate into the live decode** (currently a measured probe).
