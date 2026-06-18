@@ -43,6 +43,7 @@ mod neox;
 mod qwen3moe;
 mod retrieval;
 mod rope;
+mod ternary;
 #[cfg(feature = "api")]
 mod tools;
 mod tropical;
@@ -1254,6 +1255,56 @@ fn main() {
             }
             println!("--verify-cache: {checked} positions · {pred_mm} prediction mismatch · {atom_mm} atom mismatch (cached vs uncached) → {}",
                 if pred_mm == 0 && atom_mm == 0 { "PASS — KV-cached explain is byte-identical" } else { "FAIL" });
+            return;
+        }
+
+        // --verify-ternary (TERNARY de-risk): the byte-identical mirror of the "lossless via expansion" lemma. Expand a
+        // real int8 weight's integer codes into K balanced trits and check Σ w·x == Σ_j 3^j (Σ t_ij x_i) EXACTLY (i64)
+        // over deterministic integer activations, then report the trit sparsity (the optimization baseline — zeros are
+        // free in Datalog's closed world). The identity is activation-agnostic, so any integer x is a complete check.
+        if has_flag(&args, "--verify-ternary") {
+            let b2 = match Bundle::load(&stem) { Ok(b) => b, Err(e) => { eprintln!("[fieldrun] --verify-ternary: reload: {e}"); return; } };
+            let cands = b2.int8_weights();
+            if cands.is_empty() { eprintln!("[fieldrun] --verify-ternary: bundle has no int8/rowi8 weights (convert with an int8 dtype)"); return; }
+            let pick = flag(&args, "--weight").map(String::from)
+                .or_else(|| cands.iter().find(|(n, _, _)| n.as_str() == "lm_head" || n.as_str() == "embed").map(|(n, _, _)| n.clone()))
+                .unwrap_or_else(|| cands.iter().max_by_key(|(_, r, c)| r * c).unwrap().0.clone());
+            let (rows, cols) = match cands.iter().find(|(n, _, _)| **n == pick) {
+                Some((_, r, c)) => (*r, *c),
+                None => { eprintln!("[fieldrun] --verify-ternary: '{pick}' not int8. candidates: {:?}", cands.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>()); return; }
+            };
+            let want: usize = flag(&args, "--rows").and_then(|s| s.parse().ok()).unwrap_or(256).min(rows.max(1));
+            let step = (rows / want.max(1)).max(1);
+            let rows_w: Vec<Vec<i64>> = (0..rows).step_by(step).take(want).filter_map(|j| b2.weight_row_int8(&pick, j)).collect();
+            if rows_w.is_empty() { eprintln!("[fieldrun] --verify-ternary: no rows read from '{pick}'"); return; }
+            let qmax = rows_w.iter().flatten().map(|w| w.abs()).max().unwrap_or(127);
+            let k = ternary::trits_for(qmax);
+            // deterministic integer activation vectors (xorshift), wide signed range — the lemma is x-agnostic
+            let mk_x = |mut s: u64| -> Vec<i64> { (0..cols).map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s % 4001) as i64 - 2000 }).collect() };
+            let xs: Vec<Vec<i64>> = (1..=3u64).map(|q| mk_x(0x9E3779B97F4A7C15u64.wrapping_mul(q))).collect();
+            eprintln!("[fieldrun] --verify-ternary: '{pick}' ({rows}×{cols} int8, |code|≤{qmax}) · K={k} trits · {} rows × {} x…", rows_w.len(), xs.len());
+            let mut fails = 0usize;
+            for w in &rows_w {
+                for x in &xs {
+                    let (lhs, rhs) = ternary::distribute(w, x, k);
+                    if lhs != rhs { fails += 1; if fails <= 3 { eprintln!("  MISMATCH: lhs={lhs} rhs={rhs}"); } }
+                }
+            }
+            let all_w: Vec<i64> = rows_w.concat();
+            let st = ternary::trit_stats(&all_w, k);
+            let (nz, nw) = (st.nonzero_trits as f64, st.n_weights.max(1) as f64);
+            println!("\n=== --verify-ternary: balanced-ternary lossless-via-expansion (weight '{pick}', {} rows × {} x) ===", rows_w.len(), xs.len());
+            println!("  Σ w·x  ==  Σ_j 3^j (Σ t_ij x_i)  exact (i64):  {}",
+                if fails == 0 { "PASS — byte-identical".to_string() } else { format!("FAIL ({fails} mismatches)") });
+            println!("  K={k} (worst-case trits/weight) · nonzero {}/{}  ⇒  {:.1}% of trits are ZERO (free in Datalog's closed world)",
+                st.nonzero_trits, st.total_trits, 100.0 * (1.0 - nz / st.total_trits.max(1) as f64));
+            println!("  mean nonzero trits/weight: {:.2}  (the sparse expansion cost vs the uniform K={k})", nz / nw);
+            println!("  used-length histogram (#trits actually needed; 0 = exact zero):");
+            for (j, c) in st.used_len.iter().enumerate() {
+                if *c > 0 { println!("    {j} trit(s): {c:>9} weights  ({:.1}%)", 100.0 * *c as f64 / nw); }
+            }
+            println!("  K-table (worst-case ternary layers by source precision):  int4→{}  int8→{}  fp16→{}",
+                ternary::trits_for(7), ternary::trits_for(127), ternary::trits_for(32767));
             return;
         }
 
