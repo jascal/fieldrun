@@ -440,6 +440,9 @@ the live numbers behind the architecture above — kept here so the spec matches
 | Residual selection (decode tier) | `--probe-residual` (+ `--residual-out`) | ✅ merged | 3-trit (≈int4) bulk flips 45%, but the exact residual on **0.08% of rows** makes every calibration decision correct (constructive mask) |
 | End-to-end hybrid decode | `--probe-residual --residual-in` | ✅ merged | bulk+mask reproduces the int8 decode to **95.7% (held-out English) / 98.7% (cross-domain code)**; Tier-A short-circuit opportunity **32%** |
 | Dynamic gate (sound vs calibrated) | `--probe-residual` (gate report) | ✅ merged | **sound C-S gate is impractical** at reduced bulk (0% until full precision); the **calibrated `/√d` gate** fires 51% @4-trit → 79% @5-trit at ~1–1.6% error |
+| Decode latency benchmark | `--bench-decode` | ✅ merged | per-token (0.5B): **forward 545 ms**, unembed 25 ms (4.6%), lookup **4.5 µs** (128 000× cheaper); amortized speedup **1.47× @32% / 2.33× @57%** short-circuit coverage |
+| Compute-tier residual dial (HY-O1) | `--probe-compute --bulk-trits` | ✅ merged | the compute tier is **depth-sensitive**: 2–3 trits (≈int4 bulk) **100% flip** vs int8, 4t 25%, 5t 7.5%, **6t 0%** — usable only at 5–6 trits, so on no-NPU hardware keep Tier B at full int8 |
+| Short-circuit frontier (HY-O2) | `--probe-shortcircuit` | ✅ merged | two-knob forward-free fast path, held-out: **induction 56% fidelity @9% coverage**; both knobs (source-order θ ∧ fan-out ≤c) sweep **50%@22% (1.28×) → 29%@68% (3.12×)**; ceiling ~56% — an *opportunistic* head, not a blanket skip |
 
 **Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
 mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
@@ -453,9 +456,20 @@ is the static constructive mask, the dynamic gate is a calibrated (high-probabil
 The decode-tier mask is unusually sparse (rows = candidate tokens) and grows with the corpus; the compute
 tier is denser (HY-O1).
 
-**Remaining (forward-path) work.** (a) **Compute-tier residual** (HY-O1) — apply bulk + exact residual to
-attn/MLP weights and measure end-to-end (needs a bulk-substituted forward; the selection signal is the
-descent atoms / `DLA·(1/margin)` already in `--probe-decompose`). (b) **`--kv-quant turbo` runtime KV mode**
-— wire the codec into `forward_block_capture` (quantize post-RoPE K/V on write, dequant on read) — the
-standalone KV win. (c) A **sound certificate tighter than C-S** (a data-dependent bound on `⟨r_v, x⟩`).
-(d) **Broader-corpus mask calibration** to close the held-out generalization gap.
+**The two deployment dials (speed/accuracy frontier).** The hybrid exposes two complementary knobs, now both
+measured. (1) **Compute-tier depth** (`--bulk-trits`, HY-O1): how coarse the bulk Tier-B weights are — but the
+tier is depth-sensitive (100% flip at ≤3 trits, 0% at 6), so on no-NPU CPUs it stays at full int8 and this knob
+is mainly for accelerator targets. (2) **Short-circuit fraction** (`--probe-shortcircuit`, HY-O2): skip the
+forward entirely on the high-confidence lookup head, gated on *source order* θ (induction > quad > tri > bi)
+and *bucket fan-out* c (distinct successors; 1 = deterministic). These are complementary — they act on
+different token sets (depth on the composed tail, short-circuit on the retrievable head). On CPU/16 GB/no-NPU
+hardware the **short-circuit fraction is the real lever** (it skips the memory-bound 545 ms forward), and
+fan-out is the finer dial since source order saturates on dense in-domain stores.
+
+**Remaining (forward-path) work.** (a) **Runtime short-circuit decode** — turn the projected `1/(1−coverage)`
+speedup into a measured end-to-end decode that actually emits the lookup token and skips the forward on gated
+positions (the frontier is measured; the live decode path is not yet wired). (b) **`--kv-quant turbo` runtime
+KV mode** — wire the codec into `forward_block_capture` (quantize post-RoPE K/V on write, dequant on read) —
+the standalone KV win. (c) A **sound certificate tighter than C-S** (a data-dependent bound on `⟨r_v, x⟩`).
+(d) **Broader-corpus mask + short-circuit calibration** — the held-out short-circuit ceiling (~56% fidelity)
+is set by the corpus store; a model-captured store (`pylm` rollouts) should lift it.

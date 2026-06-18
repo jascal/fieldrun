@@ -237,6 +237,62 @@ impl Store {
         self.ngram(ctx)
     }
 
+    /// Like `predict`, but also returns the firing rule's *fan-out* — the number of distinct successors the matched
+    /// n-gram bucket ranks (1 = a singleton continuation, the maximally-confident case; large = an ambiguous context).
+    /// This is the short-circuit confidence dial: a lookup that fires from a low-fan-out bucket agrees with the full
+    /// model far more often than one from a high-fan-out bucket, so it can be emitted *without* the forward. Induction
+    /// (the in-context copy keystone) is treated as fan-out 1 — it is a deterministic copy of a single recurrence.
+    pub fn predict_conf(&self, ctx: &[i64]) -> (i64, String, usize) {
+        if let Some((id, src)) = self.induction(ctx) {
+            return (id, src, 1);
+        }
+        let n = ctx.len();
+        if !self.quad.is_empty() && n >= 3 {
+            if let Some(v) = self.quad.get(&format!("{},{},{}", ctx[n - 3], ctx[n - 2], ctx[n - 1])) {
+                if !v.is_empty() {
+                    return (v[0], "quad".into(), v.len());
+                }
+            }
+        }
+        if n >= 2 {
+            if let Some(v) = self.tri.get(&format!("{},{}", ctx[n - 2], ctx[n - 1])) {
+                if !v.is_empty() {
+                    return (v[0], "trigram".into(), v.len());
+                }
+            }
+        }
+        if n >= 1 {
+            if let Some(v) = self.bi.get(&ctx[n - 1].to_string()) {
+                if !v.is_empty() {
+                    return (v[0], "bigram".into(), v.len());
+                }
+            }
+        }
+        if let Some((id, src)) = self.grammar(ctx) {
+            // grammar fan-out: distinct successors of the matched skeleton (re-resolve the same key cheaply).
+            let fan = self.grammar_fanout(ctx).unwrap_or(usize::MAX);
+            return (id, src, fan);
+        }
+        (self.uni[0], "unigram".into(), self.uni.len())
+    }
+
+    fn grammar_fanout(&self, ctx: &[i64]) -> Option<usize> {
+        for n in [3usize, 2usize] {
+            if ctx.len() >= n {
+                let skel: Vec<String> = ctx[ctx.len() - n..]
+                    .iter()
+                    .map(|t| if self.closed.contains(t) { t.to_string() } else { "O".to_string() })
+                    .collect();
+                if let Some(v) = self.skel.get(&format!("{}:{}", n, skel.join("/"))) {
+                    if !v.is_empty() {
+                        return Some(v.len());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn induction(&self, ctx: &[i64]) -> Option<(i64, String)> {
         let mut span = self.min_induction;
         while span >= self.min_accept {
@@ -365,6 +421,17 @@ mod tests {
         // induction: the tail "1 2" recurred at the start; predicting 3 is a copy from position 2.
         let ri = s.rule_for(&[1, 2, 3, 1, 2], 3).unwrap();
         assert!(ri.idiom.starts_with("induction") && ri.source == Some(2));
+    }
+
+    #[test]
+    fn predict_conf_reports_bucket_fanout() {
+        // bigram "5" has three ranked successors → fan-out 3; induction is a deterministic copy → fan-out 1.
+        let s = from_json(r#"{"tri":{},"bi":{"5":[9,7,5]},"uni":[0]}"#);
+        let (p, src, fan) = s.predict_conf(&[1, 5]);
+        assert_eq!((p, src.as_str(), fan), (9, "bigram", 3));
+        let (pi, srci, fani) = s.predict_conf(&[1, 2, 3, 1, 2]);
+        assert_eq!((pi, fani), (3, 1));
+        assert!(srci.starts_with("induction"));
     }
 
     #[test]
