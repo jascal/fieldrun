@@ -424,3 +424,38 @@ whole thing is faithful. The result is an *exact* reconstruction of the chosen-p
 recompute path (Tier B's ternary identity is byte-exact) and a margin-gated, calibrated-sound short-circuit
 on the retrievable fraction — two regimes, not a free lunch on both axes — in one framework-free pure-Rust
 process, with the ternary `K×` the cost to minimize on the tokens that compute.**
+
+---
+
+## 12. Implementation status & measured results
+
+What is built and merged (all pure-Rust, framework-free; validated on Qwen2.5-0.5B unless noted). These are
+the live numbers behind the architecture above — kept here so the spec matches the code.
+
+| Component | Surface | Status | Key measured result |
+|---|---|---|---|
+| Lossless ternary expansion | `src/ternary.rs`, `--verify-ternary` | ✅ merged | `Σ w·x = Σ_j 3^j Σ t·x` **byte-identical** (i64) on real int8 weights; an int8 MLP layer is **52.5% zero trits, mean 2.85 nonzero/weight** |
+| TurboQuant codec | `src/turboquant.rs` (SRHT + data-free Lloyd–Max) | ✅ merged | rel-distortion sits **at** the `√3π/2·4⁻ᵇ` bound |
+| Margin–distortion gate (E-TQ2) | `--probe-distortion` | ✅ merged | **8-bit KV decision-near-lossless** (1.2% flip); flip%→0 once `margin·√d/‖r̂−r‖ > ~1–2` — the gate law, confirmed |
+| Residual selection (decode tier) | `--probe-residual` (+ `--residual-out`) | ✅ merged | 3-trit (≈int4) bulk flips 45%, but the exact residual on **0.08% of rows** makes every calibration decision correct (constructive mask) |
+| End-to-end hybrid decode | `--probe-residual --residual-in` | ✅ merged | bulk+mask reproduces the int8 decode to **95.7% (held-out English) / 98.7% (cross-domain code)**; Tier-A short-circuit opportunity **32%** |
+| Dynamic gate (sound vs calibrated) | `--probe-residual` (gate report) | ✅ merged | **sound C-S gate is impractical** at reduced bulk (0% until full precision); the **calibrated `/√d` gate** fires 51% @4-trit → 79% @5-trit at ~1–1.6% error |
+
+**Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
+mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
+bulk + exact-residual mask, reproducing int8 to ~96–99% on held-out). The unified gate `m > z·ρ_KV +
+2δ_weight` has **both terms measured** (`ρ_KV` from `--probe-distortion`, `δ_weight` from `--probe-residual`).
+
+**Honest findings folded back into the design.** (i) Lossless ternary is *not* a compression (`K×` bigger);
+its value is exactness + the multiply-free/Datalog-native form + the substrate for truncation. (ii) There is
+**no free *exact* dynamic gate** at the decode tier — Cauchy–Schwarz worst-case is too loose; the exact path
+is the static constructive mask, the dynamic gate is a calibrated (high-probability) speedup (HY-O2). (iii)
+The decode-tier mask is unusually sparse (rows = candidate tokens) and grows with the corpus; the compute
+tier is denser (HY-O1).
+
+**Remaining (forward-path) work.** (a) **Compute-tier residual** (HY-O1) — apply bulk + exact residual to
+attn/MLP weights and measure end-to-end (needs a bulk-substituted forward; the selection signal is the
+descent atoms / `DLA·(1/margin)` already in `--probe-decompose`). (b) **`--kv-quant turbo` runtime KV mode**
+— wire the codec into `forward_block_capture` (quantize post-RoPE K/V on write, dequant on read) — the
+standalone KV win. (c) A **sound certificate tighter than C-S** (a data-dependent bound on `⟨r_v, x⟩`).
+(d) **Broader-corpus mask calibration** to close the held-out generalization gap.
