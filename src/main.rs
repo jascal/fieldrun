@@ -1259,6 +1259,58 @@ fn main() {
             return;
         }
 
+        // --probe-compute (HY-O1): the compute-tier residual DIAL. Truncate the int8 attn/MLP weights to a coarse
+        // K-trit "bulk" (≈int4 at K=3) in a second model, run the full forward, and compare its decode to the int8
+        // reference — swept over --bulk-trits (comma list). This is one axis of the speed/accuracy frontier (the other
+        // is the Tier-A short-circuit fraction): more residual (higher K) ⇒ more fidelity, more compute/memory. Rope only.
+        if has_flag(&args, "--probe-compute") {
+            use retrieval::CandCfg;
+            if arch != "rope" { eprintln!("[fieldrun] --probe-compute: rope only"); return; }
+            let ks: Vec<usize> = flag(&args, "--bulk-trits").unwrap_or("3,4,5").split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            if lm.logits(&ids[..ctx_window.min(ids.len())]).is_none() { eprintln!("[fieldrun] --probe-compute: arch has no logits hook (rope only)"); return; }
+            let cap = (end - ctx_window).min(n_eval).min(80);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-compute: no positions"); return; }
+            // int8 reference: per position, the winner t8, its logit, and the route.
+            eprintln!("[fieldrun] --probe-compute: int8 reference forward over {} positions…", positions.len());
+            let refs: Vec<(usize, f32, u8)> = positions.iter().filter_map(|c| {
+                let l = lm.logits(c)?;
+                let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
+                let route = match &store { Some(s) => { let kb = s.predict(c).0 as usize; if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 } }, None => 3u8 };
+                Some((t, l[t], route))
+            }).collect();
+            let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
+            println!("\n=== --probe-compute (HY-O1): compute-tier bulk (attn/MLP int8 → K trits) vs int8 — {} positions ===", refs.len());
+            println!("  the residual dial: higher K = more fidelity, more compute/memory. (K=6 = full int8 = 0% flip.)");
+            println!("{:<11}{:>6}{}", "route", "n", ks.iter().map(|k| format!("{:>11}", format!("{k}t flip%"))).collect::<String>());
+            // per K: build a bulk model (2nd bundle, truncated), forward, compare to the int8 winner.
+            let mut by_k: Vec<Vec<bool>> = Vec::new(); // [k][pos] = flipped
+            for &k in &ks {
+                let mut bb = Bundle::load(&stem).expect("reload bundle");
+                bb.truncate_to_trits(k);
+                let lm_k: Box<dyn Model> = Box::new(Rope::new(bb, route, kv_int8));
+                eprintln!("[fieldrun] --probe-compute: bulk K={k} forward…");
+                let flips: Vec<bool> = positions.iter().zip(&refs).map(|(c, &(t8, _, _))| {
+                    match lm_k.logits(c) { Some(l) => l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(t8) != t8, None => false }
+                }).collect();
+                by_k.push(flips);
+            }
+            for (lbl, rt) in &groups {
+                let idx: Vec<usize> = (0..refs.len()).filter(|&i| *rt == 255 || refs[i].2 == *rt).collect();
+                if idx.is_empty() { continue; }
+                let cells: String = by_k.iter().map(|flips| {
+                    let f = 100.0 * idx.iter().filter(|&&i| flips[i]).count() as f32 / idx.len() as f32;
+                    format!("{:>10.1}%", f)
+                }).collect();
+                println!("{lbl:<11}{:>6}{cells}", idx.len());
+            }
+            println!("  ⇒ pick the smallest K (cheapest compute tier) whose flip% is acceptable; the Tier-A short-circuit is the");
+            println!("    second dial (it skips the forward entirely on the retrievable fraction). Two knobs = a speed/accuracy frontier.");
+            return;
+        }
+
         // --bench-decode: per-token latency micro-benchmark of the existing int8 path — full forward (attn+MLP → residual),
         // the unembedding decode matmul, and the Tier-A n-gram lookup (context-only, no forward) — plus the amortized
         // projection at a lookup short-circuit fraction. Grounds the hybrid's cost model in wall-clock. Rope only.

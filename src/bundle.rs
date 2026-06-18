@@ -519,6 +519,31 @@ impl Bundle {
         v
     }
 
+    /// Truncate every int8/rowi8 weight in-place to its top `kbulk` balanced trits (drop the low `6−kbulk`),
+    /// i.e. replace each code by a coarser "bulk" approximation — the compute-tier residual dial (HY-O1).
+    /// `kbulk ≥ 6` is a no-op (full int8); f16/f32/int4 weights are left untouched. Lets the existing forward
+    /// run at reduced effective precision without a kernel change (build a second bundle, truncate, compare).
+    pub fn truncate_to_trits(&mut self, kbulk: usize) {
+        if kbulk >= 6 {
+            return;
+        }
+        let drop = 6 - kbulk;
+        let trunc = |c: i8| -> i8 {
+            let mut t = crate::ternary::to_trits(c as i64, 6);
+            for tj in t.iter_mut().take(drop) {
+                *tj = 0;
+            }
+            crate::ternary::from_trits(&t) as i8
+        };
+        for (_, arr) in self.arrays.values_mut() {
+            match arr {
+                Arr::I8(w) => w.wt.iter_mut().for_each(|c| *c = trunc(*c)),
+                Arr::RowI8(w) => w.data.iter_mut().for_each(|c| *c = trunc(*c)),
+                _ => {}
+            }
+        }
+    }
+
     pub fn weight_row(&self, name: &str, r: usize) -> Vec<f32> {
         let (shape, arr) = self.get(name);
         let cols = shape[1];
