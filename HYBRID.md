@@ -229,11 +229,29 @@ These are the questions worth digging into; HY-O1/O2/O4 are the cruxes.
   ternary tier + a small **data-aware low-rank residual** (the `TURBOQUANT` line; the measured "rank-8
   update beats the frozen-linear Θ(d) floor losslessly") for a smaller, slightly-approximate engine? The
   accuracy/cost frontier, in *decision-fidelity* currency, not weight-MSE.
-- **HY-O7 (the fixed-point floor).** The only loss is `float → w_int`. Choose the per-layer precision `s`
-  (hence `K`) by the activation Hessian / the facet margin (spend bits where decisions are tight — the
-  forge tax) — margin-adaptive precision.
-- **HY-O8 (MoE interaction).** Tier B as routed sparse *experts* (the bucketing partition), Tier A as the
-  shared retrievable backbone — does the expert routing compose with the lookup short-circuit?
+- **HY-O7 (margin-adaptive precision — *developed*).** The only loss is `float → w_int`, so choose
+  precision per layer to spend bits where decisions are tight. The advance over standard mixed-precision
+  (HAWQ-style Hessian-trace sensitivity) is to use the **tropical facet margin** as the sensitivity signal
+  — it is *decision-aware* (what actually flips the argmax, TT2/E7) rather than loss-curvature. fieldrun
+  already computes **both** ingredients: per-circuit DLA (`--probe-decompose`, the contrib decode) and the
+  facet margin (`--probe-tropical`), so a layer's bit budget can be set from its **tightness exposure** —
+  how often its contribution is pivotal (high DLA) on a small-margin decision, e.g.
+  `Σ_decisions DLA_layer · (1/margin)`. In this architecture the precision knob is concrete: the
+  **trit-truncation depth `K′ ≤ K`**. Keep all `K` trits ⇒ lossless (no flip); truncate to `K′` where the
+  residual (`~3^{K′}` scale) stays below the margin's tolerance (the `TURBOQUANT` TT2 threshold). So
+  **HY-O6 and HY-O7 are the same knob** — per-weight/per-layer trit depth, set by the margin; the
+  fully-lossless tier is just "all trits everywhere." *Remaining crux:* aggregating the per-decision
+  margins to a static per-layer/per-group `K′`, and the closed form `K′(margin)`.
+- **HY-O8 (MoE composition — *developed*).** It composes cleanly, and the monster-tree result *is* the
+  decomposition. **Tier A** = a shared retrieval backbone (the recurring hub-experts — the bucketing
+  anchors that fire across domains, e.g. the monster tree's depth-0 hubs / the recurring late-layer hub)
+  **plus expert-specific n-gram tables** (per-domain). **Tier B** = the routed sparse experts expressed in
+  ternary (the monster tree's per-language / code / math leaves). The short-circuit then **bypasses the
+  router itself**, not just expert compute, for high-margin retrieved cases — a strictly bigger win, since
+  routing is its own cost. This rides fieldrun's existing expert-offload (`bundle.rs` paged experts): cold
+  ternary experts stay paged, the lookup backbone stays resident. *Remaining crux:* the per-token gate must
+  stay sound under routing — the margin has to bound the contribution of the **unselected** experts, not
+  just the chosen one.
 
 ---
 
