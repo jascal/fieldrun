@@ -445,6 +445,7 @@ the live numbers behind the architecture above — kept here so the spec matches
 | Short-circuit frontier (HY-O2) | `--probe-shortcircuit` | ✅ merged | two-knob forward-free fast path, held-out: **induction 56% fidelity @9% coverage**; both knobs (source-order θ ∧ fan-out ≤c) sweep **50%@22% (1.28×) → 29%@68% (3.12×)**; ceiling ~56% — an *opportunistic* head, not a blanket skip |
 | Realized short-circuit wall-clock | `--bench-shortcircuit` | ✅ merged | **measured** (scoring mode): forward 520 ms vs lookup gate 0.004 ms (124 000× cheaper); realized speedup tracks `1/(1−cov)` exactly — ≥quad∧fan≤1 **1.36× @26%**, any∧fan≤10 **3.64× @72%** — confirming the µs-vs-forward cost model in a real loop |
 | Generation-mode drift (HY-O2) | `--gen-shortcircuit` | ✅ merged | **token substitution alone derails greedy generation**: 79% per-step substitution fidelity, yet the trajectory forks at **step 13 of 40** (45% match) and tightening the gate (induction-only) doesn't move the fork — compounding dominates. Confirms the short-circuit is a **scoring / single-decision** instrument, not a faithful generation accelerator (the cheap substitution error masks the KV-hole error before it matters) |
+| TurboQuant KV vs int8 (TQ-O6) | `--probe-kv-quant` | ✅ merged | **negative result — keep `--kv-int8`**: per-head MSE turbo at 8-bit has lower logit-L2 (0.196 vs 0.208) but a *higher* flip rate (24% vs **16%**) than per-head int8, and collapses below 8 bits (70–92% flip). Confirms TQ-O6 (small `head_dim` → weak `1/d`); the full-`d` rotation and unbiased `prod`/QJL mode are the untested alternatives. The runtime turbo-KV wiring is **not** worth building |
 
 **Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
 mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
@@ -478,8 +479,14 @@ error dominates before the cached KV-hole error (§8/§10) even matters, the sho
 streaming-generation one. A faithful generation short-circuit would need a much higher-fidelity store
 (model-captured `pylm` rollouts) and/or a verify-and-rollback step — a separate research direction, not a wiring task.
 
-**Remaining (forward-path) work.** (a) **`--kv-quant turbo` runtime
-KV mode** — wire the codec into `forward_block_capture` (quantize post-RoPE K/V on write, dequant on read) —
-the standalone KV win. (b) A **sound certificate tighter than C-S** (a data-dependent bound on `⟨r_v, x⟩`).
-(c) **Broader-corpus mask + short-circuit calibration** — the held-out short-circuit ceiling (~56% fidelity)
-is set by the corpus store; a model-captured store (`pylm` rollouts) should lift it.
+**KV cache — int8 stands; turbo not worth wiring (TQ-O6, measured).** `--probe-kv-quant` settled the
+KV-quantizer question: the per-head MSE TurboQuant codec is *not* a win over the existing `--kv-int8` (lower
+logit-L2 but a higher decision-flip rate, and it collapses below 8 bits — small `head_dim` makes the `1/d`
+isotropy advantage too weak to pay for). So the standalone KV win is the already-built per-head int8 cache at
+8 bits; the runtime turbo-KV wiring is dropped. The two untested codecs that *could* beat int8 (full-`d`
+rotation before the head split; the unbiased `prod`/QJL inner-product mode) are a TurboQuant-side research
+fork, not a hybrid wiring task.
+
+**Remaining (forward-path) work.** (a) A **sound certificate tighter than C-S** (a data-dependent bound on
+`⟨r_v, x⟩`). (b) **Broader-corpus mask + short-circuit calibration** — the held-out short-circuit ceiling
+(~56% fidelity) is set by the corpus store; a model-captured store (`pylm` rollouts) should lift it.

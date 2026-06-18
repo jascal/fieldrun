@@ -226,6 +226,14 @@ pub trait Model: Sync {
         None
     }
 
+    /// Logit vector with the K/V cache round-tripped through a quantizer (`--probe-kv-quant`): `turbo_bits=None` → the
+    /// int8 per-head max-scale scheme (the existing `--kv-int8` runtime cache); `Some(b)` → a `b`-bit TurboQuant codec
+    /// (SRHT rotation + Lloyd–Max levels). Measures the decision distortion the cache quant injects vs the f32 `logits`
+    /// reference — the test of whether TurboQuant's isotropy enables a lower-bit KV cache than int8. Default None; rope wires it.
+    fn logits_kvq(&self, _ids: &[i64], _turbo_bits: Option<u8>) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Install a margin-gated retrieval-pruned output head (`--pruned-head`) on the DECODE loops — the serve/chat
     /// streaming paths only; `predict` (scoring, probes) always runs the full head. Returns false if the arch doesn't
     /// wire it (default). See `headgate::HeadGate`.

@@ -1445,6 +1445,48 @@ fn main() {
             return;
         }
 
+        // --probe-kv-quant (TurboQuant KV): does TurboQuant's isotropic rotation buy a LOWER-BIT KV cache than per-head
+        // int8? For each teacher-forced position, round-trip the post-RoPE K/V through each cache-quant scheme and
+        // compare the next-token argmax to the f32 reference — the decision-flip rate is the deployment metric. A 4-bit
+        // turbo cache that matches int8's flip rate = 8× smaller than f32 (vs 4× for int8) → ~2× the context in fixed
+        // RAM, the lever for long context on 16 GB no-NPU hardware. Round-trip only (the distortion test); the
+        // persistent bit-packed cache wired into streaming decode is the runtime mode (a follow-up). Rope only.
+        if has_flag(&args, "--probe-kv-quant") {
+            if lm.logits_kvq(&ids[..ctx_window.min(ids.len())], None).is_none() { eprintln!("[fieldrun] --probe-kv-quant: rope only"); return; }
+            let cap = (end - ctx_window).min(n_eval).min(60);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-kv-quant: no positions"); return; }
+            let schemes: [(&str, Option<u8>); 5] = [("int8 per-head", None), ("turbo-8", Some(8)), ("turbo-6", Some(6)), ("turbo-4", Some(4)), ("turbo-3", Some(3))];
+            eprintln!("[fieldrun] --probe-kv-quant: {} positions × (f32 ref + {} schemes) — full prefills…", positions.len(), schemes.len());
+            let am = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let mut flips = [0usize; 5];
+            let mut rel = [0f64; 5]; // mean relative L2 logit distortion vs f32
+            let mut n = 0usize;
+            for c in &positions {
+                let rf = match lm.logits(c) { Some(l) => l, None => continue };
+                let ref_am = am(&rf);
+                let rnorm: f64 = rf.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt().max(1e-9);
+                for (si, (_, tb)) in schemes.iter().enumerate() {
+                    if let Some(l) = lm.logits_kvq(c, *tb) {
+                        if am(&l) != ref_am { flips[si] += 1; }
+                        let d2: f64 = rf.iter().zip(&l).map(|(&a, &b)| { let e = (a - b) as f64; e * e }).sum();
+                        rel[si] += d2.sqrt() / rnorm;
+                    }
+                }
+                n += 1;
+            }
+            if n == 0 { eprintln!("[fieldrun] --probe-kv-quant: no positions produced a forward"); return; }
+            println!("\n=== --probe-kv-quant: KV cache-quant decision fidelity vs f32 — {n} positions ===");
+            println!("{:<18}{:>8}{:>16}{:>18}", "scheme", "bits", "flip% vs f32", "rel logit Δ");
+            for (si, (lbl, tb)) in schemes.iter().enumerate() {
+                let bits = tb.map(|b| b.to_string()).unwrap_or_else(|| "8*".into());
+                println!("{lbl:<18}{bits:>8}{:>15.1}%{:>18.4}", 100.0 * flips[si] as f64 / n as f64, rel[si] / n as f64);
+            }
+            println!("\n  int8* = per-head max-scale (the --kv-int8 runtime scheme, 8-bit). turbo-b = SRHT rotation + Lloyd–Max at b bits.");
+            println!("  a turbo row matching int8's flip% at FEWER bits ⇒ a smaller KV cache at the same fidelity (more context in fixed RAM).");
+            return;
+        }
+
         // --probe-compute (HY-O1): the compute-tier residual DIAL. Truncate the int8 attn/MLP weights to a coarse
         // K-trit "bulk" (≈int4 at K=3) in a second model, run the full forward, and compare its decode to the int8
         // reference — swept over --bulk-trits (comma list). This is one axis of the speed/accuracy frontier (the other

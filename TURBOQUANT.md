@@ -121,6 +121,26 @@ TurboQuant path it produces the **unbiased** explain of §6.
   So full-`d` rotation roughly **quarters** the per-coordinate distortion versus per-head — a real argument
   for it, weighed against the RoPE-ordering complication (TQ-O5). The prototype resolves this fork first.
 
+  **Measured (`--probe-kv-quant`, 0.5B, held-out, n=50) — TQ-O6 confirmed: per-head turbo is NOT a win.**
+  Round-tripping post-RoPE K/V through each scheme and comparing the next-token argmax to the f32 reference:
+
+  | scheme | bits | flip% vs f32 | rel logit Δ |
+  |---|---|---|---|
+  | int8 per-head (`--kv-int8`) | 8 | **16%** | 0.208 |
+  | turbo (MSE, per-head) | 8 | 24% | 0.196 |
+  | turbo (MSE, per-head) | 6 | 70% | 0.70 |
+  | turbo (MSE, per-head) | 4 | 76% | 0.76 |
+  | turbo (MSE, per-head) | 3 | 92% | 0.74 |
+
+  Per-head turbo at 8 bits has marginally lower logit-L2 distortion than int8 (the isotropy works) **but a
+  *higher* decision-flip rate**, and it collapses below 8 bits — softmax amplifies the rotation's correlated,
+  inverse-rotated error in a way per-coordinate int8 avoids, and at small `head_dim` the `1/d` advantage is
+  too weak to pay for it. **Verdict at this scale: keep `--kv-int8` (per-head 8-bit); the per-head MSE turbo KV
+  is not worth wiring.** The two *untested* alternatives the table above motivates remain open: (i) **full-`d`
+  rotation** before the head split (≈3.7–5.3× lower distortion — TQ-O6's own fix), and (ii) the **unbiased
+  `prod`/QJL mode** (§3.3), which is built for *inner-product* (attention-score) preservation rather than MSE
+  and so is the better-matched codec for KV. The MSE per-head codec is simply the weakest corner of the design.
+
 **When to use `--kv-quant turbo`** (intended guidance for README/CLI when it lands): long-context or
 many-position explanation workloads where the f32 KV cache dominates memory, and you can accept
 unbiased-in-expectation (not exact) attention/logits. Keep the default f32 path for certificate-grade
