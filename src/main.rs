@@ -1779,6 +1779,11 @@ fn main() {
             let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
             let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
             let kbulk_arg: usize = flag(&args, "--bulk-trits").and_then(|s| s.parse().ok()).unwrap_or(3).max(1);
+            // --residual-in: APPLY mode. Load a mask calibrated elsewhere and decode this (held-out) passage with
+            // bulk + exact-on-mask; report Tier-B fidelity vs int8 + the Tier-A lookup short-circuit opportunity.
+            let loaded_mask: Option<std::collections::BTreeSet<i64>> = flag(&args, "--residual-in")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_whitespace().next().and_then(|w| w.parse::<i64>().ok())).collect());
             let b2 = Bundle::load(&stem).expect("reload bundle");
             let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
             let (vocab, d) = b2.dims(un);
@@ -1814,7 +1819,7 @@ fn main() {
             // residual logit swing |l_full[t]−l_bulk[t]| (the per-layer δ). The mask invariant: every row v with
             // l_bulk[v] ≥ l_full[t] is kept exact, which (with t exact) guarantees t stays the argmax — by construction.
             let mut mask: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32 }
+            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32, hflip: bool, ta: bool }
             let mut recs: Vec<RouteRec> = Vec::new();
             for c in &positions {
                 let r = match lm.final_residual(c) { Some(r) => r, None => continue };
@@ -1834,15 +1839,21 @@ fn main() {
                     if l_bulk[v] >= lft { mask.insert(v as i64); }
                 }
                 mask.insert(t as i64);
-                let route = match &store {
-                    Some(s) => { let kb = s.predict(c).0 as usize; if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 } }
-                    None => 3u8,
+                let (route, ta) = match &store {
+                    Some(s) => { let kb = s.predict(c).0 as usize; (if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 }, kb == t) }
+                    None => (3u8, false),
                 };
-                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs() });
+                // apply mode: hybrid decode = bulk logits, but exact (l_full) on the loaded-mask rows; flip vs int8.
+                let hflip = match &loaded_mask {
+                    Some(m) => (0..vocab).map(|v| (v, if m.contains(&(v as i64)) { l_full[v] } else { l_bulk[v] }))
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0 != t,
+                    None => false,
+                };
+                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs(), hflip, ta });
             }
             if recs.is_empty() { eprintln!("[fieldrun] --probe-residual: no positions produced a residual"); return; }
             let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
-            println!("\n=== --probe-residual: {kbulk}-trit bulk of '{un}' (drop low {} trits) vs int8 — {} positions ===", 6 - kbulk, recs.len());
+            println!("\n=== --probe-residual: {kbulk}-trit bulk of '{un}' (drop low {} trits) vs int8 — {} positions ===", kfull - kbulk, recs.len());
             println!("  bulk-only (no residual) decision flip vs int8, by route:");
             println!("{:<11}{:>6}{:>9}{:>16}{:>14}", "route", "n", "flip%", "δ swing (logit)", "margin");
             for (lbl, rt) in &groups {
@@ -1864,6 +1875,20 @@ fn main() {
                     Ok(_) => eprintln!("[fieldrun] --probe-residual: mask ({} rows) → {path}", mask.len()),
                     Err(e) => eprintln!("[fieldrun] --probe-residual: cannot write {path}: {e}"),
                 }
+            }
+            if let Some(m) = &loaded_mask {
+                println!("\n=== APPLY (held-out): hybrid decode = {kbulk}-trit bulk + exact on the loaded mask ({} rows) ===", m.len());
+                println!("  end-to-end compose: Tier B (bulk unembed + exact residual on the mask) vs the int8 reference, on THIS passage.");
+                println!("{:<11}{:>6}{:>16}{:>22}", "route", "n", "hybrid==int8", "TierA lookup==int8");
+                for (lbl, rt) in &groups {
+                    let gg: Vec<&RouteRec> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                    if gg.is_empty() { continue; }
+                    let hf = 100.0 * gg.iter().filter(|x| !x.hflip).count() as f32 / gg.len() as f32;
+                    let taf = 100.0 * gg.iter().filter(|x| x.ta).count() as f32 / gg.len() as f32;
+                    println!("{lbl:<11}{:>6}{hf:>15.1}%{taf:>21.1}%", gg.len());
+                }
+                println!("  hybrid==int8 = Tier-B (bulk+mask) fidelity on this passage (100% if the mask covered the false leaders);");
+                println!("  TierA lookup==int8 = the short-circuit OPPORTUNITY (the HY-O2 gate's ceiling — sound gating is future work).");
             }
             return;
         }
