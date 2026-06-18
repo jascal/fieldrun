@@ -322,7 +322,47 @@ These are the questions worth digging into; HY-O1/O2/O4 are the cruxes.
 
 ---
 
-## 10. Related work & provenance
+## 10. Relationship to TurboQuant — complementary, and worth doing first
+
+[`TURBOQUANT.md`](./TURBOQUANT.md) (unbiased KV-cache quantization + the margin–distortion bound) and this
+hybrid are **complementary — they quantize different objects** — and they share one instrument, which is
+exactly why the practical sequencing is **TurboQuant first**.
+
+- **Different objects.** TurboQuant compresses the **KV cache** (per-token vectors — the attention memory);
+  the hybrid quantizes/represents the **weights** (Tier B) and the **retrieval KB** (Tier A). Orthogonal
+  axes; apply each to its own object and they compose.
+- **The one rule: don't TurboQuant the *weights*.** TurboQuant is lossy-unbiased; the hybrid keeps weights
+  exact (int8 bulk + exact ternary residual, §5.1). So: TurboQuant the **KV cache** (lossy-unbiased is fine
+  there), keep the **weights and unembedding exact** via the residual path. Double-applying is the only
+  interaction to avoid — it would break the hybrid's exact-on-demand property.
+- **They share the facet-margin gate.** TurboQuant's "stable iff `m > z·ρ_KV`" (TT2) and the hybrid's
+  "argmax-sound iff `m > 2δ_weight`" (§5.1) are the *same* margin-as-error-budget argument on different
+  error sources. Do both and the gate just sums the budgets: **`m > z·ρ_KV + 2δ_weight`** — one unified
+  gate, not a conflict.
+- **Use-case split.** The KV cache is needed *even for short-circuited tokens* (future positions attend to
+  them), so the hybrid's whole-forward short-circuit is mainly a **scoring / single-decision** win; for
+  autoregressive **generation** you still populate K/V and TurboQuant's KV compression is the dominant
+  lever. So TurboQuant is, if anything, *more* central in the generation path.
+
+**Sequencing — TurboQuant first.** Four reasons, the second being the load-bearing one:
+1. **Lower risk / better understood** — KV-cache quantization is effectively an industry standard and the
+   math is proven (the paper + the i-orca `turboquant` corpus). The hybrid's gate (HY-O2) is the *novel*
+   research risk; do the safe, high-value thing first.
+2. **It builds the shared instrument.** TurboQuant's deliverable (B) is the **margin–distortion probe** (the
+   TO7/E7 settle) — *exactly* the gate-calibration tooling the hybrid's Phase 3 reuses. Building TurboQuant
+   first produces the `ρ` / margin machinery; the hybrid then only adds the `δ_weight` half of the unified
+   gate. So this isn't just "easier first" — it's "the prerequisite that yields the hybrid's gate."
+3. **Standalone win on the memory-bound 7B.** The 7B is KV / bandwidth-bound on commodity hardware;
+   TurboQuant attacks that directly and ships value before any hybrid machinery exists.
+4. **De-risks the shared principle.** E-TQ2 (flip-rate vs margin/distortion) validates the
+   margin-as-budget law that *both* gates rest on — confirm the foundation before betting the hybrid on it.
+
+So the program order is: **TurboQuant (KV mode + margin–distortion probe) → the hybrid (Tier A lookup +
+int8-bulk/exact-residual Tier B + the unified gate, reusing TurboQuant's margin instrument).**
+
+---
+
+## 11. Related work & provenance
 
 - **The retrievable/computed split** — `FINDINGS.md` §5 (measured), `DENSITY_BUCKETING.md` (the partition),
   `LOGIC_EXPORT.md` (Tier A/B, LE-T5 `Σcontrib==logit`, the LE-T4 dense-Gram wall this dissolves).
