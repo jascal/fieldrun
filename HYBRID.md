@@ -152,6 +152,50 @@ budget (mean 2.85, with small weights needing fewer — measured histogram: most
 dataset)" is an integer program / MaxSAT over the relational form — analytically well-posed, NP-hard in
 general. This is where the analytical/optimization work lives; existence is the easy part.
 
+### 5.1 Tier B on accelerators — native low-precision bulk + a small exact ternary residual
+
+*(developed with Grok.)* Pure ternary maps poorly to accelerator matrix units (NPUs/GPUs want dense
+int4/int8 GEMM, not `{−1,0,+1}` + power-of-3 + sparsity). A **residual split** fixes this while keeping
+exactness *on demand*, and it is the practical form of Tier B (full ternary, §5, is then the exact
+*reference*):
+
+> `w = ŵ_q + r`  ⇒  `w·x = ŵ_q·x + r·x`. Run the **bulk** `ŵ_q·x` as a dense matmul on whatever the
+> hardware does fast, and compute the **residual** `r·x` with the lossless balanced-ternary expansion
+> (`src/ternary.rs`, `--verify-ternary`) only where it matters.
+
+The residual `r = w − ŵ_q` is the *low-order* quantization error, so it is **small and sparse** — `|r|` is
+bounded by the int-`q` step, giving `K_r ≈ 2–3` trits, not 6. So even a *full* exact residual is just the
+native bulk + a cheap 2–3-trit pass.
+
+**Exact vs approximate is a spectrum — a per-*decision* precision ladder (the per-decision extension of
+HY-O7).** Two regimes, both keyed by the facet margin `m`:
+- **Full residual (all weights) ⇒ bit-exact** — `w·x` reconstructed exactly (HY-T1 holds).
+- **Subset residual (the tight-margin weights, selected by `DLA·(1/m) > τ`) ⇒ approximate**, with error
+  bounded by the *omitted* residuals: `δ = ‖r_omitted‖∞ · ‖x‖₁` (tighter from the calibration activation
+  stats). The argmax is then **sound wherever `m > 2δ`** — each candidate's score shifts ≤ ±δ, so a margin
+  past `2δ` cannot flip it. (Naming note vs Grok's sketch: `δ` is the *omitted*-residual swing, so full
+  residual ⇒ `δ = 0` ⇒ exact; the more you include, the smaller `δ`, the more decisions are argmax-safe.)
+
+| facet margin `m` | path | cost | exactness |
+|---|---|---|---|
+| `m >` full Tier-B bound | **Tier A short-circuit** (skip Tier B) | lookup only | gate-sound (§7) |
+| `m > 2δ` | **native bulk + subset residual** (the common, accelerator-fast case) | int4/8 GEMM + small ternary | argmax-exact |
+| `m ≤ 2δ` | **full exact residual** (or full ternary) for that decision | int4/8 GEMM + full residual | bit-exact |
+
+Typical from the measured DLA/margin distributions: **~10–25% of weights** carry the exact residual; the
+accelerator does the rest in native low precision.
+
+**Hardware-parametric — and it subsumes "stick with int8."** The bulk precision is the target's native
+unit: **int8 on fieldrun's CPU today** (the existing `i8_dot`), int4 on an NPU later; the ternary residual
+runs on the scalar/CPU path either way. So this is exactly *"keep the native low-precision matmul, and
+bring ternary back only as a small exact correction for the tight decisions"* — the synthesis of the
+int8-first cut and the ternary exactness, with full ternary (§5) recovered by setting the bulk to zero.
+
+**Calibration reuses existing tooling.** Per-layer `δ` and the `DLA·(1/m) > τ` residual mask come from
+`--probe-decompose` (DLA) + `--probe-tropical` (margin). New work: the residual-selection calibration pass,
+the sparse residual kernel applied to the small selected set (reuses `src/ternary.rs`), and an empirical
+check of the `m > 2δ` rule's false-short-circuit rate on held-out data.
+
 ---
 
 ## 6. The combine — a trivial Rust step, certified by Datalog
