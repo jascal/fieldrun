@@ -307,6 +307,9 @@ choice of `K` *is* the temperature. They cite each other across this limit; none
   bundles) and **MoE routing**: does the power-diagram combinatorics survive quantization, and do
   tropical cells align with `--route-frac` expert selection? Tokens within `ε` of a facet (small tropical
   margin) should be the ones that flip under quantization noise — a falsifiable prediction (§11, E7/E8).
+  [`TURBOQUANT.md`](./TURBOQUANT.md) supplies the *bound* for this: under TurboQuant the distortion is
+  isotropic (random rotation), so the normalized facet margin is stable iff `m > z·ρ(b,d)` with
+  `ρ ≈ c·2⁻ᵇ/√d` (the `‖U_t−U_v‖` cancels) — turning E7 into a measurement against a closed form.
 - **TO8** *(raised by Logic Export LE-T2)* Non-scalar provenance under the dense frame geometry
   `G_{vw} = ⟨U_v, U_w⟩`: the clean monomial-sum decomposition of TT4 assumes near-diagonal `G`; when the
   frame entangles, how is the interior-point test defined? (The tropical hypersurface is still exact —
