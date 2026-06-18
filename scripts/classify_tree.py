@@ -117,6 +117,39 @@ def token_function(t):
     if t.startswith(' ') or (s[:1].isupper() and s.isalpha()): return 'word'  # word-initial
     return 'affix'                                                   # continuation / suffix
 
+# --------------------------------------------------------------------------- code vs prose (lat sub-split)
+# The 'lat' bucket (undetermined Latin script) pools code identifiers, shared-European prose, and bare
+# math-variable symbols. A marker heuristic separates them (approximate, but well-separated in practice).
+CODE_KW = set("self def return class import from items item float int str bool print len range append "
+    "None True False null true false var let const lambda try except raise with yield async await "
+    "function func result index key value args kwargs init main test assert elif while for list dict "
+    "set tuple map filter object json node next prev tmp buf idx ptr get add new push pop param config "
+    "util array string number type void public private static final this super throw catch".split())
+
+def tok_is_code(t):
+    s = t.strip()
+    if s == '': return False
+    if '\n' in t and (re.search(r'[:){]\s*\n', t) or '\n\n' in t or re.search(r'\n +', t)): return True  # block structure
+    if '_' in s: return True                                          # snake_case / dunder
+    if re.search(r'[(){}\[\];=<>/|&%^~@]', s): return True            # operators / brackets
+    if re.match(r'\.[A-Za-z_]', s): return True                       # .attr / .method access
+    if s in CODE_KW: return True
+    return bool(re.search(r'[a-z][A-Z]', s))                          # camelCase
+
+def tok_is_prose(t):
+    s = t.strip()
+    if s == '' or tok_is_code(t): return False
+    if len(s) < 2: return False                                       # single letter → math var / initial, not prose
+    return bool(re.fullmatch(r"[A-Za-zÀ-ɏ'’\-]+", s)) and any(c.isalpha() for c in s)
+
+def lat_kind(toks):
+    """Sub-split a 'lat' (undetermined-Latin) leaf into code / prose / sym by routed-token weight."""
+    cw = sum(c for t, c in toks if tok_is_code(t))
+    pw = sum(c for t, c in toks if tok_is_prose(t))
+    if cw > pw and cw > 0: return 'code'
+    if pw > cw and pw > 0: return 'prose'
+    return 'sym'                                                      # single-letter vars / bare whitespace — neither
+
 # --------------------------------------------------------------------------- classify a leaf
 def classify(toks):
     kana = any(char_script(c) == 'kana' for tx, _ in toks for c in tx)
@@ -215,6 +248,8 @@ def main():
     langtot = collections.Counter(lg for lg, *_ in leaves)
     functot = collections.Counter(fn for _, fn, *_ in leaves)
     maxd    = max(l[2] for l in leaves)
+    lat_toks = [toks for lg, fn, d, lab, toks in leaves if lg == 'lat']
+    latk    = collections.Counter(lat_kind(t) for t in lat_toks)
 
     # ---- audit table
     print(f"{a.tree}: {len(leaves)} leaves  (|C|={stats['C']}  N={stats['ntok']}  "
@@ -231,6 +266,17 @@ def main():
             if cell[(lg,fn)]:
                 print(f"  {lg:>3} · {fn:<5} [{cell[(lg,fn)]:>3}]   {', '.join(repr(x) for x in ex[(lg,fn)])}")
 
+    if lat_toks:                                                  # the lat → code/prose/sym sub-split
+        print(f"\nlat → code / prose / sym  [{len(lat_toks)} undetermined-Latin leaves]:  {dict(latk)}")
+        latex = collections.defaultdict(list)
+        for t in lat_toks:
+            k = lat_kind(t)
+            if len(latex[k]) < 6:
+                latex[k].append((t[0][0] or '∅').replace('\n', '\\n'))
+        for k in ('code', 'prose', 'sym'):
+            if latk[k]:
+                print(f"  lat · {k:<5} [{latk[k]:>3}]   {', '.join(repr(x) for x in latex[k])}")
+
     if a.no_mermaid: return
     # ---- mermaid
     title = (f"monster expert tree<br/>{len(leaves)} leaves" +
@@ -240,6 +286,11 @@ def main():
     for lg in LANG_ORDER:
         if not langtot[lg]: continue
         out.append(f'  R --> L_{lg}["{LBL[lg]}<br/>({langtot[lg]})"]')
+        if lg == 'lat':                                           # split lat by code/prose/sym, not by func
+            for k in ('code', 'prose', 'sym'):
+                if latk[k]:
+                    out.append(f'  L_lat --> L_lat_{k}["{k} · {latk[k]}"]')
+            continue
         for fn in FUNC_ORDER:
             if cell[(lg,fn)]:
                 out.append(f'  L_{lg} --> L_{lg}_{fn}["{fn} · {cell[(lg,fn)]}"]')
