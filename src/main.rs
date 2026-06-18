@@ -47,6 +47,7 @@ mod ternary;
 #[cfg(feature = "api")]
 mod tools;
 mod tropical;
+mod turboquant;
 
 use std::collections::HashMap;
 
@@ -1669,6 +1670,101 @@ fn main() {
                 }
                 println!("(E2 cross-check: interior%/necessary% should track --probe-decompose's σ(t) and confirm-flip% on the same positions)");
             }
+            return;
+        }
+
+        // --probe-distortion (TurboQuant E-TQ2/E-TQ3): TurboQuant-compress the residual at b bits, recompute the
+        // logits, and measure the decision FLIP vs the tropical facet margin and the closed-form ρ(b,d). The random
+        // rotation isotropizes the distortion, so the (normalized) facet margin predicts stability: flip ⟺ margin ≲ z·ρ.
+        // Also reports the relative distortion vs the √3π/2·4⁻ᵇ bound and the per-token logit error. --store optional
+        // (adds the route split); --kv-bits is a comma list (default 8,4,2). Rope only (needs final_residual).
+        if has_flag(&args, "--probe-distortion") {
+            use retrieval::CandCfg;
+            let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+            let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+            let bits_list: Vec<u8> = flag(&args, "--kv-bits").unwrap_or("8,4,2").split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if bits_list.is_empty() { eprintln!("[fieldrun] --probe-distortion: --kv-bits parse failed"); return; }
+            let b2 = Bundle::load(&stem).expect("reload bundle");
+            let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
+            let (vocab, d) = b2.dims(un);
+            if lm.final_residual(&ids[..ctx_window.min(ids.len())]).is_none() {
+                eprintln!("[fieldrun] --probe-distortion: arch {arch} doesn't expose final_residual (rope only)"); return;
+            }
+            eprintln!("[fieldrun] --probe-distortion: precomputing ‖U_v‖² for {vocab} unembed rows…");
+            let unorm: Vec<f32> = (0..vocab).into_par_iter().map(|v| b2.weight_row(un, v).iter().map(|x| x * x).sum()).collect();
+            let cap = (end - ctx_window).min(n_eval).min(300);
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --probe-distortion: no eval positions (need --ids with > ctx_window tokens)"); return; }
+            let codecs: Vec<turboquant::Codec> = bits_list.iter().map(|&b| turboquant::Codec::new(b, 0x7B_C0DEC_u64, d)).collect();
+            eprintln!("[fieldrun] --probe-distortion: {} positions · bits {bits_list:?} · d={d} (dpad={}) · {} unembed tokens…", positions.len(), d.next_power_of_two(), vocab);
+            struct R { route: u8, margin: f32, rnorm: f32, per_bits: Vec<(bool, f32, f32)> } // per bits: (flipped, rel-RMS distortion, Δlogit_t)
+            let recs: Vec<R> = positions.par_iter().filter_map(|c| {
+                let r = lm.final_residual(c)?;
+                let l = b2.rowdot_f32(un, &r);
+                let t = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0;
+                let ut = b2.weight_row(un, t);
+                let g = b2.rowdot_f32(un, &ut);
+                let f = tropical::nearest_facet(&l, t, &unorm, &g);
+                let rn2: f32 = r.iter().map(|v| v * v).sum::<f32>().max(1e-12);
+                let route = match &store {
+                    Some(s) => { let kb = s.predict(c).0 as usize; if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 } }
+                    None => 3u8,
+                };
+                let per_bits = codecs.iter().map(|cd| {
+                    let rh = cd.roundtrip(&r);
+                    let lh = b2.rowdot_f32(un, &rh);
+                    let th = lh.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+                    let derr2: f32 = r.iter().zip(&rh).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (th != t, (derr2 / rn2).sqrt(), lh[t] - l[t])
+                }).collect();
+                Some(R { route, margin: f.dist, rnorm: rn2.sqrt(), per_bits })
+            }).collect();
+            let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
+            for (bi, &bits) in bits_list.iter().enumerate() {
+                let bound = (3f32.sqrt() * std::f32::consts::PI / 2.0 * 4f32.powi(-(bits as i32))).sqrt();
+                println!("\n=== --probe-distortion @ {bits} bits (ρ={:.2e}, rel-RMS bound {bound:.3}) — {} positions ===", turboquant::rho(bits, d), recs.len());
+                println!("{:<11}{:>6}{:>9}{:>14}{:>15}", "route", "n", "flip%", "rel-distort", "mean Δlogit_t");
+                for (lbl, rt) in &groups {
+                    let gg: Vec<&R> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                    if gg.is_empty() { continue; }
+                    let flip = 100.0 * gg.iter().filter(|x| x.per_bits[bi].0).count() as f32 / gg.len() as f32;
+                    let dist = gg.iter().map(|x| x.per_bits[bi].1).sum::<f32>() / gg.len() as f32;
+                    let derr = gg.iter().map(|x| x.per_bits[bi].2).sum::<f32>() / gg.len() as f32;
+                    println!("{lbl:<11}{:>6}{flip:>8.1}%{dist:>14.3}{derr:>15.2e}", gg.len());
+                }
+            }
+            // headline E-TQ2: flip-rate vs the stability ratio  margin / (‖r̂−r‖/√d). The random rotation makes
+            // r̂−r isotropic, so its projection on the unit facet normal has RMS ‖r̂−r‖/√d (= rel-RMS·‖r‖/√d) — the
+            // distance the decision actually moves toward the facet. flip ⟺ that exceeds the margin (ratio ≲ 1).
+            let sd = (d as f32).sqrt();
+            println!("\n=== flip-rate vs facet-margin / projected-displacement  (E-TQ2: flip ⟺ ratio ≲ 1) ===");
+            println!("  ratio = margin·√d / ‖r̂−r‖  (the isotropic facet-normal displacement, TT2 / TQ-T2)");
+            for (bi, &bits) in bits_list.iter().enumerate() {
+                let cells: Vec<(String, f32, f32)> = [(0.0f32, 1.0f32), (1.0, 2.0), (2.0, 4.0), (4.0, f32::INFINITY)].iter().filter_map(|&(blo, bhi)| {
+                    let gg: Vec<&R> = recs.iter().filter(|x| {
+                        let disp = x.per_bits[bi].1 * x.rnorm / sd;
+                        let ratio = if disp > 0.0 { x.margin / disp } else { f32::INFINITY };
+                        ratio >= blo && ratio < bhi
+                    }).collect();
+                    if gg.is_empty() { return None; }
+                    let flip = 100.0 * gg.iter().filter(|x| x.per_bits[bi].0).count() as f32 / gg.len() as f32;
+                    let lbl = if bhi.is_infinite() { format!("≥{blo:.0}") } else { format!("{blo:.0}–{bhi:.0}") };
+                    Some((lbl, gg.len() as f32, flip))
+                }).collect();
+                let row = cells.iter().map(|(l, n, f)| format!("{l}: {f:.0}% (n{n:.0})")).collect::<Vec<_>>().join("  ");
+                println!("  @ {bits} bits   {row}");
+            }
+            println!("(prediction: flip% drops sharply as ratio passes ~1; cleanest at higher bits where the perturbation is small)");
+            // gate calibration: the conservative short-circuit threshold — coverage + residual flip at the most-stressed bits.
+            let bi_lo = bits_list.iter().enumerate().min_by_key(|(_, &b)| b).map(|(i, _)| i).unwrap_or(0);
+            println!("\n=== gate calibration @ {} bits (most stress) — short-circuit when margin·√d/‖r̂−r‖ ≥ T ===", bits_list[bi_lo]);
+            for thr in [1.0f32, 2.0, 3.0, 4.0] {
+                let above: Vec<&R> = recs.iter().filter(|x| { let disp = x.per_bits[bi_lo].1 * x.rnorm / sd; disp > 0.0 && x.margin / disp >= thr }).collect();
+                if above.is_empty() { continue; }
+                let flip = 100.0 * above.iter().filter(|x| x.per_bits[bi_lo].0).count() as f32 / above.len() as f32;
+                println!("  T ≥ {thr:.0}: covers {}/{} positions ({:.0}%), residual flip {flip:.2}%", above.len(), recs.len(), 100.0 * above.len() as f32 / recs.len().max(1) as f32);
+            }
+            println!("  ⇒ pick the smallest T with acceptable residual flip as the gate multiplier (the hybrid's δ-gate, §5.1/TQ-T2).");
             return;
         }
 
