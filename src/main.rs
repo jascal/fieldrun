@@ -1387,6 +1387,64 @@ fn main() {
             return;
         }
 
+        // --gen-shortcircuit (HY-O2 token-substitution drift): greedy-generate two trajectories from the same prompt —
+        // (ref) always the full-forward argmax, (hybrid) the lookup token when the gate fires else the full-forward
+        // argmax — both STATELESS (full recompute each step → NO KV hole). This isolates the token-SUBSTITUTION drift
+        // of emitting lookup tokens from the separate KV-hole error (the remaining HY-O2 piece). Reports gate coverage
+        // along the hybrid path, per-step substitution fidelity (did the short-circuit emit what the forward would have
+        // at the SAME hybrid context), and trajectory agreement vs the reference run (matched positions + first
+        // divergence). If emitting lookup tokens derails generation HERE, the short-circuit is scoring-only regardless
+        // of the cache. Knobs: --sc-order {induction|quad|tri|bi|any} (default quad), --sc-fanout c (default 1),
+        // --gen-new N (default 48). Rope only, needs --store.
+        if has_flag(&args, "--gen-shortcircuit") {
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) { Some(s) => s, None => { eprintln!("[fieldrun] --gen-shortcircuit: needs --store"); return; } };
+            let prompt = &ids[..ctx_window.min(ids.len())];
+            if lm.logits(prompt).is_none() { eprintln!("[fieldrun] --gen-shortcircuit: rope only"); return; }
+            let gen_new = flag(&args, "--gen-new").and_then(|s| s.parse::<usize>().ok()).unwrap_or(48);
+            let order = |s: &str| -> u8 { if s.starts_with("induction") { 4 } else if s.starts_with("quad") { 3 } else if s.starts_with("tri") { 2 } else if s.starts_with("bi") { 1 } else { 0 } };
+            let th = match flag(&args, "--sc-order").unwrap_or("quad") { "induction" => 4u8, "quad" => 3, "tri" => 2, "bi" => 1, _ => 0 };
+            let c = flag(&args, "--sc-fanout").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+            eprintln!("[fieldrun] --gen-shortcircuit: gate (order ≥ {th}, fan-out ≤ {c}) · {gen_new} new tokens from a {}-token prompt…", prompt.len());
+            // reference trajectory: pure full-forward greedy.
+            let mut rctx = prompt.to_vec();
+            let mut rtoks: Vec<i64> = Vec::with_capacity(gen_new);
+            for _ in 0..gen_new { let t = lm.predict(&rctx); rtoks.push(t); rctx.push(t); }
+            // hybrid trajectory: lookup token when gated, else full-forward argmax (stateless → no KV hole).
+            let mut hctx = prompt.to_vec();
+            let mut htoks: Vec<i64> = Vec::with_capacity(gen_new);
+            let (mut gated, mut sub_correct) = (0usize, 0usize);
+            for _ in 0..gen_new {
+                let (kb, src, fan) = store.predict_conf(&hctx);
+                let emit = if order(&src) >= th && fan <= c {
+                    gated += 1;
+                    if lm.predict(&hctx) == kb { sub_correct += 1; } // would the forward have emitted this, here?
+                    kb
+                } else {
+                    lm.predict(&hctx)
+                };
+                htoks.push(emit);
+                hctx.push(emit);
+            }
+            let lcp = rtoks.iter().zip(&htoks).take_while(|(a, b)| a == b).count();
+            let matched = rtoks.iter().zip(&htoks).filter(|(a, b)| a == b).count();
+            println!("\n=== --gen-shortcircuit: token-substitution drift (HY-O2, scoring/stateless) — {gen_new} tokens ===");
+            println!("  gate: source order ≥ {th}, fan-out ≤ {c}");
+            println!("  short-circuit coverage along the hybrid path: {}/{gen_new}  ({:.0}%)", gated, 100.0 * gated as f32 / gen_new as f32);
+            if gated > 0 {
+                println!("  per-step substitution fidelity (lookup == forward argmax at the hybrid context): {}/{}  ({:.0}%)", sub_correct, gated, 100.0 * sub_correct as f32 / gated as f32);
+            }
+            println!("  trajectory vs reference: {}/{gen_new} positions match ({:.0}%); identical prefix length {lcp}", matched, 100.0 * matched as f32 / gen_new as f32);
+            if lcp < gen_new {
+                println!("  first divergence at step {lcp}: ref→{} vs hybrid→{}", rtoks[lcp], htoks[lcp]);
+            } else {
+                println!("  trajectories IDENTICAL — the short-circuit never changed the greedy path at this gate.");
+            }
+            println!("\n  this isolates token substitution (stateless: full recompute, no KV hole). A short LCP / low match");
+            println!("  means lookup tokens derail the trajectory → scoring-only; a long LCP means the substitution is");
+            println!("  benign and the remaining HY-O2 risk is just the cached KV-hole error (separate, kernel-level).");
+            return;
+        }
+
         // --probe-compute (HY-O1): the compute-tier residual DIAL. Truncate the int8 attn/MLP weights to a coarse
         // K-trit "bulk" (≈int4 at K=3) in a second model, run the full forward, and compare its decode to the int8
         // reference — swept over --bulk-trits (comma list). This is one axis of the speed/accuracy frontier (the other
