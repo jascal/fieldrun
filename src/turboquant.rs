@@ -1,7 +1,10 @@
 //! TurboQuant codec — a structured random rotation (SRHT) + a data-free per-coordinate Lloyd–Max scalar
 //! quantizer (TURBOQUANT.md; Zandieh–Daliri–Hadian–Mirrokni, arXiv:2504.19874). Pure geometry — no model,
 //! no I/O — so it is unit-testable in isolation, and it is the codec behind `--probe-distortion` (E-TQ2:
-//! flip-rate vs facet margin / distortion) and, later, the optional KV-cache mode.
+//! flip-rate vs facet margin / distortion) and the `--probe-kv-quant` KV-cache fidelity sweep. The latter
+//! found the per-head MSE codec is NOT a win for the KV cache vs per-head int8 at small `head_dim` (it has a
+//! higher decision-flip rate despite lower logit-L2, and collapses below 8 bits — TURBOQUANT.md §3, TQ-O6);
+//! a full-`d` rotation or the unbiased `prod`/QJL inner-product mode are the untested alternatives.
 //!
 //! The point of the random rotation: it **isotropizes** the quantization distortion. A unit vector's
 //! coordinates become ~`N(0, 1/d)` after rotation, so a per-coordinate scalar quantizer is near-optimal,

@@ -164,6 +164,78 @@ impl Rope {
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }
 
+    /// Copy of `hidden` with the K/V cache round-tripped through a quantizer per (position, kv-head) — the
+    /// `--probe-kv-quant` fidelity sweep. `turbo_bits=None` → the int8 per-head max-scale scheme (== `forward_block_q`'s
+    /// runtime cache); `Some(b)` → TurboQuant (SRHT rotation + Lloyd–Max levels, `Codec::roundtrip` per head-vector).
+    /// The round-trip is applied to K and V right after RoPE, before attention, so this measures the DISTORTION the
+    /// cache quant injects into the decision — the cheap test of whether TurboQuant's isotropy buys a lower-bit KV
+    /// cache (→ longer context in fixed RAM) than per-head int8 can. (The persistent bit-packed cache wired into the
+    /// streaming decode is the runtime mode, a follow-up; here k/v ARE the whole cache since this is a cur=0 prefill.)
+    fn hidden_kvq(&self, ids: &[i64], turbo_bits: Option<u8>) -> Array2<f32> {
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let codec = turbo_bits.map(|b| crate::turboquant::Codec::new(b, 0x5EED_4B0B, hd));
+        let mut x = self.b.rows_f32("embed", ids);
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let mut v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            // round-trip K and V per (row, kv-head) through the chosen quantizer (the cache-quant distortion).
+            for i in 0..seq {
+                for kh in 0..nkv {
+                    let base = kh * hd;
+                    for arr in [&mut k, &mut v] {
+                        let vec: Vec<f32> = (0..hd).map(|c| arr[[i, base + c]]).collect();
+                        let rt = match &codec {
+                            Some(cd) => cd.roundtrip(&vec),
+                            None => {
+                                let sc = (vec.iter().fold(0f32, |mx, &val| mx.max(val.abs())) / 127.0).max(1e-8);
+                                vec.iter().map(|&val| (val / sc).round().clamp(-127.0, 127.0) * sc).collect()
+                            }
+                        };
+                        for c in 0..hd {
+                            arr[[i, base + c]] = rt[c];
+                        }
+                    }
+                }
+            }
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        rmsnorm(&x, self.b.arr1("norm"), self.eps)
+    }
+
     /// Causal-ablation copy of `hidden`: re-run the forward with the given attention heads `ah` (layer, head) and MLP
     /// neurons `an` (layer, neuron) ZEROED out of the residual stream (so downstream layers recompute without them).
     /// A separate copy keeps the faithfulness-gated `hidden` pristine. Research tool (`--probe-ablate`), not gated.
@@ -630,6 +702,11 @@ impl Model for Rope {
 
     fn logits_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<Vec<f32>> {
         let xf = self.hidden_ab(ids, heads, neurons, &[], &[]);
+        Some(self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    fn logits_kvq(&self, ids: &[i64], turbo_bits: Option<u8>) -> Option<Vec<f32>> {
+        let xf = self.hidden_kvq(ids, turbo_bits);
         Some(self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec()))
     }
 
