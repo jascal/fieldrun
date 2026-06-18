@@ -1778,7 +1778,7 @@ fn main() {
             use retrieval::CandCfg;
             let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
             let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
-            let kbulk: usize = flag(&args, "--bulk-trits").and_then(|s| s.parse().ok()).unwrap_or(3).clamp(1, 6);
+            let kbulk_arg: usize = flag(&args, "--bulk-trits").and_then(|s| s.parse().ok()).unwrap_or(3).max(1);
             let b2 = Bundle::load(&stem).expect("reload bundle");
             let un = if b2.has("lm_head") { "lm_head" } else { "embed" };
             let (vocab, d) = b2.dims(un);
@@ -1786,7 +1786,6 @@ fn main() {
                 eprintln!("[fieldrun] --probe-residual: arch {arch} doesn't expose final_residual (rope only)"); return;
             }
             let stored_int8 = b2.weight_row_int8(un, 0).is_some();
-            eprintln!("[fieldrun] --probe-residual: int8 reference + {kbulk}-trit bulk of '{un}' ({vocab}×{d}{}) — full int8 = 6 trits…", if stored_int8 { ", stored int8" } else { ", quantizing f16→int8" });
             // Per row → (int8 codes, scale). Stored-int8 → the codes directly; f16/f32 → int8-quantize (the fixed-point
             // reference) so the bulk/residual split is well-defined. ref8 = codes×scale; bulk = top-kbulk-trit recon.
             let row_cs = |v: usize| -> (Vec<i64>, f32) {
@@ -1796,19 +1795,27 @@ fn main() {
                     None => { let amax = full.iter().fold(0f32, |m, &x| m.max(x.abs())); let s = (amax / 127.0).max(1e-12); (full.iter().map(|&w| (w / s).round().clamp(-127.0, 127.0) as i64).collect(), s) }
                 }
             };
+            // Trit width from the ACTUAL code range (int8 ⇒ 6, int4 ⇒ 3, …), not hardcoded. The "bulk" keeps the top
+            // kbulk trits and drops the low (kfull − kbulk) as the exact residual; the mask restores them where they decide.
+            let qmax: i64 = (0..vocab).into_par_iter().map(|v| row_cs(v).0.iter().map(|&c| c.abs()).max().unwrap_or(0)).max().unwrap_or(127);
+            let (kfull, kbulk) = (ternary::trits_for(qmax), kbulk_arg.min(ternary::trits_for(qmax)));
+            eprintln!("[fieldrun] --probe-residual: int8 reference + {kbulk}/{kfull}-trit bulk of '{un}' ({vocab}×{d}{}, |code|≤{qmax})…", if stored_int8 { ", stored int8" } else { ", quantizing f16→int8" });
             let u_int8: Vec<f32> = (0..vocab).into_par_iter().flat_map(|v| { let (codes, s) = row_cs(v); codes.iter().map(|&c| c as f32 * s).collect::<Vec<f32>>() }).collect();
             let u_bulk: Vec<f32> = (0..vocab).into_par_iter().flat_map(|v| {
                 let (codes, s) = row_cs(v);
-                codes.iter().map(|&c| { let mut t = ternary::to_trits(c, 6); for tj in t.iter_mut().take(6 - kbulk) { *tj = 0; } ternary::from_trits(&t) as f32 * s }).collect::<Vec<f32>>()
+                codes.iter().map(|&c| { let mut t = ternary::to_trits(c, kfull); for tj in t.iter_mut().take(kfull - kbulk) { *tj = 0; } ternary::from_trits(&t) as f32 * s }).collect::<Vec<f32>>()
             }).collect();
             let unorm: Vec<f32> = (0..vocab).map(|v| u_int8[v * d..(v + 1) * d].iter().map(|x| x * x).sum()).collect();
             let cap = (end - ctx_window).min(n_eval).min(300);
             let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
             if positions.is_empty() { eprintln!("[fieldrun] --probe-residual: no eval positions"); return; }
-            eprintln!("[fieldrun] --probe-residual: {} positions · bulk={kbulk} trits (~int{}) · {vocab} rows…", positions.len(), if kbulk <= 3 { 4 } else { 8 });
-            let mut mask: std::collections::BTreeSet<i64> = Default::default();
-            struct Rr { route: u8, margin: f32, flip: bool, dswing: f32 }
-            let mut recs: Vec<Rr> = Vec::new();
+            eprintln!("[fieldrun] --probe-residual: {} positions · {vocab} rows…", positions.len());
+            // RouteRec: per-decision record — route class, facet margin, whether the bulk flipped it, and the winner's
+            // residual logit swing |l_full[t]−l_bulk[t]| (the per-layer δ). The mask invariant: every row v with
+            // l_bulk[v] ≥ l_full[t] is kept exact, which (with t exact) guarantees t stays the argmax — by construction.
+            let mut mask: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+            struct RouteRec { route: u8, margin: f32, flip: bool, dswing: f32 }
+            let mut recs: Vec<RouteRec> = Vec::new();
             for c in &positions {
                 let r = match lm.final_residual(c) { Some(r) => r, None => continue };
                 let l_full: Vec<f32> = (0..vocab).into_par_iter().map(|v| u_int8[v * d..(v + 1) * d].iter().zip(&r).map(|(a, b)| a * b).sum()).collect();
@@ -1831,7 +1838,7 @@ fn main() {
                     Some(s) => { let kb = s.predict(c).0 as usize; if kb == t { 0u8 } else if s.candidates(c, &cfg).contains(&(t as i64)) { 1 } else { 2 } }
                     None => 3u8,
                 };
-                recs.push(Rr { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs() });
+                recs.push(RouteRec { route, margin: f.dist, flip: tb != t, dswing: (lft - l_bulk[t]).abs() });
             }
             if recs.is_empty() { eprintln!("[fieldrun] --probe-residual: no positions produced a residual"); return; }
             let groups: Vec<(&str, u8)> = if store.is_some() { vec![("RETRIEVED", 0), ("SELECTED", 1), ("COMPOSED", 2), ("ALL", 255)] } else { vec![("ALL", 255)] };
@@ -1839,7 +1846,7 @@ fn main() {
             println!("  bulk-only (no residual) decision flip vs int8, by route:");
             println!("{:<11}{:>6}{:>9}{:>16}{:>14}", "route", "n", "flip%", "δ swing (logit)", "margin");
             for (lbl, rt) in &groups {
-                let gg: Vec<&Rr> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
+                let gg: Vec<&RouteRec> = recs.iter().filter(|x| *rt == 255 || x.route == *rt).collect();
                 if gg.is_empty() { continue; }
                 let flip = 100.0 * gg.iter().filter(|x| x.flip).count() as f32 / gg.len() as f32;
                 let dsw = gg.iter().map(|x| x.dswing).sum::<f32>() / gg.len() as f32;
