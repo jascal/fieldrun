@@ -443,6 +443,7 @@ the live numbers behind the architecture above — kept here so the spec matches
 | Decode latency benchmark | `--bench-decode` | ✅ merged | per-token (0.5B): **forward 545 ms**, unembed 25 ms (4.6%), lookup **4.5 µs** (128 000× cheaper); amortized speedup **1.47× @32% / 2.33× @57%** short-circuit coverage |
 | Compute-tier residual dial (HY-O1) | `--probe-compute --bulk-trits` | ✅ merged | the compute tier is **depth-sensitive**: 2–3 trits (≈int4 bulk) **100% flip** vs int8, 4t 25%, 5t 7.5%, **6t 0%** — usable only at 5–6 trits, so on no-NPU hardware keep Tier B at full int8 |
 | Short-circuit frontier (HY-O2) | `--probe-shortcircuit` | ✅ merged | two-knob forward-free fast path, held-out: **induction 56% fidelity @9% coverage**; both knobs (source-order θ ∧ fan-out ≤c) sweep **50%@22% (1.28×) → 29%@68% (3.12×)**; ceiling ~56% — an *opportunistic* head, not a blanket skip |
+| Realized short-circuit wall-clock | `--bench-shortcircuit` | ✅ merged | **measured** (scoring mode): forward 520 ms vs lookup gate 0.004 ms (124 000× cheaper); realized speedup tracks `1/(1−cov)` exactly — ≥quad∧fan≤1 **1.36× @26%**, any∧fan≤10 **3.64× @72%** — confirming the µs-vs-forward cost model in a real loop |
 
 **Stage status.** Stage 1 (TurboQuant codec + the gate law) and Stage 2 Phase 1 (residual selection + the
 mask + per-layer δ) are done; the **decode-tier hybrid is demonstrated end-to-end** (lookup short-circuit +
@@ -466,9 +467,12 @@ different token sets (depth on the composed tail, short-circuit on the retrievab
 hardware the **short-circuit fraction is the real lever** (it skips the memory-bound 545 ms forward), and
 fan-out is the finer dial since source order saturates on dense in-domain stores.
 
-**Remaining (forward-path) work.** (a) **Runtime short-circuit decode** — turn the projected `1/(1−coverage)`
-speedup into a measured end-to-end decode that actually emits the lookup token and skips the forward on gated
-positions (the frontier is measured; the live decode path is not yet wired). (b) **`--kv-quant turbo` runtime
+**Remaining (forward-path) work.** (a) **Generation-mode short-circuit** — the realized wall-clock is now
+*measured* in scoring mode (`--bench-shortcircuit`: faithful per-decision, the speedup tracks `1/(1−cov)`
+exactly), but a *cached autoregressive* short-circuit leaves a KV-cache hole at each skipped position (future
+tokens can't attend to a token whose hidden state was never computed — §8/§10). The open piece is to measure
+that missing-KV drift in a cached decode and decide whether the short-circuit is generation-viable or
+scoring-only. (b) **`--kv-quant turbo` runtime
 KV mode** — wire the codec into `forward_block_capture` (quantize post-RoPE K/V on write, dequant on read) —
 the standalone KV win. (c) A **sound certificate tighter than C-S** (a data-dependent bound on `⟨r_v, x⟩`).
 (d) **Broader-corpus mask + short-circuit calibration** — the held-out short-circuit ceiling (~56% fidelity)

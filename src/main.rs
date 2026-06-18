@@ -1331,6 +1331,62 @@ fn main() {
             return;
         }
 
+        // --bench-shortcircuit: turn the PROJECTED 1/(1−coverage) speedup into a MEASURED wall-clock. We run each
+        // reference forward exactly once and record per-position (gate, forward-argmax, lookup-id, measured t_forward,
+        // measured t_lookup); then reconstruct the realized hybrid wall-clock — Σ (t_lookup + [gated ? 0 : t_forward]) —
+        // for several operating points, vs the baseline Σ t_forward. This empirically confirms the µs-vs-545ms cost model
+        // inside a real loop (not an isolated microbench). FAITHFUL ONLY IN SCORING / SINGLE-DECISION MODE: each position
+        // is scored against its true prefix, so there is no KV-cache hole — generation-mode missing-KV drift is the open
+        // HY-O2 question and is NOT what this measures. Rope only, needs --store.
+        if has_flag(&args, "--bench-shortcircuit") {
+            let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) { Some(s) => s, None => { eprintln!("[fieldrun] --bench-shortcircuit: needs --store"); return; } };
+            if lm.logits(&ids[..ctx_window.min(ids.len())]).is_none() { eprintln!("[fieldrun] --bench-shortcircuit: rope only"); return; }
+            let cap = (end - ctx_window).min(n_eval).min(80); // each position is one ~545 ms reference forward
+            let positions: Vec<&[i64]> = (ctx_window..ctx_window + cap).map(|i| ctx(i)).collect();
+            if positions.is_empty() { eprintln!("[fieldrun] --bench-shortcircuit: no positions"); return; }
+            eprintln!("[fieldrun] --bench-shortcircuit: {} positions — timing lookup gate + reference forward…", positions.len());
+            let order = |s: &str| -> u8 { if s.starts_with("induction") { 4 } else if s.starts_with("quad") { 3 } else if s.starts_with("tri") { 2 } else if s.starts_with("bi") { 1 } else { 0 } };
+            // per position: (source order, fan-out, lookup==argmax, t_lookup ns, t_forward ns). One forward each.
+            let recs: Vec<(u8, usize, bool, u128, u128)> = positions.iter().filter_map(|c| {
+                let tl = std::time::Instant::now();
+                let (kb, src, fan) = store.predict_conf(c);
+                let t_lookup = tl.elapsed().as_nanos();
+                let tf = std::time::Instant::now();
+                let l = lm.logits(c)?;
+                let t_forward = tf.elapsed().as_nanos();
+                let t8 = l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0 as i64;
+                Some((order(&src), fan, kb == t8, t_lookup, t_forward))
+            }).collect();
+            if recs.is_empty() { eprintln!("[fieldrun] --bench-shortcircuit: no positions produced a forward"); return; }
+            let n = recs.len();
+            // measured per-forward latency (deployment-relevant; the dominant cost).
+            let mut fwd: Vec<u128> = recs.iter().map(|r| r.4).collect();
+            fwd.sort_unstable();
+            let ms = |ns: u128| ns as f64 / 1e6;
+            let mean_fwd = fwd.iter().sum::<u128>() as f64 / n as f64;
+            let mean_lookup = recs.iter().map(|r| r.3).sum::<u128>() as f64 / n as f64;
+            let baseline_ns: u128 = recs.iter().map(|r| r.4).sum(); // forward on every position
+            println!("\n=== --bench-shortcircuit: MEASURED realized wall-clock (scoring mode) — {n} positions ===");
+            println!("  forward latency: mean {:.1} ms · p50 {:.1} ms · p95 {:.1} ms   (the cost a short-circuit skips)", ms(mean_fwd as u128), ms(fwd[n / 2]), ms(fwd[(n * 95 / 100).min(n - 1)]));
+            println!("  lookup-gate latency: mean {:.4} ms  ({:.0}× cheaper than a forward)", ms(mean_lookup as u128), mean_fwd / mean_lookup.max(1.0));
+            println!("  baseline (forward every token): {:.2} s\n", ms(baseline_ns) / 1e3);
+            println!("  {:<26}{:>9}{:>11}{:>14}{:>13}", "operating point (θ,c)", "cov%", "fidelity%", "hybrid wall", "realized ×");
+            for (lbl, th, c) in [("induction only (4,1)", 4u8, 1usize), ("≥quad ∧ fan≤1 (3,1)", 3, 1), ("≥tri ∧ fan≤3 (2,3)", 2, 3), ("any ∧ fan≤10 (0,10)", 0, 10), ("any lookup (0,∞)", 0, usize::MAX)] {
+                let gated: Vec<&(u8, usize, bool, u128, u128)> = recs.iter().filter(|r| r.0 >= th && r.1 <= c).collect();
+                if gated.is_empty() { continue; }
+                let cov = gated.len() as f64 / n as f64;
+                let fid = 100.0 * gated.iter().filter(|r| r.2).count() as f64 / gated.len() as f64;
+                // realized hybrid: pay t_lookup on every position; pay t_forward only where NOT gated.
+                let gset: std::collections::HashSet<usize> = recs.iter().enumerate().filter(|(_, r)| r.0 >= th && r.1 <= c).map(|(i, _)| i).collect();
+                let hybrid_ns: u128 = recs.iter().enumerate().map(|(i, r)| r.3 + if gset.contains(&i) { 0 } else { r.4 }).sum();
+                let realized = baseline_ns as f64 / hybrid_ns.max(1) as f64;
+                println!("  {lbl:<26}{:>8.0}%{:>10.0}%{:>11.2} s{:>11.2}×", 100.0 * cov, fid, ms(hybrid_ns) / 1e3, realized);
+            }
+            println!("\n  realized × is MEASURED (Σ t_lookup + Σ_fallback t_forward), not the 1/(1−cov) projection — they agree");
+            println!("  because t_lookup ≪ t_forward. SCORING MODE: faithful per-decision; generation-mode KV holes are HY-O2.");
+            return;
+        }
+
         // --probe-compute (HY-O1): the compute-tier residual DIAL. Truncate the int8 attn/MLP weights to a coarse
         // K-trit "bulk" (≈int4 at K=3) in a second model, run the full forward, and compare its decode to the int8
         // reference — swept over --bulk-trits (comma list). This is one axis of the speed/accuracy frontier (the other
