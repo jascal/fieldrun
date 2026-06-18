@@ -23,22 +23,26 @@ tier (induction / n-gram / grammar — a lookup) and a **COMPUTED** tier (attent
 the "forge tax"). This proposal runs each tier in its natural substrate — **all within fieldrun's existing
 framework-free pure-Rust runtime** — and keeps Datalog as the proof, not the plumbing:
 
-> **Lookup → a Rust KB facility** (exact, O(1); `retrieval::Store` today, an `fst`/perfect-hash index for
-> scale). **Composition → balanced-ternary matmuls** (lossless via expansion, sparse sign-flip-accumulate;
+> **Lookup → a Rust KB facility** (O(1); `retrieval::Store` today, an `fst`/perfect-hash index for
+> scale; exact *w.r.t. its stored table* — a predictor of the model, exact-w.r.t.-the-model on the
+> retrievable fraction). **Composition → balanced-ternary matmuls** (lossless via expansion, sparse sign-flip-accumulate;
 > a Rust kernel mirroring `i4_dot`). **Combine → a trivial Rust join+argmax** over the two tiers' summed
 > contributions (the `T=0` tropical decode; `log-sum-exp` for the `T=1` measure). **Soufflé/Datalog is the
 > *offline certificate*** that proves this engine is faithful (the `LE-T5` round-trip), **not** the runtime.
 
-The key consequence: **both tiers are exact**, so the combine is exact up to the single float→int
-fixed-point step. "Get as close as possible to the original" therefore becomes "**exactly equal to the
-chosen-precision model**," and the cost (the ternary `K×` width blowup) — not accuracy — is the only
-variable to optimize. The combine itself is a relational join + aggregate with **no recursion and no
+The key consequence is **two-regime, per decision**: on the path that recomputes the composition, Tier B's
+ternary identity makes the combine **exact** up to the single float→int fixed-point step — so "get as close
+as possible" becomes "**exactly equal to the chosen-precision model**," with the ternary `K×` width blowup
+the cost to optimize. The cost-saving short-circuit path (Tier A's stored lookup, Tier B skipped) is instead
+**gate-sound, not exact** — the flat KB is a *predictor* of the model. *Exact* and *cheap* do not coincide on
+the same decision; the honest objective is exact-on-recompute, calibrated-sound-on-short-circuit. The combine itself is a relational join + aggregate with **no recursion and no
 fixpoint**, so it is a handful of Rust lines, not a Datalog-engine workload — Datalog's value here is
-verification and framing (§6), which are offline. The split also **dissolves the dense-Gram wall**
-(`LOGIC_EXPORT` LE-T4) that blocks the whole-model Datalog *export*: retrieved logits enter as **EDB
-facts** from the lookup, so the certified program is the small *combine*, not the dense forward. The lookup
-**short-circuits** the RETRIEVED majority; the ternary tier is the exact **fallback** that carries the
-COMPOSED tail, gated by the tropical **facet margin** (TT2). The hard part is honest and stated (§7, §9):
+verification and framing (§6), which are offline. The split also **sidesteps the dense-Gram wall** for the
+combine certificate (`LOGIC_EXPORT` LE-T4): retrieved logits enter as **EDB facts** from the lookup, so the
+certified program is the small *combine*, not the dense forward — though the dense-`G` coupling itself
+relocates *into* Tier B rather than vanishing (§6). The lookup
+**short-circuits** the high-margin RETRIEVED fraction (~25%); the ternary tier is the exact **fallback**
+that carries the rest, gated by the tropical **facet margin** (TT2). The hard part is honest and stated (§7, §9):
 the split is per-*decision*, not a static per-*weight* partition.
 
 ---
@@ -47,11 +51,24 @@ the split is per-*decision*, not a static per-*weight* partition.
 
 The retrievable/computed boundary is **the model's own structure**, not an imposed one:
 
-- **Measured.** `FINDINGS.md` §5 classifies every decision RETRIEVED / SELECTED / COMPOSED by whether a
-  context-keyed KB (induction + n-gram + grammar) reproduces the model's pick. On the 7B "monster" run
-  (30k tokens, 10 languages + code + math): **~57% span-1 routable** (the deciding atom fits one expert),
-  and the deciding circuits are **~93% sparser** than the full set (oracle-router proxy). The COMPOSED
-  fraction is **~15% on natural text / ~37% on code**.
+- **Measured (Qwen2.5-0.5B — the committed results here are 0.5B).** `FINDINGS.md` §5 classifies every decision
+  RETRIEVED / SELECTED / COMPOSED by whether a context-keyed KB (induction + n-gram + grammar) reproduces
+  the model's pick: on natural text **~25% RETRIEVED, ~60% SELECTED, ~15% COMPOSED** (COMPOSED rises to
+  **~37% on code** — TROPICAL TT5; from ~63% vs ~85% candidate coverage). The genuinely lookup-routable
+  fraction — a flat KB's top-1 == the model — is the **~25% RETRIEVED**; SELECTED still needs Tier B to
+  pick *within* the candidate set.
+- **Routable / sparse — the MoE oracle proxy.** Separately, the density-bucketing sweeps
+  (`DENSITY_BUCKETING.md`, `SWEEP_RESULTS.md`) measure **span-1 routability** (does the deciding atom fit
+  one *expert*) — strongly bimodal, **~50–56% prose vs ~92–95% code/math** — and an `active_fewer`
+  circuit-count saving (up to ~80–90%). The largest *committed* mixed run is the **0.5B "monster"
+  corpus-decompose (15k tokens, 10 wiki languages + code + math)**. A **7B monster run (~30k tokens, same
+  domains) was done on a separate machine** — the source of the earlier **~57% span-1 / ~93%-sparser**
+  figures — but its results are **not yet imported into this repo**, so treat those numbers as *pending
+  verification* until committed. <!-- TODO(7B): import the 7B monster-run results; swap this pending note
+  for the committed figures + source path, and restore the 7B framing in HY-T3's cost-model input. -->
+ Caveat carried from those docs: `active_fewer` is a *static oracle-router
+  proxy that assumes each token's atom is already known* — an upper bound, not a wall-clock saving; and
+  span-1 (expert routing) is a different quantity from the RETRIEVED lookup fraction above.
 - **Partitioned.** The density-bucketing work (`DENSITY_BUCKETING.md`) clusters the model's circuits into
   retrievable hub-experts + a dense residual; the residual is the part no hub absorbs.
 - **Already emitted in two tiers.** `LOGIC_EXPORT` (LO3) emits **Tier A** (the retrievable fragment as
@@ -71,7 +88,7 @@ context tokens                                            ─── all Rust (on
    │
    ├─►  [Tier A — Rust lookup facility]      retrieval / selection
    │      n-gram / induction / grammar KB  →  candidate set + retrieved logits
-   │      retrieval::Store today / fst|perfect-hash for scale;  EXACT (stored values); no quantization
+   │      retrieval::Store today / fst|perfect-hash for scale;  exact w.r.t. stored values (a model predictor); no quant
    │      (the tropical-rank-1 table — what a flat KB can express, TT5)
    │
    ├─►  [Tier B — Rust ternary composition engine]  composition / forge tax
@@ -95,21 +112,30 @@ This is the load-bearing idea. Naive ternarization (and the lossy-quant line in 
 *approximates* the model and then bounds the error. Divide-and-conquer + **lossless** expansion removes
 the approximation:
 
-- **Tier A is exact** — it *stores* the retrieved values; a lookup has no quantization error.
+- **Tier A is exact *w.r.t. its stored table*** — a lookup has no quantization error. But the table is a
+  *predictor* of the model (a flat KB), so it is exact-w.r.t.-*the-model* only on the **~25% RETRIEVED**
+  fraction (held-out lookup agreement is partial — SWEEP_RESULTS `lookup_HO`); elsewhere, reproducing the
+  model means recomputing it in Tier B.
 - **Tier B is exact** — the balanced-ternary expansion `Σᵢ wᵢxᵢ = Σⱼ 3ʲ (Σᵢ tᵢⱼxᵢ)` is an identity
   (`tᵢⱼ ∈ {−1,0,+1}`), verified **byte-identical on real int8 weights** by `--verify-ternary`
   (`src/ternary.rs`; PASS, i64-exact).
-- Therefore **the combine is exact**, up to the one lossy step that *any* finite-precision scheme has:
-  `float → w_int = round(w/s)` (choosing the fixed-point precision `s`).
+- Therefore **the combine is exact on the full-recompute path** — where Tier B carries the composition and
+  Tier A contributes the model's own retrievable share — up to the one lossy step that *any* finite-precision
+  scheme has: `float → w_int = round(w/s)` (choosing the fixed-point precision `s`). The **cost-saving
+  short-circuit** path, which skips Tier B on Tier A's stored top-1, is **gate-sound** (§7), not exact.
 
-So the objective flips: **"as close as possible" → "exactly equal to the chosen-precision model,"** and
-the cost — the ternary `K×` width blowup (`K = ⌈log₃(2·max|w_int|+1)⌉`: int4→3, int8→6, fp16→11) — becomes
-the only thing to optimize. And it is *amortizable*, not fixed:
+So the objective sharpens: on the path that reproduces the model the result is **exactly equal to the
+chosen-precision model** (not an approximation), and the cost — the ternary `K×` width blowup
+(`K = ⌈log₃(2·max|w_int|+1)⌉`: int4→3, int8→6, fp16→11) — is what you optimize there. *Exact* and *cheap*
+are different per-decision regimes (§5.1, §7), not a free lunch on both axes at once. And the cost is
+*amortizable*, not fixed:
 
 - **Sparsity.** Measured on a real int8 layer: **52.5% of trits are zero**, **mean 2.85 nonzero
   trits/weight** vs the uniform `K=6` (zeros are *free* in Datalog's closed world — absent facts).
-- **Short-circuit.** The lookup answers the RETRIEVED majority, so the ternary `K×` is paid only on the
-  COMPOSED tail (`~15–37%`).
+- **Short-circuit.** The lookup answers the high-margin **RETRIEVED** fraction (~25%); Tier B then runs on
+  the rest (SELECTED + COMPOSED ≈ 75% — SELECTED still needs the composition to pick *within* the set). The
+  sparse-trit optimization (§5, HY-O5) and especially the §5.1 residual split (native int8/int4 + a small
+  exact correction) keep that path near native cost, so the full `K×` is the *exact reference*, not the bill.
 
 Trading accuracy-loss for amortizable compute is a strictly better place to stand than minimizing a loss.
 
@@ -128,19 +154,27 @@ data-structure choice *within* Rust (the `fst` crate / perfect hashing / sorted-
 compact, embeddable, exact lookup. No C++ is needed or wanted — fieldrun is framework-free pure Rust, and a
 key→value table is the last thing that would justify an FFI boundary.
 
-**Why it's exact & cheap.** It returns *stored* values (no matmul, no quantization), `O(1)`–`O(log n)`
-per query. It carries the high-margin decisions (RETRIEVED tokens have the largest facet margins —
+**Why it's cheap — and where it's exact.** It returns *stored* values (no matmul, no quantization),
+`O(1)`–`O(log n)` per query, so it is exact *w.r.t. its table*. It reproduces *the model* exactly only on
+the retrievable fraction — which is why it is paired with the margin gate (§7) and short-circuits only the
+high-margin decisions, where stored-≈-model holds (RETRIEVED tokens have the largest facet margins —
 FINDINGS §5b: ~2.1–2.8 vs ~0.9–1.2 for COMPOSED).
 
 ---
 
 ## 5. Tier B — the ternary composition engine (the forge tax)
 
+> **The headline form of Tier B is the residual split (§5.1): native int4/int8 bulk + a small exact ternary
+> residual.** Full balanced-ternary (this section) is the *exact reference* and the existence proof —
+> correct and `--verify-ternary`-checked, but `K×` wide; §5.1 is what actually runs on hardware.
+
 **What it is.** The attention + MLP composition — the part that genuinely *computes* and that no compact
 lookup reproduces (the forge tax; TT5's tropical-rank-gap). Represented as **balanced-ternary matmuls**:
 each integer weight `w` becomes `K` trits, and the layer's dot is the power-of-3-weighted sum of `K`
-ternary dots — exact (§3). The kernel is a **sparse sign-flip accumulate** (`±x`, skip zeros), cheaper
-than int4 (`i4_dot`) and it exploits the 52.5%-zero sparsity directly.
+ternary dots — exact (§3). The kernel is a **sparse sign-flip accumulate** (`±x`, skip zeros) that exploits
+the 52.5%-zero sparsity directly. *Per trit-plane* this beats an int4 MAC, but the full tier does `K` of
+them (~2.85 nonzero/weight after sparsity), so full ternary is **not** cheaper than int4/int8 overall — it
+is the exact reference. The hardware-fast form is the §5.1 residual split.
 
 **What's new.** A `Tern` bundle dtype + `tern_dot` kernel (mirrors the existing `I4w`/`i4_dot`), the
 convert path, and the forward wiring. `src/ternary.rs` already has the expansion + the trit-sparsity
@@ -223,10 +257,13 @@ predict(v)        :- score(v, s), s = max { s2 : score(_, s2) }.   // T=0 argmax
   → the `T=1` measure, PIC) — one **semiring-parameterized** program where the temperature is the semiring
   choice. Its value is being a *statically-checkable, terminating, least-fixpoint object* that **proves the
   Rust engine faithful**, and that holds the "model IS a semiring program" claim (larql / LOGIC_EXPORT).
-- **It dissolves the dense-Gram wall (LE-T4).** The whole-model *export* was non-compact because the
-  unembedding is `vocab × d` dense weight facts. Here the *retrievable* logits arrive as **EDB facts from
-  the lookup** (no dense Gram emitted), and only the *computed* contributions + the combine are rules — so
-  the certified program is the small combine, not the dense forward.
+- **It sidesteps the dense-Gram wall (LE-T4) for the combine certificate.** The whole-model *export* was
+  non-compact because the unembedding is `vocab × d` dense weight facts. Here the *retrievable* logits
+  arrive as **EDB facts from the lookup** and the computed logits are scored over the candidate set, so the
+  certified program is the small combine, not the dense forward — no `vocab × d` Gram is emitted. The
+  dense-`G` *coupling* LE-T2/T4 calls the forge tax is **not dissolved**: it is relocated *inside* Tier B
+  (LOGIC_EXPORT — Datalog "*holds* it; it does not *compact* it"). So this is candidate-restriction of the
+  certificate, not elimination of the underlying wall.
 - **Round-trip self-check.** As LE-T5 does today: emit, run Soufflé on a held-out context, and confirm
   `predict` equals the Rust engine's decode (exactly, in the fully-lossless setting; within the gate's
   tolerance otherwise). This is the byte-identity `--verify-*` ethos, expressed as a logic proof.
@@ -244,10 +281,14 @@ lookup" for one token and "composition" for the next. So you cannot statically s
 weights" vs "ternary weights." The realization that makes the architecture work:
 
 - **Tier A is a fast-path short-circuit** keyed on context (the n-gram/induction KB *is* a table). On the
-  high-margin RETRIEVED majority it answers directly; Tier B is skipped.
-- **Tier B is the exact fallback** that runs the full composition and carries the COMPOSED tail.
-- **Amortized cost** `= P(retrieved)·lookup + P(composed)·ternary`, dominated by the cheap lookup; the
-  `K×` ternary blowup is paid only on the hard minority.
+  high-margin **RETRIEVED** fraction (~25%) it answers directly — where stored-≈-model holds and the gate
+  certifies it; Tier B is skipped.
+- **Tier B is the exact fallback** that runs the composition for the rest (SELECTED + COMPOSED ≈ 75% —
+  SELECTED still needs the composition to pick *within* the candidate set). In its §5.1 form this is native
+  int8/int4 + a small residual, not the full `K×`.
+- **Amortized cost** `= P(retrieved)·lookup + P(rest)·Tier B`. The win is real but bounded: the lookup
+  covers ~25% at O(1), and the value on the ~75% comes from §5.1 keeping Tier B near native precision, not
+  from skipping it.
 
 **The gate is the tropical facet margin (TT2).** Short-circuit on the lookup's top candidate only when its
 margin exceeds the largest swing the computed tier could contribute. In the **fully-lossless** setting the
@@ -262,9 +303,9 @@ the gate's false-accept rate.
 
 | Claim | Content | Status |
 |---|---|---|
-| **HY-T1** | The combine is **exact** up to the float→int fixed-point step (both tiers exact) | Follows from Tier-A lookup exactness + the ternary identity (`--verify-ternary` PASS) |
+| **HY-T1** | The combine is **exact on the full-recompute path** up to the float→int step (Tier B's ternary identity; Tier A = the model's own retrievable share). The cost-saving short-circuit path is **gate-sound, not exact** | Tier-B half follows from the ternary identity (`--verify-ternary` PASS); Tier-A-as-stored-lookup is a *predictor*, exact-w.r.t.-model only on the ~25% RETRIEVED |
 | **HY-T2** | The split **sidesteps the dense-Gram wall** (LE-T4): retrieved logits are EDB facts, not dense weight facts | Structural (LOGIC_EXPORT) |
-| **HY-T3** | Amortized cost `= P(retr)·lookup + P(comp)·ternary`, lookup-dominated (~57% span-1 routable) | Measured inputs; cost model is **conjecture** (HY-O4) |
+| **HY-T3** | Amortized cost `= P(retr)·lookup + P(rest)·Tier B`; the lookup-routable fraction is the **~25% RETRIEVED** (FINDINGS §5), so Tier B runs on the ~75% SELECTED+COMPOSED (cost set by §5.1) | Measured input is RETRIEVED ≈ 25% on 0.5B (the "~57% span-1" is an expert-routing proxy, not this); cost model is **conjecture** (HY-O4) |
 | **HY-T4** | The facet margin (TT2) is a sound short-circuit **gate** | **Conjecture** (calibrate via `--probe-tropical`, HY-O2) |
 | **HY-T5** | Tier B **is** the localized forge tax (the computed residue no lookup captures = TT5's tropical-rank gap) | Measured-adjacent (TT5 + the bucketing residual) |
 
@@ -345,9 +386,11 @@ exactly why the practical sequencing is **TurboQuant first**.
   lever. So TurboQuant is, if anything, *more* central in the generation path.
 
 **Sequencing — TurboQuant first.** Four reasons, the second being the load-bearing one:
-1. **Lower risk / better understood** — KV-cache quantization is effectively an industry standard and the
-   math is proven (the paper + the i-orca `turboquant` corpus). The hybrid's gate (HY-O2) is the *novel*
-   research risk; do the safe, high-value thing first.
+1. **Lower risk / better understood** — KV-cache quantization is a well-established technique, and
+   TurboQuant's *rate algebra* is kernel-checked (i-orca `turboquant`, Isabelle, zero `sorry`); its
+   *achievability* (random rotation, Lloyd–Max optimality) is, per `TURBOQUANT.md`, assumed from the paper,
+   not re-derived. The hybrid's gate (HY-O2) is the *novel* research risk; do the safer, high-value thing
+   first.
 2. **It builds the shared instrument.** TurboQuant's deliverable (B) is the **margin–distortion probe** (the
    TO7/E7 settle) — *exactly* the gate-calibration tooling the hybrid's Phase 3 reuses. Building TurboQuant
    first produces the `ρ` / margin machinery; the hybrid then only adds the `δ_weight` half of the unified
@@ -374,8 +417,10 @@ int8-bulk/exact-residual Tier B + the unified gate, reusing TurboQuant's margin 
 - **The combine** — `LOGIC_EXPORT.md` (the model as a semiring-Datalog program); `larql` ("the model IS a
   database" — Tier A is literally that).
 
-The stake: **the model split along its own measured seam — an exact Rust lookup for what's retrievable, a
-lossless Rust ternary engine for what must be computed, a trivial Rust join+argmax to combine, and a
-Soufflé/Datalog program kept as the offline certificate that the whole thing is faithful — so that the
-result is not an *approximation* of the original but an *exact* reconstruction of the chosen-precision
-model, in one framework-free pure-Rust process, with cost the only thing left to minimize.**
+The stake: **the model split along its own measured seam — a Rust lookup for what's retrievable, a lossless
+Rust ternary engine (§5.1: native int8/int4 bulk + a small exact residual) for what must be computed, a
+trivial Rust join+argmax to combine, and a Soufflé/Datalog program kept as the offline certificate that the
+whole thing is faithful. The result is an *exact* reconstruction of the chosen-precision model on the
+recompute path (Tier B's ternary identity is byte-exact) and a margin-gated, calibrated-sound short-circuit
+on the retrievable fraction — two regimes, not a free lunch on both axes — in one framework-free pure-Rust
+process, with the ternary `K×` the cost to minimize on the tokens that compute.**
