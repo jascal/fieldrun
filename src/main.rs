@@ -1314,6 +1314,20 @@ fn main() {
                 println!("\n=== Runtime residency profile (experts by token-load; hot set resident, tail paged on demand) ===");
                 print!("{}", buckets.residency(e_req, cov));
             }
+            // --mlp-oracle "4,8,16,32": Stage-0 ceiling for routing-plan #1 — carve the DENSE MLP into G neuron-groups
+            // and report the oracle-router saving (vs the full dense MLP, in FFN FLOPs / page-in bytes) across G, against
+            // a hash-bucketed random-grouping control. Decides whether a learned router can pay off before any router work.
+            if let Some(spec) = flag(&args, "--mlp-oracle") {
+                let gs: Vec<usize> = spec.split(',').filter_map(|s| s.trim().parse::<usize>().ok()).filter(|&g| g > 0).collect();
+                match lm.mlp_dims() {
+                    Some((nl, dd, ff)) if !gs.is_empty() => {
+                        println!("\n=== Stage-0 MLP-only oracle ceiling (carve the dense MLP into G neuron-groups; routing-plan #1) ===");
+                        print!("{}", buckets.mlp_oracle_sweep(&gs, nl, ff, dd, 1));
+                    }
+                    Some(_) => eprintln!("[fieldrun] --mlp-oracle: empty/invalid group list (e.g. --mlp-oracle 4,8,16,32)"),
+                    None => eprintln!("[fieldrun] --mlp-oracle: arch exposes no dense MLP dims (rope/Qwen only)"),
+                }
+            }
             // --experts-out <path>: emit the CONCRETE partition (each expert's anchor + full circuit list + token routing)
             // as JSON — the build artifact a router / weight-chunk pager consumes, not just the summary above.
             if let Some(path) = flag(&args, "--experts-out") {

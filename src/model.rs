@@ -273,6 +273,13 @@ pub trait Model: Sync {
         None
     }
 
+    /// (n_layer, d_model, ffn) for a dense arch — the dims the MLP-routing oracle probe (`--mlp-oracle`) needs to turn
+    /// neuron counts into FFN FLOPs / page-in bytes (gate+up+down = 3·d MACs, 3·d bytes/neuron at int8). Default None;
+    /// rope implements it.
+    fn mlp_dims(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+
     /// Cosine similarity between two unembedding rows U_a, U_b — the runner-up *coherence* ρ for the incoherence-
     /// boundary probe (`--probe-ablate`, problem A): the decoupling proof assumes a circuit's push toward `t` is ~⊥ its
     /// push toward the runner-up `v*`; that fails when U_t ≈ U_{v*} (near-synonym, high ρ), where D_j = c_j·(U_t−U_{v*})

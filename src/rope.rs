@@ -656,6 +656,10 @@ impl Model for Rope {
         Some((self.b.config[0] as usize, self.b.config[1] as usize)) // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
     }
 
+    fn mlp_dims(&self) -> Option<(usize, usize, usize)> {
+        Some((self.b.config[0] as usize, self.b.config[4] as usize, self.b.config[5] as usize)) // (n_layer, d, ffn)
+    }
+
     fn predict_block_quant(&self, ids: &[i64], block: usize, bits: u8) -> Option<i64> {
         // Mirror `hidden`, but quantize the `block`-th residual write (per-row symmetric round-trip to `bits`) before
         // it is added to the stream — so downstream layers recompute over the quantized contribution (the real

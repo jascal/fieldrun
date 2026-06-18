@@ -338,6 +338,79 @@ impl CorpusBuckets {
         out
     }
 
+    /// Stage-0 oracle ceiling for carving the DENSE MLP into G neuron-groups (routing-plan step #1).
+    ///
+    /// Restricts each token's atom to its MLP-neuron circuits (`kind == 1`) — attention stays dense — then, for each G
+    /// in `groups`, reports the oracle-router saving: a token routes to the groups its atom's neurons touch and pays the
+    /// FULL neuron count of those groups (the grouping tax is already included, the same cost model as `cluster_atoms`).
+    /// Every MLP neuron costs the same work (gate+up+down = 3·`d` MACs, 3·`d`·`dtype_bytes` weight bytes), so the
+    /// neuron-count saving IS the FFN FLOP / page-in saving. The headline saving is vs the FULL dense MLP
+    /// (`n_layer`·`ffn` neurons). A deterministic hash-bucketed RANDOM control at the same G is the chance floor — if the
+    /// co-firing clustering doesn't beat it, the partition adds nothing over arbitrary grouping and the router is hopeless.
+    pub fn mlp_oracle_sweep(&self, groups: &[usize], n_layer: usize, ffn: usize, d: usize, dtype_bytes: usize) -> String {
+        let mut out = String::new();
+        let n_tok = self.atoms.len();
+        let neuron_atoms: Vec<Vec<Circuit>> =
+            self.atoms.iter().map(|a| a.iter().copied().filter(|c| c.0 == 1).collect()).collect();
+        let spanned = neuron_atoms.iter().filter(|a| !a.is_empty()).count();
+        if spanned == 0 {
+            let _ = writeln!(out, "  (no MLP-neuron circuits in any atom — every decision is carried by attention alone)");
+            return out;
+        }
+        let mut working: HashSet<Circuit> = HashSet::new();
+        for a in &neuron_atoms {
+            working.extend(a.iter().copied());
+        }
+        // Per-neuron floor: the unattainable best — compute exactly each token's atom neurons, no whole-group rounding.
+        // The grouping tax at a given G is (whole-group neurons/tok) / floor; structured routing pays for whole groups.
+        let floor: f32 = neuron_atoms.iter().filter(|a| !a.is_empty()).map(|a| a.iter().collect::<HashSet<_>>().len()).sum::<usize>() as f32 / spanned.max(1) as f32;
+        let dense = (n_layer * ffn).max(1);
+        let per_neuron_bytes = 3 * d * dtype_bytes; // gate+up+down weight bytes paged per active neuron
+        let _ = writeln!(out, "  dense MLP            {n_layer} layers × {ffn} ffn = {dense} neurons   (per neuron: {} MACs, {per_neuron_bytes} B int8)", 3 * d);
+        let _ = writeln!(out, "  corpus working set   {} distinct neurons ever in a certificate = {:.2}% of dense   (grows with corpus; coverage-limited at {n_tok} tokens)", working.len(), 100.0 * working.len() as f32 / dense as f32);
+        let _ = writeln!(out, "  MLP-free tokens      {}/{} ({:.0}%) decided by attention alone — zero MLP groups needed", n_tok - spanned, n_tok, 100.0 * (n_tok - spanned) as f32 / n_tok.max(1) as f32);
+        let _ = writeln!(out, "  per-neuron floor     {floor:.2} neurons/tok (atom size; the G→∞ best, no whole-group rounding)");
+        // Working-set GROWTH curve (cheap post-hoc walk over the already-computed atoms): does the set of distinct
+        // certificate-neurons saturate to a small recurring core, or keep climbing ~linearly? Marginal = new neurons per
+        // corpus token over the preceding segment — decaying toward 0 ⇒ a reusable core (router-friendly); flat ⇒ none.
+        let _ = writeln!(out, "  working-set growth (distinct certificate-neurons vs corpus tokens):");
+        let _ = writeln!(out, "    {:>8}  {:>10}  {:>12}", "tokens", "distinct", "marginal new/tok");
+        let mut acc: HashSet<Circuit> = HashSet::new();
+        let (mut prev_t, mut prev_d) = (0usize, 0usize);
+        let checkpoints: Vec<usize> = [100, 200, 300, 500, 800, 1200, 2000, 3000, 5000, 8000, 10000, 15000, 20000]
+            .into_iter().filter(|&c| c < n_tok).chain(std::iter::once(n_tok)).collect();
+        for (t, a) in neuron_atoms.iter().enumerate() {
+            acc.extend(a.iter().copied());
+            let tok = t + 1;
+            if checkpoints.contains(&tok) {
+                let marg = if tok > prev_t { (acc.len() - prev_d) as f32 / (tok - prev_t) as f32 } else { 0.0 };
+                let _ = writeln!(out, "    {tok:>8}  {:>10}  {marg:>12.2}", acc.len());
+                prev_t = tok;
+                prev_d = acc.len();
+            }
+        }
+        let _ = writeln!(out, "  {:>5}  {:>7}  {:>9}  {:>11}  {:>9}  {:>11}  {:>9}  {:>12}", "G", "span1", "grps/tok", "real n/tok", "tax×", "rand n/tok", "rtax×", "page-in/tok");
+        for &g in groups {
+            let cl = match cluster_atoms(&neuron_atoms, g) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Route BOTH the co-firing clustering and the random control through the same accounting for an
+            // apples-to-apples number (cl.expert_of assigns every neuron; groups = cl.e + the residual bucket).
+            let real = group_active_stats(&neuron_atoms, |c| cl.expert_of[&c], cl.e + 1);
+            let rnd = group_active_stats(&neuron_atoms, |c| hash_group(c, g), g);
+            let bytes_tok = real.mean_active * per_neuron_bytes as f32;
+            let _ = writeln!(out, "  {g:>5}  {:>6.0}%  {:>9.2}  {:>11.1}  {:>8.1}×  {:>11.1}  {:>8.1}×  {:>12}",
+                100.0 * real.span1_frac, real.mean_span, real.mean_active, real.mean_active / floor.max(1e-6),
+                rnd.mean_active, rnd.mean_active / floor.max(1e-6), fmt_bytes(bytes_tok));
+        }
+        let _ = writeln!(out, "  (oracle = perfect routing to exactly the groups a token's atom touches; cost = whole touched groups.");
+        let _ = writeln!(out, "   'tax×' = real neurons/tok ÷ per-neuron floor (whole-group rounding penalty); 'rtax×' = same for a random");
+        let _ = writeln!(out, "   hash-grouping = the chance floor. real ≪ rand ⇒ co-firing clustering helps; real ≈ rand ⇒ grouping is incidental.");
+        let _ = writeln!(out, "   Certificate = minimal DLA-sufficient set (keeps top-1 to the linear-DLA approx --probe-ablate validated), not exact logits.)");
+        out
+    }
+
     /// The concrete expert PARTITION as a serializable object: each expert's anchor + the full list of circuits assigned
     /// to it (the residual bucket last) + per-token routing stats. This is the build artifact — the actual expert→circuit
     /// sets a router/weight-chunk pager would consume — not just the summary. Empty (no experts) if nothing ingested.
@@ -589,6 +662,63 @@ fn cluster_atoms(atoms: &[Vec<Circuit>], experts: usize) -> Option<Cluster> {
         tok_per_expert[route] += 1;
     }
     Some(Cluster { e, n, distinct, total, freq, ranked, expert_of, size, tok_per_expert, span1, spanned, span_sum, cost_sum })
+}
+
+/// Per-token active-group stats for a GIVEN neuron→group assignment (shared by the co-firing clustering and the random
+/// control, so both numbers come from identical accounting). A token's cost = the total neuron count of every group its
+/// atom touches — whole groups page in, so the grouping tax is baked in. `mean_active` is neurons computed per token.
+struct GroupStats {
+    mean_active: f32,
+    span1_frac: f32,
+    mean_span: f32,
+}
+
+fn group_active_stats(atoms: &[Vec<Circuit>], group_of: impl Fn(Circuit) -> usize, n_groups: usize) -> GroupStats {
+    let mut size = vec![0usize; n_groups];
+    let mut seen: HashSet<Circuit> = HashSet::new();
+    for a in atoms {
+        for &c in a {
+            if seen.insert(c) {
+                size[group_of(c)] += 1;
+            }
+        }
+    }
+    let (mut span1, mut spanned, mut span_sum, mut cost_sum) = (0usize, 0usize, 0usize, 0usize);
+    for a in atoms {
+        if a.is_empty() {
+            continue;
+        }
+        let mut touched: HashSet<usize> = HashSet::new();
+        for &c in a {
+            touched.insert(group_of(c));
+        }
+        span_sum += touched.len();
+        spanned += 1;
+        if touched.len() == 1 {
+            span1 += 1;
+        }
+        cost_sum += touched.iter().map(|&g| size[g]).sum::<usize>();
+    }
+    let f = spanned.max(1) as f32;
+    GroupStats { mean_active: cost_sum as f32 / f, span1_frac: span1 as f32 / f, mean_span: span_sum as f32 / f }
+}
+
+/// Deterministic neuron→group hash — the random-grouping control. Mixes (layer, idx) so the assignment is reproducible
+/// but uncorrelated with co-firing; no RNG, matching the embedding-free determinism of the rest of the clustering.
+fn hash_group(c: Circuit, g: usize) -> usize {
+    let h = (c.1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (c.2 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ (c.0 as u64);
+    (h % g.max(1) as u64) as usize
+}
+
+/// Human-readable byte count for the per-token page-in column.
+fn fmt_bytes(b: f32) -> String {
+    if b >= 1.0e6 {
+        format!("{:.1} MB", b / 1.0e6)
+    } else if b >= 1.0e3 {
+        format!("{:.0} KB", b / 1.0e3)
+    } else {
+        format!("{b:.0} B")
+    }
 }
 
 /// Summary metrics for a built tree (leaves carry depth + token-load), for comparing tree algorithms: size, depth (max +
