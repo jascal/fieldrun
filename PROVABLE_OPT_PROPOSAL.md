@@ -174,7 +174,11 @@ certified()  :- margin(M), delta(D), M > 2 * D.        // ⇒ pruned decode == f
 
 > **PO-T3 (Margin-certified decode invariance).** A transformation of `Π` that bounds the per-logit
 > perturbation by `δ` preserves `decide` on every input where `margin > 2δ`. The bound and the check are
-> Datalog; the witness is a Soufflé proof. **Status: established as a *local* certificate** — it is exactly
+> Datalog; the witness is a Soufflé proof. **Status: established as a *local* certificate — now also
+> kernel-checked in Isabelle** ([`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt),
+> `ProvableOpt_Common.decode_margin_certified` / `decode_margin_Max_certified`, with a concrete neuron-drop
+> instance and an explicit boundary `small_margin_decode_can_flip` witness proving the `2δ` guard is necessary;
+> zero `sorry`). It is exactly
 > Maslov-dequantization of the classical margin argument: in `(max,+)` a `δ`-swing moves winner vs. runner-up
 > by at most `2δ`, so `m > 2δ` is **necessary and sufficient** for invariance on that input, inheriting LE-T5
 > soundness. The provable upgrade of: `--pruned-head` (heuristic margin gate → *certificate*),
@@ -246,7 +250,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | Claim | Content | Status |
 |---|---|---|
 | PO-T1 | lossless `T_P`-preserving rewrites keep `decide`/`logit` for every context | **Established** + anchored (`--magic-transform` on `whole_base.dl`) |
-| PO-T3 | margin-certified decode invariance (`m > 2δ`) — sound **local** certificate | **Established locally**; **globally bounded by LE-T2** (vacuous on dense-`G`/forge-tax tokens) |
+| PO-T3 | margin-certified decode invariance (`m > 2δ`) — sound **local** certificate | **Established locally + kernel-checked** ([`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt): `decode_margin_certified` / `decode_margin_Max_certified` + a boundary flip-witness, zero `sorry`); **globally bounded by LE-T2** (vacuous on dense-`G`/forge-tax tokens) |
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
 | PO-T4 | machine-checked equivalence for a transform of `Π` | **First rung closed (Isabelle)** — the lossless demand / dead-stratum (`lastpos`) `T_P`-equivalence is kernel-checked in [`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt) (`demand_restrict_lfp` / `demand_restrict_query` + a lossless-and-strict `lastpos` instance, zero `sorry`). Magic-sets adornment + real-bundle `Π` + PO-T3-margin remain open |
