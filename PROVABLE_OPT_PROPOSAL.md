@@ -286,10 +286,13 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   *sound by construction* (it over-approximates demand, so a "droppable" verdict is never wrong; an independent
   cross-check finds no droppable relation read at a non-`lastpos` position), consistent with Soufflé's verified
   `--magic-transform`. **This discharges the PREMISE of i-orca's PO-T1 `demand_restrict_query`
-  (`demand_closed`) on the real `Π`; the kernel theorem supplies the lossless conclusion.** Honest residual
-  (the kernel-bridge rung, still open): the checker itself is not Isabelle-verified — a machine-checked
-  `syntactically_demand_closed rules D ⟹ demand_closed (T_P rules) D` would let the checker's syntactic output
-  plug into the kernel proof, closing the gap from "premise certified by a tool" to "premise proved".
+  (`demand_closed`) on the real `Π`; the kernel theorem supplies the lossless conclusion.** **The kernel
+  bridge is now CLOSED** (i-orca `ProvableOpt_Datalog.thy`, zero `sorry`): `syn_demand_closed_imp_demand_closed`
+  proves the *syntactic* check the tool runs (`syn_demand_closed R D` — every rule producing a kept atom reads
+  only kept atoms) *entails* the *semantic* `demand_closed (T_P R) D`, and `syn_demand_closed_lossless` chains
+  it through `demand_restrict_query` to decode-preservation. So the checker's output now plugs into a *proved*
+  implication — "premise certified by a tool" → "premise proved". Remaining trust (the last, separate rung):
+  a reflected/verified parser + `syn_demand_closed` decision procedure (parser-faithfulness + checker-correctness).
 - **PO2 — the magic-sets forge-tax measure.** Emit `Π` with an explicit retrievable fragment (induction =
   recursive clause, n-gram = fact) and the dense fragment; run `--magic-transform`; report lossless tuple
   reduction (= retrievable mass) and residual (= forge tax); correlate with PR / treewidth (LO4 bridge).
