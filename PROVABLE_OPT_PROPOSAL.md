@@ -253,7 +253,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T3 | margin-certified decode invariance (`m > 2δ`) — sound **local** certificate | **Established locally + kernel-checked** ([`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt): `decode_margin_certified` / `decode_margin_Max_certified` + a boundary flip-witness, zero `sorry`); **globally bounded by LE-T2** (vacuous on dense-`G`/forge-tax tokens) |
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
-| PO-T4 | machine-checked equivalence for a transform of `Π` | **First rung closed (Isabelle)** — the lossless demand / dead-stratum (`lastpos`) `T_P`-equivalence is kernel-checked in [`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt) (`demand_restrict_lfp` / `demand_restrict_query` + a lossless-and-strict `lastpos` instance, zero `sorry`). Magic-sets adornment + real-bundle `Π` + PO-T3-margin remain open |
+| PO-T4 | machine-checked equivalence for a transform of `Π` | **First rung closed (Isabelle)** — the lossless demand / dead-stratum (`lastpos`) `T_P`-equivalence is kernel-checked in [`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt) (`demand_restrict_lfp` / `demand_restrict_query` + a lossless-and-strict `lastpos` instance, zero `sorry`). **Real-bundle `Π` now discharged at the checker level** (`lo3a/demand_closure.py` soundly certifies the dead stratum on `whole_base.dl` = the whole final-layer post-attention cone); the **kernel bridge** (a verified syntactic→semantic demand-closure lemma) and magic-sets adornment remain open |
 | PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested + replicated up the ladder** (Pythia-70m **and 160m**, 28 ckpts each): cert fraction rises then *saturates* (confidence-bound); **PR consolidates in a discrete late event invisible to accuracy/margin/cert** (70m ~step 80k; 160m PR 39→26 at 96k→110k) — and the new `PROBE_CIRCUITS` fingerprint shows that late event is a **migration of the dominant DLA circuits onto final-layer (L11) heads** (Jaccard 0.40 across it). The dissociation is the certificate's boundedness, empirically (R3) |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
@@ -274,6 +274,22 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   **≈0 exactly-dead neurons**, so the losslessly-removable set is ≈0 and zero-shot pruning trades decode
   fidelity (15/18 at 1–2% smaller, 12/18 at 4–6%). That is **PO-T2 measured on a real model**: the dense
   computed fragment does not compress losslessly — the forge tax is real, and the certifier names exactly where.
+- **PO-DC — structural demand-closure certificate on a REAL emitted `Π` (the PO-T4 real-bundle rung,
+  checker level), DONE (`lo3a/demand_closure.py`, `lo3a/whole_base.demand_cert.json`).** A sound,
+  position-stratified static analysis over the emitted `.dl`: it propagates per-relation *demand position*
+  (`lastpos` / inherited / all-positions) backward from `decide`, and certifies which computed relations are
+  demanded **only at `lastpos`** — exactly the dead stratum the kernel theorem (`lastpos_transform_lossless_and_strict`)
+  is allowed to drop. On the real 2-layer `whole_base.dl` it certifies the dead stratum is the **entire
+  final-layer post-attention cone** — `{attno1, oproj1, xmid1, ssm1, a2_1, gate1, up1, hid1, down1, x2, ssf, xf}`
+  (12 relations), a strict generalisation of the documented `xf`/`ssf` — while the 25 relations that feed
+  attention (all of layer 0, plus layer-1 `q/k/v/score/prob`) stay **live at all positions**. The analysis is
+  *sound by construction* (it over-approximates demand, so a "droppable" verdict is never wrong; an independent
+  cross-check finds no droppable relation read at a non-`lastpos` position), consistent with Soufflé's verified
+  `--magic-transform`. **This discharges the PREMISE of i-orca's PO-T1 `demand_restrict_query`
+  (`demand_closed`) on the real `Π`; the kernel theorem supplies the lossless conclusion.** Honest residual
+  (the kernel-bridge rung, still open): the checker itself is not Isabelle-verified — a machine-checked
+  `syntactically_demand_closed rules D ⟹ demand_closed (T_P rules) D` would let the checker's syntactic output
+  plug into the kernel proof, closing the gap from "premise certified by a tool" to "premise proved".
 - **PO2 — the magic-sets forge-tax measure.** Emit `Π` with an explicit retrievable fragment (induction =
   recursive clause, n-gram = fact) and the dense fragment; run `--magic-transform`; report lossless tuple
   reduction (= retrievable mass) and residual (= forge tax); correlate with PR / treewidth (LO4 bridge).
