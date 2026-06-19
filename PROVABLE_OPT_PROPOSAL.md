@@ -291,8 +291,13 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
   proves the *syntactic* check the tool runs (`syn_demand_closed R D` — every rule producing a kept atom reads
   only kept atoms) *entails* the *semantic* `demand_closed (T_P R) D`, and `syn_demand_closed_lossless` chains
   it through `demand_restrict_query` to decode-preservation. So the checker's output now plugs into a *proved*
-  implication — "premise certified by a tool" → "premise proved". Remaining trust (the last, separate rung):
-  a reflected/verified parser + `syn_demand_closed` decision procedure (parser-faithfulness + checker-correctness).
+  implication — "premise certified by a tool" → "premise proved". **The checker-correctness half is also now
+  closed** (i-orca `ProvableOpt_Checker.thy`): `echeck` is an *executable, faithful* decision procedure
+  (`echeck_iff`: sound + complete vs `syn_demand_closed`) whose pass yields losslessness by `eval`
+  (`executable_checker_certifies_lossless`), and `export_code` extracts it to SML. So the demand-closure
+  *decision* is kernel-computed, not Python-trusted; `lo3a/test_demand_closure.py` regression-tests this
+  checker against the same dead-stratum shape. **The only remaining trusted component is the PARSER**
+  (`.dl` text → rule list) — everything from the rule list onward is machine-checked.
 - **PO2 — the magic-sets forge-tax measure.** Emit `Π` with an explicit retrievable fragment (induction =
   recursive clause, n-gram = fact) and the dense fragment; run `--magic-transform`; report lossless tuple
   reduction (= retrievable mass) and residual (= forge tax); correlate with PR / treewidth (LO4 bridge).
