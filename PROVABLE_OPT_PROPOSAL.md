@@ -221,8 +221,17 @@ Three rungs, increasing in rigor and cost — all available because `Π` is a fi
    formal semantics.*
 
 > **PO-T4 (Certified pipeline).** A concrete transform on `Π` (e.g. the dead-stratum `lastpos` restriction,
-> or GQA-CSE) carried with a machine-checked `T_P`-equivalence proof. **Status: open** — the Coq/Lean Datalog
-> formalizations exist; instantiating one on a transform of `Π` is the formality frontier of this paper.
+> or GQA-CSE) carried with a machine-checked `T_P`-equivalence proof. **Status: first rung CLOSED (Isabelle).**
+> The lossless demand / dead-stratum (`lastpos`) transform is now carried with a kernel-checked
+> `T_P`-equivalence in [`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt) (Isabelle 2025-2,
+> zero `sorry`, no `quick_and_dirty`): the general theorem `demand_restrict_lfp`
+> (`mono T ⟹ demand_closed T D ⟹ lfp (restrict_op T D) = lfp T ∩ D`) and its decode corollary
+> `demand_restrict_query` (`Q ⊆ D ⟹` same query on every EDB) prove PO-T1 *as a fixpoint theorem*; the
+> concrete `lastpos` instance `lastpos_transform_lossless_and_strict` exhibits a lossless-and-strict saving
+> ("final-norm at one position, not all"); and the compiled i-orca surface (`ProvableOpt_Surface`) is
+> certified end-to-end (table → Isar → kernel). **Still open:** the full magic-sets *adornment* transform
+> (binding-pattern specialisation), the certificate on an emitted *real-bundle* `Π` (not the minimal model),
+> and PO-T3's margin certificate as a companion kernel theorem.
 
 **Caveats (inherited from Datalog optimization theory).** Magic sets is *query-specific*: it preserves the
 answers to the targeted outputs (`decide`/`logit`), not necessarily every IDB relation — fine here, since
@@ -240,7 +249,7 @@ variants over aggregation must respect stratification, so PO2/PO3 verify decode-
 | PO-T3 | margin-certified decode invariance (`m > 2δ`) — sound **local** certificate | **Established locally**; **globally bounded by LE-T2** (vacuous on dense-`G`/forge-tax tokens) |
 | PO-T2 | lossless demand residual = the dense forge tax (a 4th LO4 measure) | Measured-adjacent |
 | PO-T6 | a compact a-priori through-layers `δ` would re-materialize the high-treewidth graph | Open; **likely false in closed form** (= LE-T2/T4) |
-| PO-T4 | machine-checked (Coq/Lean) equivalence for a transform of `Π` | Open (formality frontier) |
+| PO-T4 | machine-checked equivalence for a transform of `Π` | **First rung closed (Isabelle)** — the lossless demand / dead-stratum (`lastpos`) `T_P`-equivalence is kernel-checked in [`i-orca/examples/provable_opt`](../i-orca/examples/provable_opt) (`demand_restrict_lfp` / `demand_restrict_query` + a lossless-and-strict `lastpos` instance, zero `sorry`). Magic-sets adornment + real-bundle `Π` + PO-T3-margin remain open |
 | PO-T7 | certifiable-compressible fraction = a **grokking order parameter** (treewidth/PR/tropical rank = progress measures) | **Tested + replicated up the ladder** (Pythia-70m **and 160m**, 28 ckpts each): cert fraction rises then *saturates* (confidence-bound); **PR consolidates in a discrete late event invisible to accuracy/margin/cert** (70m ~step 80k; 160m PR 39→26 at 96k→110k) — and the new `PROBE_CIRCUITS` fingerprint shows that late event is a **migration of the dominant DLA circuits onto final-layer (L11) heads** (Jaccard 0.40 across it). The dissociation is the certificate's boundedness, empirically (R3) |
 
 - **PO1 — certified reducer → smaller bundle + HF round trip, DONE (`lo3a/reduce.py`, `lo3a/to_safetensors.py`).**
