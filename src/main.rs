@@ -88,6 +88,40 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+fn xorshift(r: &mut u64) -> u64 {
+    *r ^= *r << 13;
+    *r ^= *r >> 7;
+    *r ^= *r << 17;
+    *r
+}
+
+/// A random arithmetic s-expression of exactly `depth` nesting, all sub-results in [0, maxv]. Returns (string, value).
+fn gen_arith(depth: usize, maxv: i64, r: &mut u64) -> (String, i64) {
+    if depth == 0 {
+        let v = (xorshift(r) % (maxv as u64 + 1)) as i64;
+        return (v.to_string(), v);
+    }
+    for _ in 0..400 {
+        let op = ['+', '-', '*'][(xorshift(r) % 3) as usize];
+        let (mut dl, mut dr) = (depth - 1, (xorshift(r) % depth as u64) as usize);
+        if xorshift(r) & 1 == 1 {
+            std::mem::swap(&mut dl, &mut dr);
+        }
+        let (ls, lv) = gen_arith(dl, maxv, r);
+        let (rs, rv) = gen_arith(dr, maxv, r);
+        if op == '-' && lv < rv {
+            continue;
+        }
+        let v = match op { '+' => lv + rv, '-' => lv - rv, '*' => lv * rv, _ => 0 };
+        if !(0..=maxv).contains(&v) {
+            continue;
+        }
+        return (format!("({op} {ls} {rs})"), v);
+    }
+    let v = (xorshift(r) % (maxv as u64 + 1)) as i64;
+    (v.to_string(), v)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -899,6 +933,84 @@ fn main() {
         // Each lit position prints the VALUE STACK read from the residual (late-layer logit-lens). rope family only.
         if has_flag(&args, "--recursion-explain") {
             let tg = api::TextGen::load(&stem, eos.clone());
+
+            // ── --measure: sweep the depth-bounded abductive export over a query distribution. Generate arithmetic
+            // exprs of increasing nesting, get the model's answer, abduce its effective recursion depth + cut, and
+            // report: model accuracy vs depth (the cliff), faithfulness (abduction reproduces the model), and the
+            // recursive-vs-broken-cut-vs-semiring split. Tests "errs iff depth>D" and "error == retrieved cut". ──
+            if has_flag(&args, "--measure") {
+                let tg = match &tg { Some(t) => t, None => { eprintln!("[fieldrun] --measure needs a tokenizer next to {stem}"); return; } };
+                let n_per: usize = flag(&args, "--n").and_then(|s| s.parse().ok()).unwrap_or(8);
+                let dmax: usize = flag(&args, "--dmax").and_then(|s| s.parse().ok()).unwrap_or(6);
+                let maxv: i64 = flag(&args, "--maxv").and_then(|s| s.parse().ok()).unwrap_or(9);
+                let mut rng: u64 = flag(&args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+                const MPRIME: &str = "(+ 1 2) = 3\n(* 2 3) = 6\n(- 9 4) = 5\n(* 2 (+ 1 2)) = 6\n(- 8 (+ 1 2)) = 5\n";
+                let prime_lits: Vec<i64> = MPRIME.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse::<i64>().ok()).collect();
+                #[derive(Clone, Default)]
+                struct Agg { n: usize, correct: usize, faithful: usize, clean: usize, cut: usize, semi: usize, sumd: i64, err: usize, err_cut: usize }
+                let mut per: Vec<Agg> = vec![Agg::default(); dmax + 1];
+                eprintln!("[fieldrun] datalog measure · {n_per} exprs/depth × depths 1..{dmax} · maxv {maxv} · {stem}");
+                for depth in 1..=dmax {
+                    for _ in 0..n_per {
+                        let (expr, truev) = gen_arith(depth, maxv, &mut rng);
+                        let mut ids = tg.encode(&format!("{MPRIME}{expr} ="), false);
+                        let mut cont = String::new();
+                        for _ in 0..4 {
+                            let t = lm.predict(&ids);
+                            let s = tg.decode(&[t]);
+                            if s.contains('\n') { break; }
+                            cont.push_str(&s);
+                            ids.push(t);
+                        }
+                        let num: String = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+                        let model_answer = match num.parse::<i64>() { Ok(v) => v, Err(_) => continue };
+                        let tree = match recursion_dl::parse_str(&expr) { Some(t) => t, None => continue };
+                        let mut lits = prime_lits.clone();
+                        lits.extend(expr.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse::<i64>().ok()));
+                        let (abd, maxd, _) = recursion_dl::analyze(&tree, model_answer, &lits);
+                        let a = &mut per[depth];
+                        a.n += 1;
+                        let ok = model_answer == truev;
+                        if ok { a.correct += 1; } else { a.err += 1; }
+                        match abd {
+                            Some(ab) => {
+                                a.faithful += 1;
+                                a.sumd += ab.depth;
+                                if ab.cuts.is_empty() && ab.depth as usize == maxd { a.clean += 1; }
+                                else {
+                                    a.cut += 1;
+                                    if !ok && ab.cuts.iter().any(|&(_, _, ctx)| ctx) { a.err_cut += 1; }
+                                }
+                            }
+                            None => a.semi += 1,
+                        }
+                    }
+                }
+                let pct = |x: usize, n: usize| if n > 0 { 100.0 * x as f64 / n as f64 } else { 0.0 };
+                println!("# datalog measure — depth-bounded abductive faithfulness ({stem})");
+                println!("depth   n  model-acc  faithful  meanD  clean  cut  semiring");
+                let mut tot = Agg::default();
+                let mut dstar = 0usize;
+                for depth in 1..=dmax {
+                    let a = per[depth].clone();
+                    if a.n == 0 { continue; }
+                    if pct(a.correct, a.n) >= 50.0 { dstar = dstar.max(depth); }
+                    println!("{:>5} {:>3} {:>8.0}% {:>8.0}% {:>6.1} {:>6} {:>4} {:>8}",
+                             depth, a.n, pct(a.correct, a.n), pct(a.faithful, a.n),
+                             if a.faithful > 0 { a.sumd as f64 / a.faithful as f64 } else { 0.0 }, a.clean, a.cut, a.semi);
+                    tot.n += a.n; tot.correct += a.correct; tot.faithful += a.faithful;
+                    tot.clean += a.clean; tot.cut += a.cut; tot.semi += a.semi; tot.err += a.err; tot.err_cut += a.err_cut;
+                }
+                println!("\n→ model accuracy {:.0}% · FAITHFULNESS (abduction reproduces the model) {:.0}% of {} queries",
+                         pct(tot.correct, tot.n), pct(tot.faithful, tot.n), tot.n);
+                println!("→ split: {:.0}% clean recursion · {:.0}% broken-cut (early-cut retrieval) · {:.0}% semiring-needed (no depth-cut found)",
+                         pct(tot.clean, tot.n), pct(tot.cut, tot.n), pct(tot.semi, tot.n));
+                println!("→ effective recursion depth D* = {dstar} (deepest where model-acc ≥ 50%)  [cross-check vs the recursion-depth probe]");
+                println!("→ P1 (errs as depth exceeds D*): see the model-acc cliff in the table above");
+                println!("→ P2 (a wrong answer == a context-literal cut): {:.0}% of {} errors explained by a retrieved cut", pct(tot.err_cut, tot.err), tot.err);
+                return;
+            }
+
             let defer: f32 = flag(&args, "--defer").and_then(|s| s.parse().ok()).unwrap_or(0.6);
             let reach_min: usize = flag(&args, "--reach-min").and_then(|s| s.parse().ok()).unwrap_or(3);
             let conc_min: f32 = flag(&args, "--conc-min").and_then(|s| s.parse().ok()).unwrap_or(0.20);
