@@ -112,9 +112,35 @@ fn eval_bounded(nodes: &[Flat], idx: usize, b: i64, cuts: &std::collections::Has
     }
 }
 
+/// Parse a target s-expression directly from a string (atomizes it; token indices are irrelevant here).
+pub fn parse_str(s: &str) -> Option<Node> {
+    let mut atoms: Vec<(String, usize)> = Vec::new();
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            if !num.is_empty() { atoms.push((std::mem::take(&mut num), 0)); }
+            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/') { atoms.push((ch.to_string(), 0)); }
+        }
+    }
+    if !num.is_empty() { atoms.push((num, 0)); }
+    parse_target(&atoms)
+}
+
 pub struct Abduction {
     pub depth: i64,                       // deepest recursion budget that reproduces the model (effective depth)
     pub cuts: Vec<(usize, i64, bool)>,    // (node id, retrieved value, from_context_literal)
+}
+
+/// Flatten + abduce + correct-eval in one call. Returns (abduction, max nesting depth, correct value).
+pub fn analyze(root: &Node, model_answer: i64, literals: &[i64]) -> (Option<Abduction>, usize, Option<i64>) {
+    let mut nodes = Vec::new();
+    let mut depth = Vec::new();
+    flatten(root, &mut nodes, &mut depth, 0);
+    let maxd = *depth.iter().max().unwrap_or(&0);
+    let correct = eval_bounded(&nodes, 0, i64::MAX, &Default::default());
+    (abduce(&nodes, &depth, model_answer, literals), maxd, correct)
 }
 
 /// Abduce the model's broken program: the DEEPEST D such that recursing to D and taking memorized values at the cut
