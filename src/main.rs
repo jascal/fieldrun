@@ -879,6 +879,73 @@ fn main() {
         //   (B) within-bucket pick entropy when the conflict set is held FIXED (bucket by the n-gram key). H≈0 / 100%
         //       agreement ⇒ the pick is a function of the firing state (symbolic-representable); H>0 is the residue that
         //       needs a finer incidence space than the rules carry. Finer key (bi→tri) = finer incidence partition.
+        // ── recursion-explain: show explain detail ONLY where the model does recursive computation ──────────────
+        // Gate each position on the recursion signature (model-internal, no parser, generalises past Lisp):
+        //   COMPUTED  (final top-1 is NOT a flat in-context copy) ∧
+        //   DEFERRED  (logit-lens resolve-layer is LATE — recursive eval resolves late, not an early read-out) ∧
+        //   BINDING   (a CONCENTRATED, sink-excluded back-attention to a DISTANT antecedent, reach≥3 = the frame it
+        //              folds — the discriminator that silences flat prose, which binds to the previous token).
+        // Each lit position prints the VALUE STACK read from the residual (late-layer logit-lens). rope family only.
+        if has_flag(&args, "--recursion-explain") {
+            let tg = api::TextGen::load(&stem, eos.clone());
+            let defer: f32 = flag(&args, "--defer").and_then(|s| s.parse().ok()).unwrap_or(0.6);
+            let reach_min: usize = flag(&args, "--reach-min").and_then(|s| s.parse().ok()).unwrap_or(3);
+            let conc_min: f32 = flag(&args, "--conc-min").and_then(|s| s.parse().ok()).unwrap_or(0.20);
+            let show_all = has_flag(&args, "--show-all");
+            const PRIME: &str = "(+ 2 3) = 5\n(* 2 4) = 8\n(- 9 4) = 5\n(+ 1 (* 2 3)) = 7\n(- 8 (+ 1 2)) = 5\n";
+            let rec_ids: Vec<i64> = if let Some(text) = flag(&args, "--text") {
+                match &tg { Some(t) => t.encode(text, false),
+                    None => { eprintln!("[fieldrun] --recursion-explain --text needs a tokenizer next to {stem}"); return; } }
+            } else if flag(&args, "--ids").is_some() {
+                ids.clone()
+            } else {
+                match &tg { Some(t) => t.encode(&format!("{PRIME}(+ 1 (* 3 (- 5 1))) ="), false),
+                    None => { eprintln!("[fieldrun] --recursion-explain: give --text or --ids (no tokenizer for the default demo)"); return; } }
+            };
+            let lbl = |id: i64| -> String { match &tg { Some(t) => t.decode(&[id]), None => format!("[{id}]") } };
+            let trace = match lm.recursion_trace(&rec_ids) {
+                Some(t) => t,
+                None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }
+            };
+            let nl = trace.first().map(|r| r.n_layer).unwrap_or(0);
+            println!("[fieldrun] recursion-explain · {} tokens · {nl} layers · gate(defer≥{defer}, reach≥{reach_min}, conc≥{conc_min})",
+                     rec_ids.len());
+            let mut n_lit = 0usize;
+            for r in &trace {
+                // COMPUTED: final top-1 is NOT reproducible by a flat in-context copy (longest-suffix induction)
+                let ctx = &rec_ids[..=r.pos];
+                let mut copy = false;
+                let maxspan = std::cmp::min(6, ctx.len().saturating_sub(1));
+                'spans: for span in (2..=maxspan).rev() {
+                    let tail = &ctx[ctx.len() - span..];
+                    for i in (0..ctx.len() - span).rev() {
+                        if &ctx[i..i + span] == tail && i + span < ctx.len() {
+                            copy = ctx[i + span] == r.final_top1;
+                            break 'spans;
+                        }
+                    }
+                }
+                let deferred = r.resolve_layer as f32 / r.n_layer.max(1) as f32;
+                let reach = r.pos - r.back;
+                let lit = !copy && deferred >= defer && reach >= reach_min && r.conc >= conc_min;
+                if lit { n_lit += 1; }
+                if lit || show_all {
+                    let stack: String = r.lens_late.iter()
+                        .map(|(l, t)| format!("L{l}:{:?}", lbl(*t).trim())).collect::<Vec<_>>().join(" ");
+                    let mark = if lit { "▶" } else { " " };
+                    println!(" {mark} {:>3}  {:<10}  resolve {:>2}/{}  defer {:.2}  reach {:>2}  conc {:.2}  folds←{:>3}:{:<8}  | {}",
+                             r.pos, format!("{:?}", lbl(rec_ids[r.pos])), r.resolve_layer, r.n_layer,
+                             deferred, reach, r.conc, r.back, format!("{:?}", lbl(rec_ids[r.back])), stack);
+                }
+            }
+            if n_lit == 0 && !show_all {
+                println!("  (no recursive computation detected — silent)");
+            } else {
+                println!("  → {n_lit} of {} positions flagged as recursive computation", trace.len());
+            }
+            return;
+        }
+
         if has_flag(&args, "--probe") {
             use retrieval::CandCfg;
             let store = match flag(&args, "--store").and_then(|p| Store::load(p).ok()) {
@@ -3242,6 +3309,7 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --generate M          greedy-generate M tokens\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
   fieldrun --bundle <stem> --chat [--explain] [--raw]                     chat REPL (/explain, /format in-REPL)\n\
+  fieldrun --bundle <stem> --recursion-explain [--text \"...\"]              show explain ONLY where the model recurses\n\
   fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: token-id + OpenAI/Anthropic\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\

@@ -173,9 +173,26 @@ pub fn prefix_generate_q(
     out
 }
 
+/// Per-position recursion substrate for `--recursion-explain`: the raw model-internal signals the recursion gate
+/// reads — resolve-layer (logit-lens), the late-layer value-stack readout, and the dominant non-sink back-attention.
+pub struct RecPos {
+    pub pos: usize,
+    pub final_top1: i64,
+    pub resolve_layer: usize,        // first layer whose logit-lens argmax == final_top1 (deferred = late)
+    pub n_layer: usize,
+    pub lens_late: Vec<(usize, i64)>, // (layer, logit-lens top-1) at the late layers — the value stack
+    pub back: usize,                  // dominant NON-SINK late-layer back-attention target (the frame it folds)
+    pub conc: f32,                    // attention weight on `back` (max over late layers+heads); high = real bind
+}
+
 pub trait Model: Sync {
     /// Top-1 next-token id for a context.
     fn predict(&self, ids: &[i64]) -> i64;
+
+    /// Per-position recursion substrate (`--recursion-explain`). Default None; the RoPE family implements it.
+    fn recursion_trace(&self, _ids: &[i64]) -> Option<Vec<RecPos>> {
+        None
+    }
 
     /// Explain the prediction (composition-side circuits + features). Default None; GPT-2 implements it.
     fn explain(&self, _ids: &[i64]) -> Option<crate::explain::Explanation> {

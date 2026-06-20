@@ -84,7 +84,7 @@ impl TextGen {
             .map(|tok| TextGen { tok, eos, prefix: std::sync::Mutex::new(crate::model::PrefixKv::default()) })
     }
 
-    fn encode(&self, text: &str, add_special: bool) -> Vec<i64> {
+    pub fn encode(&self, text: &str, add_special: bool) -> Vec<i64> {
         self.tok
             .encode(text, add_special)
             .map(|e| e.get_ids().iter().map(|&u| u as i64).collect())
@@ -97,7 +97,7 @@ impl TextGen {
         u32::try_from(id).ok().and_then(|u| self.tok.id_to_token(u))
     }
 
-    fn decode(&self, ids: &[i64]) -> String {
+    pub fn decode(&self, ids: &[i64]) -> String {
         let u: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         self.tok.decode(&u, true).unwrap_or_default()
     }
