@@ -404,11 +404,21 @@ fn main() {
 
     // ids are needed for scoring / --generate / --explain / Tier A; --serve and --chat don't use them, so load
     // gracefully (empty if absent) rather than panicking when someone just wants to serve or chat.
-    let ids: Vec<i64> = std::fs::read_to_string(ids_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Holdout>(&s).ok())
-        .map(|h| h.holdout_ids)
-        .unwrap_or_default();
+    // --text is UNIVERSAL: if given, tokenize it with the bundle's tokenizer so EVERY ids-based mode (--explain,
+    // --probe…, --recursion-explain) can run on plain text instead of a token-id JSON. Needs --bundle (for the
+    // tokenizer next to it). Falls back to the --ids file (or default) when --text is absent.
+    let ids: Vec<i64> = if let Some(text) = flag(&args, "--text") {
+        match flag(&args, "--bundle").map(resolve_bundle).and_then(|s| api::TextGen::load(&s, Vec::new())) {
+            Some(tg) => tg.encode(text, false),
+            None => { eprintln!("[fieldrun] --text needs --bundle <stem> with a .tokenizer.json next to it"); Vec::new() }
+        }
+    } else {
+        std::fs::read_to_string(ids_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Holdout>(&s).ok())
+            .map(|h| h.holdout_ids)
+            .unwrap_or_default()
+    };
     let end = (ctx_window + n_eval).min(ids.len());
     let ctx = |i: usize| &ids[i.saturating_sub(ctx_window)..i];
     let threads = rayon::current_num_threads();
@@ -893,10 +903,8 @@ fn main() {
             let conc_min: f32 = flag(&args, "--conc-min").and_then(|s| s.parse().ok()).unwrap_or(0.20);
             let show_all = has_flag(&args, "--show-all");
             const PRIME: &str = "(+ 2 3) = 5\n(* 2 4) = 8\n(- 9 4) = 5\n(+ 1 (* 2 3)) = 7\n(- 8 (+ 1 2)) = 5\n";
-            let rec_ids: Vec<i64> = if let Some(text) = flag(&args, "--text") {
-                match &tg { Some(t) => t.encode(text, false),
-                    None => { eprintln!("[fieldrun] --recursion-explain --text needs a tokenizer next to {stem}"); return; } }
-            } else if flag(&args, "--ids").is_some() {
+            // --text / --ids already populated the shared `ids` (universal). With neither, run the primed Lisp demo.
+            let rec_ids: Vec<i64> = if flag(&args, "--text").is_some() || flag(&args, "--ids").is_some() {
                 ids.clone()
             } else {
                 match &tg { Some(t) => t.encode(&format!("{PRIME}(+ 1 (* 3 (- 5 1))) ="), false),
@@ -3349,6 +3357,7 @@ USAGE\n\
   --bundle takes a stem (<stem>.fieldrun.json) or a bare model name resolved under ~/.cache/fieldrun/bundles/<name>/.\n\
 \n\
   --ids expects {{\"holdout_ids\": [<token ids>]}} from the model's tokenizer.\n\
+  --text \"...\"  tokenizes plain text in place of --ids (any ids-based mode: --explain / --probe / --recursion-explain).\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
