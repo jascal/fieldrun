@@ -951,7 +951,9 @@ fn main() {
                 let num: String = cont.chars().skip_while(|c| !c.is_ascii_digit())
                     .take_while(|c| c.is_ascii_digit()).collect();
                 let model_answer: Option<i64> = num.parse::<i64>().ok();
-                let dl = recursion_dl::emit(&tree, model_answer);
+                // context literals = every integer in the input (candidate RETRIEVED values for the cuts)
+                let literals: Vec<i64> = atoms.iter().filter_map(|(a, _)| a.parse::<i64>().ok()).collect();
+                let dl = recursion_dl::emit(&tree, model_answer, &literals);
                 match flag(&args, "--out") {
                     Some(p) => { let _ = std::fs::write(p, &dl); eprintln!("[fieldrun] wrote {p}"); }
                     None => print!("{dl}"),
