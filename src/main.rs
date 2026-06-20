@@ -41,6 +41,7 @@ mod mla;
 mod model;
 mod neox;
 mod qwen3moe;
+mod recursion_dl;
 mod retrieval;
 mod rope;
 mod ternary;
@@ -907,7 +908,7 @@ fn main() {
             let rec_ids: Vec<i64> = if flag(&args, "--text").is_some() || flag(&args, "--ids").is_some() {
                 ids.clone()
             } else {
-                match &tg { Some(t) => t.encode(&format!("{PRIME}(+ 1 (* 3 (- 5 1))) ="), false),
+                match &tg { Some(t) => t.encode(&format!("{PRIME}(+ 1 (* 2 (- 4 3))) ="), false),
                     None => { eprintln!("[fieldrun] --recursion-explain: give --text or --ids (no tokenizer for the default demo)"); return; } }
             };
             let lbl = |id: i64| -> String { match &tg { Some(t) => t.decode(&[id]), None => format!("[{id}]") } };
@@ -915,6 +916,49 @@ fn main() {
                 Some(t) => t,
                 None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }
             };
+
+            // ── --datalog: emit the recursion as a RUNNABLE recursive Soufflé program (parse tree + eval/2 fixpoint +
+            // the model's per-node value readouts from the trace) instead of the per-position view. ──
+            if has_flag(&args, "--datalog") {
+                let mut atoms: Vec<(String, usize)> = Vec::new();      // (atom, source-token index); splits BPE merges
+                for (ti, &id) in rec_ids.iter().enumerate() {
+                    let mut num = String::new();
+                    for ch in lbl(id).chars() {
+                        if ch.is_ascii_digit() {
+                            num.push(ch);
+                        } else {
+                            if !num.is_empty() { atoms.push((std::mem::take(&mut num), ti)); }
+                            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/') { atoms.push((ch.to_string(), ti)); }
+                        }
+                    }
+                    if !num.is_empty() { atoms.push((num, ti)); }
+                }
+                let tree = match recursion_dl::parse_target(&atoms) {
+                    Some(t) => t,
+                    None => { eprintln!("[fieldrun] --datalog: no arithmetic s-expression found — give e.g. --text \"(+ 1 (* 3 (- 5 1)))\""); return; }
+                };
+                // FAITHFULNESS anchor: the model's ACTUAL answer (greedily generate a few tokens — Qwen emits a space
+                // then the digits — and read the leading integer of the continuation; exact, not a logit-lens guess).
+                let mut gids = rec_ids.clone();
+                let mut cont = String::new();
+                for _ in 0..4 {
+                    let t = lm.predict(&gids);
+                    let s = lbl(t);
+                    if s.contains('\n') { break; }
+                    cont.push_str(&s);
+                    gids.push(t);
+                }
+                let num: String = cont.chars().skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit()).collect();
+                let model_answer: Option<i64> = num.parse::<i64>().ok();
+                let dl = recursion_dl::emit(&tree, model_answer);
+                match flag(&args, "--out") {
+                    Some(p) => { let _ = std::fs::write(p, &dl); eprintln!("[fieldrun] wrote {p}"); }
+                    None => print!("{dl}"),
+                }
+                return;
+            }
+
             let nl = trace.first().map(|r| r.n_layer).unwrap_or(0);
             println!("[fieldrun] recursion-explain · {} tokens · {nl} layers · gate(defer≥{defer}, reach≥{reach_min}, conc≥{conc_min})",
                      rec_ids.len());
