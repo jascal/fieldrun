@@ -176,6 +176,11 @@ pub enum ExplainMode {
     /// the top contributing residual blocks + the margin (LOGIC_EXPORT.md). Faithful-by-construction (it is the
     /// provenance of the actual decode; LE-T5). Pays one forward/token (the `residual_decomp` deopt).
     Logic,
+    /// The recursion spectrum: instead of the DLA circuits, gate each reply token on the recursion signature
+    /// (COMPUTED ∧ DEFERRED ∧ BINDING) and show the long-range binds vs the strictly-nested folds (depth≥2 =
+    /// recursion). The REPL analogue of `--recursion-explain --mode spectrum`. Reads `recursion_trace`; rope family
+    /// only. Pays one trace/reply, not per token.
+    Recursion,
 }
 
 impl ExplainMode {
@@ -186,9 +191,94 @@ impl ExplainMode {
             "circuits" | "circuit" | "dla" => Some(ExplainMode::Circuits),
             "all" | "full" | "verbose" => Some(ExplainMode::All),
             "logic" | "provenance" | "datalog" => Some(ExplainMode::Logic),
+            "recursion" | "rec" | "recurse" => Some(ExplainMode::Recursion),
             _ => None,
         }
     }
+}
+
+/// Render the recursion spectrum from a `recursion_trace`: gate each position on the recursion signature
+/// (COMPUTED — final top-1 is not a flat in-context copy; DEFERRED — logit-lens resolves late; BINDING — a
+/// concentrated, sink-excluded back-attention to a distant antecedent) and lay out the long-range binds vs the
+/// strictly-nested folds (a fold whose span contains an inner fold to an inner target ⇒ depth≥2 ⇒ recursion).
+/// Shared by `--recursion-explain --mode <mode>` (CLI) and the chat REPL's `/explain recursion`; returns the block
+/// so each caller prints it where it wants. `label(id)` decodes a token; `ids` is the sequence the trace covers;
+/// `mode` ∈ {spectrum (both), recursion (nested only), binding (all Level-1)}.
+#[cfg(feature = "api")]
+#[allow(clippy::too_many_arguments)]
+pub fn recursion_spectrum(
+    trace: &[crate::model::RecPos],
+    ids: &[i64],
+    label: &dyn Fn(i64) -> String,
+    defer: f32,
+    reach_min: usize,
+    conc_min: f32,
+    mode: &str,
+    show_all: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    let nl = trace.first().map(|r| r.n_layer).unwrap_or(0);
+    let _ = writeln!(o, "[fieldrun] recursion-explain · {} tokens · {nl} layers · gate(defer≥{defer}, reach≥{reach_min}, conc≥{conc_min})",
+                     ids.len());
+    struct Lit { pos: usize, back: usize, reach: usize, conc: f32, resolve: usize, depth: usize, value: String }
+    let mut lits: Vec<Lit> = Vec::new();
+    for r in trace {
+        // COMPUTED: final top-1 is NOT a flat in-context copy (longest-suffix induction)
+        let ctx = &ids[..=r.pos];
+        let mut copy = false;
+        let maxspan = std::cmp::min(6, ctx.len().saturating_sub(1));
+        'spans: for span in (2..=maxspan).rev() {
+            let tail = &ctx[ctx.len() - span..];
+            for i in (0..ctx.len() - span).rev() {
+                if &ctx[i..i + span] == tail && i + span < ctx.len() {
+                    copy = ctx[i + span] == r.final_top1;
+                    break 'spans;
+                }
+            }
+        }
+        let deferred = r.resolve_layer as f32 / r.n_layer.max(1) as f32;
+        let reach = r.pos - r.back;
+        let g1 = !copy && deferred >= defer && reach >= reach_min && r.conc >= conc_min; // Level-1 binding gate
+        let value: String = r.lens_late.iter()
+            .map(|(l, t)| format!("L{l}:{:?}", label(*t).trim())).collect::<Vec<_>>().join(" ");
+        if g1 {
+            lits.push(Lit { pos: r.pos, back: r.back, reach, conc: r.conc, resolve: r.resolve_layer, depth: 1, value });
+        } else if show_all {
+            let _ = writeln!(o, "    {:>3}  {:<10}  resolve {:>2}/{}  defer {:.2}  reach {:>2}  conc {:.2}  folds←{:>3}:{:<8}  | {}",
+                             r.pos, format!("{:?}", label(ids[r.pos])), r.resolve_layer, r.n_layer,
+                             deferred, reach, r.conc, r.back, format!("{:?}", label(ids[r.back])), value);
+        }
+    }
+    // nesting depth (Level 2): a fold STRICTLY CONTAINS an inner fold — inner target deeper (back_i<back_j) and inner
+    // closes earlier (pos_j<pos_i). DP in pos order (lits are already pos-ordered). depth≥2 ⇒ recursion.
+    for i in 0..lits.len() {
+        let mut d = 1usize;
+        for j in 0..i {
+            if lits[i].back < lits[j].back && lits[j].pos < lits[i].pos {
+                d = d.max(1 + lits[j].depth);
+            }
+        }
+        lits[i].depth = d;
+    }
+    let n_rec = lits.iter().filter(|l| l.depth >= 2).count();
+    let mut shown = 0usize;
+    for l in &lits {
+        let is_rec = l.depth >= 2;
+        if mode == "recursion" && !is_rec { continue; }
+        shown += 1;
+        let mark = if is_rec { format!("▶ rec d{}", l.depth) } else { "· bind   ".to_string() };
+        let _ = writeln!(o, " {:<9} {:>3}  {:<10}  resolve {:>2}/{}  reach {:>2}  conc {:.2}  folds←{:>3}:{:<8}  | {}",
+                         mark, l.pos, format!("{:?}", label(ids[l.pos])), l.resolve, nl, l.reach, l.conc,
+                         l.back, format!("{:?}", label(ids[l.back])), l.value);
+    }
+    if shown == 0 && !show_all {
+        let what = if mode == "recursion" { "nested recursion" } else { "recursive/long-range processing" };
+        let _ = writeln!(o, "  (no {what} detected — silent)");
+    } else {
+        let _ = writeln!(o, "  → spectrum: {} long-range BINDING · {n_rec} of them NESTED RECURSION  (mode={mode})", lits.len());
+    }
+    o
 }
 
 /// Name an attention head's behaviour at the predicting position from its attention row (length seq), using the
@@ -544,6 +634,9 @@ mod tests {
         assert_eq!(ExplainMode::parse("on"), Some(ExplainMode::Route)); // alias for the cheap default
         assert_eq!(ExplainMode::parse("CIRCUITS"), Some(ExplainMode::Circuits)); // case-insensitive
         assert_eq!(ExplainMode::parse("all"), Some(ExplainMode::All));
+        assert_eq!(ExplainMode::parse("logic"), Some(ExplainMode::Logic));
+        assert_eq!(ExplainMode::parse("recursion"), Some(ExplainMode::Recursion));
+        assert_eq!(ExplainMode::parse("REC"), Some(ExplainMode::Recursion)); // alias, case-insensitive
         assert_eq!(ExplainMode::parse("--raw"), None); // a following flag isn't a mode → caller defaults to Route
     }
 
