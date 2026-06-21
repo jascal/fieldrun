@@ -283,6 +283,54 @@ pub fn run_list_measure(args: &[String], lm: &dyn crate::model::Model, tg: &Opti
     println!("  acc-by-list-length = the list-depth cliff. These map onto textbook recursive Datalog (len/last/member/fold).");
 }
 
+/// DUMP (task, list, model-output, truth) JSONL for the list battery — the input to the offline bottom-up synthesizer
+/// (RULE_EXTRACTION_PROPOSAL §8). The synthesizer fits a program to the MODEL'S output (faithful), so we dump the
+/// model's actual answer per list; `truth` is the textbook value (for grading discovery, not a fit target).
+pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --list-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--list-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --list-dump needs a path"); return; } };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(120);
+    let lmin: usize = 3;
+    let lmax: usize = flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(7);
+    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    type LFn = (&'static str, &'static str, fn(&[i64]) -> Option<i64>);
+    let fns: [LFn; 6] = [
+        ("last",  "last 3 7 2 5 = 5\nlast 1 8 4 = 4\nlast 6 0 9 2 = 2\n", |l| l.last().copied()),
+        ("first", "first 3 7 2 5 = 3\nfirst 1 8 4 = 1\nfirst 6 0 9 2 = 6\n", |l| l.first().copied()),
+        ("len",   "len 3 7 2 5 = 4\nlen 1 8 4 = 3\nlen 6 0 9 2 5 = 5\n", |l| Some(l.len() as i64)),
+        ("max",   "max 3 7 2 5 = 7\nmax 1 8 4 = 8\nmax 6 0 9 2 = 9\n", |l| l.iter().max().copied()),
+        ("min",   "min 3 7 2 5 = 2\nmin 1 8 4 = 1\nmin 6 0 9 2 = 0\n", |l| l.iter().min().copied()),
+        ("sum",   "sum 3 1 2 = 6\nsum 4 0 1 = 5\nsum 2 3 1 = 6\n", |l| { let s: i64 = l.iter().sum(); (s <= 9).then_some(s) }),
+    ];
+    let mut out = String::new();
+    let mut total = 0usize;
+    eprintln!("[fieldrun] list-dump · {n} lists/task · len {lmin}..{lmax} → {path}");
+    for (name, prime, truth) in fns {
+        let (mut got, mut tries) = (0usize, 0usize);
+        while got < n && tries < n * 40 {
+            tries += 1;
+            let len = lmin + (xorshift(&mut rng) % (lmax - lmin + 1) as u64) as usize;
+            let list: Vec<i64> = (0..len).map(|_| (xorshift(&mut rng) % 10) as i64).collect();
+            let tv = match truth(&list) { Some(a) if (0..=9).contains(&a) => a, _ => continue };
+            let listing = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            let mut g = tg.encode(&format!("{prime}{name} {listing} ="), false);
+            let mut cont = String::new();
+            for _ in 0..3 { let t = lm.predict(&g); let s = tg.decode(&[t]); if s.contains('\n') { break; } cont.push_str(&s); g.push(t); }
+            let mo: Option<i64> = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+            if let Some(mo) = mo {
+                let ls = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                out.push_str(&format!("{{\"task\":\"{name}\",\"list\":[{ls}],\"out\":{mo},\"truth\":{tv}}}\n"));
+                got += 1;
+                total += 1;
+            }
+        }
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {total} records → {path}"),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 /// FAITHFUL cross-attribution: for each ASKED list-function, score what the model ACTUALLY computes against EVERY
 /// candidate (incl. broken variants) — the best match is the model's real function, which may not be the one we named.
 /// Faithfulness, not correctness: we fit the model's output, "wrong"-by-textbook included. Off-diagonal > diagonal =
