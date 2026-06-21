@@ -749,6 +749,9 @@ fn render_typed_trace(
         ExplainMode::Circuits => "route + DLA circuits on COMPOSED tokens (the forge tax)",
         ExplainMode::All => "route + DLA circuits on every token",
         ExplainMode::Logic => "route + logic-export provenance (per-block contributions + the decode margin; LOGIC_EXPORT.md)",
+        // Recursion is rendered out-of-band (the whole-reply recursion spectrum, not the per-token DLA trace this
+        // function emits) — see the chat loop. This arm only keeps the legend match exhaustive.
+        ExplainMode::Recursion => "recursion spectrum (long-range binds vs nested folds; rendered separately)",
     };
     let n = gen_ids.len();
     // head_tail bounds ONLY the expensive + verbose CIRCUIT breakdown (one faithful forward each) — the route + rule
@@ -1118,13 +1121,14 @@ impl rustyline::completion::Completer for SlashHelper {
             let arg_start = upto.rfind(' ').unwrap() + 1;
             let frag = &upto[arg_start..];
             let subs: &[&str] = match cmd {
-                "/explain" => &["on", "off", "context", "all"],
+                "/explain" => &["on", "off", "route", "circuits", "all", "logic", "recursion", "context", "tokens"],
                 "/format" => &["on", "off"],
+                "/bucket" => &["on", "off", "experts", "k", "reset", "dump"],
                 _ => &[],
             };
             Ok((arg_start, subs.iter().filter(|s| s.starts_with(frag)).map(|s| pair(s)).collect()))
         } else {
-            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/export-logic", "/format", "/raw", "/help"];
+            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/export-logic", "/bucket", "/format", "/raw", "/help"];
             Ok((0, CMDS.iter().filter(|c| c.starts_with(upto)).map(|c| pair(c)).collect()))
         }
     }
@@ -1254,7 +1258,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                                   if explain_tk == 0 { "ALL tokens".to_string() } else { format!("first/last {explain_tk}") });
                     }
                     Some(other) => {
-                        eprintln!("[fieldrun] /explain {other}? use: off | route (free) | circuits (DLA on composed) | all | context N | tokens N");
+                        eprintln!("[fieldrun] /explain {other}? use: off | route (free) | circuits (DLA on composed) | all | logic | recursion | context N | tokens N");
                     }
                 },
                 "format" | "md" | "markdown" => {
@@ -1365,11 +1369,55 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                     }
                     Some(other) => eprintln!("[fieldrun] /bucket {other}? use: on | off | experts N | k N | reset | dump [path.dl|.json] | (no arg = show)"),
                 },
-                "help" => eprintln!("[fieldrun] commands: /exit (or /quit) · /reset (clear history) · \
-                                     /explain [on|off] (circuits + features) · /explain context <N|all> · \
-                                     /export-logic [file.dl] <prompt> (semiring-Datalog export) · \
-                                     /bucket [on|off|experts N|k N|reset|dump path] (incremental expert clustering) · \
-                                     /format [on|off] (markdown) · /help"),
+                "help" => {
+                    // one option per line, grouped with blank lines; the command column is padded so the
+                    // descriptions line up. A command wider than the column (e.g. export-logic) puts its
+                    // description on the next, indented line instead of blowing the alignment out.
+                    fn group(h: &mut String, title: &str, rows: &[(&str, &str)]) {
+                        h.push('\n');
+                        h.push_str(title);
+                        h.push('\n');
+                        for &(cmd, desc) in rows {
+                            if cmd.chars().count() > 30 {
+                                h.push_str(&format!("    {cmd}\n    {:30}{desc}\n", ""));
+                            } else {
+                                h.push_str(&format!("    {cmd:30}{desc}\n"));
+                            }
+                        }
+                    }
+                    let mut h = String::from("[fieldrun] commands — Tab completes them, ↑/↓ scroll history:\n");
+                    group(&mut h, "session", &[
+                        ("/help", "list these commands"),
+                        ("/reset", "clear conversation history — start a fresh context (alias /clear)"),
+                        ("/exit", "leave chat — also /quit, /q, or Ctrl-D"),
+                    ]);
+                    group(&mut h, "output", &[
+                        ("/format [on|off]", "toggle Markdown rendering; no arg flips it (alias /md, /markdown)"),
+                        ("/raw", "turn Markdown off — plain text"),
+                    ]);
+                    group(&mut h, "explain — why the model chose each token", &[
+                        ("/explain [on|off]", "turn explanation on (route mode) or off"),
+                        ("/explain route", "routing only: RETRIEVED / COMPOSED … (free — no extra forward pass)"),
+                        ("/explain circuits", "+ DLA circuit breakdown on COMPOSED tokens (the forge tax)"),
+                        ("/explain all", "circuit breakdown on every token (slow)"),
+                        ("/explain logic", "per-block contributions + decode margin (logic-export provenance)"),
+                        ("/explain recursion", "long-range binds vs nested folds over the reply (rope family only)"),
+                        ("/explain context <N|all>", "how many trailing context tokens to show (default 10)"),
+                        ("/explain tokens <N|all>", "deep-explain only the first/last N reply tokens"),
+                    ]);
+                    group(&mut h, "datalog export", &[
+                        ("/export-logic [file.dl] <prompt>", "generate the whole reply and emit one runnable .dl per token (semiring-Datalog decode trace); stitch with `fieldrun stitch`"),
+                    ]);
+                    group(&mut h, "expert clustering (--bucket)", &[
+                        ("/bucket", "show the current session clustering (also turns it on)"),
+                        ("/bucket on|off", "cluster after each reply / stop"),
+                        ("/bucket experts N", "set the number of experts E"),
+                        ("/bucket k N", "set the competitor count K"),
+                        ("/bucket reset", "clear the session corpus"),
+                        ("/bucket dump [path.dl|.json]", "write the partition (.json) or Datalog model (.dl)"),
+                    ]);
+                    eprint!("{h}");
+                }
                 other => eprintln!("[fieldrun] unknown command /{other} — try /help"),
             }
             continue;
@@ -1466,13 +1514,28 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
         // generated token, a debugger-style stack of the model "looping and thinking" (not just the first decision).
         // Decoded via the bundled tokenizer. Off by default (toggle with /explain).
         if let Some(mode) = explain {
-            // Route is free (no forward); Circuits/All re-run the faithful forward (only on COMPOSED tokens for Circuits).
-            // For a circuit mode on an arch with no explain support, the route still renders; only the breakdown is empty.
-            if matches!(mode, ExplainMode::Circuits | ExplainMode::All) && lm.explain(&gen_out.prompt_ids).is_none() {
-                eprintln!("[fieldrun] (no circuit explain for arch {arch} — showing route only; /explain route to silence)");
-            }
             let dec = |id: i64| tg.token_label(id);
-            eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx, explain_tk));
+            if mode == ExplainMode::Recursion {
+                // Recursion spectrum: gate each token of the WHOLE reply (prompt ++ reply) on the recursion signature
+                // (COMPUTED ∧ DEFERRED ∧ BINDING) and lay out the long-range binds vs the strictly-nested folds. One
+                // `recursion_trace` forward over the sequence; rope family only (same substrate as the CLI mode).
+                let full: Vec<i64> = gen_out.prompt_ids.iter().chain(&gen_out.gen_ids).copied().collect();
+                // plain decode (not token_label) — the spectrum already Debug-quotes each token, so the bare piece
+                // renders clean (" (*") instead of token_label's already-annotated form double-quoted.
+                let rdec = |id: i64| tg.decode(&[id]);
+                match lm.recursion_trace(&full) {
+                    Some(trace) => eprintln!("\n[explain]\n{}",
+                        crate::explain::recursion_spectrum(&trace, &full, &rdec, 0.6, 3, 0.20, "spectrum", false)),
+                    None => eprintln!("[fieldrun] (no recursion trace for arch {arch} — rope family only; /explain route to silence)"),
+                }
+            } else {
+                // Route is free (no forward); Circuits/All re-run the faithful forward (only on COMPOSED tokens for Circuits).
+                // For a circuit mode on an arch with no explain support, the route still renders; only the breakdown is empty.
+                if matches!(mode, ExplainMode::Circuits | ExplainMode::All) && lm.explain(&gen_out.prompt_ids).is_none() {
+                    eprintln!("[fieldrun] (no circuit explain for arch {arch} — showing route only; /explain route to silence)");
+                }
+                eprintln!("\n[explain]\n{}", render_typed_trace(lm.as_ref(), &gen_out.prompt_ids, &gen_out.gen_ids, store.as_ref(), &cand, mode, &dec, explain_ctx, explain_tk));
+            }
         }
         // --bucket: ingest each reply token's irreducible atom (descend prompt_ids ++ gen_ids[..i]) into the session
         // corpus, then report the running expert clustering. One descent forward per reply token — heavy, opt-in.
