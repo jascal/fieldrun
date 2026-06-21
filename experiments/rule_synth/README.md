@@ -17,9 +17,20 @@ python synth.py /tmp/listdump.jsonl 4            # arg2 = DSL depth K (default 4
 # 2b. the discriminating test: train on short lists, test on long (real fn vs in-distribution coincidence)
 python synth.py /tmp/listdump.jsonl 4 --ood
 
-# 3. emit each discovered program as recursive Soufflé + residue EDB, and round-trip-verify it reproduces the model
-python emit_datalog.py /tmp/listdump.jsonl 4 /tmp/souffle_out     # needs `souffle` on PATH
+# 3. emit each discovered program as recursive Soufflé + a residue, and round-trip-verify it reproduces the model
+python emit_datalog.py /tmp/listdump.jsonl 4 /tmp/souffle_out                  # needs `souffle` on PATH
+python emit_datalog.py /tmp/listdump.jsonl 4 /tmp/souffle_out --strategy=ensemble   # residue strategy (below)
 ```
+
+**`--residue-strategy` (the export choice, [PIC_LOSSINESS.md] §4).** The crisp head always emits as recursive Datalog;
+the residue (where the head disagrees with the model) is strategy-selected — both reproduce the model 100% by
+construction:
+- `edb` (default) — a flat `residue(l,o)` fact table (memorise).
+- `ensemble` — the held-out-gated decision list (`synth.decision_list`) emitted as **guarded Datalog rules** (guards:
+  `len>k`, `first==max`/`first==min`/`last==max`, `is_sorted`) + a *shrunk* residue EDB for what the guards still miss.
+  Reduces the residue where a guarded alternate generalises (e.g. `last` 12%→9%).
+- `ring` / `pic` — route those tokens to LOGIC_EXPORT's semiring-Datalog (T=0 / T=1); the alignment showed most residue
+  is low-margin + concentrated (ensemble/edb-cheap), so these earn their keep on the rare diffuse, natural-text residue.
 
 ### Tree-traversal rules (proposal §11 — the untried deterministic class)
 
