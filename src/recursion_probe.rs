@@ -40,6 +40,15 @@ pub fn gen_arith(depth: usize, maxv: i64, r: &mut u64) -> (String, i64) {
     (v.to_string(), v)
 }
 
+/// Mean and population std-dev of a slice — for seed-variance reporting (`--seeds K` re-runs with K seeds).
+pub fn mean_std(xs: &[f64]) -> (f64, f64) {
+    if xs.is_empty() { return (0.0, 0.0); }
+    let n = xs.len() as f64;
+    let m = xs.iter().sum::<f64>() / n;
+    let v = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n;
+    (m, v.sqrt())
+}
+
 /// A random depth-`depth` expression over an arbitrary operator set `ops`, all sub-results in [0, maxv] (or {0,1} for
 /// Boolean). Generalises gen_arith to any family — lets --measure gauge WHICH recursive functions a model can do.
 pub fn gen_family(depth: usize, ops: &[char], maxv: i64, r: &mut u64) -> (String, i64) {
@@ -228,7 +237,8 @@ pub fn run_list_measure(args: &[String], lm: &dyn crate::model::Model, tg: &Opti
     let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
     let lmin: usize = 3;
     let lmax: usize = flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(6);
-    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    let base_seed: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seeds: usize = flag(args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(1);
     type LFn = (&'static str, &'static str, fn(&[i64]) -> Option<i64>);
     let fns: [LFn; 6] = [
         ("last",  "last 3 7 2 5 = 5\nlast 1 8 4 = 4\nlast 6 0 9 2 = 2\n", |l| l.last().copied()),
@@ -238,31 +248,36 @@ pub fn run_list_measure(args: &[String], lm: &dyn crate::model::Model, tg: &Opti
         ("min",   "min 3 7 2 5 = 2\nmin 1 8 4 = 1\nmin 6 0 9 2 = 0\n", |l| l.iter().min().copied()),
         ("sum",   "sum 3 1 2 = 6\nsum 4 0 1 = 5\nsum 2 3 1 = 6\n", |l| { let s: i64 = l.iter().sum(); (s <= 9).then_some(s) }),
     ];
-    eprintln!("[fieldrun] list-recursion battery · {n} lists/fn · len {lmin}..{lmax} · {stem}");
+    eprintln!("[fieldrun] list-recursion battery · {n} lists/fn × {seeds} seeds · len {lmin}..{lmax} · {stem}");
     println!("# list-recursion battery — which RECURSIVE (list-fold) functions can the model do? ({stem})");
-    println!("  function  accuracy   n    acc-by-list-length");
+    println!("  function  accuracy(mean±sd over {seeds} seeds)   acc-by-list-length(pooled)");
     for (name, prime, truth) in fns {
-        let (mut tot, mut ok) = (0usize, 0usize);
+        let mut accs: Vec<f64> = Vec::new();
         let mut bylen: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
-        let mut tries = 0;
-        while tot < n && tries < n * 30 {
-            tries += 1;
-            let len = lmin + (xorshift(&mut rng) % (lmax - lmin + 1) as u64) as usize;
-            let list: Vec<i64> = (0..len).map(|_| (xorshift(&mut rng) % 10) as i64).collect();
-            let ans = match truth(&list) { Some(a) if (0..=9).contains(&a) => a, _ => continue };
-            let listing = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
-            let mut g = tg.encode(&format!("{prime}{name} {listing} ="), false);
-            let mut cont = String::new();
-            for _ in 0..3 { let t = lm.predict(&g); let s = tg.decode(&[t]); if s.contains('\n') { break; } cont.push_str(&s); g.push(t); }
-            let pred: Option<i64> = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
-            tot += 1;
-            let e = bylen.entry(len).or_insert((0, 0));
-            e.1 += 1;
-            if pred == Some(ans) { ok += 1; e.0 += 1; }
+        for si in 0..seeds {
+            let mut rng: u64 = (base_seed ^ (si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+            let (mut tot, mut ok) = (0usize, 0usize);
+            let mut tries = 0;
+            while tot < n && tries < n * 30 {
+                tries += 1;
+                let len = lmin + (xorshift(&mut rng) % (lmax - lmin + 1) as u64) as usize;
+                let list: Vec<i64> = (0..len).map(|_| (xorshift(&mut rng) % 10) as i64).collect();
+                let ans = match truth(&list) { Some(a) if (0..=9).contains(&a) => a, _ => continue };
+                let listing = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                let mut g = tg.encode(&format!("{prime}{name} {listing} ="), false);
+                let mut cont = String::new();
+                for _ in 0..3 { let t = lm.predict(&g); let s = tg.decode(&[t]); if s.contains('\n') { break; } cont.push_str(&s); g.push(t); }
+                let pred: Option<i64> = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+                tot += 1;
+                let e = bylen.entry(len).or_insert((0, 0));
+                e.1 += 1;
+                if pred == Some(ans) { ok += 1; e.0 += 1; }
+            }
+            accs.push(100.0 * ok as f64 / tot.max(1) as f64);
         }
-        let acc = 100.0 * ok as f64 / tot.max(1) as f64;
-        let bl: Vec<String> = bylen.iter().map(|(l, (o, m))| format!("{l}:{:.0}%", 100.0 * *o as f64 / (*m).max(1) as f64)).collect();
-        println!("  {name:<8}  {acc:>5.0}%  {tot:>3}    {}", bl.join("  "));
+        let (m, s) = mean_std(&accs);
+        let bl: Vec<String> = bylen.iter().map(|(l, (o, mm))| format!("{l}:{:.0}%", 100.0 * *o as f64 / (*mm).max(1) as f64)).collect();
+        println!("  {name:<8}  {m:>4.0}% ± {s:<3.0}   {}", bl.join("  "));
     }
     println!("\n→ which RECURSIVE functions the model computes over LISTS (folds), not just numeric expressions;");
     println!("  acc-by-list-length = the list-depth cliff. These map onto textbook recursive Datalog (len/last/member/fold).");
@@ -371,7 +386,8 @@ pub fn run_bind_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Option
     let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --bind-patch needs a tokenizer next to {stem}"); return; } };
     let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(50);
     let nvars: usize = flag(args, "--nvars").and_then(|s| s.parse().ok()).unwrap_or(3);
-    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    let base_seed: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seeds: usize = flag(args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(1);
     let layers: Vec<usize> = match flag(args, "--layers") {
         Some(s) => s.split(',').filter_map(|x| x.parse().ok()).collect(),
         None => vec![0, 4, 8, 12, 16, 20, 24],
@@ -389,9 +405,13 @@ pub fn run_bind_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Option
         }
         cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
     };
+    let mut layer_rates: std::collections::BTreeMap<usize, Vec<f64>> = layers.iter().map(|&l| (l, Vec::new())).collect();
+    let mut base_rates: Vec<f64> = Vec::new();
+    eprintln!("[fieldrun] bind-patch · {n} pairs × {seeds} seeds · {nvars} vars · layers {layers:?} · {stem}");
+    for si in 0..seeds {
+    let mut rng: u64 = (base_seed ^ (si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
     let (mut total, mut base_ok) = (0usize, 0usize);
     let mut hits: std::collections::BTreeMap<usize, usize> = layers.iter().map(|&l| (l, 0)).collect();
-    eprintln!("[fieldrun] bind-patch · {n} pairs · {nvars} vars · layers {layers:?} · {stem}");
     for _ in 0..n {
         let (sa, sb, ansa, ansb) = match gen_bind_pair(nvars, &mut rng) { Some(x) => x, None => continue };
         let aids = tg.encode(&format!("{PRIME}{sa}"), false);
@@ -411,12 +431,18 @@ pub fn run_bind_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Option
         }
     }
     let pc = |x: usize| 100.0 * x as f64 / total.max(1) as f64;
-    println!("# bind-patch — VARIABLE-BINDING retrieval, causal ({stem}) · {total} pairs · {nvars} vars");
-    println!("# baseline: B retrieves its OWN value {:.0}% of the time", pc(base_ok));
-    println!("  layer   B→A retrieval (binding-site causal)");
-    for (&l, &h) in &hits { println!("  {l:>4}        {:>5.0}%   (of {total})", pc(h)); }
-    println!("\n→ HIGH = patching the binding site flips the RETRIEVED value → the held binding is causally retrieved");
-    println!("  (held-for-retrieval confirmed). The peak layer locates where the retrieval circuit reads the binding.");
+    for &l in &layers { layer_rates.get_mut(&l).unwrap().push(pc(*hits.get(&l).unwrap())); }
+    base_rates.push(pc(base_ok));
+    }
+    let (bm, bs) = mean_std(&base_rates);
+    println!("# bind-patch — VARIABLE-BINDING retrieval, causal ({stem}) · n={n}/seed × {seeds} seeds · {nvars} vars");
+    println!("# baseline: B retrieves its OWN value {bm:.0}% ± {bs:.0} (sd over seeds)");
+    println!("  layer   B→A retrieval (binding-site causal · mean% ± sd over {seeds} seeds)");
+    for &l in &layers {
+        let (m, s) = mean_std(layer_rates.get(&l).unwrap());
+        println!("  {l:>4}        {m:>5.0}% ± {s:<4.0}");
+    }
+    println!("\n→ HIGH = patching the binding site flips the RETRIEVED value → held binding causally retrieved; ± = sd across {seeds} seeds.");
 }
 
 /// CONSUMING-CONTEXT test (user: "not a spectator in OTHER evaluations of the same circuit"). Vary the HOLD DISTANCE
@@ -480,7 +506,8 @@ pub fn run_hold_sweep(args: &[String], lm: &dyn crate::model::Model, tg: &Option
 pub fn run_value_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
     let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --value-patch needs a tokenizer next to {stem}"); return; } };
     let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(40);
-    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    let base_seed: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seeds: usize = flag(args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(1);
     let layers: Vec<usize> = match flag(args, "--layers") {
         Some(s) => s.split(',').filter_map(|x| x.parse().ok()).collect(),
         None => vec![4, 8, 12, 16, 18, 20, 24],
@@ -499,9 +526,13 @@ pub fn run_value_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
         }
         cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
     };
+    let mut layer_rates: std::collections::BTreeMap<usize, Vec<f64>> = layers.iter().map(|&l| (l, Vec::new())).collect();
+    let mut base_rates: Vec<f64> = Vec::new();
+    eprintln!("[fieldrun] value-patch · {n} pairs × {seeds} seeds · layers {layers:?} · patch={} · {stem}", if span_mode { "LEFT-SPAN" } else { "left-close" });
+    for si in 0..seeds {
+    let mut rng: u64 = (base_seed ^ (si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
     let (mut total, mut base_ok) = (0usize, 0usize);
     let mut hits: std::collections::BTreeMap<usize, usize> = layers.iter().map(|&l| (l, 0)).collect();
-    eprintln!("[fieldrun] value-patch · {n} matched pairs · layers {layers:?} · patch={} · {stem}", if span_mode { "LEFT-SPAN (operands+close)" } else { "left-close only" });
     for _ in 0..n {
         let (ea, eb, ansa, ansb, _la, _lb) = match gen_patch_pair(&mut rng) { Some(x) => x, None => continue };
         let aids = tg.encode(&format!("{PRIME}{ea} ="), false);
@@ -527,14 +558,18 @@ pub fn run_value_patch(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
         }
     }
     let pc = |x: usize| 100.0 * x as f64 / total.max(1) as f64;
-    println!("# value-patch — CAUSAL interchange ({stem}) · {total} matched pairs · patch={}", if span_mode { "left-span" } else { "left-close" });
-    println!("# baseline: B computes its OWN answer {:.0}% of the time (patch only meaningful on these)", pc(base_ok));
-    println!("  layer   B→A-answer (causal carry)");
-    for (&l, &h) in &hits {
-        println!("  {l:>4}        {:>5.0}%   (of {total})", pc(h));
+    for &l in &layers { layer_rates.get_mut(&l).unwrap().push(pc(*hits.get(&l).unwrap())); }
+    base_rates.push(pc(base_ok));
     }
-    println!("\n→ a HIGH rate at some layer = patching A's left-child residual there makes B output A's answer →");
-    println!("  that (layer,pos) CAUSALLY carries the left value (decodable AND used). Peak layer should match the probe's.");
+    let (bm, bs) = mean_std(&base_rates);
+    println!("# value-patch — CAUSAL interchange ({stem}) · n={n}/seed × {seeds} seeds · patch={}", if span_mode { "left-span" } else { "left-close" });
+    println!("# baseline: B computes its OWN answer {bm:.0}% ± {bs:.0} (sd over seeds)");
+    println!("  layer   B→A-answer (causal carry · mean% ± sd over {seeds} seeds)");
+    for &l in &layers {
+        let (m, s) = mean_std(layer_rates.get(&l).unwrap());
+        println!("  {l:>4}        {m:>5.0}% ± {s:<4.0}");
+    }
+    println!("\n→ HIGH at a layer = patching there makes B output A's answer (causal carry); ± = sd across {seeds} seeds (n={n} pairs each).");
 }
 
 /// B2 — supervised value-probe DUMP. For many depth-2 exprs, capture the per-layer residual at each subtree node's
