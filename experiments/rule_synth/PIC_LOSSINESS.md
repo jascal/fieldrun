@@ -57,8 +57,10 @@ shows    decodes_to L' V t                    (the approximation decodes to the 
 
 So any compact / perturbed representation (a rank-truncated PIC, a dropped FFN neuron, quantisation) **reproduces the
 model's next token on every token whose margin exceeds 2δ**. The loss can therefore only live in the **sub-2δ-margin**
-tokens — which are exactly the low-margin, high-PR, dense-Gram residue (the forge tax). Margin and PR jointly localise
-where a compact code can flip, and PO-T3 certifies everywhere else.
+tokens (the forge tax). NB the paper's per-token PR is **route-invariant** (≈45-way for retrieved *and* computed); the
+retrieve-vs-compute axes are the **margin** and **μ_t**, not PR — so it is the *low-margin / low-μ_t* tokens that a
+compact code can flip, and PO-T3 certifies everywhere else. (The "high-PR" descriptor belongs to the *aggregate
+irreducible computation* — the dense-Gram fixpoint of Thm 5 — not to a per-token residue label.)
 
 ## 4. The corrected picture for `--residue-strategy`
 

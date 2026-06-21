@@ -439,6 +439,53 @@ pub fn run_source_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Op
     }
 }
 
+/// NATURAL-TEXT alignment dump (the two-regime check): like --source-pr-dump but over a prose corpus and the full vocab.
+/// Per position emits the model's source-PR `(Σ_b c_b)²/Σ_b c_b²` over the 57 DLA blocks (the paper's Thm-5 diffuseness
+/// quantity), margin, and μ_t — over the top-K logit candidates. The retrieved-vs-computed (track A) label is built
+/// offline from the dumped token ids (n-gram / induction). Tests whether COMPUTED natural-text tokens are HIGH source-PR
+/// (the paper's regime, PR≈45) — in contrast to the structured-task finding (residue = LOW PR).
+pub fn run_natural_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --natural-pr-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--natural-pr-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --natural-pr-dump needs a path"); return; } };
+    let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(40);
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(400);
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted. When the evidence contradicts a \
+        theory, the theory must change, however elegant it may seem. This willingness to discard a beautiful idea in the \
+        face of a stubborn fact is, more than any single discovery, the engine that drives progress.";
+    let text = flag(args, "--text").unwrap_or(DEFAULT);
+    let ids = tg.encode(text, false);
+    if ids.len() < 4 { eprintln!("[fieldrun] natural-pr-dump: text too short ({} ids)", ids.len()); return; }
+    let mut out = String::new();
+    let last = (ids.len() - 1).min(nmax + 1);
+    eprintln!("[fieldrun] natural-pr-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
+    for p in 1..last {
+        let ctx = &ids[..=p];
+        let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return; } };
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
+        let (_labels, contrib) = match lm.residual_decomp(ctx, &cand) { Some(x) => x, None => { eprintln!("[fieldrun] no residual_decomp"); return; } };
+        let nb = contrib.len();
+        let pred = cand[0]; // == order[0], the argmax
+        let margin = logits[order[0]] - logits[order[1]];
+        let cb: Vec<f32> = (0..nb).map(|b| contrib[b][0]).collect();
+        let s2: f32 = cb.iter().map(|c| c * c).sum();
+        let pr = if s2 > 0.0 { cb.iter().sum::<f32>().powi(2) / s2 } else { 0.0 };
+        let prmag = if s2 > 0.0 { cb.iter().map(|c| c.abs()).sum::<f32>().powi(2) / s2 } else { 0.0 };
+        let mu = (0..nb).filter(|&b| {
+            (0..cand.len()).max_by(|&x, &y| contrib[b][x].partial_cmp(&contrib[b][y]).unwrap()).unwrap() == 0
+        }).count();
+        out.push_str(&format!("{{\"pos\":{p},\"cur\":{},\"pred\":{pred},\"pr\":{pr:.3},\"prmag\":{prmag:.3},\"margin\":{margin:.4},\"mu\":{mu},\"nb\":{nb}}}\n", ids[p]));
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}", last.saturating_sub(1)),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 /// Dump the unembedding rows `U_id` for a set of output tokens (default the digits 0–9) — the frame elements for the
 /// Gram kernel `G_{vw}=⟨U_v,U_w⟩` (PIC_PROPOSAL §2). Lets the offline rank diagnostic test the paper's claim that the
 /// computed fragment's structure is a tropical-rank gap that *linear* SVD rank cannot measure (PIC_LOSSINESS §6, track B).
