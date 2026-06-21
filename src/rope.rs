@@ -1090,6 +1090,11 @@ impl Model for Rope {
         if na > 0.0 && nb > 0.0 { Some(dot / (na * nb)) } else { None }
     }
 
+    fn unembed_row(&self, id: usize) -> Option<Vec<f32>> {
+        let r = self.b.weight_row(self.unembed_name(), id);
+        if r.is_empty() { None } else { Some(r) }
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);

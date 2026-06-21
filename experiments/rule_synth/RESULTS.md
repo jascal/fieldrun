@@ -193,8 +193,107 @@ Mean residue rises 16% (6 clean tasks) → **30%** (10 tasks incl. these) — th
   gap. The soft (PIC) representation is still future and only for what survives *both* the list and tree DSLs.
 - **`first` is oddly low at 1.5B (78%)** — the model deviates from `first` 22% of the time (a real model quirk the synthesizer faithfully reports, not a synth bug).
 
+## Scope coverage (step 2.5) — the real tail test across 30 problems (1.5B, OOD)
+
+A broad battery (`fieldrun --scope-dump`, 30 list→int families: position / reduction / selection / comparison / count /
+arithmetic) run through the synthesizer (`scope_report.py`). The question: across *many* problems, does a small DSL +
+reused rule-library cover most (short head) or does each need bespoke rules (long tail)? **Scope mean forge tax (OOD) =
+33%** — but that number is *deflated* by a degeneracy the broad battery exposes:
+
+| band | count | tasks |
+|---|---|---|
+| HEAD resid≤15% — **genuine function** | **3** | `first` `max` `min` (real program, competent model) |
+| HEAD resid≤15% — **degenerate constant-fit** | 8 | `gcdred=1@96%` `argmax=5@9%` `cmax=1@71%` `issorted=0@95%` `allsame=0@100%` `ndesc=1@36%` `prodmod=0@60%` `ceven=2@26%` |
+| MID 15–50% | 9 | `last` `min2` `range` `nasc` `adiff` `sum` `nuniq` `second` `len` |
+| TAIL resid≥50% | 10 | `max2` `maxcount` `median` `penult` `codd` `midval` `czero` `summod` `argmin` `mode` |
+
+**The honest reading (a partial surprise vs the "short head" hope):** of 30 diverse problems the model *cleanly*
+implements only **~3** as genuine crisp functions (the simplest folds/selections). 8 more land in the "head" only
+because the model **can't do the task and emits a near-constant** (argmax 9%, ceven 26%, ndesc 36% accurate) which a
+*constant* program trivially reproduces — that is model degeneracy, not DSL coverage, and it inflates the naive
+coverage curve. So genuine crisp coverage is small; the tail (idiosyncratic + degenerate) is the bulk. The coverage
+*curve* (`resid≤50%: 67%`) looks short-head-ish; the genuine-function curve is much shorter.
+
+## PIC residue (step 3) — reducible vs irreducible on the 19 non-head problems — `pic_residue.py`
+
+For each surviving problem: top-40 candidate programs → incidence over the best-1 residue → PR from the set-cover
+marginal gains + **held-out** ensemble coverage + unexplained% (outside the crisp family). The labels:
+
+- **7 ensemble-reducible** (a small *generalizing* family of ≤2–4 crisp rules; held-out cover ≥60%): e.g. `max2` (~2
+  rules, 90%), `midval` (78%), `nasc` (69%), `mode` (~4 rules, 64%).
+- **1 PIC-irreducible**: `summod` — **71% of held-out residue outside the crisp family** (modular sum is genuinely not
+  a crisp fold in this DSL).
+- **11 diffuse/noise**: the train-chosen cover does *not* generalize (held-out coverage low) — the residue is model
+  inconsistency, not a coherent alternative algorithm.
+- **program-PR is LOW everywhere (1.0–2.9)**: where the residue is coverable at all, a *small* ensemble suffices; mean
+  unexplained-residue (outside the crisp family) over non-head = **10%**.
+
+**Caveat — the two PRs (do not conflate).** This is the *surrogate* program-PR (effective number of synthesized
+candidate programs), **not** the model's source-PR (the paper's PR≈45 over the model's own circuits). Thm 5
+(Diffuseness, proved) is about the *source*-PR; low program-PR here says nothing about it. Testing Thm 5 needs the
+model's DLA (track B, future) — see `PIC_LOSSINESS.md` §6.
+
+## Track B — the digit-output Gram kernel (a direct test of proved Thm 2) — `gram_probe.py`
+
+`fieldrun --dump-unembed` extracts the unembedding rows `U_v` for the digit tokens; `gram_probe.py` characterises
+`G_{vw}=⟨U_v,U_w⟩`:
+
+| model | Thm 2 `‖U_v−U_w‖²=2(1−ρ)` | mean off-diag ρ | Gram effective rank |
+|---|---|---|---|
+| 0.5B | **confirmed, err 7.1e-15** | +0.73 | **1.72 / 10** |
+| 1.5B | **confirmed, err 7.6e-15** | +0.75 | **1.63 / 10** |
+
+**Thm 2 confirmed numerically to machine precision at both scales** — a clean theory⟷experiment confirmation of a
+kernel-proved theorem. And the digit-output frame is **strongly coupled**, spanning only a **~1.6–1.7-dimensional
+number-line manifold** (not a 10-D one-hot space; the ρ matrix is a clean ordering — adjacent digits most similar, `0`
+the outlier), scale-consistent. This is the regime where a per-token one-hot/EDB view sees up to rank 10 while the
+kernel `G` reveals the decisions live in ~2 dimensions — direct evidence for the paper's "linear SVD rank cannot
+measure the gap" / `pic`-win direction. **Honest scope:** digits are an unusually coherent semantic family, so this is
+a digit-output-specific result, not a claim about all vocabulary.
+
+## Alignment — does the surrogate residue line up with the model's *computed* tokens? (track A ↔ track B) — `align.py`
+
+The decisive join: for each token, **track A** = does the best crisp synthesized program reproduce the model output
+(captured) or not (residue); **track B** = the model's own per-token DLA from `fieldrun --source-pr-dump` — **source-PR**
+`(Σ_b c_b)²/Σ_b c_b²` over the 57 residual-write blocks (the paper's diffuseness quantity), decode **margin**, and
+**μ_t** (blocks already argmaxing to the chosen digit; μ_t=0 = composed). 480 tokens, 1.5B, 12 tasks spanning head→tail.
+
+| signal | residue | captured | AUC | paper's "computed" ⇒ | verdict |
+|---|---|---|---|---|---|
+| **margin** | 0.46 | 1.53 | 0.22 | lower | ✓ **confirmed** |
+| **μ_t** | 6.45 | 8.70 | 0.36 | lower | ✓ **confirmed** |
+| source-PR (signed) | 4.87 | 5.51 | 0.30 | higher | ✗ **reversed** |
+| PR-magnitude `(Σ\|c\|)²/Σc²` | 7.10 | 8.13 | 0.29 | higher | ✗ **reversed** |
+
+**Confirmed (margin + μ_t):** the surrogate residue boundary is a *real mechanistic boundary* — where the crisp program
+fails, the model is making a **low-margin, composed (μ_t-low)** decision, not a clean single-source retrieval. So the
+export's crisp-head / residue split corresponds to something the model actually does. (Margin is the cleanest router,
+AUC 0.22.)
+
+**The surprise (source-PR, robust to the signed-vs-magnitude confound):** residue tokens are **more *concentrated*
+(lower block-PR), not more diffuse.** The paper's high-PR diffuse computation (PR≈45) is a *natural-text* regime; on
+these structured single-digit tasks the whole regime is low-PR (3–8) and the residue is *lower* still. **This does not
+contradict Thm 5** (which is about the natural-text source-PR) — it says the structured-task residue is a *different,
+concentrated regime*: a small coalition of blocks commits to a different (often wrong) answer at low margin, rather than
+a diffuse dense-Gram repair.
+
+**Two consequences for the export (both reassuring):**
+1. "Outside the crisp DSL" ≠ "diffuse/incompressible." `summod` (modular sum) is outside our DSL only because it lacks
+   a modular primitive — the model computes it *concentratedly* (low PR). So surrogate-irreducibility is a **DSL-
+   expressiveness gap**, not mechanistic diffuseness; extending the DSL can convert more residue into crisp rules.
+2. The genuinely-incompressible high-PR dense-Gram residue (the expensive `pic` case) is **rare in this regime** — most
+   residue is low-margin + concentrated, so a small ensemble / low-rank `pic` / `edb` captures it cheaply. The costly
+   diffuse-PIC part is a natural-text / open-vocabulary phenomenon, not the structured-task forge tax.
+
+**Caveats:** one model (1.5B), single-digit structured tasks, n=480, source-PR over 57 residual-write blocks. The
+margin/μ_t alignment is robust; the low-PR-residue claim is specific to this structured-task family — the natural-text
+diffuse regime (where the proved Thm 5 lives) is the obvious next measurement.
+
 ## Next
 
-Done this round: tree-recursion DSL + §6 tree-ADT round-trip + the emergence diagnostic (tree-vs-list gap). Remaining:
-the 7B scaling point; broadening problem **scope** (a wider task battery — the more representative forge-tax/tail test);
-**wild-site scoping** (§9); then the soft (PIC) representation for what survives both deterministic DSLs.
+Done this round: tree-recursion DSL + §6 round-trip; scope battery (2.5) + coverage/degeneracy split; PIC residue
+labels (3) + the program-PR-vs-source-PR distinction; track-B Gram (Thm 2 confirmed, ~1.6-D digit frame); the **A↔B
+alignment** (margin/μ_t confirm the residue boundary; source-PR reversed = structured residue is concentrated, not
+diffuse). Remaining:
+the **model source-PR / DLA** test of Thm 5 (the real diffuseness test); the **tropical-rank vs linear-rank** logit
+experiment; the 7B scaling point; **wild-site scoping** (§9); then the `--residue-strategy` roll-in to LOGIC_EXPORT.

@@ -328,6 +328,13 @@ pub trait Model: Sync {
         None
     }
 
+    /// The raw unembedding row `U_id` (the frame element for token `id`) — for building the Gram kernel `G_{vw}=⟨U_v,U_w⟩`
+    /// and rank diagnostics offline (PIC_PROPOSAL §2; the paper's "linear SVD rank cannot measure the gap" test). Default
+    /// None; rope implements it via `weight_row(unembed_name, id)`.
+    fn unembed_row(&self, _id: usize) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
     /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
     /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole
