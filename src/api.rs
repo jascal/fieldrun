@@ -1523,9 +1523,11 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                 // plain decode (not token_label) — the spectrum already Debug-quotes each token, so the bare piece
                 // renders clean (" (*") instead of token_label's already-annotated form double-quoted.
                 let rdec = |id: i64| tg.decode(&[id]);
+                // no result line here: in the REPL the model's answer was already streamed to the user as `bot> …`,
+                // so the trace's `result` slot stays None (the CLI --text path, which never prints a reply, fills it).
                 match lm.recursion_trace(&full) {
                     Some(trace) => eprintln!("\n[explain]\n{}",
-                        crate::explain::recursion_spectrum(&trace, &full, &rdec, 0.6, 3, 0.20, "spectrum", false)),
+                        crate::explain::recursion_spectrum(&trace, &full, &rdec, 0.6, 3, 0.20, "spectrum", false, None)),
                     None => eprintln!("[fieldrun] (no recursion trace for arch {arch} — rope family only; /explain route to silence)"),
                 }
             } else {
