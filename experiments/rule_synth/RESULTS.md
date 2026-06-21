@@ -67,6 +67,19 @@ The discovered program → position-indexed recursive Soufflé (`elem(l,i,v)`/`l
 
 So the full pipeline runs end-to-end: **model I/O → faithful program (§2) → recursive Soufflé + residue EDB (§6) → runs in Soufflé and reproduces the model 100%**, with the residue fact-count = the per-task forge tax. `max` becomes a *pure rule* (0 EDB); `len` is mostly EDB (the model's "len" isn't a clean fold). (The §6 translator currently covers the fold + list-modifier ops; binary-int programs like `imax(4,len(tail(xs)))` are flagged `unsupported-op` and would route to residue.)
 
+## Head-vs-tail: residue vs DSL depth (proposal §9) — `python synth.py <dump> <K>`
+
+Sweeping DSL depth K=2→6 (the program space grows from ~hundreds to thousands of distinct behaviours):
+
+| mean residue | K2 | K3 | K4 | K5 | K6 |
+|---|---|---|---|---|---|
+| 0.5B | 33% | 33% | 32% | 30% | 30% |
+| 1.5B | 16% | 16% | 16% | 16% | 16% |
+
+**The residue is a floor, not a long tail of bigger programs.** Per-task, where the model does a *clean* function the residue is flat across K (1.5B max 0→0, min 6→6, last 8→8, sum 14→14, first 22→22) — the simple fold *is* the function, and the residue is the model's own **deviation/inconsistency**, which no deeper program can fix (`max` floors at 0 because the model is perfectly consistent; `first` floors at 22% because the model deviates that often). Where the model is *systematically broken*, deeper DSL **does** find more structure (0.5B `len` 36→22%, `min` 50→42%).
+
+Reading for §9: the "head" (clean folds) is captured at K=2; growing the *same* DSL barely moves the residue. The forge-tax floor is **model-deviation outside this DSL family**, not a long tail of larger same-family programs — so cracking it needs a *different representation*, not bigger programs (consistent with the "novel encodings" intuition). And greedy decoding ⇒ the residue is *deterministic* (a consistent un-DSL-expressible answer), not sampling noise.
+
 ## Honest caveats
 
 - **The guarded pass rarely fires** on these tasks once the held-out margin is enforced (+4%) — the 0.5B models are too noisy to have *clean* blends, and the 1.5B does the clean functions outright. Guards earn their place only on genuinely piecewise behaviour (the 0.5B `min`/K=5 `len`). This is the conservative, honest setting.

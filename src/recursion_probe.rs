@@ -294,13 +294,18 @@ pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
     let lmax: usize = flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
     type LFn = (&'static str, &'static str, fn(&[i64]) -> Option<i64>);
-    let fns: [LFn; 6] = [
+    let fns: [LFn; 10] = [
         ("last",  "last 3 7 2 5 = 5\nlast 1 8 4 = 4\nlast 6 0 9 2 = 2\n", |l| l.last().copied()),
         ("first", "first 3 7 2 5 = 3\nfirst 1 8 4 = 1\nfirst 6 0 9 2 = 6\n", |l| l.first().copied()),
         ("len",   "len 3 7 2 5 = 4\nlen 1 8 4 = 3\nlen 6 0 9 2 5 = 5\n", |l| Some(l.len() as i64)),
         ("max",   "max 3 7 2 5 = 7\nmax 1 8 4 = 8\nmax 6 0 9 2 = 9\n", |l| l.iter().max().copied()),
         ("min",   "min 3 7 2 5 = 2\nmin 1 8 4 = 1\nmin 6 0 9 2 = 0\n", |l| l.iter().min().copied()),
         ("sum",   "sum 3 1 2 = 6\nsum 4 0 1 = 5\nsum 2 3 1 = 6\n", |l| { let s: i64 = l.iter().sum(); (s <= 9).then_some(s) }),
+        // harder / non-textbook tasks — the model is poor at these, so the synthesizer should surface OBSCURE/broken fns
+        ("max2",  "max2 3 7 2 5 = 5\nmax2 1 8 4 = 4\nmax2 6 0 9 2 = 6\n", |l| { let mut s = l.to_vec(); s.sort_unstable(); (s.len() >= 2).then(|| s[s.len() - 2]) }),
+        ("mode",  "mode 3 7 3 5 = 3\nmode 1 8 1 = 1\nmode 6 2 6 9 = 6\n", |l| { let mut c = std::collections::HashMap::new(); for &x in l { *c.entry(x).or_insert(0usize) += 1; } c.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(v, _)| v) }),
+        ("cmax",  "cmax 3 7 7 5 = 2\ncmax 1 8 4 = 1\ncmax 9 0 9 9 = 3\n", |l| l.iter().max().map(|&m| l.iter().filter(|&&x| x == m).count() as i64)),
+        ("range", "range 3 7 2 5 = 5\nrange 1 8 4 = 7\nrange 6 0 9 2 = 9\n", |l| match (l.iter().min(), l.iter().max()) { (Some(&a), Some(&b)) => Some(b - a), _ => None }),
     ];
     let mut out = String::new();
     let mut total = 0usize;

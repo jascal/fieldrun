@@ -219,7 +219,7 @@ def main():
     import random
     rng = random.Random(0)
     rows = []
-    for task in ["first", "last", "len", "max", "min", "sum"]:
+    for task in by_task:                              # infer tasks from the dump (any --list-dump battery)
         recs = by_task.get(task)
         if not recs:
             continue
