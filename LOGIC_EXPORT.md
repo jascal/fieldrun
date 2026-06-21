@@ -298,6 +298,13 @@ as provenance structure vs intervention diffuseness.
     certificate. Wiring this shortlist into `export --logic` (so the whole-model emit is *compact-and-certified
     where the margin clears, full only on the thin-margin tail*) is the concrete next step against the LE-T4
     wall — noted here as the achievable increment; the lossless whole-`vocab×d` emit stays blocked.
+  - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
+    {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
+    form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-
+    trip the model under `eval --semiring max` (argmax = the model token) and `log` (the softmax); on a 16-token prose
+    trace the `edb` (all-compact) artifact is 26 KB vs `ring` (all-Π) 71 KB, with `margin` in between — the forge tax is
+    paid only where the margin is thin. This realizes the increment *for the per-context trace*; lifting the same router
+    onto the **context-free `--logic-whole`** unembed (the `shortlist×d` + PO-T3 certificate above) is the remaining LE-T4 step.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank). *Caveat
   (Grok): treewidth `τ` is the load-bearing invariant (the forge tax = the no-compact-sub-conjunction

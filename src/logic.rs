@@ -85,6 +85,14 @@ pub fn explain_line(p: &Provenance, label: &dyn Fn(i64) -> String) -> String {
 /// `ctx` is the context (for the header comment only); `label` maps a token id to display text (also comments only —
 /// the program references tokens by id).
 pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> String {
+    emit_dl_mode(p, ctx, label, false)
+}
+
+/// As `emit_dl`, but `compact=true` ELIDES the dense Tier-B per-block contributions (the forge tax) and asserts the
+/// decode directly — the `edb` form for a high-margin token, decode-safe above 2δ by PO-T3. The margin-routed
+/// whole-model export uses `compact` for high-margin/retrieved tokens and the full Π for the low-margin tail, which
+/// localizes the forge tax to exactly the tokens the model computes.
+pub fn emit_dl_mode(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String, compact: bool) -> String {
     let mut o = String::new();
     o.push_str("// ============================================================\n");
     o.push_str("// fieldrun logic export — semiring-Datalog program for ONE next-token decision\n");
@@ -123,6 +131,15 @@ pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> St
         }
     }
     o.push('\n');
+    if compact {
+        // margin-routed `edb`: high-margin token — elide the dense Tier-B sum and assert the decode directly.
+        o.push_str("// ---- TIER B ELIDED (margin-routed edb): high-margin token — the dense per-block forge-tax sum is\n");
+        o.push_str("// dropped and the decode asserted directly; safe because a δ-bounded change can't flip a >2δ margin (PO-T3).\n");
+        o.push_str(&format!("decide({}).   // the model's pick — retrieved / high-margin\n", p.predicted));
+        o.push_str(".output decide\n");
+        o.push_str(&format!("// margin {:+.3} over {}; full Π elided as decode-safe.\n", p.margin, label(p.runner_up)));
+        return o;
+    }
     o.push_str("// ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");
     o.push_str("// contrib(Block, Token, Weight): block's exact contribution to Token's logit. Σ_Block = logit(Token).\n");
     o.push_str("// |W|>=0.1 blocks shown; the dense remainder folds into block \"rest\" (the irreducible high-PR\n");
