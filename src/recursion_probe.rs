@@ -342,6 +342,105 @@ pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
 /// quantity), the decode **margin**, and **μ_t** (how many blocks already argmax to the chosen digit; μ_t=0 = composed).
 /// Joined offline with the synth residue (where crisp programs fail), this tests whether the surrogate residue lines up
 /// with the model's *computed* (high source-PR / low-margin / μ_t=0) tokens. One residual_decomp per example.
+/// RING dump (the margin-routed ring/pic residue strategy): like --source-pr-dump but also emits, per example, the
+/// per-block DLA contribution matrix `c[block][digit] = inv_rms·Σ_d gain·write_block·U_digit` for the winning token form
+/// of each digit (so `Σ_b c[b][d] = logit[d]` exactly, and argmax_d = the model token). This IS the model's per-token
+/// semiring-weighted Datalog `Π` (LOGIC_EXPORT): under max-product (`ring`, T=0) it decodes the token; under log-sum-exp
+/// (`pic`, T=1) it gives the softmax. emit_datalog.py routes the low-MARGIN residue tokens to this Π (the alignment's
+/// router), and high-margin residue to a flat EDB.
+pub fn run_ring_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --ring-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--ring-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --ring-dump needs a path"); return; } };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let (lmin, lmax) = (3usize, flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(7usize));
+    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    type LFn = (&'static str, fn(&[i64]) -> Option<i64>);
+    let fns: [LFn; 12] = [
+        ("first", |l| l.first().copied()),
+        ("max",   |l| l.iter().max().copied()),
+        ("min",   |l| l.iter().min().copied()),
+        ("last",  |l| l.last().copied()),
+        ("sum",   |l| { let s: i64 = l.iter().sum(); (0..=9).contains(&s).then_some(s) }),
+        ("nuniq", |l| Some(l.iter().collect::<std::collections::HashSet<_>>().len() as i64)),
+        ("max2",  |l| { let mut s = l.to_vec(); s.sort_unstable(); (s.len() >= 2).then(|| s[s.len() - 2]) }),
+        ("median", |l| { let mut s = l.to_vec(); s.sort_unstable(); s.get(s.len() / 2).copied() }),
+        ("range", |l| match (l.iter().min(), l.iter().max()) { (Some(&a), Some(&b)) => Some(b - a), _ => None }),
+        ("midval", |l| l.get(l.len() / 2).copied()),
+        ("summod", |l| Some(l.iter().sum::<i64>() % 10)),
+        ("mode",  |l| { let mut c = std::collections::HashMap::new(); for &x in l { *c.entry(x).or_insert(0usize) += 1; } c.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(v, _)| v) }),
+    ];
+    let primes: [&[i64]; 5] = [&[3, 7, 2, 5], &[1, 8, 4], &[6, 0, 9, 2], &[4, 4, 1, 9], &[2, 5, 5, 0, 7]];
+    let mut cand: Vec<i64> = Vec::new();
+    let mut cval: Vec<i64> = Vec::new();
+    for d in 0..10i64 {
+        for form in [format!(" {d}"), d.to_string()] {
+            if let Some(&id) = tg.encode(&form, false).first() {
+                if !cand.contains(&id) { cand.push(id); cval.push(d); }
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut total = 0usize;
+    eprintln!("[fieldrun] ring-dump · {} tasks · {n}/task → {path}", fns.len());
+    for (name, truth) in fns {
+        let mut prime = String::new();
+        for pl in primes.iter() {
+            if let Some(v) = truth(pl) { if (0..=9).contains(&v) {
+                let ls = pl.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                prime.push_str(&format!("{name} {ls} = {v}\n"));
+            } }
+        }
+        let (mut got, mut tries) = (0usize, 0usize);
+        while got < n && tries < n * 50 {
+            tries += 1;
+            let len = lmin + (xorshift(&mut rng) % (lmax - lmin + 1) as u64) as usize;
+            let list: Vec<i64> = (0..len).map(|_| (xorshift(&mut rng) % 10) as i64).collect();
+            let tv = match truth(&list) { Some(a) if (0..=9).contains(&a) => a, _ => continue };
+            let listing = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            let mut g = tg.encode(&format!("{prime}{name} {listing} ="), false);
+            let mut decomp_ctx = None;
+            for _ in 0..3 {
+                let t = lm.predict(&g);
+                if tg.decode(&[t]).chars().any(|c| c.is_ascii_digit()) { decomp_ctx = Some(g.clone()); break; }
+                g.push(t);
+            }
+            let Some(ctx) = decomp_ctx else { continue };
+            let (_labels, contrib) = match lm.residual_decomp(&ctx, &cand) { Some(x) => x, None => { eprintln!("[fieldrun] no residual_decomp (arch)"); return; } };
+            let nb = contrib.len();
+            // winning token form per digit (max summed logit), so Σ_b c[b][d] = logit[d] exactly
+            let mut dlogit = [f32::NEG_INFINITY; 10];
+            let mut dtok = [usize::MAX; 10];
+            for (ci, &dv) in cval.iter().enumerate() {
+                let s: f32 = (0..nb).map(|b| contrib[b][ci]).sum();
+                if s > dlogit[dv as usize] { dlogit[dv as usize] = s; dtok[dv as usize] = ci; }
+            }
+            let t = (0..10).max_by(|&a, &b| dlogit[a].partial_cmp(&dlogit[b]).unwrap()).unwrap();
+            let runner = (0..10).filter(|&v| v != t).max_by(|&a, &b| dlogit[a].partial_cmp(&dlogit[b]).unwrap()).unwrap();
+            let margin = dlogit[t] - dlogit[runner];
+            // c[block][digit] = the winning form's per-block contribution
+            let mut cmat = String::from("[");
+            for b in 0..nb {
+                if b > 0 { cmat.push(','); }
+                cmat.push('[');
+                for d in 0..10 {
+                    if d > 0 { cmat.push(','); }
+                    let w = if dtok[d] != usize::MAX { contrib[b][dtok[d]] } else { 0.0 };
+                    cmat.push_str(&format!("{w:.6}"));
+                }
+                cmat.push(']');
+            }
+            cmat.push(']');
+            let ls = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+            out.push_str(&format!("{{\"task\":\"{name}\",\"list\":[{ls}],\"out\":{t},\"truth\":{tv},\"margin\":{margin:.4},\"nb\":{nb},\"c\":{cmat}}}\n"));
+            got += 1; total += 1;
+        }
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {total} records → {path}"),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 pub fn run_source_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
     let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --source-pr-dump needs a tokenizer next to {stem}"); return; } };
     let path = match flag(args, "--source-pr-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-pr-dump needs a path"); return; } };

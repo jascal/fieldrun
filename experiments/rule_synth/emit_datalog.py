@@ -198,11 +198,67 @@ def build_dl_ensemble(dl_rules, predmap, lists, target):
     return "\n".join(rules) + "\n" + "\n".join(facts) + "\n" + "\n".join(res) + "\n", len(res)
 
 
+def build_dl_margin(head_ast, recs, lists, target, strategy, tau):
+    """Margin-routed `ring`/`pic` residue strategy. The crisp head emits as Datalog; residue tokens are routed by the
+    per-token MARGIN (`recs[i]['margin']`, from `fieldrun --ring-dump`): low-margin (< tau) → the model's own block-
+    provenance semiring-Datalog `Π` (`rlogit(v)=Σ_b cw(b,v)` → argmax = the model token; LE-T5 lossless, the `ring`
+    representation; `pic` is the same facts under log-sum-exp); high-margin → a flat EDB. `strategy='ring'` routes ALL
+    residue to Π. Returns (dl_text, n_ring, n_edb) or None if the head isn't §6-emittable.
+
+    NB `target[i]` is the MODEL's output token (the dump's `out` field), NOT ground truth — so the `argmax==target[lid]`
+    gate below is a pure FAITHFULNESS backstop (route to ring only when the emitted Π actually reproduces the model),
+    not a correctness gate."""
+    rules = [".decl elem(l:number,i:number,v:number)\n.decl len(l:number,n:number)",
+             ".decl prog_answer(l:number,v:number)\n.decl residue(l:number,o:number)\n.decl residue_l(l:number)",
+             ".decl cw(l:number,b:number,v:number,w:float)\n.decl rlogit(l:number,v:number,s:float)",
+             ".decl ring_l(l:number)\n.decl ringans(l:number,v:number)",
+             ".decl answer(l:number,v:number)\n.output answer"]
+    ctr = [0]
+    if not emit_answer(head_ast, ctr, rules):
+        return None
+    # the model's per-token Π: logit = Σ_b contributions, decode = argmax (max-product / tropical T=0 = `ring`)
+    rules.append("rlogit(L,V,S) :- cw(L,_,V,_), S = sum w : { cw(L,B,V,w) }.")
+    rules.append("ringans(L,V) :- rlogit(L,V,S), S = max s : { rlogit(L,VV,s) }.")
+    cw_facts, res, n_ring, n_edb = [], [], 0, 0
+    for lid, r in enumerate(recs):
+        # route only the residue tokens (head disagrees with the model)
+        if r.get("_head_ok", True):
+            continue
+        c = r["c"]                                  # nb × 10 contribution matrix
+        argmax = max(range(10), key=lambda d: sum(c[b][d] for b in range(len(c))))
+        # route low-margin (or all, for strategy=ring) to Π — but only if the Π's argmax reproduces the model output
+        # target[lid] (a faithfulness backstop; target is the model's `out`, not ground truth). Else fall to edb.
+        to_ring = (strategy == "ring" or r["margin"] < tau) and argmax == target[lid]
+        if to_ring:
+            for b in range(len(c)):
+                for d in range(10):
+                    cw_facts.append(f"cw({lid},{b},{d},{c[b][d]:.6f}).")
+            cw_facts.append(f"ring_l({lid}).")     # mark as a Π-handled token
+            n_ring += 1
+        else:
+            res.append(f"residue({lid},{target[lid]}).")
+            n_edb += 1
+    rules.append("residue_l(L) :- residue(L,_).")
+    rules.append("residue_l(L) :- ring_l(L).")
+    rules.append("answer(L,V) :- prog_answer(L,V), !residue_l(L).")   # crisp head
+    rules.append("answer(L,V) :- ring_l(L), ringans(L,V).")           # ring residue (the model's Π)
+    rules.append("answer(L,O) :- residue(L,O).")                       # edb residue
+    facts = []
+    for lid, l in enumerate(lists):
+        facts.append(f"len({lid},{len(l)}).")
+        facts += [f"elem({lid},{i},{v})." for i, v in enumerate(l)]
+    body = "\n".join(rules) + "\n" + "\n".join(facts) + "\n" + "\n".join(res) + "\n" + "\n".join(cw_facts) + "\n"
+    return body, n_ring, n_edb
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/listdump_15b.jsonl"
     K = next((int(a) for a in sys.argv[2:] if a.isdigit()), 4)
     outdir = next((a for a in sys.argv[2:] if a.startswith("/") or a.startswith("./")), "/tmp/souffle_rulesynth")
     strategy = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--strategy=")), "edb")
+    tau = next((float(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--tau=")), 1.0)  # margin router threshold
+    if any(a.startswith("--tau=") for a in sys.argv) and strategy != "margin":
+        print(f"# note: --tau only affects --strategy=margin (ignored for strategy={strategy})")
     os.makedirs(outdir, exist_ok=True)
     by_task = defaultdict(list)
     for line in open(path):
@@ -229,7 +285,17 @@ def main():
         best = progs[0]
         note, label = "", best.rep
         built = None
-        if strategy == "ensemble":
+        if strategy in ("ring", "margin"):
+            if "c" not in recs[0]:
+                print(f"{task:<8}{best.rep[:34]:<34}{'—':>8}{'—':>8}{'need --ring-dump':>16}")
+                continue
+            for lid in range(n):
+                recs[lid]["_head_ok"] = (best.vals[lid] == target[lid])
+            mb = build_dl_margin(parse_repr(best.rep), recs, lists, target, strategy, tau)
+            if mb is not None:
+                dl3, n_ring, n_edb = mb
+                built = (dl3, n_ring + n_edb); note = f"ring{n_ring}/edb{n_edb}"
+        elif strategy == "ensemble":
             sh = list(range(n)); rng.shuffle(sh); cut = int(0.7 * n); tr, te = sh[:cut], sh[cut:]
             preds = synth.predicate_programs(lists, levels)
             dl_rules_p, _gtr, _gte = synth.decision_list(progs, preds, target, tr, te)
@@ -239,7 +305,7 @@ def main():
                 label = synth.rules_repr(dl_rules_p)
                 if built is None:
                     note = "ens-unsupported→edb"
-        if built is None:  # edb (default, or ensemble fallback)
+        if built is None:  # edb (default, or ensemble/ring fallback)
             ast = parse_repr(best.rep)
             built = build_dl(ast, lists, list(best.vals), target)
             label = best.rep
