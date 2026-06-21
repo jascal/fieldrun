@@ -251,9 +251,49 @@ kernel `G` reveals the decisions live in ~2 dimensions — direct evidence for t
 measure the gap" / `pic`-win direction. **Honest scope:** digits are an unusually coherent semantic family, so this is
 a digit-output-specific result, not a claim about all vocabulary.
 
+## Alignment — does the surrogate residue line up with the model's *computed* tokens? (track A ↔ track B) — `align.py`
+
+The decisive join: for each token, **track A** = does the best crisp synthesized program reproduce the model output
+(captured) or not (residue); **track B** = the model's own per-token DLA from `fieldrun --source-pr-dump` — **source-PR**
+`(Σ_b c_b)²/Σ_b c_b²` over the 57 residual-write blocks (the paper's diffuseness quantity), decode **margin**, and
+**μ_t** (blocks already argmaxing to the chosen digit; μ_t=0 = composed). 480 tokens, 1.5B, 12 tasks spanning head→tail.
+
+| signal | residue | captured | AUC | paper's "computed" ⇒ | verdict |
+|---|---|---|---|---|---|
+| **margin** | 0.46 | 1.53 | 0.22 | lower | ✓ **confirmed** |
+| **μ_t** | 6.45 | 8.70 | 0.36 | lower | ✓ **confirmed** |
+| source-PR (signed) | 4.87 | 5.51 | 0.30 | higher | ✗ **reversed** |
+| PR-magnitude `(Σ\|c\|)²/Σc²` | 7.10 | 8.13 | 0.29 | higher | ✗ **reversed** |
+
+**Confirmed (margin + μ_t):** the surrogate residue boundary is a *real mechanistic boundary* — where the crisp program
+fails, the model is making a **low-margin, composed (μ_t-low)** decision, not a clean single-source retrieval. So the
+export's crisp-head / residue split corresponds to something the model actually does. (Margin is the cleanest router,
+AUC 0.22.)
+
+**The surprise (source-PR, robust to the signed-vs-magnitude confound):** residue tokens are **more *concentrated*
+(lower block-PR), not more diffuse.** The paper's high-PR diffuse computation (PR≈45) is a *natural-text* regime; on
+these structured single-digit tasks the whole regime is low-PR (3–8) and the residue is *lower* still. **This does not
+contradict Thm 5** (which is about the natural-text source-PR) — it says the structured-task residue is a *different,
+concentrated regime*: a small coalition of blocks commits to a different (often wrong) answer at low margin, rather than
+a diffuse dense-Gram repair.
+
+**Two consequences for the export (both reassuring):**
+1. "Outside the crisp DSL" ≠ "diffuse/incompressible." `summod` (modular sum) is outside our DSL only because it lacks
+   a modular primitive — the model computes it *concentratedly* (low PR). So surrogate-irreducibility is a **DSL-
+   expressiveness gap**, not mechanistic diffuseness; extending the DSL can convert more residue into crisp rules.
+2. The genuinely-incompressible high-PR dense-Gram residue (the expensive `pic` case) is **rare in this regime** — most
+   residue is low-margin + concentrated, so a small ensemble / low-rank `pic` / `edb` captures it cheaply. The costly
+   diffuse-PIC part is a natural-text / open-vocabulary phenomenon, not the structured-task forge tax.
+
+**Caveats:** one model (1.5B), single-digit structured tasks, n=480, source-PR over 57 residual-write blocks. The
+margin/μ_t alignment is robust; the low-PR-residue claim is specific to this structured-task family — the natural-text
+diffuse regime (where the proved Thm 5 lives) is the obvious next measurement.
+
 ## Next
 
 Done this round: tree-recursion DSL + §6 round-trip; scope battery (2.5) + coverage/degeneracy split; PIC residue
-labels (3) + the program-PR-vs-source-PR distinction; track-B Gram (Thm 2 confirmed, ~1.6-D digit frame). Remaining:
+labels (3) + the program-PR-vs-source-PR distinction; track-B Gram (Thm 2 confirmed, ~1.6-D digit frame); the **A↔B
+alignment** (margin/μ_t confirm the residue boundary; source-PR reversed = structured residue is concentrated, not
+diffuse). Remaining:
 the **model source-PR / DLA** test of Thm 5 (the real diffuseness test); the **tropical-rank vs linear-rank** logit
 experiment; the 7B scaling point; **wild-site scoping** (§9); then the `--residue-strategy` roll-in to LOGIC_EXPORT.

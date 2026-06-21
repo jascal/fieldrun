@@ -337,6 +337,108 @@ pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
     }
 }
 
+/// ALIGNMENT dump (PIC_LOSSINESS §6 track A↔B): for a focused battery, emit per-example the model's **source-PR** (the
+/// participation ratio of the logit's block-wise DLA `(Σ_b c_b)²/Σ_b c_b²` — the paper's ≈45-way additive sum / Thm 5
+/// quantity), the decode **margin**, and **μ_t** (how many blocks already argmax to the chosen digit; μ_t=0 = composed).
+/// Joined offline with the synth residue (where crisp programs fail), this tests whether the surrogate residue lines up
+/// with the model's *computed* (high source-PR / low-margin / μ_t=0) tokens. One residual_decomp per example.
+pub fn run_source_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --source-pr-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--source-pr-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-pr-dump needs a path"); return; } };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(40);
+    let (lmin, lmax) = (3usize, flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(7usize));
+    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    type LFn = (&'static str, fn(&[i64]) -> Option<i64>);
+    // focused battery spanning the residue spectrum (head→tail) — keeps the alignment run fast
+    let fns: [LFn; 12] = [
+        ("first", |l| l.first().copied()),
+        ("max",   |l| l.iter().max().copied()),
+        ("min",   |l| l.iter().min().copied()),
+        ("last",  |l| l.last().copied()),
+        ("sum",   |l| { let s: i64 = l.iter().sum(); (0..=9).contains(&s).then_some(s) }),
+        ("nuniq", |l| Some(l.iter().collect::<std::collections::HashSet<_>>().len() as i64)),
+        ("max2",  |l| { let mut s = l.to_vec(); s.sort_unstable(); (s.len() >= 2).then(|| s[s.len() - 2]) }),
+        ("median", |l| { let mut s = l.to_vec(); s.sort_unstable(); s.get(s.len() / 2).copied() }),
+        ("range", |l| match (l.iter().min(), l.iter().max()) { (Some(&a), Some(&b)) => Some(b - a), _ => None }),
+        ("midval", |l| l.get(l.len() / 2).copied()),
+        ("summod", |l| Some(l.iter().sum::<i64>() % 10)),
+        ("mode",  |l| { let mut c = std::collections::HashMap::new(); for &x in l { *c.entry(x).or_insert(0usize) += 1; } c.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(v, _)| v) }),
+    ];
+    let primes: [&[i64]; 5] = [&[3, 7, 2, 5], &[1, 8, 4], &[6, 0, 9, 2], &[4, 4, 1, 9], &[2, 5, 5, 0, 7]];
+    // digit candidate tokens: both " d" and "d" forms → (token_id, digit_value)
+    let mut cand: Vec<i64> = Vec::new();
+    let mut cval: Vec<i64> = Vec::new();
+    for d in 0..10i64 {
+        for form in [format!(" {d}"), d.to_string()] {
+            if let Some(&id) = tg.encode(&form, false).first() {
+                if !cand.contains(&id) { cand.push(id); cval.push(d); }
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut total = 0usize;
+    eprintln!("[fieldrun] source-pr-dump · {} tasks · {n}/task · {} digit-cands → {path}", fns.len(), cand.len());
+    for (name, truth) in fns {
+        let mut prime = String::new();
+        for pl in primes.iter() {
+            if let Some(v) = truth(pl) { if (0..=9).contains(&v) {
+                let ls = pl.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                prime.push_str(&format!("{name} {ls} = {v}\n"));
+            } }
+        }
+        let (mut got, mut tries) = (0usize, 0usize);
+        while got < n && tries < n * 50 {
+            tries += 1;
+            let len = lmin + (xorshift(&mut rng) % (lmax - lmin + 1) as u64) as usize;
+            let list: Vec<i64> = (0..len).map(|_| (xorshift(&mut rng) % 10) as i64).collect();
+            let tv = match truth(&list) { Some(a) if (0..=9).contains(&a) => a, _ => continue };
+            let listing = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            // walk the greedy continuation to the position whose NEXT token is the answer digit (the model often emits a
+            // space first); decomp THERE, so the DLA is for the digit prediction — not the space. (Mirrors the dump parse.)
+            let mut g = tg.encode(&format!("{prime}{name} {listing} ="), false);
+            let mut decomp_ctx = None;
+            for _ in 0..3 {
+                let nt = lm.predict(&g);
+                if tg.decode(&[nt]).chars().any(|c| c.is_ascii_digit()) { decomp_ctx = Some(g.clone()); break; }
+                g.push(nt);
+            }
+            let Some(ctx) = decomp_ctx else { continue };
+            let (_labels, contrib) = match lm.residual_decomp(&ctx, &cand) { Some(x) => x, None => { eprintln!("[fieldrun] no residual_decomp (arch)"); return; } };
+            let nb = contrib.len();
+            // logit per digit value = max over its token forms of the block-summed contribution
+            let mut dlogit = [f32::NEG_INFINITY; 10];
+            let mut dtok = [0usize; 10]; // winning candidate index per digit
+            for (ci, &dv) in cval.iter().enumerate() {
+                let s: f32 = (0..nb).map(|b| contrib[b][ci]).sum();
+                if s > dlogit[dv as usize] { dlogit[dv as usize] = s; dtok[dv as usize] = ci; }
+            }
+            let t = (0..10).max_by(|&a, &b| dlogit[a].partial_cmp(&dlogit[b]).unwrap()).unwrap();
+            let runner = (0..10).filter(|&v| v != t).max_by(|&a, &b| dlogit[a].partial_cmp(&dlogit[b]).unwrap()).unwrap();
+            let margin = dlogit[t] - dlogit[runner];
+            // source-PR over blocks for the winning candidate token of digit t
+            let ci = dtok[t];
+            let cb: Vec<f32> = (0..nb).map(|b| contrib[b][ci]).collect();
+            let s1: f32 = cb.iter().sum();
+            let s2: f32 = cb.iter().map(|c| c * c).sum();
+            let pr = if s2 > 0.0 { s1 * s1 / s2 } else { 0.0 };
+            let s1a: f32 = cb.iter().map(|c| c.abs()).sum();
+            let prmag = if s2 > 0.0 { s1a * s1a / s2 } else { 0.0 };
+            // μ_t: blocks whose argmax candidate maps to digit t
+            let mu = (0..nb).filter(|&b| {
+                let bi = (0..cand.len()).max_by(|&x, &y| contrib[b][x].partial_cmp(&contrib[b][y]).unwrap()).unwrap();
+                cval[bi] == t as i64
+            }).count();
+            let ls = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+            out.push_str(&format!("{{\"task\":\"{name}\",\"list\":[{ls}],\"out\":{t},\"truth\":{tv},\"pr\":{pr:.3},\"prmag\":{prmag:.3},\"margin\":{margin:.4},\"mu\":{mu},\"nb\":{nb}}}\n"));
+            got += 1; total += 1;
+        }
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {total} records → {path}"),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 /// Dump the unembedding rows `U_id` for a set of output tokens (default the digits 0–9) — the frame elements for the
 /// Gram kernel `G_{vw}=⟨U_v,U_w⟩` (PIC_PROPOSAL §2). Lets the offline rank diagnostic test the paper's claim that the
 /// computed fragment's structure is a tropical-rank gap that *linear* SVD rank cannot measure (PIC_LOSSINESS §6, track B).
