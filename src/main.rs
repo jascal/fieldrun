@@ -2709,6 +2709,75 @@ fn main() {
         // makes `eval` sum contribs across different tokens (silently wrong) — so each decode is its own file. The
         // context advances by the model's own pick each step, so the .dl set is a faithful decode trajectory. Steps via
         // --steps N (default 8). Rope-only (needs residual_decomp). One full explain+residual_decomp forward per step.
+        // --export-logic-corpus <prompts.txt>: the CORPUS aggregation of the margin-routed trace — run the per-token
+        // decode trace over many prompts (one per line) and report the model-wide forge-tax localization: what fraction
+        // of tokens are compact (decode-robust, edb) vs full-Π, the byte saving vs all-Π, and the split BY ROUTE
+        // (RETRIEVED / SELECTED / COMPOSED). Turns the single-trace demo into a quantitative claim. No .dl files written.
+        if let Some(corpus_path) = flag(&args, "--export-logic-corpus") {
+            #[cfg(not(feature = "api"))]
+            { eprintln!("[fieldrun] --export-logic-corpus {corpus_path:?} needs the tokenizer (build with --features api)"); return; }
+            #[cfg(feature = "api")]
+            {
+                use retrieval::CandCfg;
+                let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());
+                let cfg = CandCfg { recent: 64, induction: 4, quad: 8, tri: 8, bi: 8, skel: 8, uni: 128, closed: true };
+                let cap_c: usize = flag(&args, "--candidates").and_then(|s| s.parse().ok()).unwrap_or(48);
+                let steps: usize = flag(&args, "--steps").and_then(|s| s.parse().ok()).unwrap_or(8);
+                let strategy = flag(&args, "--residue-strategy").unwrap_or("margin");
+                let tau: f32 = flag(&args, "--tau").and_then(|s| s.parse().ok()).unwrap_or(2.0);
+                let Some(tg) = api::TextGen::load(&stem, eos.clone()) else {
+                    eprintln!("[fieldrun] --export-logic-corpus: no tokenizer next to {stem}"); return;
+                };
+                let text = match std::fs::read_to_string(corpus_path) {
+                    Ok(t) => t, Err(e) => { eprintln!("[fieldrun] --export-logic-corpus: cannot read {corpus_path}: {e}"); return; }
+                };
+                let prompts: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+                let lbl = |id: i64| -> String { format!("[{id}]") };
+                // per token: (margin, full_bytes, compact_bytes, route) — collected once; the τ-sweep just re-thresholds.
+                let mut toks: Vec<(f32, usize, usize, usize)> = Vec::new();
+                eprintln!("[fieldrun] export-logic-corpus: {} prompts × {steps} steps · strategy={strategy} …", prompts.len());
+                for p in &prompts {
+                    let enc = tg.encode(p, false);
+                    if enc.is_empty() { continue; }
+                    let mut ctx_v: Vec<i64> = if enc.len() > ctx_window { enc[..ctx_window].to_vec() } else { enc };
+                    for _ in 0..steps {
+                        let Some(prov) = logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) else { break };
+                        let full = logic::emit_dl_mode(&prov, &ctx_v, &lbl, false).len();
+                        let comp = logic::emit_dl_mode(&prov, &ctx_v, &lbl, true).len();
+                        toks.push((prov.margin, full, comp, (prov.route as usize).min(3)));
+                        ctx_v.push(prov.predicted);
+                    }
+                }
+                let tot = toks.len();
+                if tot == 0 { eprintln!("[fieldrun] --export-logic-corpus: no tokens (empty corpus?)"); return; }
+                // a token is compact under `strategy`: edb=always, margin=margin≥τ, ring/pic=never
+                let is_compact = |m: f32, tau: f32| -> bool { match strategy { "edb" => true, "margin" => m >= tau, _ => false } };
+                let bytes_full: usize = toks.iter().map(|t| t.1).sum();
+                println!("# export-logic-corpus · {} prompts · {tot} tokens · strategy={strategy} · all-Π size {} KB", prompts.len(), bytes_full / 1024);
+                if strategy == "margin" {
+                    println!("#   margin-localization sweep (compact = decode-robust → memorised; the rest pay the dense Π):");
+                    println!("#     {:>5}  {:>10}  {:>9}", "τ", "compact", "bytes saved");
+                    for &tausw in &[1.0f32, 1.5, 2.0, 3.0, 5.0] {
+                        let (mut c, mut routed) = (0usize, 0usize);
+                        for &(m, full, comp, _) in &toks {
+                            if is_compact(m, tausw) { c += 1; routed += comp; } else { routed += full; }
+                        }
+                        println!("#     {tausw:>5.1}  {c:>4} ({:>3.0}%)  {:>7.0}% saved", 100.0 * c as f64 / tot as f64,
+                                 100.0 * (1.0 - routed as f64 / bytes_full.max(1) as f64));
+                    }
+                }
+                // by route at the primary τ
+                let mut by_route = [[0usize; 2]; 4];
+                for &(m, _, _, r) in &toks { by_route[r][0] += 1; if is_compact(m, tau) { by_route[r][1] += 1; } }
+                println!("#   by route @ τ={tau} (count · % compact = % decode-robust):");
+                for r in 0..4 {
+                    let c = by_route[r][0];
+                    if c == 0 { continue; }
+                    println!("#     {:<10} {c:>5}  ({:.0}% compact)", logic::route_name(r as u8), 100.0 * by_route[r][1] as f64 / c as f64);
+                }
+                return;
+            }
+        }
         if let Some(prefix) = flag(&args, "--export-logic") {
             use retrieval::CandCfg;
             let store = flag(&args, "--store").and_then(|p| Store::load(p).ok());

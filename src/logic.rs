@@ -28,12 +28,13 @@ pub fn build(lm: &dyn Model, c: &[i64], store: Option<&Store>, cfg: &CandCfg, ca
     let ex = lm.explain(c)?;
     let (t, v) = (ex.model_predicts, ex.runner_up);
     let store_cands: Vec<i64> = store.map(|st| st.candidates(c, cfg)).unwrap_or_default();
+    let ind = induction_rule(c, t);                 // computed once: induction IS retrieval (a clean in-context copy)
     let route = match store {
         Some(st) => {
             let (kb, _) = st.predict(c);
             if kb == t { 0u8 } else if store_cands.contains(&t) { 1 } else { 2 }
         }
-        None => 3,
+        None => if ind.is_some() { 0 } else { 3 },  // no store: induction → RETRIEVED, else unknown
     };
     let mut cand = vec![t];
     if v != t { cand.push(v); }
