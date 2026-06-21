@@ -80,6 +80,24 @@ Sweeping DSL depth K=2→6 (the program space grows from ~hundreds to thousands 
 
 Reading for §9: the "head" (clean folds) is captured at K=2; growing the *same* DSL barely moves the residue. The forge-tax floor is **model-deviation outside this DSL family**, not a long tail of larger same-family programs — so cracking it needs a *different representation*, not bigger programs (consistent with the "novel encodings" intuition). And greedy decoding ⇒ the residue is *deterministic* (a consistent un-DSL-expressible answer), not sampling noise.
 
+## Harder / non-textbook tasks — obscure-function discovery (1.5B, K=5)
+
+Four tasks the model is *poor* at (`--list-dump` battery extended): second-largest (`max2`), most-common (`mode`), count-of-max (`cmax`), range (`max−min`). Faithful synthesis surfaces **what the model substitutes** when it can't do the task:
+
+| task | model-acc | model *actually* computes | faith | truth | residue |
+|---|---|---|---|---|---|
+| max2  | 32% | **`max(xs)`** — falls back to the simpler related fn | **83%** | 19% | 17% |
+| cmax  | 29% | **`imax(2,min(xs))`** — obscure min-heuristic | 61→67% (guarded) | 24% | 33% |
+| range | 17% | `max(tail(xs))` — broken approximation | 31% | 44% | 67% |
+| mode  | 44% | obscure `nth(sort(xs),min(xs))`/`last(take(sort(xs),4))` | 17→22% | 37% | **78%** |
+
+Three behaviours, all surfaced faithfully:
+1. **Simpler-function substitution** — asked `max2`, the model returns `max` **83%** of the time (it cannot compute "second", so it defaults to a related simpler fold). A clean, faithful "what it really does."
+2. **Obscure broken approximation** — `cmax`→`imax(2,min(xs))`, `range`→`max(tail(xs))`: non-human-named functions, partially faithful.
+3. **Outside the DSL (forge tax)** — `mode` 78% residue: the model's behaviour there is mostly not expressible as a list-fold; the discovered programs are obscure and only ~20% faithful. This is the genuine tail for that site.
+
+Mean residue rises 16% (6 clean tasks) → **30%** (10 tasks incl. these) — the harder sites carry more forge tax. The synthesizer's value: it doesn't just say "the model fails max2" — it says **"the model computes `max` when you ask for max2,"** which is the mechanistic content.
+
 ## Honest caveats
 
 - **The guarded pass rarely fires** on these tasks once the held-out margin is enforced (+4%) — the 0.5B models are too noisy to have *clean* blends, and the 1.5B does the clean functions outright. Guards earn their place only on genuinely piecewise behaviour (the 0.5B `min`/K=5 `len`). This is the conservative, honest setting.
