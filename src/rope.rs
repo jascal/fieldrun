@@ -788,6 +788,7 @@ impl Model for Rope {
                 }
             }
             let lens_late: Vec<(usize, i64)> = (late0..nl).map(|l| (l + 1, lens[l][p])).collect();
+            let lens_full: Vec<(usize, i64)> = (0..nl).map(|l| (l + 1, lens[l][p])).collect();
             let (mut back, mut conc) = (p, 0f32);
             for k in 0..p {
                 if maxback[[p, k]] > conc {
@@ -795,7 +796,99 @@ impl Model for Rope {
                     back = k;
                 }
             }
-            out.push(RecPos { pos: p, final_top1, resolve_layer: resolve, n_layer: nl, lens_late, back, conc });
+            out.push(RecPos { pos: p, final_top1, resolve_layer: resolve, n_layer: nl, lens_late, lens_full, back, conc });
+        }
+        Some(out)
+    }
+
+    fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
+        use ndarray::s;
+        let (resids, _) = self.recursion_capture(ids);
+        let nl = self.n_layer;
+        let late0 = 2 * nl / 3;
+        let un = self.unembed_name();
+        let mut out = Vec::with_capacity(positions.len());
+        for &p in positions {
+            let mut late = Vec::new();
+            for l in late0..nl {
+                if p >= resids[l].nrows() { continue; }
+                let row = resids[l].slice(s![p..p + 1, ..]).to_owned(); // 1×d
+                let normed = rmsnorm(&row, self.b.arr1("norm"), self.eps);
+                let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
+                let am = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+                late.push((l + 1, am));
+            }
+            out.push(late);
+        }
+        Some(out)
+    }
+
+    fn predict_patched(&self, ids: &[i64], layer: usize, positions: &[usize], donors: &[Vec<f32>]) -> Option<i64> {
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq { scores[[i, j]] = -1e30; }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = silu(*hv) * uv; }
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
+            // CAUSAL PATCH: overwrite the residual at each (layer, positions[i]) with donors[i], then keep going
+            if l == layer {
+                for (pos, donor) in positions.iter().zip(donors.iter()) {
+                    if *pos < seq && donor.len() == x.ncols() {
+                        for (j, &val) in donor.iter().enumerate() { x[[*pos, j]] = val; }
+                    }
+                }
+            }
+        }
+        let normed = rmsnorm(&x, self.b.arr1("norm"), self.eps);
+        let un = self.unembed_name();
+        let lg = self.b.rowdot_f32(un, &normed.row(seq - 1).to_vec());
+        Some(lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn residuals_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<Vec<f32>>>> {
+        let (resids, _) = self.recursion_capture(ids);
+        let nl = self.n_layer;
+        let mut out = Vec::with_capacity(positions.len());
+        for &p in positions {
+            let mut layers = Vec::with_capacity(nl);
+            for l in 0..nl {
+                if p < resids[l].nrows() {
+                    layers.push(resids[l].row(p).to_vec());
+                } else {
+                    layers.push(Vec::new());
+                }
+            }
+            out.push(layers);
         }
         Some(out)
     }

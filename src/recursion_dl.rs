@@ -94,6 +94,27 @@ fn apply(op: char, x: i64, y: i64) -> Option<i64> {
         '-' => x - y,
         '*' => x * y,
         '/' => { if y == 0 { return None; } x / y }
+        '&' => x & y,                 // Boolean AND (on {0,1})
+        '|' => x | y,                 // Boolean OR
+        '^' => x ^ y,                 // Boolean XOR
+        '<' => x.min(y),              // min
+        '>' => x.max(y),              // max
+        _ => return None,
+    })
+}
+
+/// The Soufflé arithmetic body for an op (agrees with `apply` on the op's value domain).
+pub fn op_rhs(op: char) -> Option<&'static str> {
+    Some(match op {
+        '+' => "V = X + Y",
+        '-' => "V = X - Y",
+        '*' => "V = X * Y",
+        '/' => "Y != 0, V = X / Y",
+        '&' => "V = X * Y",               // AND on {0,1}
+        '|' => "V = max(X, Y)",           // OR on {0,1}
+        '^' => "V = X + Y - 2 * X * Y",   // XOR on {0,1}
+        '<' => "V = min(X, Y)",
+        '>' => "V = max(X, Y)",
         _ => return None,
     })
 }
@@ -121,7 +142,7 @@ pub fn parse_str(s: &str) -> Option<Node> {
             num.push(ch);
         } else {
             if !num.is_empty() { atoms.push((std::mem::take(&mut num), 0)); }
-            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/') { atoms.push((ch.to_string(), 0)); }
+            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '&' | '|' | '^' | '<' | '>' | '%' | '@' | '#' | '~') { atoms.push((ch.to_string(), 0)); }
         }
     }
     if !num.is_empty() { atoms.push((num, 0)); }
@@ -242,10 +263,14 @@ pub fn emit(root: &Node, model_answer: Option<i64>, literals: &[i64]) -> String 
     o.push_str("\n// ---- the depth-bounded RECURSIVE evaluator (cut = retrieval at the budget) ----\n");
     o.push_str("eval(N,V,B) :- B <= 0, retrieved(N,V).                                  // CUT (the semiring core)\n");
     o.push_str("eval(N,V,B) :- B > 0, leaf(N,V).\n");
-    o.push_str("eval(N,V,B) :- B > 0, node(N,\"+\",A,C), eval(A,X,B-1), eval(C,Y,B-1), V = X + Y.\n");
-    o.push_str("eval(N,V,B) :- B > 0, node(N,\"-\",A,C), eval(A,X,B-1), eval(C,Y,B-1), V = X - Y.\n");
-    o.push_str("eval(N,V,B) :- B > 0, node(N,\"*\",A,C), eval(A,X,B-1), eval(C,Y,B-1), V = X * Y.\n");
-    o.push_str("eval(N,V,B) :- B > 0, node(N,\"/\",A,C), eval(A,X,B-1), eval(C,Y,B-1), Y != 0, V = X / Y.\n\n");
+    let ops_used: std::collections::BTreeSet<char> =
+        nodes.iter().filter_map(|f| if let Flat::Op(op, ..) = f { Some(*op) } else { None }).collect();
+    for op in &ops_used {
+        if let Some(rhs) = op_rhs(*op) {
+            o.push_str(&format!("eval(N,V,B) :- B > 0, node(N,\"{op}\",A,C), eval(A,X,B-1), eval(C,Y,B-1), {rhs}.\n"));
+        }
+    }
+    o.push('\n');
     o.push_str(&format!("answer(V)     :- eval(\"n0\", V, {dbud}).        // run at the model's effective depth\n"));
     o.push_str("reproduces(V)  :- answer(V), model_answer(V).             // FAITHFUL: symbolic == model ✓\n");
     o.push_str("diverges(P,M)  :- answer(P), model_answer(M), P != M.\n\n");

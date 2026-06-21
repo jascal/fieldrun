@@ -181,6 +181,7 @@ pub struct RecPos {
     pub resolve_layer: usize,        // first layer whose logit-lens argmax == final_top1 (deferred = late)
     pub n_layer: usize,
     pub lens_late: Vec<(usize, i64)>, // (layer, logit-lens top-1) at the late layers — the value stack
+    pub lens_full: Vec<(usize, i64)>, // (layer, logit-lens top-1) at ALL layers — the value stack across depth
     pub back: usize,                  // dominant NON-SINK late-layer back-attention target (the frame it folds)
     pub conc: f32,                    // attention weight on `back` (max over late layers+heads); high = real bind
 }
@@ -191,6 +192,27 @@ pub trait Model: Sync {
 
     /// Per-position recursion substrate (`--recursion-explain`). Default None; the RoPE family implements it.
     fn recursion_trace(&self, _ids: &[i64]) -> Option<Vec<RecPos>> {
+        None
+    }
+
+    /// CHEAP logit-lens at SPECIFIC positions, LATE layers only — for batched value-stack reads in --induce sweeps
+    /// without paying the full-vocab argmax at every layer×position. Returns, per requested position (same order),
+    /// the late-layer (layer, logit-lens top-1) reads. Default None; the RoPE family implements it.
+    fn recursion_lens_at(&self, _ids: &[i64], _positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
+        None
+    }
+
+    /// Raw per-layer residual-stream vectors at SPECIFIC positions — feeds the supervised value-probe (B2): can a
+    /// trained linear map read an intermediate subtree value off the residual, where the unembed-basis lens can't?
+    /// Returns, per requested position (same order), a Vec over layers, each the d-dim residual. Default None.
+    fn residuals_at(&self, _ids: &[i64], _positions: &[usize]) -> Option<Vec<Vec<Vec<f32>>>> {
+        None
+    }
+
+    /// CAUSAL interchange: run the forward but REPLACE the residual at each `positions[i]` with `donors[i]` (residuals
+    /// captured from another expr at the same slots) right after `layer`, then predict the top-1 next token. If swapping
+    /// in another expression's intermediate state changes the OUTPUT toward it, those slots causally carry it.
+    fn predict_patched(&self, _ids: &[i64], _layer: usize, _positions: &[usize], _donors: &[Vec<f32>]) -> Option<i64> {
         None
     }
 
