@@ -13,6 +13,8 @@ No deps beyond the stdlib.
 import json, sys, itertools
 from collections import defaultdict
 
+SIZE_PEN = 0.012  # MDL: small per-node penalty so a simpler near-best program wins ties (shared with emit_datalog.py)
+
 # ---------- DSL ----------
 # A program is (typ, size, repr, fn) where fn: list[int] -> value (int | tuple | bool | None). None = undefined.
 def _safe(fn):
@@ -209,13 +211,13 @@ def main():
         if line:
             r = json.loads(line)
             by_task[r["task"]].append(r)
-    print(f"# rule-synth: {path} · DSL depth K={K}  (faith = held-out faithfulness to the MODEL's output)")
+    split = "OOD-length (train ≤5, test ≥6)" if "--ood" in sys.argv else "random 70/30"
+    print(f"# rule-synth: {path} · DSL depth K={K} · split={split}  (faith = held-out faithfulness to the MODEL's output)")
     print(f"# columns: model-acc = how often the model = textbook; best-1 = simplest near-best program (MDL);")
     print(f"#          truth% = how often the discovered program = textbook (low ⇒ a faithful BROKEN function).\n")
     print(f"{'task':<7}{'n':>4}{'model':>7}  {'best-1 program':<28}{'faith':>6}{'truth':>6}  {'guarded (decision list)':<46}{'g-faith':>7}{'resid':>6}")
     import random
     rng = random.Random(0)
-    SIZE_PEN = 0.012  # MDL: small per-node penalty so a simpler near-best program wins ties
     rows = []
     for task in ["first", "last", "len", "max", "min", "sum"]:
         recs = by_task.get(task)

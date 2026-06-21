@@ -136,7 +136,7 @@ def main():
             r = json.loads(line); by_task[r["task"]].append(r)
     print(f"# emit-datalog: {path}  (souffle round-trip — does the discovered program + residue reproduce the model?)")
     print(f"{'task':<7}{'discovered program':<28}{'souffle ok':>11}{'residue':>8}{'note':>8}")
-    SIZE_PEN = 0.012
+    SIZE_PEN = synth.SIZE_PEN
     for task in ["first", "last", "len", "max", "min", "sum"]:
         recs = by_task.get(task)
         if not recs:
