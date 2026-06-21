@@ -11,7 +11,7 @@ held-out faithfulness, the guarded program + faithfulness, the residue, and what
 No deps beyond the stdlib.
 """
 import json, sys, itertools
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 SIZE_PEN = 0.012  # MDL: small per-node penalty so a simpler near-best program wins ties (shared with emit_datalog.py)
 
@@ -34,7 +34,16 @@ L2I = {
     "max":   _safe(lambda l: max(l) if l else None),
     "min":   _safe(lambda l: min(l) if l else None),
     "sum":   _safe(lambda l: sum(l)),
+    # --- breadth packs (deterministic exhaustion) ---
+    "argmax":   _safe(lambda l: l.index(max(l)) if l else None),     # pos
+    "argmin":   _safe(lambda l: l.index(min(l)) if l else None),     # pos
+    "countmax": _safe(lambda l: l.count(max(l)) if l else None),     # hist
+    "nuniq":    _safe(lambda l: len(set(l))),                        # hist
+    "maxcount": _safe(lambda l: max(Counter(l).values()) if l else None),  # hist (the mode's frequency)
 }
+
+# which breadth pack each primitive belongs to ("base" = the original DSL, always on)
+PACK_OF = {"argmax": "pos", "argmin": "pos", "countmax": "hist", "nuniq": "hist", "maxcount": "hist"}
 # list -> list
 L2L = {
     "tail":    _safe(lambda l: tuple(l[1:])),
@@ -67,8 +76,10 @@ class P:
         self.typ, self.size, self.rep, self.vals = typ, size, rep, vals
 
 
-def enumerate_programs(lists, K=4, bank_cap=60000):
-    """Bottom-up + observational equivalence. Returns levels[typ][size] -> list[P] (smallest program per behaviour)."""
+def enumerate_programs(lists, K=4, bank_cap=60000, enabled=None):
+    """Bottom-up + observational equivalence. `enabled` = set of breadth packs in use (None ⇒ all; "base" always on).
+    Returns levels[typ][size] -> list[P] (smallest program per behaviour)."""
+    ok = lambda nm: enabled is None or PACK_OF.get(nm, "base") in enabled
     seen = {"int": {}, "list": {}}          # sig -> size (smallest seen)
     levels = {"int": defaultdict(list), "list": defaultdict(list)}
 
@@ -94,10 +105,12 @@ def enumerate_programs(lists, K=4, bank_cap=60000):
         # list -> int
         for ch in of("list", cs):
             for nm, f in L2I.items():
+                if not ok(nm): continue
                 add(P("int", size, f"{nm}({ch.rep})", tuple(f(list(v)) if v is not None else None for v in ch.vals)))
         # list -> list
         for ch in of("list", cs):
             for nm, f in L2L.items():
+                if not ok(nm): continue
                 add(P("list", size, f"{nm}({ch.rep})", tuple(f(list(v)) if v is not None else None for v in ch.vals)))
         # binary: split sizes s1 + s2 = size - 1
         for s1 in range(1, cs):
@@ -106,13 +119,16 @@ def enumerate_programs(lists, K=4, bank_cap=60000):
             for a in li:
                 for b in ii:
                     for nm, f in LI2I.items():
+                        if not ok(nm): continue
                         add(P("int", size, f"{nm}({a.rep},{b.rep})", tuple(f(list(x), y) if (x is not None) else None for x, y in zip(a.vals, b.vals))))
                     for nm, f in LI2L.items():
+                        if not ok(nm): continue
                         add(P("list", size, f"{nm}({a.rep},{b.rep})", tuple(f(list(x), y) if (x is not None) else None for x, y in zip(a.vals, b.vals))))
             ia, ib = of("int", s1), of("int", s2)
             for a in ia:
                 for b in ib:
                     for nm, f in II2I.items():
+                        if not ok(nm): continue
                         add(P("int", size, f"{nm}({a.rep},{b.rep})", tuple(f(x, y) if (x is not None and y is not None) else None for x, y in zip(a.vals, b.vals))))
         if sum(len(v) for v in seen.values()) > bank_cap:
             break
@@ -218,8 +234,13 @@ def main():
     print(f"{'task':<7}{'n':>4}{'model':>7}  {'best-1 program':<28}{'faith':>6}{'truth':>6}  {'guarded (decision list)':<46}{'g-faith':>7}{'resid':>6}")
     import random
     rng = random.Random(0)
+    want = next((set(a.split("=", 1)[1].split(",")) for a in sys.argv if a.startswith("--tasks=")), None)
+    packs = next((set(a.split("=", 1)[1].split(",")) for a in sys.argv if a.startswith("--packs=")), {"base", "pos", "hist"})
+    packs.add("base")  # base DSL is always on
     rows = []
     for task in by_task:                              # infer tasks from the dump (any --list-dump battery)
+        if want and task not in want:                 # optional --tasks=first,last filter for large dumps
+            continue
         recs = by_task.get(task)
         if not recs:
             continue
@@ -236,7 +257,7 @@ def main():
         else:
             idx = list(range(n)); rng.shuffle(idx)
             cut = int(0.7 * n); tr, te = idx[:cut], idx[cut:]
-        levels, seen = enumerate_programs(lists, K=K)
+        levels, seen = enumerate_programs(lists, K=K, enabled=packs)
         # output-type constraint: the answer is a single digit, so only programs whose values are all in 0..9 (or None)
         # are admissible — this drops out-of-range junk like add(1,9)=10 that can never be the model's function.
         progs = [p for p in all_int_programs(levels) if all(v is None or (0 <= v <= 9) for v in p.vals)]

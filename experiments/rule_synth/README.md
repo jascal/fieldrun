@@ -21,6 +21,28 @@ python synth.py /tmp/listdump.jsonl 4 --ood
 python emit_datalog.py /tmp/listdump.jsonl 4 /tmp/souffle_out     # needs `souffle` on PATH
 ```
 
+### Tree-traversal rules (proposal §11 — the untried deterministic class)
+
+The flat-list DSL above is exhausted on flat-list tasks (depth + breadth, see RESULTS). The next *deterministic*
+representation it cannot express is **tree catamorphisms** — structural recursion over a parse tree. `eval` of nested
+arithmetic is the zero-ICL tree task (the model evaluates `(+ 3 (* 2 5))` natively), so it needs no priming.
+
+```bash
+# T1. dump (task=eval, expr, model-output, truth) — nested arithmetic the model EVALUATES
+fieldrun --bundle ~/.cache/fieldrun/bundles/Qwen2.5-1.5B/Qwen2.5-1.5B \
+         --recursion-explain --tree-dump /tmp/treedump.jsonl --n 250 --dmax 3 --maxv 9
+
+# T2. synthesize the faithful tree catamorphism + the flat-list contrast + §6 tree-ADT Soufflé round-trip
+python tree_synth.py /tmp/treedump.jsonl 4 --emit          # --emit runs the recursive-Datalog round-trip
+python tree_synth.py /tmp/treedump.jsonl 4 --ood           # OOD-DEPTH: train depth≤2, test depth≥3
+```
+
+`tree_synth.py` reports, per task: the discovered catamorphism (`eval`/`maxleaf`/`depth`/…), its held-out faithfulness,
+and — the punchline — the best **flat-list** program's faithfulness on the *same* exprs (the list DSL cannot express tree
+`eval`, so the gap = what tree traversal recovers). `--emit` closes §6: the catamorphism becomes recursive Soufflé over a
+tree ADT (`leaf`/`node` facts + `ev(t,v):-node(t,"+",l,r),ev(l,a),ev(r,b),v=a+b.`) + a residue EDB → reproduces the model
+100% by construction.
+
 ## What each column means (`synth.py`)
 
 - `model` — how often the model equals the textbook function (its competence on the task).
@@ -37,8 +59,28 @@ python emit_datalog.py /tmp/listdump.jsonl 4 /tmp/souffle_out     # needs `souff
   wrapper (`answer = program unless residue, else residue`); runs `souffle` and checks `answer == model output`.
 - `RESULTS.md` — 0.5B / 1.5B results, OOD analysis, §6 round-trip, caveats.
 
+## Battery & reproducing the sweeps
+
+The `--list-dump` battery is **10 tasks**: the 6 textbook folds (`first`/`last`/`len`/`max`/`min`/`sum`) plus 4 harder
+non-textbook ones (`max2`=2nd-largest, `mode`=most-common [ties→smaller], `cmax`=count-of-max, `range`=max−min) that the
+model is poor at — the synthesizer surfaces what it *substitutes* (e.g. asked `max2`, the model computes `max`). `synth.py`
+and `emit_datalog.py` infer tasks from the dump, so any battery works; `synth.py --tasks=first,max2` restricts the report.
+
+Regenerate the key sweeps (deterministic — default `--seed`):
+```bash
+for k in 2 3 4 5 6; do python synth.py /tmp/listdump.jsonl $k | grep "mean residue"; done   # head-vs-tail (RESULTS §9)
+python synth.py /tmp/listdump.jsonl 5 --ood                                                  # honest (OOD) forge tax
+```
+
 ## Scope (current)
 
-Flat list folds (`first`/`last`/`len`/`max`/`min`/`sum`/`nth`) + list transforms (`init`/`tail`/`reverse`/`take`/`drop`)
-+ binary numeric ops in the DSL; the Datalog emitter covers the folds + transforms (binary-int programs flag
-`unsupported-op` and route to residue). Tree recursion + wild-site scoping are future (proposal §9/§11).
+Two deterministic representations:
+- **Flat list** (`synth.py`): folds (`first`/`last`/`len`/`max`/`min`/`sum`/`nth`) + transforms
+  (`init`/`tail`/`reverse`/`take`/`drop`) + binary numeric ops; Datalog emitter covers folds + transforms
+  (binary-int programs flag `unsupported-op` → residue). Exhausted on flat-list tasks (depth + breadth).
+- **Tree catamorphism** (`tree_synth.py`, proposal §11): `eval`/`maxleaf`/`minleaf`/`sumleaf`/`nleaves`/`nops`/`depth`/
+  `leftleaf`/`rightleaf` over a binary parse tree + subtree selectors (`left`/`right`) + int combinators; all nine have a
+  clean recursive-Datalog catamorphism for the §6 round-trip.
+
+Still future: wild-site scoping (proposal §9); the soft (PIC) representation for whatever survives *both* deterministic
+DSLs per problem.
