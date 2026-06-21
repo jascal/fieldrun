@@ -425,7 +425,7 @@ pub fn run_ring_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
                 for d in 0..10 {
                     if d > 0 { cmat.push(','); }
                     let w = if dtok[d] != usize::MAX { contrib[b][dtok[d]] } else { 0.0 };
-                    cmat.push_str(&format!("{w:.5}"));
+                    cmat.push_str(&format!("{w:.6}"));
                 }
                 cmat.push(']');
             }

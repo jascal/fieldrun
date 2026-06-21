@@ -203,7 +203,11 @@ def build_dl_margin(head_ast, recs, lists, target, strategy, tau):
     per-token MARGIN (`recs[i]['margin']`, from `fieldrun --ring-dump`): low-margin (< tau) → the model's own block-
     provenance semiring-Datalog `Π` (`rlogit(v)=Σ_b cw(b,v)` → argmax = the model token; LE-T5 lossless, the `ring`
     representation; `pic` is the same facts under log-sum-exp); high-margin → a flat EDB. `strategy='ring'` routes ALL
-    residue to Π. Returns (dl_text, n_ring, n_edb) or None if the head isn't §6-emittable."""
+    residue to Π. Returns (dl_text, n_ring, n_edb) or None if the head isn't §6-emittable.
+
+    NB `target[i]` is the MODEL's output token (the dump's `out` field), NOT ground truth — so the `argmax==target[lid]`
+    gate below is a pure FAITHFULNESS backstop (route to ring only when the emitted Π actually reproduces the model),
+    not a correctness gate."""
     rules = [".decl elem(l:number,i:number,v:number)\n.decl len(l:number,n:number)",
              ".decl prog_answer(l:number,v:number)\n.decl residue(l:number,o:number)\n.decl residue_l(l:number)",
              ".decl cw(l:number,b:number,v:number,w:float)\n.decl rlogit(l:number,v:number,s:float)",
@@ -222,11 +226,13 @@ def build_dl_margin(head_ast, recs, lists, target, strategy, tau):
             continue
         c = r["c"]                                  # nb × 10 contribution matrix
         argmax = max(range(10), key=lambda d: sum(c[b][d] for b in range(len(c))))
-        to_ring = (strategy == "ring" or r["margin"] < tau) and argmax == target[lid]  # backstop: Π must reproduce out
+        # route low-margin (or all, for strategy=ring) to Π — but only if the Π's argmax reproduces the model output
+        # target[lid] (a faithfulness backstop; target is the model's `out`, not ground truth). Else fall to edb.
+        to_ring = (strategy == "ring" or r["margin"] < tau) and argmax == target[lid]
         if to_ring:
             for b in range(len(c)):
                 for d in range(10):
-                    cw_facts.append(f"cw({lid},{b},{d},{c[b][d]:.5f}).")
+                    cw_facts.append(f"cw({lid},{b},{d},{c[b][d]:.6f}).")
             cw_facts.append(f"ring_l({lid}).")     # mark as a Π-handled token
             n_ring += 1
         else:
@@ -251,6 +257,8 @@ def main():
     outdir = next((a for a in sys.argv[2:] if a.startswith("/") or a.startswith("./")), "/tmp/souffle_rulesynth")
     strategy = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--strategy=")), "edb")
     tau = next((float(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--tau=")), 1.0)  # margin router threshold
+    if any(a.startswith("--tau=") for a in sys.argv) and strategy != "margin":
+        print(f"# note: --tau only affects --strategy=margin (ignored for strategy={strategy})")
     os.makedirs(outdir, exist_ok=True)
     by_task = defaultdict(list)
     for line in open(path):

@@ -45,6 +45,11 @@ python emit_datalog.py /tmp/ring.jsonl 4 /tmp/souffle_out --strategy=ring       
 python emit_datalog.py /tmp/ring.jsonl 4 /tmp/souffle_out --strategy=margin --tau=1.0 # low-margin → Π, high-margin → edb
 ```
 
+`--ring-dump` JSONL schema (one record per example): `{"task","list","out" (model token),"truth","margin","nb"
+(#blocks=57),"c"}`, where `c` is an `nb × 10` matrix and `Σ_b c[b][d] = logit[d]` for digit `d` (so `argmax_d = out`).
+The emitter turns each routed token's `c` into `cw(l,b,v,w)` facts + `rlogit(l,v,s):- s=sum w:{cw(l,b,v,w)}` and
+`ringans(l,v):- s=max s2:{rlogit(l,_,s2)}` — i.e. the model's per-token semiring-Datalog Π.
+
 ### Tree-traversal rules (proposal §11 — the untried deterministic class)
 
 The flat-list DSL above is exhausted on flat-list tasks (depth + breadth, see RESULTS). The next *deterministic*
