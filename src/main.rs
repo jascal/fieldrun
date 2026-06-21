@@ -42,6 +42,8 @@ mod model;
 mod neox;
 mod qwen3moe;
 mod recursion_dl;
+mod recursion_probe;
+use recursion_probe::{collect_leaves, collect_ops, true_eval};
 mod retrieval;
 mod rope;
 mod ternary;
@@ -86,40 +88,6 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
-}
-
-fn xorshift(r: &mut u64) -> u64 {
-    *r ^= *r << 13;
-    *r ^= *r >> 7;
-    *r ^= *r << 17;
-    *r
-}
-
-/// A random arithmetic s-expression of exactly `depth` nesting, all sub-results in [0, maxv]. Returns (string, value).
-fn gen_arith(depth: usize, maxv: i64, r: &mut u64) -> (String, i64) {
-    if depth == 0 {
-        let v = (xorshift(r) % (maxv as u64 + 1)) as i64;
-        return (v.to_string(), v);
-    }
-    for _ in 0..400 {
-        let op = ['+', '-', '*'][(xorshift(r) % 3) as usize];
-        let (mut dl, mut dr) = (depth - 1, (xorshift(r) % depth as u64) as usize);
-        if xorshift(r) & 1 == 1 {
-            std::mem::swap(&mut dl, &mut dr);
-        }
-        let (ls, lv) = gen_arith(dl, maxv, r);
-        let (rs, rv) = gen_arith(dr, maxv, r);
-        if op == '-' && lv < rv {
-            continue;
-        }
-        let v = match op { '+' => lv + rv, '-' => lv - rv, '*' => lv * rv, _ => 0 };
-        if !(0..=maxv).contains(&v) {
-            continue;
-        }
-        return (format!("({op} {ls} {rs})"), v);
-    }
-    let v = (xorshift(r) % (maxv as u64 + 1)) as i64;
-    (v.to_string(), v)
 }
 
 fn main() {
@@ -938,78 +906,29 @@ fn main() {
             // exprs of increasing nesting, get the model's answer, abduce its effective recursion depth + cut, and
             // report: model accuracy vs depth (the cliff), faithfulness (abduction reproduces the model), and the
             // recursive-vs-broken-cut-vs-semiring split. Tests "errs iff depth>D" and "error == retrieved cut". ──
-            if has_flag(&args, "--measure") {
-                let tg = match &tg { Some(t) => t, None => { eprintln!("[fieldrun] --measure needs a tokenizer next to {stem}"); return; } };
-                let n_per: usize = flag(&args, "--n").and_then(|s| s.parse().ok()).unwrap_or(8);
-                let dmax: usize = flag(&args, "--dmax").and_then(|s| s.parse().ok()).unwrap_or(6);
-                let maxv: i64 = flag(&args, "--maxv").and_then(|s| s.parse().ok()).unwrap_or(9);
-                let mut rng: u64 = flag(&args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
-                const MPRIME: &str = "(+ 1 2) = 3\n(* 2 3) = 6\n(- 9 4) = 5\n(* 2 (+ 1 2)) = 6\n(- 8 (+ 1 2)) = 5\n";
-                let prime_lits: Vec<i64> = MPRIME.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse::<i64>().ok()).collect();
-                #[derive(Clone, Default)]
-                struct Agg { n: usize, correct: usize, faithful: usize, clean: usize, cut: usize, semi: usize, sumd: i64, err: usize, err_cut: usize }
-                let mut per: Vec<Agg> = vec![Agg::default(); dmax + 1];
-                eprintln!("[fieldrun] datalog measure · {n_per} exprs/depth × depths 1..{dmax} · maxv {maxv} · {stem}");
-                for depth in 1..=dmax {
-                    for _ in 0..n_per {
-                        let (expr, truev) = gen_arith(depth, maxv, &mut rng);
-                        let mut ids = tg.encode(&format!("{MPRIME}{expr} ="), false);
-                        let mut cont = String::new();
-                        for _ in 0..4 {
-                            let t = lm.predict(&ids);
-                            let s = tg.decode(&[t]);
-                            if s.contains('\n') { break; }
-                            cont.push_str(&s);
-                            ids.push(t);
-                        }
-                        let num: String = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
-                        let model_answer = match num.parse::<i64>() { Ok(v) => v, Err(_) => continue };
-                        let tree = match recursion_dl::parse_str(&expr) { Some(t) => t, None => continue };
-                        let mut lits = prime_lits.clone();
-                        lits.extend(expr.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse::<i64>().ok()));
-                        let (abd, maxd, _) = recursion_dl::analyze(&tree, model_answer, &lits);
-                        let a = &mut per[depth];
-                        a.n += 1;
-                        let ok = model_answer == truev;
-                        if ok { a.correct += 1; } else { a.err += 1; }
-                        match abd {
-                            Some(ab) => {
-                                a.faithful += 1;
-                                a.sumd += ab.depth;
-                                if ab.cuts.is_empty() && ab.depth as usize == maxd { a.clean += 1; }
-                                else {
-                                    a.cut += 1;
-                                    if !ok && ab.cuts.iter().any(|&(_, _, ctx)| ctx) { a.err_cut += 1; }
-                                }
-                            }
-                            None => a.semi += 1,
-                        }
-                    }
-                }
-                let pct = |x: usize, n: usize| if n > 0 { 100.0 * x as f64 / n as f64 } else { 0.0 };
-                println!("# datalog measure — depth-bounded abductive faithfulness ({stem})");
-                println!("depth   n  model-acc  faithful  meanD  clean  cut  semiring");
-                let mut tot = Agg::default();
-                let mut dstar = 0usize;
-                for depth in 1..=dmax {
-                    let a = per[depth].clone();
-                    if a.n == 0 { continue; }
-                    if pct(a.correct, a.n) >= 50.0 { dstar = dstar.max(depth); }
-                    println!("{:>5} {:>3} {:>8.0}% {:>8.0}% {:>6.1} {:>6} {:>4} {:>8}",
-                             depth, a.n, pct(a.correct, a.n), pct(a.faithful, a.n),
-                             if a.faithful > 0 { a.sumd as f64 / a.faithful as f64 } else { 0.0 }, a.clean, a.cut, a.semi);
-                    tot.n += a.n; tot.correct += a.correct; tot.faithful += a.faithful;
-                    tot.clean += a.clean; tot.cut += a.cut; tot.semi += a.semi; tot.err += a.err; tot.err_cut += a.err_cut;
-                }
-                println!("\n→ model accuracy {:.0}% · FAITHFULNESS (abduction reproduces the model) {:.0}% of {} queries",
-                         pct(tot.correct, tot.n), pct(tot.faithful, tot.n), tot.n);
-                println!("→ split: {:.0}% clean recursion · {:.0}% broken-cut (early-cut retrieval) · {:.0}% semiring-needed (no depth-cut found)",
-                         pct(tot.clean, tot.n), pct(tot.cut, tot.n), pct(tot.semi, tot.n));
-                println!("→ effective recursion depth D* = {dstar} (deepest where model-acc ≥ 50%)  [cross-check vs the recursion-depth probe]");
-                println!("→ P1 (errs as depth exceeds D*): see the model-acc cliff in the table above");
-                println!("→ P2 (a wrong answer == a context-literal cut): {:.0}% of {} errors explained by a retrieved cut", pct(tot.err_cut, tot.err), tot.err);
-                return;
-            }
+            if has_flag(&args, "--measure") { recursion_probe::run_measure(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--value-probe-dump") { recursion_probe::run_value_probe_dump(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--value-patch") { recursion_probe::run_value_patch(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--hold-sweep") { recursion_probe::run_hold_sweep(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--bind-patch") { recursion_probe::run_bind_patch(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--list-measure") { recursion_probe::run_list_measure(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--list-attribute") { recursion_probe::run_list_attribute(&args, lm.as_ref(), &tg, &stem); return; }
+
+            // ── --discover: discover a recursive function WITHOUT knowing it a priori. Teach the model an operator
+            // under a NOVEL symbol via few-shot (the induction code is BLIND to its meaning), then (1) PROBE flat
+            // (sym a b) — each answer is a direct observation of apply(a,b); (2) INDUCE the semantics by fitting the
+            // smallest operator from a basis to the observed table (or keep the table as EDB facts if none fits);
+            // (3) VERIFY the DISCOVERED recursive Datalog reproduces the model on held-out NESTED expressions. This
+            // is the coverage engine: every operator we can induce converts opaque "here-be-dragons" into legible
+            // recursive rules; what resists induction is the genuine residue. ──
+            if has_flag(&args, "--discover") { recursion_probe::run_discover(&args, lm.as_ref(), &tg, &stem); return; }
+
+            // ── --induce (sweep): DESCRIPTIVE value-flow profile — no textbook assumed. Across many depth-2 exprs,
+            // read each structural position (root / left-child / right-child) off the trace and classify what the
+            // legible read MATCHES: the textbook subtree value, an input operand (a copy), the model's own answer,
+            // something else, or nothing. The model's ACTUAL learned algorithm shows up in these statistics — which
+            // may not be the depth-first fold a developer would write. ──
+            if has_flag(&args, "--induce") && flag(&args, "--text").is_none() && flag(&args, "--ids").is_none() { recursion_probe::run_induce(&args, lm.as_ref(), &tg, &stem); return; }
 
             let defer: f32 = flag(&args, "--defer").and_then(|s| s.parse().ok()).unwrap_or(0.6);
             let reach_min: usize = flag(&args, "--reach-min").and_then(|s| s.parse().ok()).unwrap_or(3);
@@ -1029,6 +948,105 @@ fn main() {
                 None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }
             };
 
+            // ── --induce: MEASURE which rules are LEGIBLE in the trace. Read each subtree node's value off the
+            // value-stack (logit-lens at the node's token positions) and grade it against the true value. What reads
+            // cleanly is an extractable rule; what doesn't stays the Datalog KERNEL backstop (the cut / semiring).
+            // Measurement before fitting — we don't assume the value stack is readable, we check. ──
+            if has_flag(&args, "--induce") {
+                let mut atoms: Vec<(String, usize)> = Vec::new();
+                for (ti, &id) in rec_ids.iter().enumerate() {
+                    let mut num = String::new();
+                    for ch in lbl(id).chars() {
+                        if ch.is_ascii_digit() { num.push(ch); }
+                        else {
+                            if !num.is_empty() { atoms.push((std::mem::take(&mut num), ti)); }
+                            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '&' | '|' | '^' | '<' | '>' | '%' | '@' | '#' | '~') { atoms.push((ch.to_string(), ti)); }
+                        }
+                    }
+                    if !num.is_empty() { atoms.push((num, ti)); }
+                }
+                let tree = match recursion_dl::parse_target(&atoms) {
+                    Some(t) => t,
+                    None => { eprintln!("[fieldrun] --induce: no s-expression found in input"); return; }
+                };
+                // Read an integer from the value stack near a token position: the most frequent decoded-int across the
+                // late layers, scanning the close token and the two before it (the subtree's value may settle just
+                // before its bracket merges). Returns (value, which-offset, n-late-hits).
+                let read_stack = |pos: usize| -> Option<(i64, i64, usize)> {
+                    let mut best: Option<(i64, i64, usize)> = None;
+                    for off in 0..=2i64 {
+                        let p = pos.wrapping_sub(off as usize);
+                        let r = match trace.get(p) { Some(r) => r, None => continue };
+                        let mut counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+                        for &(_, tok) in &r.lens_late {
+                            if let Ok(v) = lbl(tok).trim().parse::<i64>() { *counts.entry(v).or_default() += 1; }
+                        }
+                        if let Some((v, c)) = counts.into_iter().max_by_key(|&(_, c)| c) {
+                            if best.map(|(_, _, bc)| c > bc).unwrap_or(true) { best = Some((v, off, c)); }
+                        }
+                    }
+                    best
+                };
+                let mut ops: Vec<&recursion_dl::Node> = Vec::new();
+                collect_ops(&tree, &mut ops);
+                println!("# induce — value-stack legibility per subtree node ({stem})");
+                println!("  subtree            true   read  off  hits  resolve/Lyr  match");
+                let (mut hit, mut tot) = (0usize, 0usize);
+                for node in &ops {
+                    if let recursion_dl::Node::Op(op, _a, _b, _open, close) = node {
+                        let truev = true_eval(node);
+                        let read = read_stack(*close);
+                        let (resolve, nl) = trace.get(*close).map(|r| (r.resolve_layer, r.n_layer)).unwrap_or((0, 0));
+                        let m = matches!((truev, read), (Some(t), Some((r, _, _))) if t == r);
+                        if truev.is_some() { tot += 1; if m { hit += 1; } }
+                        println!("  ({op} ..)@tok{close:<3}    {:>5}   {:>4}  {:>3}  {:>4}   {:>5}/{:<3}   {}",
+                                 truev.map(|v| v.to_string()).unwrap_or("?".into()),
+                                 read.map(|(v, _, _)| v.to_string()).unwrap_or("·".into()),
+                                 read.map(|(_, o, _)| o.to_string()).unwrap_or("·".into()),
+                                 read.map(|(_, _, c)| c.to_string()).unwrap_or("·".into()),
+                                 resolve, nl, if m { "✓" } else { " " });
+                    }
+                }
+                println!("\n→ value-stack legibility: {hit}/{tot} subtree nodes read correctly off the trace");
+                println!("  (legible nodes → extractable rules; the rest → Datalog KERNEL backstop via the cut)");
+
+                // The real test: in a right-nested expr the closes MERGE (all nodes share one token), so the value
+                // stack can't live across POSITIONS — it must live across LAYERS at the cascade position. Dump the
+                // decoded-integer logit-lens trajectory by layer at each distinct node position + the final tokens.
+                let traj_ints = |pos: usize| -> Vec<(usize, i64)> {
+                    trace.get(pos).map(|r| r.lens_full.iter()
+                        .filter_map(|&(l, tok)| lbl(tok).trim().parse::<i64>().ok().map(|v| (l, v)))
+                        .collect()).unwrap_or_default()
+                };
+                // the model's actual answer to the whole query (is it even correct? — else nothing to read)
+                let mut gids = rec_ids.clone();
+                let mut cont = String::new();
+                for _ in 0..4 { let t = lm.predict(&gids); let s = lbl(t); if s.contains('\n') { break; } cont.push_str(&s); gids.push(t); }
+                let model_ans: Option<i64> = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+                let truev = true_eval(&tree);
+                println!("\n  model answer = {}  ·  true = {}  ·  {}",
+                         model_ans.map(|v| v.to_string()).unwrap_or("?".into()),
+                         truev.map(|v| v.to_string()).unwrap_or("?".into()),
+                         if model_ans == truev { "model CORRECT (intermediate values exist to read)" } else { "model WRONG (no correct value stack to find)" });
+                println!("\n# value stack ACROSS LAYERS — every position with an integer logit-lens read (by layer)");
+                println!("# (* = read is NOT a query operand → candidate COMPUTED intermediate value)");
+                let mut qleaves = Vec::new();
+                collect_leaves(&tree, &mut qleaves);
+                let operands: std::collections::HashSet<i64> = qleaves.into_iter().collect();
+                for p in 0..rec_ids.len().saturating_sub(1) {
+                    let ints = traj_ints(p);
+                    if ints.is_empty() { continue; }
+                    let tok = rec_ids.get(p).map(|&id| lbl(id)).unwrap_or_default();
+                    let seq: Vec<String> = ints.iter().map(|&(l, v)| {
+                        let mark = if operands.contains(&v) { "" } else { "*" }; // * = not an operand → computed
+                        format!("L{l}:{v}{mark}")
+                    }).collect();
+                    println!("  tok{p:<3} '{}'  {}", tok.replace('\n', "\\n"), seq.join(" "));
+                }
+                println!("  (* marks a read that is NOT an input operand — a candidate COMPUTED intermediate value)");
+                return;
+            }
+
             // ── --datalog: emit the recursion as a RUNNABLE recursive Soufflé program (parse tree + eval/2 fixpoint +
             // the model's per-node value readouts from the trace) instead of the per-position view. ──
             if has_flag(&args, "--datalog") {
@@ -1040,7 +1058,7 @@ fn main() {
                             num.push(ch);
                         } else {
                             if !num.is_empty() { atoms.push((std::mem::take(&mut num), ti)); }
-                            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/') { atoms.push((ch.to_string(), ti)); }
+                            if matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '&' | '|' | '^' | '<' | '>' | '%' | '@' | '#' | '~') { atoms.push((ch.to_string(), ti)); }
                         }
                     }
                     if !num.is_empty() { atoms.push((num, ti)); }
@@ -3509,6 +3527,9 @@ USAGE\n\
   fieldrun --bundle <stem> --ids <ids.json> --ctx N --explain [--vocab vocab.json]   circuits + features\n\
   fieldrun --bundle <stem> --chat [--explain] [--raw]                     chat REPL (/explain, /format in-REPL)\n\
   fieldrun --bundle <stem> --recursion-explain [--text \"...\"] [--mode binding|recursion|spectrum]   recursion spectrum\n\
+  fieldrun --bundle <stem> --recursion-explain --measure [--n N --dmax D]  depth-bounded faithfulness sweep\n\
+  fieldrun --bundle <stem> --recursion-explain --datalog [--text \"(+ 1 (* 2 3))\"]   emit recursive Soufflé program\n\
+  fieldrun --bundle <stem> --recursion-explain --discover [--teach + --sym @]   induce a recursive op from behavior\n\
   fieldrun --bundle <stem> --serve <PORT>                                 HTTP API: token-id + OpenAI/Anthropic\n\
   fieldrun --store <store.json> --ids <ids.json>                          retrieval-only (Tier A)\n\
 \n\

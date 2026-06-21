@@ -40,3 +40,4 @@ sim/data/train_ids.json
 sim/data/probes.json
 sim/data/hf/
 sim/data/threx.fieldrun.*
+experiments/ilp_decompile/
