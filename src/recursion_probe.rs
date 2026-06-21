@@ -294,13 +294,19 @@ pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
     let lmax: usize = flag(args, "--lmax").and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
     type LFn = (&'static str, &'static str, fn(&[i64]) -> Option<i64>);
-    let fns: [LFn; 6] = [
+    let fns: [LFn; 10] = [
         ("last",  "last 3 7 2 5 = 5\nlast 1 8 4 = 4\nlast 6 0 9 2 = 2\n", |l| l.last().copied()),
         ("first", "first 3 7 2 5 = 3\nfirst 1 8 4 = 1\nfirst 6 0 9 2 = 6\n", |l| l.first().copied()),
         ("len",   "len 3 7 2 5 = 4\nlen 1 8 4 = 3\nlen 6 0 9 2 5 = 5\n", |l| Some(l.len() as i64)),
         ("max",   "max 3 7 2 5 = 7\nmax 1 8 4 = 8\nmax 6 0 9 2 = 9\n", |l| l.iter().max().copied()),
         ("min",   "min 3 7 2 5 = 2\nmin 1 8 4 = 1\nmin 6 0 9 2 = 0\n", |l| l.iter().min().copied()),
         ("sum",   "sum 3 1 2 = 6\nsum 4 0 1 = 5\nsum 2 3 1 = 6\n", |l| { let s: i64 = l.iter().sum(); (s <= 9).then_some(s) }),
+        // harder / non-textbook tasks — the model is poor at these, so the synthesizer should surface OBSCURE/broken fns.
+        // (mode tie-break: equal counts → the SMALLER value, via the reversed value compare in max_by below.)
+        ("max2",  "max2 3 7 2 5 = 5\nmax2 1 8 4 = 4\nmax2 6 0 9 2 = 6\n", |l| { let mut s = l.to_vec(); s.sort_unstable(); (s.len() >= 2).then(|| s[s.len() - 2]) }),
+        ("mode",  "mode 3 7 3 5 = 3\nmode 1 8 1 = 1\nmode 6 2 6 9 = 6\n", |l| { let mut c = std::collections::HashMap::new(); for &x in l { *c.entry(x).or_insert(0usize) += 1; } c.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(v, _)| v) }),
+        ("cmax",  "cmax 3 7 7 5 = 2\ncmax 1 8 4 = 1\ncmax 9 0 9 9 = 3\n", |l| l.iter().max().map(|&m| l.iter().filter(|&&x| x == m).count() as i64)),
+        ("range", "range 3 7 2 5 = 5\nrange 1 8 4 = 7\nrange 6 0 9 2 = 9\n", |l| match (l.iter().min(), l.iter().max()) { (Some(&a), Some(&b)) => Some(b - a), _ => None }),
     ];
     let mut out = String::new();
     let mut total = 0usize;
@@ -321,6 +327,68 @@ pub fn run_list_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<
                 let ls = list.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
                 out.push_str(&format!("{{\"task\":\"{name}\",\"list\":[{ls}],\"out\":{mo},\"truth\":{tv}}}\n"));
                 got += 1;
+                total += 1;
+            }
+        }
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {total} records → {path}"),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
+/// Extract the leaf operands of an arithmetic expression string, left-to-right (all numbers; gen_family keeps them 0..9).
+fn expr_leaves(expr: &str) -> Vec<i64> {
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    for c in expr.chars() {
+        if c.is_ascii_digit() { cur.push(c); }
+        else if !cur.is_empty() { out.push(cur.parse().unwrap()); cur.clear(); }
+    }
+    if !cur.is_empty() { out.push(cur.parse().unwrap()); }
+    out
+}
+
+/// TREE-traversal dump: nested arithmetic expressions + the model's answer for a BATTERY of tree tasks — for the
+/// tree-recursion synthesizer (proposal §11, the untried deterministic class). Four catamorphisms over the parse tree:
+///   eval      (full recursive eval — ZERO-ICL, the model evaluates `(+ 3 (* 2 5))` natively),
+///   maxleaf   (leaf fold: the largest operand),
+///   leftleaf  (left-spine traversal: the first operand),  rightleaf (right-spine traversal: the last operand).
+/// Each is lightly few-shot-primed; the offline tree synthesizer fits the catamorphism faithful to the model's output —
+/// where the model substitutes a *simpler* traversal (the tree analog of list `max2`→`max`), the synth surfaces that.
+pub fn run_tree_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --tree-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--tree-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --tree-dump needs a path"); return; } };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let dmax: usize = flag(args, "--dmax").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let maxv: i64 = flag(args, "--maxv").and_then(|s| s.parse().ok()).unwrap_or(9);
+    // --tree-tasks=eval,maxleaf (default: all four). Lets a quick run do just the zero-ICL `eval`.
+    let want: Option<Vec<&str>> = flag(args, "--tree-tasks").map(|s| s.split(',').collect());
+    let mut rng: u64 = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1;
+    // (task name, few-shot prime, prompt prefix). `eval` needs no prefix — bare arithmetic the model completes natively.
+    let tasks: [(&str, &str, &str); 4] = [
+        ("eval", "(+ 1 2) = 3\n(* 2 3) = 6\n(- 9 4) = 5\n(+ 2 (* 3 1)) = 5\n(- 8 (+ 1 2)) = 5\n", ""),
+        ("maxleaf", "max (+ 1 2) = 2\nmax (* 3 4) = 4\nmax (- 9 5) = 9\nmax (+ 2 (* 3 1)) = 3\nmax (- 8 (+ 1 6)) = 8\n", "max "),
+        ("leftleaf", "first (+ 1 2) = 1\nfirst (* 3 4) = 3\nfirst (- 9 5) = 9\nfirst (+ 2 (* 3 1)) = 2\nfirst (- 8 (+ 1 6)) = 8\n", "first "),
+        ("rightleaf", "last (+ 1 2) = 2\nlast (* 3 4) = 4\nlast (- 9 5) = 5\nlast (+ 2 (* 3 1)) = 1\nlast (- 8 (+ 1 6)) = 6\n", "last "),
+    ];
+    let mut out = String::new();
+    let mut total = 0usize;
+    eprintln!("[fieldrun] tree-dump · {n} nested exprs · depth 1..{dmax} · maxv {maxv} · tasks {:?} → {path}",
+              want.clone().unwrap_or_else(|| tasks.iter().map(|t| t.0).collect()));
+    for _ in 0..n {
+        let depth = 1 + (xorshift(&mut rng) % dmax as u64) as usize;
+        let (expr, truev) = gen_family(depth, &['+', '-', '*'], maxv, &mut rng);
+        let leaves = expr_leaves(&expr);
+        if leaves.is_empty() { continue; }
+        let truths = [truev, *leaves.iter().max().unwrap(), leaves[0], leaves[leaves.len() - 1]];
+        for (ti, (task, prime, prefix)) in tasks.iter().enumerate() {
+            if let Some(w) = &want { if !w.contains(task) { continue; } }
+            let mut g = tg.encode(&format!("{prime}{prefix}{expr} ="), false);
+            let mut cont = String::new();
+            for _ in 0..4 { let t = lm.predict(&g); let s = tg.decode(&[t]); if s.contains('\n') { break; } cont.push_str(&s); g.push(t); }
+            let mo: Option<i64> = cont.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+            if let Some(mo) = mo {
+                out.push_str(&format!("{{\"task\":\"{task}\",\"expr\":\"{expr}\",\"out\":{mo},\"truth\":{}}}\n", truths[ti]));
                 total += 1;
             }
         }
