@@ -132,12 +132,16 @@ pub fn emit_dl_mode(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String, 
     }
     o.push('\n');
     if compact {
-        // margin-routed `edb`: high-margin token — elide the dense Tier-B sum and assert the decode directly.
-        o.push_str("// ---- TIER B ELIDED (margin-routed edb): high-margin token — the dense per-block forge-tax sum is\n");
-        o.push_str("// dropped and the decode asserted directly; safe because a δ-bounded change can't flip a >2δ margin (PO-T3).\n");
+        // margin-routed `edb` (extensional-database fact): MEMORISE the decode rather than recompute it — faithful by
+        // assertion. We do this for high-margin tokens because PO-T3 makes their decode robust (margin > 2δ ⟹ no
+        // δ-bounded approximation of the dense Π flips the argmax), so the per-block forge-tax sum carries no
+        // decode-relevant content here; the full Π earns its bytes only on the thin-margin tail.
+        o.push_str("// ---- TIER B ELIDED (margin-routed `edb` = extensional-database fact): the decode is MEMORISED, not\n");
+        o.push_str("// recomputed — faithful by assertion. Justified here because the margin is wide: PO-T3 says a >2δ margin\n");
+        o.push_str("// can't be flipped by any δ-bounded change to the dense Π, so its exact value is decode-irrelevant.\n");
         o.push_str(&format!("decide({}).   // the model's pick — retrieved / high-margin\n", p.predicted));
         o.push_str(".output decide\n");
-        o.push_str(&format!("// margin {:+.3} over {}; full Π elided as decode-safe.\n", p.margin, label(p.runner_up)));
+        o.push_str(&format!("// margin {:+.3} over {}; dense Π dropped (decode-robust at this margin).\n", p.margin, label(p.runner_up)));
         return o;
     }
     o.push_str("// ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");

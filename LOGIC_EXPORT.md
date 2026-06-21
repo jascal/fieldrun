@@ -303,8 +303,16 @@ as provenance structure vs intervention diffuseness.
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-
     trip the model under `eval --semiring max` (argmax = the model token) and `log` (the softmax); on a 16-token prose
     trace the `edb` (all-compact) artifact is 26 KB vs `ring` (all-Π) 71 KB, with `margin` in between — the forge tax is
-    paid only where the margin is thin. This realizes the increment *for the per-context trace*; lifting the same router
-    onto the **context-free `--logic-whole`** unembed (the `shortlist×d` + PO-T3 certificate above) is the remaining LE-T4 step.
+    paid only where the margin is thin. (`edb` = *extensional database*, the Datalog name for a fact table: the compact
+    form memorises the decode as a fact rather than recomputing it.) This realizes the increment *for the per-context
+    trace*; lifting the same router onto the **context-free `--logic-whole`** unembed (the `shortlist×d` + PO-T3
+    certificate above) is the remaining LE-T4 step.
+
+    | strategy | per-token emission | 16-tok prose trace | faithful (`eval` max / log) |
+    |---|---|---|---|
+    | `ring` / `pic` (default) | full per-block Π every token | 0 compact / 16 Π · **71 KB** | argmax = model token / softmax ✓ |
+    | `edb` | decode memorised every token | 16 compact / 0 Π · **26 KB** | model token asserted ✓ |
+    | `margin --tau 2` | high-margin → memorise, low → Π | 2 compact / 14 Π · ~66 KB | ✓ (PO-T3 on the compact set) |
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank). *Caveat
   (Grok): treewidth `τ` is the load-bearing invariant (the forge tax = the no-compact-sub-conjunction
