@@ -85,6 +85,14 @@ pub fn explain_line(p: &Provenance, label: &dyn Fn(i64) -> String) -> String {
 /// `ctx` is the context (for the header comment only); `label` maps a token id to display text (also comments only —
 /// the program references tokens by id).
 pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> String {
+    emit_dl_mode(p, ctx, label, false)
+}
+
+/// As `emit_dl`, but `compact=true` ELIDES the dense Tier-B per-block contributions (the forge tax) and asserts the
+/// decode directly — the `edb` form for a high-margin token, decode-safe above 2δ by PO-T3. The margin-routed
+/// whole-model export uses `compact` for high-margin/retrieved tokens and the full Π for the low-margin tail, which
+/// localizes the forge tax to exactly the tokens the model computes.
+pub fn emit_dl_mode(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String, compact: bool) -> String {
     let mut o = String::new();
     o.push_str("// ============================================================\n");
     o.push_str("// fieldrun logic export — semiring-Datalog program for ONE next-token decision\n");
@@ -123,6 +131,19 @@ pub fn emit_dl(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String) -> St
         }
     }
     o.push('\n');
+    if compact {
+        // margin-routed `edb` (extensional-database fact): MEMORISE the decode rather than recompute it — faithful by
+        // assertion. We do this for high-margin tokens because PO-T3 makes their decode robust (margin > 2δ ⟹ no
+        // δ-bounded approximation of the dense Π flips the argmax), so the per-block forge-tax sum carries no
+        // decode-relevant content here; the full Π earns its bytes only on the thin-margin tail.
+        o.push_str("// ---- TIER B ELIDED (margin-routed `edb` = extensional-database fact): the decode is MEMORISED, not\n");
+        o.push_str("// recomputed — faithful by assertion. Justified here because the margin is wide: PO-T3 says a >2δ margin\n");
+        o.push_str("// can't be flipped by any δ-bounded change to the dense Π, so its exact value is decode-irrelevant.\n");
+        o.push_str(&format!("decide({}).   // the model's pick — retrieved / high-margin\n", p.predicted));
+        o.push_str(".output decide\n");
+        o.push_str(&format!("// margin {:+.3} over {}; dense Π dropped (decode-robust at this margin).\n", p.margin, label(p.runner_up)));
+        return o;
+    }
     o.push_str("// ---- TIER B: composition (per-block residual contributions; the forge tax) ----\n");
     o.push_str("// contrib(Block, Token, Weight): block's exact contribution to Token's logit. Σ_Block = logit(Token).\n");
     o.push_str("// |W|>=0.1 blocks shown; the dense remainder folds into block \"rest\" (the irreducible high-PR\n");

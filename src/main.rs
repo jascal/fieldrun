@@ -2713,30 +2713,45 @@ fn main() {
             // token text for the .dl comments comes from the tokenizer (api feature); without it, fall back to ids.
             #[cfg(feature = "api")]
             let tg = api::TextGen::load(&stem, eos.clone());
-            let (mut written, mut faithful) = (0usize, 0usize);
+            // --residue-strategy {ring|pic|edb|margin}: the whole-model analog of the rule-synth residue choice. `ring`/
+            // `pic` (default) emit the full per-token Π for every token; `edb` emits the compact decode-only form for
+            // every token; `margin` ROUTES by the per-token margin — high-margin (≥ --tau, retrieved, decode-safe by
+            // PO-T3) get the compact form, the low-margin tail keeps the full Π. This localizes the forge tax to exactly
+            // the tokens the model computes (the dense Π is paid only where the margin is thin).
+            let strategy = flag(&args, "--residue-strategy").unwrap_or("ring");
+            let tau: f32 = flag(&args, "--tau").and_then(|s| s.parse().ok()).unwrap_or(5.0);
+            let (mut written, mut faithful, mut n_compact, mut bytes) = (0usize, 0usize, 0usize, 0usize);
             for step in 0..steps {
                 let Some(prov) = logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) else {
                     eprintln!("[fieldrun] --export-logic: arch {arch} has no residual_decomp (rope only)");
                     return;
                 };
+                let compact = match strategy {
+                    "edb" => true,
+                    "margin" => prov.margin >= tau,        // high-margin → compact; low-margin → full Π
+                    _ => false,                            // ring / pic → full Π always
+                };
                 #[cfg(feature = "api")]
                 let o = {
                     let lbl = |id: i64| -> String { tg.as_ref().map(|g| g.token_label(id)).unwrap_or_else(|| format!("[{id}]")) };
-                    logic::emit_dl(&prov, &ctx_v, &lbl)
+                    logic::emit_dl_mode(&prov, &ctx_v, &lbl, compact)
                 };
                 #[cfg(not(feature = "api"))]
-                let o = logic::emit_dl(&prov, &ctx_v, &|id: i64| format!("[{id}]"));
+                let o = logic::emit_dl_mode(&prov, &ctx_v, &|id: i64| format!("[{id}]"), compact);
                 let path = format!("{stem_pfx}.{step:03}.dl");
                 if std::fs::write(&path, &o).is_ok() {
                     written += 1;
-                    if o.contains("✓ FAITHFUL") { faithful += 1; }
+                    bytes += o.len();
+                    if compact { n_compact += 1; faithful += 1; } else if o.contains("✓ FAITHFUL") { faithful += 1; }
                 } else {
                     eprintln!("[fieldrun] --export-logic: could not write {path}");
                 }
                 ctx_v.push(prov.predicted); // advance by the model's greedy pick → the trace follows a real trajectory
             }
-            eprintln!("[fieldrun] --export-logic → {stem_pfx}.{{000..{:03}}}.dl  ({written} steps, {faithful} FAITHFUL ✓) — run: fieldrun eval {stem_pfx}.000.dl --semiring max|log",
-                      steps.saturating_sub(1));
+            eprintln!("[fieldrun] --export-logic → {stem_pfx}.{{000..{:03}}}.dl  ({written} steps, {faithful} FAITHFUL ✓ · \
+                       strategy={strategy}{} · {n_compact} compact / {} full-Π · {} KB) — run: fieldrun eval {stem_pfx}.000.dl --semiring max|log",
+                      steps.saturating_sub(1), if strategy == "margin" { format!(" τ={tau}") } else { String::new() },
+                      written - n_compact, bytes / 1024);
             return;
         }
 
