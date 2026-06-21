@@ -313,6 +313,12 @@ as provenance structure vs intervention diffuseness.
     | `ring` / `pic` (default) | full per-block Π every token | 0 compact / 16 Π · **71 KB** | argmax = model token / softmax ✓ |
     | `edb` | decode memorised every token | 16 compact / 0 Π · **26 KB** | model token asserted ✓ |
     | `margin --tau 2` | high-margin → memorise, low → Π | 2 compact / 14 Π · ~66 KB | ✓ (PO-T3 on the compact set) |
+
+    **Corpus aggregation** (`--export-logic-corpus <prompts.txt>`) runs the margin-routed trace over many prompts and
+    reports the model-wide **forge-tax-localization curve** — the fraction of tokens that are decode-robust (compact) and
+    the bytes saved, swept over τ, plus the split by route. On an 18-prompt / 144-token slice (Qwen2.5-1.5B):
+    τ=1 → 58% compact / 36% saved · τ=2 → 31% / 20% · τ=5 → 12% / 8%; and the RETRIEVED (induction) tokens are **100%
+    compact** while non-induction are 29% — i.e. the dense Π is paid exactly where the model isn't confidently retrieving.
 - **LO4** Treewidth of the core's factor graph as a quantitative forge-tax measure; relate to PR and to
   the Tropical paper's tropical rank (one wall, three measures: PR, treewidth, tropical rank). *Caveat
   (Grok): treewidth `τ` is the load-bearing invariant (the forge tax = the no-compact-sub-conjunction
