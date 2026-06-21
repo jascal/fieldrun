@@ -141,6 +141,30 @@ answer(Xs, R)   :- residue(Xs, R).                     % kernel fallback (EDB fa
 
 In Soufflé the list/recursion is via record ADTs and the guard via stratified negation — mechanical, if not free. Folds → recursive rules; guards → rule-body conditions; residue → EDB facts + a fallback clause.
 
+## 11. Answers to review — round 2
+
+*(Round-1 review predated §10, which already covers the DSL grammar, guard-overfit controls, the residue stop-criterion, and a Datalog emission example. The genuinely new points:)*
+
+**Stochasticity (§2).** Current task sites use **greedy** decoding, so the model is deterministic and `obs[x]` is a single token — observational equivalence is exact. Under sampled decoding `obs[x]` becomes a distribution; then either **(a)** fit the **argmax/mode** (keeps the exact-match engine; the faithful target is the model's most-likely answer), or **(b)** score by **agreement with the sampled distribution** (expected match, or a soft observational-equivalence on the induced answer distribution). We start with (a); the engine is unchanged.
+
+**Higher-order slots (§3).** We do **not** enumerate arbitrary lambdas for `filter(pred)` / `fold(f,·)` / `map(g)` initially — that's the combinatorial killer. The higher-order slots draw from a **closed set of built-ins**: `fold`'s combiner is restricted to the binary `Int×Int→Int` primitives (`+ × min max …`); `filter`'s `pred` / `map`'s `g` draw from the small fixed predicate/function set (the same shallow set used for guards). Higher-order is **closed and bounded**, not open enumeration. If the residue demands richer `pred`/`f`, we enumerate small fragments for *those slots* in a later, separately-budgeted pass.
+
+**Worked synthesis trace (illustrative).** Tiny `I = [[3,7,2], [5,1,8], [4,4,9]]`; the model's outputs when asked `min` are `obs = ⟨3, 5, 4⟩` (it returns the *first* element — the broken behaviour #82 found). Bottom-up:
+
+```
+size 1: xs ; const 0..9
+size 2: first(xs) → ⟨3,5,4⟩   100%   ← matches obs exactly
+        min(xs)   → ⟨2,1,4⟩    33%   (the TEXTBOOK answer — wrong for THIS model)
+        last(xs)  → ⟨2,8,9⟩     0%
+        max(xs)   → ⟨7,8,9⟩     0%
+        len(xs)   → ⟨3,3,3⟩     0%
+        nth(xs,0) → ⟨3,5,4⟩    ≡ first(xs) → OE PRUNE (keep the smaller)
+```
+
+`first(xs)` is found at size 2 with 100% faithfulness ⇒ the discovered function for asked-`min` is **`first`, not `min`**. The trace shows both the **faithful target** (we fit the model's `⟨3,5,4⟩`, not the textbook `⟨2,1,4⟩`) and **OE pruning** (`nth(xs,0) ≡ first(xs)` collapse). On realistic sites we expect the bank to be dominated by such collapses — most size-`k` programs reduce to a handful of behaviours — which is why the working set tracks distinct behaviours, not program count.
+
+**How this feeds the roadmap.** The discovered programs are the legible half of the minimum-to-run decomposition: folds → recursive `recursion_dl` rules, primitives/constants → the flat EDB store, residue → the kernel. Running the synthesiser across a corpus and accreting the rule library + fact store is the whole-model export step; the **residue fraction it leaves is the measured "forge tax"** — the number the faithful-decompilation program is driving down, capability by capability.
+
 ---
 
 *Engine: bottom-up enumeration + observational equivalence (EUSolver/PROBE-class), dependency-free. Novelty for this use: the target is the model's **output** (faithful, "wrong" allowed) rather than a spec, plus guarded/piecewise composition for heuristic blends and an explicit residue = kernel.*
