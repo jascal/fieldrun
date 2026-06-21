@@ -258,24 +258,25 @@ The decisive join: for each token, **track A** = does the best crisp synthesized
 `(Σ_b c_b)²/Σ_b c_b²` over the 57 residual-write blocks (the paper's diffuseness quantity), decode **margin**, and
 **μ_t** (blocks already argmaxing to the chosen digit; μ_t=0 = composed). 480 tokens, 1.5B, 12 tasks spanning head→tail.
 
-| signal | residue | captured | AUC | paper's "computed" ⇒ | verdict |
+| signal | residue | captured | AUC | paper's actual claim | verdict |
 |---|---|---|---|---|---|
-| **margin** | 0.46 | 1.53 | 0.22 | lower | ✓ **confirmed** |
-| **μ_t** | 6.45 | 8.70 | 0.36 | lower | ✓ **confirmed** |
-| source-PR (signed) | 4.87 | 5.51 | 0.30 | higher | ✗ **reversed** |
-| PR-magnitude `(Σ\|c\|)²/Σc²` | 7.10 | 8.13 | 0.29 | higher | ✗ **reversed** |
+| **margin** | 0.46 | 1.53 | 0.22 | separates, computed lower | ✓ **confirmed** |
+| **μ_t** | 6.45 | 8.70 | 0.36 | separates, computed lower | ✓ **confirmed** |
+| source-PR (signed) | 4.87 | 5.51 | 0.30 | route-**invariant** (no separation) | ✓ ~consistent (weak) |
+| PR-magnitude `(Σ\|c\|)²/Σc²` | 7.10 | 8.13 | 0.29 | route-**invariant** | ✓ ~consistent (weak) |
 
 **Confirmed (margin + μ_t):** the surrogate residue boundary is a *real mechanistic boundary* — where the crisp program
-fails, the model is making a **low-margin, composed (μ_t-low)** decision, not a clean single-source retrieval. So the
+fails, the model is making a **low-margin, composed (μ_t-low)** decision, not a clean single-source retrieval. These are
+exactly the paper's two retrieve-vs-compute axes ("a power-diagram margin and a readout multiplicity μ_t"). So the
 export's crisp-head / residue split corresponds to something the model actually does. (Margin is the cleanest router,
 AUC 0.22.)
 
-**The surprise (source-PR, robust to the signed-vs-magnitude confound):** residue tokens are **more *concentrated*
-(lower block-PR), not more diffuse.** The paper's high-PR diffuse computation (PR≈45) is a *natural-text* regime; on
-these structured single-digit tasks the whole regime is low-PR (3–8) and the residue is *lower* still. **This does not
-contradict Thm 5** (which is about the natural-text source-PR) — it says the structured-task residue is a *different,
-concentrated regime*: a small coalition of blocks commits to a different (often wrong) answer at low margin, rather than
-a diffuse dense-Gram repair.
+**On PR — a framing correction.** The paper's claim is that PR is **route-invariant** (≈45-way, the SAME for retrieved
+and computed); retrieval and computation separate on margin and μ_t, **not** on PR. So PR *not* separating the residue is
+*consistent* with the paper, not a surprise (an earlier draft mis-stated the claim as "computed ⇒ higher PR"). The one
+genuinely new, regime-level observation is the **absolute** level: these structured single-digit tasks sit at PR ≈ 3–8,
+far below the paper's natural-text ≈45 — i.e. structured-task decisions are *much more concentrated* than natural text.
+That two-regime contrast (structured ≈3–8 vs text ≈45) is tested directly by the natural-text alignment below.
 
 **Two consequences for the export (both reassuring):**
 1. "Outside the crisp DSL" ≠ "diffuse/incompressible." `summod` (modular sum) is outside our DSL only because it lacks
@@ -289,11 +290,35 @@ a diffuse dense-Gram repair.
 margin/μ_t alignment is robust; the low-PR-residue claim is specific to this structured-task family — the natural-text
 diffuse regime (where the proved Thm 5 lives) is the obvious next measurement.
 
+## Natural-text alignment — the two-regime check (`fieldrun --natural-pr-dump` + `align_nat.py`)
+
+The structured-task alignment above raised: is natural text the *different, more diffuse* regime the paper's PR≈45
+describes, with PR route-invariant and margin/μ_t separating? `--natural-pr-dump` runs the same per-token DLA over a
+prose corpus (full-vocab top-K candidates); track A = a parameter-free **induction** baseline (copy what followed the
+current token's last occurrence) = retrieved, else computed. 115 tokens, 1.5B, 57 blocks:
+
+| | retrieved | computed | AUC(computed>retr) | paper's claim | verdict |
+|---|---|---|---|---|---|
+| source-PR | 11.2 | 10.8 | 0.47 | route-**invariant** | ✓ |
+| PR-magnitude | 13.7 | 14.0 | 0.53 | route-**invariant** | ✓ |
+| margin | 1.84 | 1.31 | 0.38 | separates, computed lower | ✓ |
+| μ_t | 3.80 | 3.04 | 0.42 | separates, computed lower | ✓ |
+
+- **All four directions confirm the paper:** PR does *not* separate retrieve-from-compute (AUC≈0.5); margin and μ_t do
+  (computed lower). This *reconciles* the structured result — margin/μ_t separated there too, and PR was ~flat in both.
+- **Two-regime, but modest:** absolute PR ≈ **10.9/57** on text vs ≈ **5/57** on the structured single-digit tasks (same
+  57-block granularity) — natural-text decisions are ~2× more diffuse, not dramatically so. (The paper's "≈45" is over
+  finer head/neuron sources; the effective fraction ~0.19 matches.)
+- **Honest caveat (underpowered):** the induction baseline flags only **4% retrieved** on 115 tokens of non-repetitive
+  prose, so the retrieved group is tiny and the retrieve-vs-compute AUCs are directional, not robust. A firm per-token
+  split needs the full phrasebook/route apparatus (n-grams + recency + copy, FINDINGS §5) over a longer, more repetitive
+  corpus. The well-powered part is the *regime-level* PR contrast (text ≈11 vs structured ≈5).
+
 ## Next
 
 Done this round: tree-recursion DSL + §6 round-trip; scope battery (2.5) + coverage/degeneracy split; PIC residue
 labels (3) + the program-PR-vs-source-PR distinction; track-B Gram (Thm 2 confirmed, ~1.6-D digit frame); the **A↔B
-alignment** (margin/μ_t confirm the residue boundary; source-PR reversed = structured residue is concentrated, not
-diffuse). Remaining:
-the **model source-PR / DLA** test of Thm 5 (the real diffuseness test); the **tropical-rank vs linear-rank** logit
-experiment; the 7B scaling point; **wild-site scoping** (§9); then the `--residue-strategy` roll-in to LOGIC_EXPORT.
+alignment** (margin/μ_t confirm the paper's actual separators; PR route-invariant as the paper says; structured PR
+≈3–8 vs the paper's text ≈45 = a two-regime contrast). Remaining:
+the **natural-text DLA alignment** (below — does text sit at PR≈45 with margin/μ_t separating?); the **tropical-rank vs
+linear-rank** logit experiment; the 7B scaling point; **wild-site scoping** (§9); then the `--residue-strategy` roll-in.
