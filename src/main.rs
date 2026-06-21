@@ -922,6 +922,7 @@ fn main() {
             if has_flag(&args, "--bind-patch") { recursion_probe::run_bind_patch(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--list-measure") { recursion_probe::run_list_measure(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--list-attribute") { recursion_probe::run_list_attribute(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--list-dump") { recursion_probe::run_list_dump(&args, lm.as_ref(), &tg, &stem); return; }
 
             // ── --discover: discover a recursive function WITHOUT knowing it a priori. Teach the model an operator
             // under a NOVEL symbol via few-shot (the induction code is BLIND to its meaning), then (1) PROBE flat
