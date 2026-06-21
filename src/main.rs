@@ -42,7 +42,9 @@ mod model;
 mod neox;
 mod qwen3moe;
 mod recursion_dl;
+#[cfg(feature = "api")]
 mod recursion_probe;
+#[cfg(feature = "api")]
 use recursion_probe::{collect_leaves, collect_ops, true_eval};
 mod retrieval;
 mod rope;
@@ -411,10 +413,14 @@ fn main() {
     // --probe…, --recursion-explain) can run on plain text instead of a token-id JSON. Needs --bundle (for the
     // tokenizer next to it). Falls back to the --ids file (or default) when --text is absent.
     let ids: Vec<i64> = if let Some(text) = flag(&args, "--text") {
-        match flag(&args, "--bundle").map(resolve_bundle).and_then(|s| api::TextGen::load(&s, Vec::new())) {
+        #[cfg(feature = "api")]
+        let r = match flag(&args, "--bundle").map(resolve_bundle).and_then(|s| api::TextGen::load(&s, Vec::new())) {
             Some(tg) => tg.encode(text, false),
             None => { eprintln!("[fieldrun] --text needs --bundle <stem> with a .tokenizer.json next to it"); Vec::new() }
-        }
+        };
+        #[cfg(not(feature = "api"))]
+        let r = { let _ = text; eprintln!("[fieldrun] --text needs the `api` feature (tokenizer); use --ids in the lean build"); Vec::new() };
+        r
     } else {
         std::fs::read_to_string(ids_path)
             .ok()
@@ -899,6 +905,9 @@ fn main() {
         //   BINDING   (a CONCENTRATED, sink-excluded back-attention to a DISTANT antecedent, reach≥3 = the frame it
         //              folds — the discriminator that silences flat prose, which binds to the previous token).
         // Each lit position prints the VALUE STACK read from the residual (late-layer logit-lens). rope family only.
+        // The whole recursion-explain surface needs the tokenizer (TextGen, behind `api`); gated so the lean
+        // `--no-default-features` token-id-only binary still builds (this also fixes a pre-existing master breakage).
+        #[cfg(feature = "api")]
         if has_flag(&args, "--recursion-explain") {
             let tg = api::TextGen::load(&stem, eos.clone());
 
@@ -1391,7 +1400,7 @@ fn main() {
                 let n = g.len() as f32;
                 if n < 2.0 { return f32::NAN; }
                 let (mx, my) = (g.iter().map(|r| r.nmargin).sum::<f32>() / n, g.iter().map(|r| r.mu_t as f32).sum::<f32>() / n);
-                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0, 0.0);
+                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0f32, 0.0f32);
                 for r in g { let (dx, dy) = (r.nmargin - mx, r.mu_t as f32 - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
                 if sxx > 0.0 && syy > 0.0 { sxy / (sxx.sqrt() * syy.sqrt()) } else { f32::NAN }
             };
@@ -1492,7 +1501,7 @@ fn main() {
             let corr = {
                 let n = recs.len() as f32;
                 let (mx, my) = (recs.iter().map(|r| r.atom as f32).sum::<f32>() / n, recs.iter().map(|r| r.pr).sum::<f32>() / n);
-                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0, 0.0);
+                let (mut sxy, mut sxx, mut syy) = (0.0f32, 0.0f32, 0.0f32);
                 for r in &recs { let (dx, dy) = (r.atom as f32 - mx, r.pr - my); sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
                 if sxx > 0.0 && syy > 0.0 { sxy / (sxx.sqrt() * syy.sqrt()) } else { f32::NAN }
             };
@@ -1637,7 +1646,7 @@ fn main() {
                 if g.is_empty() { continue; }
                 let cov = g.len() as f32 / n;
                 let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
-                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0_f32 / (1.0_f32 - cov).max(1e-3_f32));
             }
             // Knob 2 — bucket fan-out c: gate on how peaked the firing rule is (≤ c distinct successors). A singleton
             // continuation (fan-out 1) is the high-fidelity, deterministic case; large fan-out is an ambiguous context.
@@ -1649,7 +1658,7 @@ fn main() {
                 let cov = g.len() as f32 / n;
                 let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
                 let lbl = if c == usize::MAX { "any (∞)".to_string() } else { format!("≤ {c}") };
-                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+                println!("{lbl:<22}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0_f32 / (1.0_f32 - cov).max(1e-3_f32));
             }
             // Both knobs together: the deployment frontier. Each (θ, c) pair is a reachable operating point.
             println!("\n  both knobs — (source order ≥ θ) AND (fan-out ≤ c): the speed/accuracy frontier:");
@@ -1660,7 +1669,7 @@ fn main() {
                     if g.is_empty() { continue; }
                     let cov = g.len() as f32 / n;
                     let acc = 100.0 * g.iter().filter(|x| x.2).count() as f32 / g.len() as f32;
-                    println!("{olbl:<10}{c:>8}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0 / (1.0 - cov).max(1e-3));
+                    println!("{olbl:<10}{c:>8}{:>10.0}%{:>10.0}%{:>11.2}×", 100.0 * cov, acc, 1.0_f32 / (1.0_f32 - cov).max(1e-3_f32));
                 }
             }
             println!("\n  speedup ≈ 1/(1−coverage): short-circuited tokens skip the ~545 ms forward (lookup is ~µs).");
