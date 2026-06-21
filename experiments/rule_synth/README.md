@@ -29,8 +29,21 @@ construction:
 - `ensemble` — the held-out-gated decision list (`synth.decision_list`) emitted as **guarded Datalog rules** (guards:
   `len>k`, `first==max`/`first==min`/`last==max`, `is_sorted`) + a *shrunk* residue EDB for what the guards still miss.
   Reduces the residue where a guarded alternate generalises (e.g. `last` 12%→9%).
-- `ring` / `pic` — route those tokens to LOGIC_EXPORT's semiring-Datalog (T=0 / T=1); the alignment showed most residue
-  is low-margin + concentrated (ensemble/edb-cheap), so these earn their keep on the rare diffuse, natural-text residue.
+- `ring` — emit the model's own **block-provenance semiring-Datalog `Π`** for the residue token: `rlogit(v)=Σ_b cw(b,v)`
+  over the 57 DLA blocks, decode `argmax` (max-product / tropical T=0). Reproduces the model token by construction
+  (LE-T5). `pic` is the *same* facts under the log-semiring (sum-product T=1 = the softmax distribution).
+- `margin` — **margin-routed**: route low-margin residue (margin < `--tau`) to `ring` (the model's Π) and high-margin
+  residue to `edb`. Margin is the alignment's per-token retrieve-vs-compute router; most residue is high-margin (cheap
+  EDB), the low-margin tail gets the mechanistic Π.
+
+`ring`/`pic`/`margin` need the per-token DLA contribution matrix from `fieldrun --ring-dump` (margin + `c[block][digit]`,
+where `Σ_b c[b][d] = logit[d]` for the winning digit form, so `argmax_d = the model token`):
+
+```bash
+fieldrun --bundle <…1.5B> --recursion-explain --ring-dump /tmp/ring.jsonl --n 30
+python emit_datalog.py /tmp/ring.jsonl 4 /tmp/souffle_out --strategy=ring            # all residue → the model's Π
+python emit_datalog.py /tmp/ring.jsonl 4 /tmp/souffle_out --strategy=margin --tau=1.0 # low-margin → Π, high-margin → edb
+```
 
 ### Tree-traversal rules (proposal §11 — the untried deterministic class)
 
