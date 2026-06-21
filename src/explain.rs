@@ -203,7 +203,8 @@ impl ExplainMode {
 /// strictly-nested folds (a fold whose span contains an inner fold to an inner target ⇒ depth≥2 ⇒ recursion).
 /// Shared by `--recursion-explain --mode <mode>` (CLI) and the chat REPL's `/explain recursion`; returns the block
 /// so each caller prints it where it wants. `label(id)` decodes a token; `ids` is the sequence the trace covers;
-/// `mode` ∈ {spectrum (both), recursion (nested only), binding (all Level-1)}.
+/// `mode` ∈ {spectrum (both), recursion (nested only), binding (all Level-1)}. `result` is the model's returned
+/// value, printed under the header so the trace is always read alongside what the model actually produced.
 #[cfg(feature = "api")]
 #[allow(clippy::too_many_arguments)]
 pub fn recursion_spectrum(
@@ -215,12 +216,16 @@ pub fn recursion_spectrum(
     conc_min: f32,
     mode: &str,
     show_all: bool,
+    result: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut o = String::new();
     let nl = trace.first().map(|r| r.n_layer).unwrap_or(0);
     let _ = writeln!(o, "[fieldrun] recursion-explain · {} tokens · {nl} layers · gate(defer≥{defer}, reach≥{reach_min}, conc≥{conc_min})",
                      ids.len());
+    if let Some(r) = result {
+        let _ = writeln!(o, "  → {r}");
+    }
     struct Lit { pos: usize, back: usize, reach: usize, conc: f32, resolve: usize, depth: usize, value: String }
     let mut lits: Vec<Lit> = Vec::new();
     for r in trace {

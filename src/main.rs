@@ -1107,6 +1107,21 @@ fn main() {
                 return;
             }
 
+            // ALWAYS show what the model actually returned, alongside the trace — the --text path only computes the
+            // trace from the given ids and never generates, so the model's own answer would otherwise be invisible.
+            // Greedily generate the continuation (stop at the first newline) and show it verbatim; the reader decides
+            // whether it's correct. No ground-truth check — the value the model produced is the point.
+            let mut gids = rec_ids.clone();
+            let mut cont = String::new();
+            for _ in 0..8 {
+                let t = lm.predict(&gids);
+                let s = lbl(t);
+                if s.contains('\n') { break; }
+                cont.push_str(&s);
+                gids.push(t);
+            }
+            let cont = cont.trim();
+            let outcome = format!("model returned: {}", if cont.is_empty() { "(no output)" } else { cont });
             // mode = the SPECTRUM of recursion-like processing:
             //   binding   — Level 1: ANY computed, deferred, distant concentrated back-bind (coreference, parallel
             //               structure, center-embedding-to-anchor — long-range but not nested).
@@ -1115,7 +1130,7 @@ fn main() {
             //   spectrum  — both, each Level-1 bind labelled with its nesting depth (default).
             // The gating + layout is shared with the chat REPL's `/explain recursion` (explain::recursion_spectrum).
             let mode = flag(&args, "--mode").unwrap_or("spectrum");
-            print!("{}", explain::recursion_spectrum(&trace, &rec_ids, &lbl, defer, reach_min, conc_min, mode, show_all));
+            print!("{}", explain::recursion_spectrum(&trace, &rec_ids, &lbl, defer, reach_min, conc_min, mode, show_all, Some(&outcome)));
             return;
         }
 
