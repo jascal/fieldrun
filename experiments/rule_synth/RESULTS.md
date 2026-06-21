@@ -52,6 +52,21 @@ Train on lists of length ≤5, test on length ≥6. This separates a **real func
 
 **Key methodological finding:** the random held-out **underestimates the forge tax** — `sum` looks 86% faithful in-distribution but **0% OOD**, i.e. the model does not actually implement a sum *fold*; it pattern-matches short cases. Mean residue rises **16% (random) → 34% (OOD)** once the coincidences are stripped out. Observational match in-distribution is necessary but not sufficient (proposal §7); **OOD is the honest faithfulness signal**, and it should be the default residue/forge-tax number going forward.
 
+## §6 — Datalog emission round-trip (the loop closes) — `python emit_datalog.py <dump> 4`
+
+The discovered program → position-indexed recursive Soufflé (`elem(l,i,v)`/`len(l,n)` + a fold rule) + a `residue(l,o)` EDB for the lists the program gets wrong + a wrapper `answer = program unless residue, else residue`. Run with `souffle`; by construction `answer == model output` on every list. Qwen2.5-1.5B:
+
+| task | discovered → Datalog | souffle reproduces model | residue (EDB) |
+|---|---|---|---|
+| max  | `max(xs)` → recursive `acc(L,I,M):-acc(L,I-1,M0),e(L,I,V),M=max(M0,V).` | **100%** | **0%** |
+| min  | `min(xs)` → recursive min-fold | 100% | 2% |
+| sum  | `sum(xs)` → recursive sum-fold | 100% | 10% |
+| last | `last(xs)` | 100% | 12% |
+| first| `first(xs)` | 100% | 24% |
+| len  | `len(xs)` | 100% | 49% |
+
+So the full pipeline runs end-to-end: **model I/O → faithful program (§2) → recursive Soufflé + residue EDB (§6) → runs in Soufflé and reproduces the model 100%**, with the residue fact-count = the per-task forge tax. `max` becomes a *pure rule* (0 EDB); `len` is mostly EDB (the model's "len" isn't a clean fold). (The §6 translator currently covers the fold + list-modifier ops; binary-int programs like `imax(4,len(tail(xs)))` are flagged `unsupported-op` and would route to residue.)
+
 ## Honest caveats
 
 - **The guarded pass rarely fires** on these tasks once the held-out margin is enforced (+4%) — the 0.5B models are too noisy to have *clean* blends, and the 1.5B does the clean functions outright. Guards earn their place only on genuinely piecewise behaviour (the 0.5B `min`/K=5 `len`). This is the conservative, honest setting.
