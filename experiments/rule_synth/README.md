@@ -72,6 +72,25 @@ for k in 2 3 4 5 6; do python synth.py /tmp/listdump.jsonl $k | grep "mean resid
 python synth.py /tmp/listdump.jsonl 5 --ood                                                  # honest (OOD) forge tax
 ```
 
+### Scope coverage (2.5), PIC residue (3), and the Gram (track B)
+
+```bash
+# 2.5 — broad 30-problem battery + coverage curve / head-vs-tail across problems
+fieldrun --bundle <…1.5B> --recursion-explain --scope-dump /tmp/scopedump.jsonl --n 80 --lmax 7
+python scope_report.py /tmp/scopedump.jsonl 4        # genuine-function vs degenerate-constant-fit, coverage curve
+
+# 3 — PIC residue: per-problem reducible/irreducible label, PR from set-cover, held-out ensemble coverage
+python pic_residue.py /tmp/scopedump.jsonl 4 --M=40
+
+# track B — the output Gram kernel G_vw = <U_v,U_w> (tests proved Thm 2; the "SVD can't measure the gap" claim)
+fieldrun --bundle <…> --recursion-explain --dump-unembed /tmp/unembed.jsonl --tokens "0,1,2,3,4,5,6,7,8,9"
+python gram_probe.py /tmp/unembed.jsonl
+```
+
+`PIC_LOSSINESS.md` is the theory note (PIC is lossless w.r.t. the model — kernel-proved Thm 4; the lossy thing is
+*compressing* the irreducible region, obstruction = tropical rank; PO-T3 decode-cert ≥2δ). It distinguishes the
+*surrogate* program-PR (these scripts) from the model *source*-PR (the proved theorems are about the latter).
+
 ## Scope (current)
 
 Two deterministic representations:

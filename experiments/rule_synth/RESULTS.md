@@ -193,8 +193,67 @@ Mean residue rises 16% (6 clean tasks) → **30%** (10 tasks incl. these) — th
   gap. The soft (PIC) representation is still future and only for what survives *both* the list and tree DSLs.
 - **`first` is oddly low at 1.5B (78%)** — the model deviates from `first` 22% of the time (a real model quirk the synthesizer faithfully reports, not a synth bug).
 
+## Scope coverage (step 2.5) — the real tail test across 30 problems (1.5B, OOD)
+
+A broad battery (`fieldrun --scope-dump`, 30 list→int families: position / reduction / selection / comparison / count /
+arithmetic) run through the synthesizer (`scope_report.py`). The question: across *many* problems, does a small DSL +
+reused rule-library cover most (short head) or does each need bespoke rules (long tail)? **Scope mean forge tax (OOD) =
+33%** — but that number is *deflated* by a degeneracy the broad battery exposes:
+
+| band | count | tasks |
+|---|---|---|
+| HEAD resid≤15% — **genuine function** | **3** | `first` `max` `min` (real program, competent model) |
+| HEAD resid≤15% — **degenerate constant-fit** | 8 | `gcdred=1@96%` `argmax=5@9%` `cmax=1@71%` `issorted=0@95%` `allsame=0@100%` `ndesc=1@36%` `prodmod=0@60%` `ceven=2@26%` |
+| MID 15–50% | 9 | `last` `min2` `range` `nasc` `adiff` `sum` `nuniq` `second` `len` |
+| TAIL resid≥50% | 10 | `max2` `maxcount` `median` `penult` `codd` `midval` `czero` `summod` `argmin` `mode` |
+
+**The honest reading (a partial surprise vs the "short head" hope):** of 30 diverse problems the model *cleanly*
+implements only **~3** as genuine crisp functions (the simplest folds/selections). 8 more land in the "head" only
+because the model **can't do the task and emits a near-constant** (argmax 9%, ceven 26%, ndesc 36% accurate) which a
+*constant* program trivially reproduces — that is model degeneracy, not DSL coverage, and it inflates the naive
+coverage curve. So genuine crisp coverage is small; the tail (idiosyncratic + degenerate) is the bulk. The coverage
+*curve* (`resid≤50%: 67%`) looks short-head-ish; the genuine-function curve is much shorter.
+
+## PIC residue (step 3) — reducible vs irreducible on the 19 non-head problems — `pic_residue.py`
+
+For each surviving problem: top-40 candidate programs → incidence over the best-1 residue → PR from the set-cover
+marginal gains + **held-out** ensemble coverage + unexplained% (outside the crisp family). The labels:
+
+- **7 ensemble-reducible** (a small *generalizing* family of ≤2–4 crisp rules; held-out cover ≥60%): e.g. `max2` (~2
+  rules, 90%), `midval` (78%), `nasc` (69%), `mode` (~4 rules, 64%).
+- **1 PIC-irreducible**: `summod` — **71% of held-out residue outside the crisp family** (modular sum is genuinely not
+  a crisp fold in this DSL).
+- **11 diffuse/noise**: the train-chosen cover does *not* generalize (held-out coverage low) — the residue is model
+  inconsistency, not a coherent alternative algorithm.
+- **program-PR is LOW everywhere (1.0–2.9)**: where the residue is coverable at all, a *small* ensemble suffices; mean
+  unexplained-residue (outside the crisp family) over non-head = **10%**.
+
+**Caveat — the two PRs (do not conflate).** This is the *surrogate* program-PR (effective number of synthesized
+candidate programs), **not** the model's source-PR (the paper's PR≈45 over the model's own circuits). Thm 5
+(Diffuseness, proved) is about the *source*-PR; low program-PR here says nothing about it. Testing Thm 5 needs the
+model's DLA (track B, future) — see `PIC_LOSSINESS.md` §6.
+
+## Track B — the digit-output Gram kernel (a direct test of proved Thm 2) — `gram_probe.py`
+
+`fieldrun --dump-unembed` extracts the unembedding rows `U_v` for the digit tokens; `gram_probe.py` characterises
+`G_{vw}=⟨U_v,U_w⟩`:
+
+| model | Thm 2 `‖U_v−U_w‖²=2(1−ρ)` | mean off-diag ρ | Gram effective rank |
+|---|---|---|---|
+| 0.5B | **confirmed, err 7.1e-15** | +0.73 | **1.72 / 10** |
+| 1.5B | **confirmed, err 7.6e-15** | +0.75 | **1.63 / 10** |
+
+**Thm 2 confirmed numerically to machine precision at both scales** — a clean theory⟷experiment confirmation of a
+kernel-proved theorem. And the digit-output frame is **strongly coupled**, spanning only a **~1.6–1.7-dimensional
+number-line manifold** (not a 10-D one-hot space; the ρ matrix is a clean ordering — adjacent digits most similar, `0`
+the outlier), scale-consistent. This is the regime where a per-token one-hot/EDB view sees up to rank 10 while the
+kernel `G` reveals the decisions live in ~2 dimensions — direct evidence for the paper's "linear SVD rank cannot
+measure the gap" / `pic`-win direction. **Honest scope:** digits are an unusually coherent semantic family, so this is
+a digit-output-specific result, not a claim about all vocabulary.
+
 ## Next
 
-Done this round: tree-recursion DSL + §6 tree-ADT round-trip + the emergence diagnostic (tree-vs-list gap). Remaining:
-the 7B scaling point; broadening problem **scope** (a wider task battery — the more representative forge-tax/tail test);
-**wild-site scoping** (§9); then the soft (PIC) representation for what survives both deterministic DSLs.
+Done this round: tree-recursion DSL + §6 round-trip; scope battery (2.5) + coverage/degeneracy split; PIC residue
+labels (3) + the program-PR-vs-source-PR distinction; track-B Gram (Thm 2 confirmed, ~1.6-D digit frame). Remaining:
+the **model source-PR / DLA** test of Thm 5 (the real diffuseness test); the **tropical-rank vs linear-rank** logit
+experiment; the 7B scaling point; **wild-site scoping** (§9); then the `--residue-strategy` roll-in to LOGIC_EXPORT.
