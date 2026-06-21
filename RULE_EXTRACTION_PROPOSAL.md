@@ -102,6 +102,45 @@ The discovered artifacts translate directly, and the RETRIEVED/COMPUTED causal r
 - **Site definition in the wild.** For synthetic tasks the I/O is clean; for arbitrary prompt positions the local function's "input" is not cleanly defined. Early work stays on controlled task families.
 - **Relation to the kernel.** Is the residue a *short head + long Zipf tail* (a few function-families cover most, tail never closes) — the measurement that would tell us whether the kernel floor is small or large?
 
+## 10. Answers to review — round 1
+
+**(Q1) DSL grammar + search-space.** Concrete initial grammar (≈18 primitives):
+
+```
+E_int  ::= var | 0..9
+         | first(E_list) | last(E_list) | nth(E_list, E_int) | len(E_list)
+         | max(E_list) | min(E_list) | sum(E_list) | count(E_list, E_int)
+         | E_int (+ | - | * | min | max) E_int
+E_list ::= var | tail(E_list) | reverse(E_list) | take(E_list,E_int) | drop(E_list,E_int) | sort(E_list)
+E_bool ::= E_int (< | > | =) E_int | is_sorted(E_list)
+```
+
+Naive program count at size `k` is exponential (~`branching^k`). The point of **observational equivalence** is that the working set (`bank`) is bounded **not by program count but by the number of distinct behaviours on the sample `I`** — a program collapses into an existing bank entry the moment its output vector `⟨eval(p,x):x∈I⟩` is already present. For a `List→Int` (single-digit) task the behaviour space is bounded by the distinct vectors the DSL actually realises, which in the EUSolver/PROBE literature stays in the `10³–10⁵` range to depth ≈6. We will **instrument and cap the bank** and report where it saturates — i.e. the real numbers come from the prototype, but the *bound* is the distinct-behaviour count, not `20^k`.
+
+**(Q2) Guard learning (avoiding overfit).** Staged, not joint: **(i)** synthesise the *pieces* (programs that each cover a subset of inputs well); **(ii)** learn a shallow **decision list** over a small, fixed predicate DSL (`len>k`, `is_sorted`, `first=max`, …) to route between pieces. Three controls: an **MDL objective** `cost = Σ(piece sizes) + (guard complexity) + λ·errors` (a guard earns its place only if it cuts errors by more than its description length); **held-out faithfulness** (guards fit on train, scored on held-out — reject guards that don't generalise); and a **depth-limited predicate set** so guards can't memorise. This is the operational form of the "broken rule with cuts."
+
+**(Q3) Residue criterion + representation.** Stop synthesising for a site when *any* of: faithfulness `≥ τ` (e.g. 0.95); size/guard budget exhausted; or the **marginal MDL gain** of the next piece/guard `< ε` (added complexity stops paying). The residue is the uncovered `(input, model-output)` set — represented **not as a black-box oracle but as an explicit EDB fact table** plus a last-resort clause: `answer(X,O) :- residue(X,O).` So the kernel is *data, not understanding* — finite, inspectable, and it keeps the whole program output-faithful. (Optionally a piece is only *admitted* if it passes the #82 causal gate, so residue = "what no causally-validated program covers.")
+
+**(Q4) Tree recursion vs. wild sites — different difficulties.** The **engine extends unchanged** to trees: swap `List` for a `Tree` ADT and add a tree-fold combinator; bottom-up + OE is type-agnostic. (Arithmetic expressions are already trees, so we have a tree domain in hand.) The genuinely harder problem is **site definition in the wild**: at an arbitrary prompt position the local function's *input* isn't a clean typed object. That needs the input to be *scoped first* — which is exactly what the #82 causal dataflow (what the site causally reads) can provide. So: tree recursion is a DSL extension; wild-site scoping is a real open sub-problem, and the **first prototype stays on controlled task families with defined I/O**.
+
+**(Q5) Validation beyond observational match.** Observational match on the synthesis distribution is necessary, not sufficient. Additional checks: **(a) OOD held-out** (longer lists, shifted distribution — a program that matches in-distribution but breaks OOD isn't the real function); **(b) causal cross-check** with the #82 tooling — if the synthesised program uses `last`, does `bind`/`value-patch` show the model causally *reads* that position? RETRIEVED/COMPUTED labels must agree with the program's structure; **(c) agreement with cross-attribution** (does the synthesised function match the `--list-attribute` best-fit, e.g. `min≈first`?). Faithful decompilation = observational + causal-consistency + probe-agreement, not I/O alone.
+
+**(Q6) Implementation surface — staged.** **Offline first:** a pure-Python synthesiser ingesting a dumped `(input, model-output)` file (reuses the `experiments/value_probe/train_probe.py` pattern) — fast DSL/loop iteration, no Rust rebuild per experiment. **Then fold the engine into fieldrun** (a `recursion_synth` module) once the DSL + loop stabilise, for speed and tight coupling to the causal router. The only fieldrun-side need up front is a `(input, model-output)` **dump mode** extending the existing `--list-*` harness.
+
+**(Q7) Toy Datalog emission.** The model's `max ≈ max(60%) + last(30%)` blend synthesises (toy guard) to `maxish(xs) = if is_sorted(xs) then last(xs) else max(xs)`, which emits:
+
+```prolog
+maxf([X], X).                              % fold (COMPUTED → recursive IDB rule)
+maxf([H|T], M)  :- maxf(T, M0), M = max(H, M0).
+lastf([X], X).                             % last (RETRIEVED-leaning)
+lastf([_|T], X) :- lastf(T, X).
+answer(Xs, R)   :- is_sorted(Xs), lastf(Xs, R).        % guarded pieces
+answer(Xs, R)   :- !is_sorted(Xs), maxf(Xs, R).
+answer(Xs, R)   :- residue(Xs, R).                     % kernel fallback (EDB facts)
+```
+
+In Soufflé the list/recursion is via record ADTs and the guard via stratified negation — mechanical, if not free. Folds → recursive rules; guards → rule-body conditions; residue → EDB facts + a fallback clause.
+
 ---
 
 *Engine: bottom-up enumeration + observational equivalence (EUSolver/PROBE-class), dependency-free. Novelty for this use: the target is the model's **output** (faithful, "wrong" allowed) rather than a spec, plus guarded/piecewise composition for heuristic blends and an explicit residue = kernel.*
