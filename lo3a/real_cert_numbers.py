@@ -13,64 +13,12 @@ plus the would-be unembed fact reduction vocab×d → K×d.
 
 Run from repo root: python lo3a/real_cert_numbers.py [smollm|smollm360|smollm17]
 """
-import sys, os
+import sys, os, collections
 sys.path.insert(0, "lo3a")
 import bundle_io as bio
 import numpy as np
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "smollm"
-
-
-def forward_x(W, cfg, cfg_f, ids):
-    """bundle_io.forward, but also returns xf[-1] (the post-final-norm residual the unembed dots against)."""
-    n_layer, H, NKV, HD, D, FFN, VOCAB, TIED = [int(c) for c in cfg]
-    theta, eps = float(cfg_f[0]), float(cfg_f[1]); HALF, REP = HD // 2, H // NKV
-    inv = (1.0 / (theta ** (2.0 * np.arange(HALF, dtype=np.float32) / HD))).astype(np.float32)
-    bias = "l0.self_attn.q_proj.bias" in W
-    ids = list(ids); seq = len(ids)
-    ang = np.arange(seq, dtype=np.float32)[:, None] * inv[None, :]
-    COS = np.cos(ang).astype(np.float32)[:, None, :]; SIN = np.sin(ang).astype(np.float32)[:, None, :]
-    causal = np.triu(np.ones((seq, seq), dtype=bool), k=1)
-    def rope(x, nh):
-        xr = x.reshape(seq, nh, HD); x1, x2 = xr[..., :HALF], xr[..., HALF:]
-        return np.concatenate([x1 * COS - x2 * SIN, x2 * COS + x1 * SIN], axis=-1).reshape(seq, nh * HD).astype(np.float32)
-    x = W["embed"][ids].astype(np.float32)
-    for l in range(n_layer):
-        p = f"l{l}."
-        a = bio._rmsnorm(x, W[p + "in_ln"], eps)
-        q = (a @ W[p + "self_attn.q_proj"]).astype(np.float32); k = (a @ W[p + "self_attn.k_proj"]).astype(np.float32)
-        v = (a @ W[p + "self_attn.v_proj"]).astype(np.float32)
-        if bias:
-            q += W[p + "self_attn.q_proj.bias"]; k += W[p + "self_attn.k_proj.bias"]; v += W[p + "self_attn.v_proj.bias"]
-        q, k = rope(q, H), rope(k, NKV)
-        ao = np.zeros((seq, H * HD), dtype=np.float32)
-        for h in range(H):
-            kv = h // REP
-            qh, kh, vh = q[:, h * HD:(h + 1) * HD], k[:, kv * HD:(kv + 1) * HD], v[:, kv * HD:(kv + 1) * HD]
-            sc = (qh @ kh.T).astype(np.float32) / np.float32(np.sqrt(HD)); sc[causal] = np.float32(-1e30)
-            sc = np.exp(sc - sc.max(axis=1, keepdims=True)).astype(np.float32); sc /= sc.sum(axis=1, keepdims=True)
-            ao[:, h * HD:(h + 1) * HD] = (sc @ vh).astype(np.float32)
-        x = (x + ao @ W[p + "self_attn.o_proj"]).astype(np.float32)
-        a2 = bio._rmsnorm(x, W[p + "post_ln"], eps)
-        hid = (bio._silu(a2 @ W[p + "mlp.gate_proj"]) * (a2 @ W[p + "mlp.up_proj"])).astype(np.float32)
-        x = (x + hid @ W[p + "mlp.down_proj"]).astype(np.float32)
-    xf = bio._rmsnorm(x, W["norm"], eps)
-    unemb = W["lm_head"] if TIED == 0 else W["embed"]
-    return (xf[-1] @ unemb.T).astype(np.float32), xf[-1]
-
-
-def cert_params(U, k):
-    """Mirror the Rust emit_whole: top-K by ‖U_v‖, dominant elided direction μ̂, a_max/a_min, ρ_max (+0.1% slack)."""
-    n2 = (U * U).sum(1)
-    order = np.argsort(-n2)
-    keep = set(order[:k].tolist()); elided = order[k:]
-    UE = U[elided]
-    mu = UE[0].astype(np.float32).copy(); mu /= (np.linalg.norm(mu) + 1e-9)
-    for _ in range(16):
-        mu = UE.T @ (UE @ mu); mu /= (np.linalg.norm(mu) + 1e-9)
-    a = UE @ mu
-    rho2 = np.clip((UE * UE).sum(1) - a * a, 0, None).max()
-    return keep, order[:k], mu.astype(np.float32), float(a.max()), float(a.min()), float(np.sqrt(rho2 * 1.001))
 
 
 def cert_params_for(U, keep_ids):
@@ -94,7 +42,7 @@ def gen_ctxs(W, cfg, cfg_f, vocab, seeds):
     for s in seeds:
         ids = starts[s]
         for _ in range(24):
-            lg, xf = forward_x(W, cfg, cfg_f, ids)
+            lg, xf = bio.forward(W, cfg, cfg_f, ids, want_x=True)
             ctxs.append((lg, xf, int(lg.argmax()))); ids.append(int(lg.argmax()))
             if len(ids) > 40: ids = ids[-40:]
     return ctxs
@@ -124,7 +72,6 @@ def main():
     test = gen_ctxs(W, cfg, cfg_f, vocab, range(8, 16))   # measure on held-out
     n2 = (U * U).sum(1)
     norm_order = list(np.argsort(-n2))
-    import collections
     freq = collections.Counter(win for _, _, win in train)
     print(f"# real-model cert · {MODEL} · vocab={vocab} d={d} · train {len(train)} / test {len(test)} contexts (held-out)\n")
     print(f"#   {'shortlist':<12}{'K':>5}  {'unembed facts':>16}  {'contains':>9}{'certified':>10}{'sound':>7}")

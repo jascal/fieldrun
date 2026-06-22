@@ -53,7 +53,7 @@ def _rmsnorm(x, w, eps):
 
 def _silu(x): return (x / (1.0 + np.exp(-x))).astype(np.float32)
 
-def forward(W, cfg, cfg_f, ids, want_acts=False):
+def forward(W, cfg, cfg_f, ids, want_acts=False, want_x=False):
     n_layer, H, NKV, HD, D, FFN, VOCAB, TIED = [int(c) for c in cfg]
     theta, eps = float(cfg_f[0]), float(cfg_f[1])
     HALF, REP = HD // 2, H // NKV
@@ -95,6 +95,8 @@ def forward(W, cfg, cfg_f, ids, want_acts=False):
     xf = _rmsnorm(x, W["norm"], eps)
     unemb = W["lm_head"] if TIED == 0 else W["embed"]
     logits = (xf[-1] @ unemb.T).astype(np.float32)
+    if want_x:                                   # xf[-1] = the post-final-norm residual the unembed dots against
+        return logits, xf[-1]
     return (logits, acts) if want_acts else logits
 
 def predict(W, cfg, cfg_f, ids):

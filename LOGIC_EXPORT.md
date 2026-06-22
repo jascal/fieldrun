@@ -308,7 +308,8 @@ as provenance structure vs intervention diffuseness.
     shortlist-decode == full-vocab-decode (0 mismatches); `lm_head` shrinks `vocab×d → K×d` (1536→512 at K=16). Firing
     scales with unembed structure: **0% uniform → 48% at a 22× norm ratio** (rank-1 lifts the raw-Cauchy–Schwarz 40% by
     removing the dominant elided direction from the slack); real LLMs (large norm spread + low-rank structure) fire more.
-    **Real-model result (`lo3a/real_cert_numbers.py`, SmolLM-135M, d=576, vocab=49152) — a decisive NEGATIVE:** the
+    **Real-model result (`lo3a/real_cert_numbers.py`, SmolLM-135M, d=576, vocab=49152; repro: `python
+    lo3a/real_cert_numbers.py smollm`) — a decisive NEGATIVE:** the
     certificate is sound but **never fires on a real model** (0% certified). Two findings: (1) the **norm shortlist
     misses the winners** — the model's argmax tokens have *low* unembed norm (norm-rank median ~40k/49k; large embed
     norms are *rare* tokens, not frequent ones), so top-K-by-‖U_v‖ has **0% contains**, while a **frequency** shortlist
