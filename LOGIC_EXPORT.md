@@ -308,6 +308,12 @@ as provenance structure vs intervention diffuseness.
     actually correct, 25/25 here); (b) this is the **OUTPUT half** — the *input* `embed` stays `vocab×d` (any token can
     appear in the context), so the dense-embed wall is the remaining LE-T4 piece; (c) **tied** models share embed/unembed,
     so only the *output computation* shrinks (the facts don't), while **untied** models get the real `K×d` fact win.
+    The `S>0` guard in the certificate is **soundness-critical** (the rule squares the bound to avoid `sqrt`, and squaring
+    drops the sign — a large-negative `S` would otherwise satisfy `S²>XN·umax²`); a +0.1% slack keeps it conservative
+    under f32 drift. **LE-T4 ledger:** ✅ certified-compact *unembed* (this) → ⬜ a *tighter* certificate (the
+    Cauchy–Schwarz bound under-fires) → ⬜ the input **`embed`** wall (context-token-only embed) → ⬜ firing-rate +
+    fact-reduction on a real exported bundle (the synthetic verifier is the soundness gate; real-model numbers are a
+    follow-up).
   - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
     {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-

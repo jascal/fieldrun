@@ -301,11 +301,16 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
         // PO-T3 / LE-T4 certificate: the shortlist argmax == the full-vocab argmax when the winner's logit S exceeds
         // ‖x‖·max‖U_elided‖ — because every elided token's logit ⟨x,U_v⟩ ≤ ‖x‖·‖U_v‖ ≤ ‖x‖·max‖U_elided‖ < S, so no
         // dropped token can beat it. `certified()` true ⇒ decide is exact; false ⇒ thin-margin, fall back to full vocab.
-        w!("// ---------- LE-T4 shortlist certificate (umax²_elided = {}) ----------", ff(umax2_elided));
+        let k = shortlist.as_ref().map(|s| s.len()).unwrap_or(0);
+        let umax2_cert = umax2_elided * 1.001; // +0.1% slack: keep the squared bound strictly conservative under f32 drift
+        w!("// ---------- LE-T4 shortlist certificate (K={k} kept by ‖U_v‖; umax²_elided={}; vocab(V) above IS the shortlist) ----------", ff(umax2_elided));
+        w!("// certified() ⇒ the shortlist argmax PROVABLY equals the full-vocab argmax; false ⇒ thin-margin, recompute full vocab.");
         w!(".decl xfn(s:float)");
         w!("xfn(N) :- lastpos(LP), N = sum (V*V) : {{ xf(LP,_,V) }}.   // ‖x‖² at the predicting position");
         w!(".decl certified()");
-        w!("certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN*{}.   // S > ‖x‖·max‖U_elided‖", ff(umax2_elided));
+        // S>0 is SOUNDNESS-CRITICAL: the rule squares the bound (to avoid sqrt in Datalog), and squaring drops the sign —
+        // a large-NEGATIVE S would satisfy S*S>XN*umax² yet fail the real bound S>‖x‖·max‖U_elided‖. The guard rules it out.
+        w!("certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN*{}.   // S>0 ∧ S² > ‖x‖²·umax²_elided  ⟺  S > ‖x‖·max‖U_elided‖", ff(umax2_cert));
         w!(".output certified");
     }
     Ok(o)
