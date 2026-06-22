@@ -320,10 +320,23 @@ as provenance structure vs intervention diffuseness.
     unembed is infeasible on real models;** the compact unembed must be **LOSSY** (the `pr_core` factored readout, R4 —
     decode-kept ~67% on SmolLM) or use a fundamentally non-Cauchy–Schwarz (data-dependent, soundness-trading) bound.
 
-    **LE-T4 ledger (revised by the real-model result):** ✅ certified-compact unembed + rank-1 (sound; *synthetic-only* —
-    real-model-vacuous) → ❌ rank-r (can't close the √d gap — dropped) → ➡ **lossy `pr_core` compaction** is the viable
-    unembed path on real models → ⬜ the input **`embed`** wall (still open, distinct). Scope unchanged: only **untied**
-    models would get the `K×d` *fact* win; the input embed stays `vocab×d` regardless.
+    **Convergent real-model finding — no compact-faithful unembed in ANY algebra (`lo3a/pr_core_residual_gate.py`,
+    `lo3a/tropical_rank.py`):** the compact unembed caps at a **~65% head** in both algebras. (a) *Linear* `pr_core`
+    (SVD readout-aligned basis) keeps ~50–67% of decodes at 6×; its margin gate predicts core-correctness (AUC 0.80)
+    but reaching ~exact collapses the average compression to ~1.1–1.3× (core fidelity too low). (b) *Tropical* — the
+    winning-monomial support of the max-plus decode does **not saturate** (distinct winners climb at ~0.34/position, no
+    plateau) and a top-K-frequent-winner support covers only **~65% of held-out decodes, flat in K** (256→60%,
+    4096→65%). The flat cap is the signature of a **compact head (~65%, the Zipf-frequent winners) + an irreducible
+    open-class tail (~35%, rare winners no support captures)** — the empirical face of the paper's "no compact extension"
+    and of *forge-tax = Zipf's tail*. So the certified path (√d), the SVD path (67%), and the tropical path (65%) all
+    cap at the same head: **the unembed is irreducibly high-rank in every algebra tried.**
+
+    **LE-T4 ledger (revised twice):** ✅ certified-compact unembed + rank-1 (sound; *synthetic-only* — real-model-vacuous,
+    √d) → ❌ rank-r (can't close √d — dropped) → 🟡 `pr_core` / tropical compaction = **head-compact only (~65%)**; the
+    open-class tail is irreducible (no compact-faithful unembed exists on real models). The honest remaining theorem:
+    **formalize the head/tail split in i-orca** — a tropical (max-plus) margin certificate that the *frequent-monomial*
+    decode equals the full decode, with the tail the explicit uncertified residue (composes `examples/tropical` +
+    `decode_margin_certified`). ⬜ the input **`embed`** wall stays open and distinct.
   - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
     {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-
