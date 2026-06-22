@@ -196,7 +196,8 @@ impl Neox {
     /// Causal-ablation copy of `hidden`: the given attention heads `ah` (layer, head) are zeroed at the pre-dense
     /// value-output and MLP neurons `an` (layer, neuron) at the post-GELU activation, so downstream layers recompute
     /// without them. Research tool (`--probe-ablate`), not gated.
-    fn hidden_ab(&self, ids: &[i64], ah: &[(usize, usize)], an: &[(usize, usize)]) -> Array2<f32> {
+    fn hidden_ab(&self, ids: &[i64], ah: &[(usize, usize)], an: &[(usize, usize)],
+                 ablk: &[usize], mblk: &[usize]) -> Array2<f32> {
         let (h, hd) = (self.h, self.hd);
         let mut x = self.b.rows_f32("embed", ids);
         for l in 0..self.n_layer {
@@ -213,7 +214,8 @@ impl Neox {
                     attn_out.slice_mut(s![.., hh * hd..(hh + 1) * hd]).fill(0.0);
                 }
             }
-            let attn = self.proj(&attn_out, &format!("{p}dense"));
+            let mut attn = self.proj(&attn_out, &format!("{p}dense"));
+            if ablk.contains(&l) { attn.fill(0.0); } // zero the whole attention block's residual write
             let mlp_in = if self.parallel { x.clone() } else { &x + &attn };
             let a2 = self.ln(&mlp_in, &format!("{p}ln2"));
             let mut hm = self.proj(&a2, &format!("{p}fc_in"));
@@ -223,7 +225,8 @@ impl Neox {
                     hm.slice_mut(s![.., nn..nn + 1]).fill(0.0);
                 }
             }
-            let mlp = &self.down(&hm, &format!("{p}fc_out")) + &self.b.arr1(&format!("{p}fc_out.bias"));
+            let mut mlp = &self.down(&hm, &format!("{p}fc_out")) + &self.b.arr1(&format!("{p}fc_out.bias"));
+            if mblk.contains(&l) { mlp.fill(0.0); } // zero the whole MLP block's residual write
             // same combine either way: in the sequential form mlp was computed from (x + attn), in the parallel
             // form from x — the residual sum is x + attn + mlp in both.
             x = &(&x + &attn) + &mlp;
@@ -429,9 +432,22 @@ impl Model for Neox {
     }
 
     fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
-        let xf = self.hidden_ab(ids, heads, neurons);
+        let xf = self.hidden_ab(ids, heads, neurons, &[], &[]);
         let logits = self.b.rowdot_f32("lm_head", &xf.row(ids.len() - 1).to_vec());
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    /// Causal block ablation: zero whole attention/MLP blocks of the listed layers and recompute — the cross-arch
+    /// `--block-ablate` sufficiency/necessity test for the decode circuit (the neox sibling of rope's method).
+    fn predict_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)],
+                              attn_layers: &[usize], mlp_layers: &[usize]) -> Option<i64> {
+        let xf = self.hidden_ab(ids, heads, neurons, attn_layers, mlp_layers);
+        let logits = self.b.rowdot_f32("lm_head", &xf.row(ids.len() - 1).to_vec());
+        Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn dims(&self) -> Option<(usize, usize)> {
+        Some((self.n_layer, self.h))
     }
 
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
