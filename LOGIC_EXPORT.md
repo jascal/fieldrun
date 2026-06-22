@@ -308,10 +308,22 @@ as provenance structure vs intervention diffuseness.
     shortlist-decode == full-vocab-decode (0 mismatches); `lm_head` shrinks `vocab×d → K×d` (1536→512 at K=16). Firing
     scales with unembed structure: **0% uniform → 48% at a 22× norm ratio** (rank-1 lifts the raw-Cauchy–Schwarz 40% by
     removing the dominant elided direction from the slack); real LLMs (large norm spread + low-rank structure) fire more.
-    **LE-T4 ledger:** ✅ certified-compact *unembed* + ✅ rank-1 tighter bound → ⬜ **rank-r** bound (keep `r` directions
-    with per-elided projections — tighter still, at `elided×r` facts) → ⬜ the input **`embed`** wall (context-token-only
-    embed) → ⬜ firing-rate + fact-reduction on a real exported bundle. Scope: only **untied** models get the `K×d` *fact*
-    win (tied share embed/unembed, so only the output *computation* shrinks); the input embed stays `vocab×d` regardless.
+    **Real-model result (`lo3a/real_cert_numbers.py`, SmolLM-135M, d=576, vocab=49152; repro: `python
+    lo3a/real_cert_numbers.py smollm`) — a decisive NEGATIVE:** the
+    certificate is sound but **never fires on a real model** (0% certified). Two findings: (1) the **norm shortlist
+    misses the winners** — the model's argmax tokens have *low* unembed norm (norm-rank median ~40k/49k; large embed
+    norms are *rare* tokens, not frequent ones), so top-K-by-‖U_v‖ has **0% contains**, while a **frequency** shortlist
+    gets ~57%; (2) even with a good shortlist, the certificate is **~14× from firing** (elided bound ≈227 vs winner
+    logit ≈16) because in `d=576`, `‖x‖·‖U_v‖` overestimates `⟨x,U_v⟩` by **~√d ≈ 24×** (high-dim Cauchy–Schwarz). A
+    rank-r removal subtracts only `O(r)` directions, so it **cannot close a √d gap.** The synthetic verifier passed only
+    because it had engineered low effective dimension (norm=winner, big margins). **Conclusion: a HARD certified-compact
+    unembed is infeasible on real models;** the compact unembed must be **LOSSY** (the `pr_core` factored readout, R4 —
+    decode-kept ~67% on SmolLM) or use a fundamentally non-Cauchy–Schwarz (data-dependent, soundness-trading) bound.
+
+    **LE-T4 ledger (revised by the real-model result):** ✅ certified-compact unembed + rank-1 (sound; *synthetic-only* —
+    real-model-vacuous) → ❌ rank-r (can't close the √d gap — dropped) → ➡ **lossy `pr_core` compaction** is the viable
+    unembed path on real models → ⬜ the input **`embed`** wall (still open, distinct). Scope unchanged: only **untied**
+    models would get the `K×d` *fact* win; the input embed stays `vocab×d` regardless.
   - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
     {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-
