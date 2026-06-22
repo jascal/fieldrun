@@ -297,17 +297,21 @@ as provenance structure vs intervention diffuseness.
     just the shortlist, so the dense `vocab×d` emit shrinks to `shortlist×d` with a Soufflé-checkable
     certificate.
   - **The certified-compact unembed is now wired into `--logic-whole`** (`export --logic-whole --shortlist K`): the
-    output `vocab` and the unembed are restricted to the **top-K tokens by ‖U_v‖**, plus a Soufflé certificate
-    `certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN·umax²_elided.` — true ⇒ the shortlist argmax
-    *provably* equals the full-vocab argmax (no dropped token's logit `⟨x,U_v⟩ ≤ ‖x‖‖U_v‖ ≤ ‖x‖·max‖U_elided‖ < S`).
-    Verified (`lo3a/verify_shortlist.py`, tiny untied rope): **SOUND** — across held-out contexts every `certified()`
-    context has shortlist-decode == full-vocab-decode (0 mismatches); the untied `lm_head` shrinks `vocab×d → K×d`
-    (e.g. 1536→512 facts). **The firing rate scales with the unembed-norm spread** — 0% on a uniform random init,
-    ~40% at a 22× norm ratio; real LLMs have large spread (frequent tokens carry big norms), so it fires broadly there.
-    Honest scope: (a) the bound is **conservative** (Cauchy–Schwarz — it certifies *less* than the shortlist is
-    actually correct, 25/25 here); (b) this is the **OUTPUT half** — the *input* `embed` stays `vocab×d` (any token can
-    appear in the context), so the dense-embed wall is the remaining LE-T4 piece; (c) **tied** models share embed/unembed,
-    so only the *output computation* shrinks (the facts don't), while **untied** models get the real `K×d` fact win.
+    output `vocab` and the unembed are restricted to the **top-K tokens by ‖U_v‖**, plus a Soufflé certificate `certified()`
+    — true ⇒ the shortlist argmax *provably* equals the full-vocab argmax (no dropped token can outscore the winner).
+    The bound on a dropped token's logit is a **rank-1 directional split**, not raw Cauchy–Schwarz: writing
+    `U_v = a_v·μ̂ + r_v` along the dominant elided direction `μ̂` (top singular vector of the dropped rows),
+    `⟨x,U_v⟩ = a_v·g + ⟨x,r_v⟩ ≤ max(a_max·g, a_min·g) + ‖x‖·ρ_max`, where `g=⟨x,μ̂⟩` and `ρ_max=max‖r_v‖`. This fires
+    far more often than `‖x‖·max‖U_v‖` because `g ≪ ‖x‖` for a generic `x` and `ρ_max < max‖U_v‖`; and it needs **no
+    squaring**, so there's no sign caveat (the earlier squared form required an `S>0` guard since squaring drops the sign).
+    Verified (`lo3a/verify_shortlist.py`, tiny untied rope, varied-norm mint): **SOUND** — every `certified()` context has
+    shortlist-decode == full-vocab-decode (0 mismatches); `lm_head` shrinks `vocab×d → K×d` (1536→512 at K=16). Firing
+    scales with unembed structure: **0% uniform → 48% at a 22× norm ratio** (rank-1 lifts the raw-Cauchy–Schwarz 40% by
+    removing the dominant elided direction from the slack); real LLMs (large norm spread + low-rank structure) fire more.
+    **LE-T4 ledger:** ✅ certified-compact *unembed* + ✅ rank-1 tighter bound → ⬜ **rank-r** bound (keep `r` directions
+    with per-elided projections — tighter still, at `elided×r` facts) → ⬜ the input **`embed`** wall (context-token-only
+    embed) → ⬜ firing-rate + fact-reduction on a real exported bundle. Scope: only **untied** models get the `K×d` *fact*
+    win (tied share embed/unembed, so only the output *computation* shrinks); the input embed stays `vocab×d` regardless.
   - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
     {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-

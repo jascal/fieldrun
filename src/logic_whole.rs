@@ -21,6 +21,17 @@ use std::fmt::Write;
 
 const E: &str = "2.718281828459045"; // e, so exp(x) = E^x
 
+/// Rank-1 certificate parameters for the unembed shortlist: the dominant elided direction `μ̂` (top singular vector of
+/// the dropped rows) and the extremes of the elided rows decomposed along it — `a = ⟨U_v,μ̂⟩` (amax/amin) and the max
+/// off-`μ̂` residual norm `ρmax = max‖U_v − a·μ̂‖`. Used to bound any dropped token's logit far more tightly than
+/// Cauchy–Schwarz: `⟨x,U_v⟩ ≤ max(amax·g, amin·g) + ‖x‖·ρmax`, `g=⟨x,μ̂⟩` (tighter because `g ≪ ‖x‖` generically and
+/// `ρmax < max‖U_v‖`).
+#[derive(Debug)]
+struct ShortCert { mu: Vec<f32>, amax: f32, amin: f32, rhomax: f32 }
+
+const POWER_ITERS: usize = 16; // max power-method iterations for μ̂ (early-exits on convergence)
+const RHO_SLACK: f32 = 1.001;  // +0.1% slack on ρ_max² before sqrt, for f32 safety
+
 /// f32 → a Soufflé-safe positional float literal. Rust's `Display` is shortest-round-trip and never
 /// uses exponent notation (Soufflé rejects `1e-5`); we only need to guarantee a decimal point so the
 /// literal types as `float`, not `number`.
@@ -69,18 +80,42 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
     // full-vocab argmax whenever its logit S exceeds ‖x‖·max‖U_elided‖ (no elided token's logit ⟨x,U_v⟩ ≤ ‖x‖‖U_v‖ can
     // reach it). Where the certificate fires the dense vocab×d unembed shrinks to shortlist×d; the thin tail is uncertified.
     let unembed_name = if tied { "embed" } else { "lm_head" };
-    let (shortlist, umax2_elided): (Option<Vec<usize>>, f32) = match shortlist_k {
+    let (shortlist, cert): (Option<Vec<usize>>, Option<ShortCert>) = match shortlist_k {
         Some(k) if k > 0 && k < vocab => {
             let (ush, ud) = b.f32_array(unembed_name); // [vocab, d]
             let dc = ush[1];
-            let mut norms: Vec<(usize, f32)> = (0..vocab)
-                .map(|v| (v, (0..dc).map(|j| { let x = ud[v * dc + j]; x * x }).sum::<f32>()))
-                .collect();
+            let n2 = |v: usize| (0..dc).map(|j| { let x = ud[v * dc + j]; x * x }).sum::<f32>();
+            let mut norms: Vec<(usize, f32)> = (0..vocab).map(|v| (v, n2(v))).collect();
             norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // desc by ‖U_v‖²
             let keep: Vec<usize> = norms[..k].iter().map(|&(v, _)| v).collect();
-            (Some(keep), norms[k].1) // umax²_elided = the (k+1)-th largest row-norm²
+            let elided: Vec<usize> = norms[k..].iter().map(|&(v, _)| v).collect();
+            // dominant elided direction μ̂ = top right singular vector of the dropped rows, via the power method on UᵀU.
+            // init = the highest-norm elided row (`elided` is sorted desc by ‖U_v‖, so elided[0] IS that row). Cost is
+            // O((V−K)·d·iters) — fine for a one-time export, and it early-exits once μ̂ stops moving (fast when the
+            // singular gap is wide). Tune via POWER_ITERS.
+            let mut mu = (0..dc).map(|j| ud[elided[0] * dc + j]).collect::<Vec<f32>>();
+            let renorm = |m: &mut Vec<f32>| { let nrm = m.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9); for x in m.iter_mut() { *x /= nrm; } };
+            renorm(&mut mu);
+            for _ in 0..POWER_ITERS {
+                let mut nx = vec![0f32; dc];
+                for &v in &elided {
+                    let dot: f32 = (0..dc).map(|j| ud[v * dc + j] * mu[j]).sum();
+                    for j in 0..dc { nx[j] += ud[v * dc + j] * dot; }
+                }
+                renorm(&mut nx);
+                let align = nx.iter().zip(&mu).map(|(a, b)| a * b).sum::<f32>().abs(); // |⟨μ_new, μ_old⟩|
+                mu = nx;
+                if align > 1.0 - 1e-6 { break; } // converged
+            }
+            let (mut amax, mut amin, mut rho2) = (f32::MIN, f32::MAX, 0f32);
+            for &v in &elided {
+                let a: f32 = (0..dc).map(|j| ud[v * dc + j] * mu[j]).sum();
+                amax = amax.max(a); amin = amin.min(a);
+                rho2 = rho2.max((n2(v) - a * a).max(0.0)); // ‖r_v‖² = ‖U_v‖² − a²
+            }
+            (Some(keep), Some(ShortCert { mu, amax, amin, rhomax: (rho2 * RHO_SLACK).sqrt() }))
         }
-        _ => (None, 0.0),
+        _ => (None, None),
     };
 
     // RoPE inverse frequencies, computed in f32 exactly as src/rope.rs does.
@@ -297,15 +332,24 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
     w!("decide(V) :- logit(V,S), S = max S2 : {{ logit(_,S2) }}.");
     w!(".output decide");
     w!(".output logit");
-    if shortlist.is_some() {
-        // PO-T3 / LE-T4 certificate: the shortlist argmax == the full-vocab argmax when the winner's logit S exceeds
-        // ‖x‖·max‖U_elided‖ — because every elided token's logit ⟨x,U_v⟩ ≤ ‖x‖·‖U_v‖ ≤ ‖x‖·max‖U_elided‖ < S, so no
-        // dropped token can beat it. `certified()` true ⇒ decide is exact; false ⇒ thin-margin, fall back to full vocab.
-        w!("// ---------- LE-T4 shortlist certificate (umax²_elided = {}) ----------", ff(umax2_elided));
+    if let Some(sc) = &cert {
+        // LE-T4 RANK-1 certificate: `certified()` ⇒ the shortlist argmax PROVABLY equals the full-vocab argmax (false ⇒
+        // thin-margin, recompute full vocab). A dropped token's logit is bounded by splitting U_v along the dominant
+        // elided direction μ̂: ⟨x,U_v⟩ = a_v·g + ⟨x,r_v⟩ ≤ max(amax·g, amin·g) + ‖x‖·ρmax, g=⟨x,μ̂⟩. No squaring (so no
+        // sign caveat); much tighter than ‖x‖·max‖U_elided‖ because g ≪ ‖x‖ generically and ρmax < max‖U_v‖.
+        let k = shortlist.as_ref().map(|s| s.len()).unwrap_or(0);
+        w!("// ---------- LE-T4 rank-1 shortlist certificate (K={k} kept by ‖U_v‖; vocab(V) above IS the shortlist) ----------");
+        w!(".decl mu(d:number, v:float)   // μ̂ — dominant elided direction (top singular vector of the dropped rows)");
+        for (j, &mv) in sc.mu.iter().enumerate() { w!("mu({j}, {}).", ff(mv)); }
         w!(".decl xfn(s:float)");
-        w!("xfn(N) :- lastpos(LP), N = sum (V*V) : {{ xf(LP,_,V) }}.   // ‖x‖² at the predicting position");
+        w!("xfn(N) :- lastpos(LP), N = sum (V*V) : {{ xf(LP,_,V) }}.   // ‖x‖²");
+        w!(".decl gproj(g:float)");
+        w!("gproj(G) :- lastpos(LP), G = sum (XV*MV) : {{ xf(LP,D,XV), mu(D,MV) }}.   // g = ⟨x, μ̂⟩");
+        w!(".decl elidedbound(b:float)   // upper bound on every dropped token's logit");
+        w!("elidedbound(({})*G + (XN^0.5)*({})) :- gproj(G), G>=0.0, xfn(XN).", ff(sc.amax), ff(sc.rhomax));
+        w!("elidedbound(({})*G + (XN^0.5)*({})) :- gproj(G), G<0.0, xfn(XN).", ff(sc.amin), ff(sc.rhomax));
         w!(".decl certified()");
-        w!("certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN*{}.   // S > ‖x‖·max‖U_elided‖", ff(umax2_elided));
+        w!("certified() :- decide(V), logit(V,S), elidedbound(B), S > B.   // winner beats the dropped-token upper bound");
         w!(".output certified");
     }
     Ok(o)
