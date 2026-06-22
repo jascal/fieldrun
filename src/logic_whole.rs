@@ -26,7 +26,11 @@ const E: &str = "2.718281828459045"; // e, so exp(x) = E^x
 /// off-`μ̂` residual norm `ρmax = max‖U_v − a·μ̂‖`. Used to bound any dropped token's logit far more tightly than
 /// Cauchy–Schwarz: `⟨x,U_v⟩ ≤ max(amax·g, amin·g) + ‖x‖·ρmax`, `g=⟨x,μ̂⟩` (tighter because `g ≪ ‖x‖` generically and
 /// `ρmax < max‖U_v‖`).
+#[derive(Debug)]
 struct ShortCert { mu: Vec<f32>, amax: f32, amin: f32, rhomax: f32 }
+
+const POWER_ITERS: usize = 16; // max power-method iterations for μ̂ (early-exits on convergence)
+const RHO_SLACK: f32 = 1.001;  // +0.1% slack on ρ_max² before sqrt, for f32 safety
 
 /// f32 → a Soufflé-safe positional float literal. Rust's `Display` is shortest-round-trip and never
 /// uses exponent notation (Soufflé rejects `1e-5`); we only need to guarantee a decimal point so the
@@ -85,17 +89,23 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
             norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // desc by ‖U_v‖²
             let keep: Vec<usize> = norms[..k].iter().map(|&(v, _)| v).collect();
             let elided: Vec<usize> = norms[k..].iter().map(|&(v, _)| v).collect();
-            // power-iterate the dominant elided direction μ̂ (top right singular vector of the dropped rows)
+            // dominant elided direction μ̂ = top right singular vector of the dropped rows, via the power method on UᵀU.
+            // init = the highest-norm elided row (`elided` is sorted desc by ‖U_v‖, so elided[0] IS that row). Cost is
+            // O((V−K)·d·iters) — fine for a one-time export, and it early-exits once μ̂ stops moving (fast when the
+            // singular gap is wide). Tune via POWER_ITERS.
             let mut mu = (0..dc).map(|j| ud[elided[0] * dc + j]).collect::<Vec<f32>>();
             let renorm = |m: &mut Vec<f32>| { let nrm = m.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9); for x in m.iter_mut() { *x /= nrm; } };
             renorm(&mut mu);
-            for _ in 0..16 {
+            for _ in 0..POWER_ITERS {
                 let mut nx = vec![0f32; dc];
                 for &v in &elided {
                     let dot: f32 = (0..dc).map(|j| ud[v * dc + j] * mu[j]).sum();
                     for j in 0..dc { nx[j] += ud[v * dc + j] * dot; }
                 }
-                mu = nx; renorm(&mut mu);
+                renorm(&mut nx);
+                let align = nx.iter().zip(&mu).map(|(a, b)| a * b).sum::<f32>().abs(); // |⟨μ_new, μ_old⟩|
+                mu = nx;
+                if align > 1.0 - 1e-6 { break; } // converged
             }
             let (mut amax, mut amin, mut rho2) = (f32::MIN, f32::MAX, 0f32);
             for &v in &elided {
@@ -103,7 +113,7 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
                 amax = amax.max(a); amin = amin.min(a);
                 rho2 = rho2.max((n2(v) - a * a).max(0.0)); // ‖r_v‖² = ‖U_v‖² − a²
             }
-            (Some(keep), Some(ShortCert { mu, amax, amin, rhomax: (rho2 * 1.001).sqrt() })) // +0.1% f32 slack
+            (Some(keep), Some(ShortCert { mu, amax, amin, rhomax: (rho2 * RHO_SLACK).sqrt() }))
         }
         _ => (None, None),
     };
