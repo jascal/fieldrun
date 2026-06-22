@@ -539,6 +539,64 @@ pub fn run_source_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Op
 }
 
 /// NATURAL-TEXT alignment dump (the two-regime check): like --source-pr-dump but over a prose corpus and the full vocab.
+/// `--pil-dump <path>`: the PIL real-DLA seam. Per natural-text position emits the FULL per-block DLA incidence
+/// matrix `contrib[block][cand] = <d_block, U_cand>` over the top-K logit candidates (with the ground-truth target
+/// forced into the candidate set), plus the target index, prediction and margin — as JSON lines. This is the real-model
+/// analogue of the synthetic compositional sources: each DLA block is a "rule", its per-candidate contribution the
+/// incidence. Consumed by `pil/fieldrun_io.py::load_pil_dump` to re-run the rank / coherence / margin analyses
+/// (§5e–§5g) on a real model instead of planted XOR.
+pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --pil-dump needs a tokenizer next to {stem}"); return; } };
+    let path = match flag(args, "--pil-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --pil-dump needs a path"); return; } };
+    let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(16);
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(400);
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted. When the evidence contradicts a \
+        theory, the theory must change, however elegant it may seem. This willingness to discard a beautiful idea in the \
+        face of a stubborn fact is, more than any single discovery, the engine that drives progress.";
+    let text = flag(args, "--text").unwrap_or(DEFAULT);
+    let ids = tg.encode(text, false);
+    if ids.len() < 4 { eprintln!("[fieldrun] pil-dump: text too short ({} ids)", ids.len()); return; }
+    let mut out = String::new();
+    let last = (ids.len() - 1).min(nmax + 1);
+    eprintln!("[fieldrun] pil-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
+    for p in 1..last {
+        let ctx = &ids[..=p];
+        let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return; } };
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let target = ids[p + 1]; // ground-truth next token (p+1 <= len-1 by the `last` bound)
+        let mut cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
+        if !cand.contains(&target) { cand.pop(); cand.push(target); } // force the target into the candidate set
+        let (_labels, contrib) = match lm.residual_decomp(ctx, &cand) { Some(x) => x, None => { eprintln!("[fieldrun] no residual_decomp (arch)"); return; } };
+        let nb = contrib.len();
+        let pred = order[0] as i64;
+        let margin = logits[order[0]] - logits[order[1]];
+        let tgt_idx: i64 = cand.iter().position(|&c| c == target).map(|x| x as i64).unwrap_or(-1);
+        let mut cstr = String::from("[");
+        for b in 0..nb {
+            if b > 0 { cstr.push(','); }
+            cstr.push('[');
+            for (k, _) in cand.iter().enumerate() {
+                if k > 0 { cstr.push(','); }
+                cstr.push_str(&format!("{:.5}", contrib[b][k]));
+            }
+            cstr.push(']');
+        }
+        cstr.push(']');
+        let cands_str: Vec<String> = cand.iter().map(|c| c.to_string()).collect();
+        out.push_str(&format!(
+            "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"nb\":{nb},\"cands\":[{}],\"contrib\":{cstr}}}\n",
+            ids[p], cands_str.join(",")));
+    }
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}", last.saturating_sub(1)),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 /// Per position emits the model's source-PR `(Σ_b c_b)²/Σ_b c_b²` over the 57 DLA blocks (the paper's Thm-5 diffuseness
 /// quantity), margin, and μ_t — over the top-K logit candidates. The retrieved-vs-computed (track A) label is built
 /// offline from the dumped token ids (n-gram / induction). Tests whether COMPUTED natural-text tokens are HIGH source-PR
