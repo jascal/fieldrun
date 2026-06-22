@@ -558,6 +558,88 @@ impl Model for Mla {
         Some(self.explanation(ids))
     }
 
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        let xf = self.hidden(ids);
+        Some(self.b.rowdot_f32(self.unembed(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    fn dims(&self) -> Option<(usize, usize)> {
+        Some((self.nl, self.nh))
+    }
+
+    /// Per-block DLA decomposition (the `--pil-dump` seam for the MLA / DeepSeek family — exotic attention).
+    /// MLA's latent-compressed attention only changes how `attn_out` is computed; the residual write is still
+    /// `o_proj(attn_out)` per layer plus the FFN (dense or routed-expert MoE), summing to the pre-final-norm
+    /// residual. RMSNorm geometry (no center/bias), so contribution = `inv_rms · Σ_d gain_d write_b_d U_v_d`.
+    /// Mirrors `hidden` exactly, recording each layer's attn and FFN write at the last position.
+    fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        let seq = ids.len();
+        let last = seq - 1;
+        let (nh, qkh, qk_nope, qk_rope, vh) = (self.nh, self.qkh, self.qk_nope, self.qk_rope, self.v_head);
+        let kpv_hd = qk_nope + vh;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut writes: Vec<Vec<f32>> = vec![x.row(last).to_vec()];
+        for l in 0..self.nl {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = if self.q_lora > 0 {
+                let qa = self.norm(&self.b.mm(&a, &format!("{p}q_a")), &format!("{p}q_a_ln"));
+                self.b.mm(&qa, &format!("{p}q_b"))
+            } else {
+                self.b.mm(&a, &format!("{p}q"))
+            };
+            let ckv = self.b.mm(&a, &format!("{p}kv_a"));
+            let mut krot = ckv.slice(s![.., self.kv_lora..self.kv_lora + qk_rope]).to_owned();
+            let klat = self.norm(&ckv.slice(s![.., 0..self.kv_lora]).to_owned(), &format!("{p}kv_a_ln"));
+            let kpv = self.b.mm(&klat, &format!("{p}kv_b"));
+            for tpos in 0..seq {
+                for hh in 0..nh {
+                    let base = hh * qkh + qk_nope;
+                    self.rope_one(&mut q.as_slice_mut().unwrap()[tpos * nh * qkh + base..tpos * nh * qkh + base + qk_rope], tpos);
+                }
+                self.rope_one(&mut krot.as_slice_mut().unwrap()[tpos * qk_rope..(tpos + 1) * qk_rope], tpos);
+            }
+            let mut attn_out = Array2::<f32>::zeros((seq, nh * vh));
+            for hh in 0..nh {
+                let mut kh = Array2::<f32>::zeros((seq, qkh));
+                let mut vhead = Array2::<f32>::zeros((seq, vh));
+                for tpos in 0..seq {
+                    for c in 0..qk_nope { kh[[tpos, c]] = kpv[[tpos, hh * kpv_hd + c]]; }
+                    for c in 0..qk_rope { kh[[tpos, qk_nope + c]] = krot[[tpos, c]]; }
+                    for c in 0..vh { vhead[[tpos, c]] = kpv[[tpos, hh * kpv_hd + qk_nope + c]]; }
+                }
+                let qh = q.slice(s![.., hh * qkh..(hh + 1) * qkh]);
+                let mut scores = qh.dot(&kh.t()) * self.scale;
+                for i in 0..seq {
+                    for j in (i + 1)..seq { scores[[i, j]] = -1e30; }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., hh * vh..(hh + 1) * vh]).assign(&scores.dot(&vhead));
+            }
+            let aw = self.b.mm(&attn_out, &format!("{p}o_proj"));
+            writes.push(aw.row(last).to_vec());
+            labels.push(format!("L{l}.attn"));
+            x = &x + &aw;
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let mw = if l < self.first_k { self.dense_mlp(l, &a2) } else { self.moe(l, &a2) };
+            writes.push(mw.row(last).to_vec());
+            labels.push(format!("L{l}.{}", if l < self.first_k { "mlp" } else { "moe" }));
+            x = &x + &mw;
+        }
+        let xpre = x.row(last).to_vec();
+        let d = xpre.len();
+        let inv_rms = 1.0 / (xpre.iter().map(|v| v * v).sum::<f32>() / d as f32 + self.eps).sqrt();
+        let gain = self.b.arr1("norm");
+        let un = self.unembed();
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row(un, t as usize)).collect();
+        let contrib: Vec<Vec<f32>> = writes
+            .iter()
+            .map(|w| urows.iter().map(|u| inv_rms * (0..d).map(|i| gain[i] * w[i] * u[i]).sum::<f32>()).collect())
+            .collect();
+        Some((labels, contrib))
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);

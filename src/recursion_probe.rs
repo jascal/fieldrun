@@ -605,7 +605,6 @@ pub fn run_block_ablate(args: &[String], lm: &dyn crate::model::Model, tg: &Opti
 /// incidence. Consumed by `pil/fieldrun_io.py::load_pil_dump` to re-run the rank / coherence / margin analyses
 /// (§5e–§5g) on a real model instead of planted XOR.
 pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
-    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --pil-dump needs a tokenizer next to {stem}"); return; } };
     let path = match flag(args, "--pil-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --pil-dump needs a path"); return; } };
     let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(16);
     let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(400);
@@ -615,9 +614,18 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
         in which a hypothesis must be tested against evidence before it can be accepted. When the evidence contradicts a \
         theory, the theory must change, however elegant it may seem. This willingness to discard a beautiful idea in the \
         face of a stubborn fact is, more than any single discovery, the engine that drives progress.";
-    let text = flag(args, "--text").unwrap_or(DEFAULT);
-    let ids = tg.encode(text, false);
-    if ids.len() < 4 { eprintln!("[fieldrun] pil-dump: text too short ({} ids)", ids.len()); return; }
+    // ids from --ids <json: {"holdout_ids":[..]} or [..]> (tokenizer-free, e.g. tiny-random validation bundles)
+    // else tokenize --text (needs a tokenizer next to the bundle).
+    let ids: Vec<i64> = if let Some(idspath) = flag(args, "--ids") {
+        let txt = std::fs::read_to_string(idspath).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let arr = v.get("holdout_ids").and_then(|a| a.as_array()).or_else(|| v.as_array());
+        match arr { Some(a) => a.iter().filter_map(|x| x.as_i64()).collect(), None => { eprintln!("[fieldrun] --ids: no id array"); return; } }
+    } else {
+        match tg { Some(t) => t.encode(flag(args, "--text").unwrap_or(DEFAULT), false),
+                   None => { eprintln!("[fieldrun] --pil-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
+    };
+    if ids.len() < 4 { eprintln!("[fieldrun] pil-dump: too few ids ({})", ids.len()); return; }
     let mut out = String::new();
     let last = (ids.len() - 1).min(nmax + 1);
     eprintln!("[fieldrun] pil-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
