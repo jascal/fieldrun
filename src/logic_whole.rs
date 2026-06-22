@@ -34,7 +34,7 @@ fn ff(x: f32) -> String {
 
 /// Emit the whole-model forward pass for a `rope` bundle as one Datalog program.
 /// `maxpos` = how many RoPE position rows to precompute (the max context length the program supports).
-pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
+pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Result<String, String> {
     if b.arch != "rope" {
         return Err(format!(
             "logic-whole: arch {:?} unsupported — the whole-model emit targets the rope family (Llama/Qwen2.5/Qwen3/Mistral)",
@@ -62,6 +62,26 @@ pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
     if !tied && !b.has("lm_head") {
         return Err("logic-whole: untied model but no lm_head array".into());
     }
+
+    // ---- LE-T4: PO-T3-certified unembed shortlist (option 2) ----
+    // Keep only the top-K output tokens by ‖U_v‖ (the unembed row norm — the only tokens that can have a large logit),
+    // emit the unembed for just those, and add a Soufflé-checkable CERTIFICATE: the shortlist argmax provably equals the
+    // full-vocab argmax whenever its logit S exceeds ‖x‖·max‖U_elided‖ (no elided token's logit ⟨x,U_v⟩ ≤ ‖x‖‖U_v‖ can
+    // reach it). Where the certificate fires the dense vocab×d unembed shrinks to shortlist×d; the thin tail is uncertified.
+    let unembed_name = if tied { "embed" } else { "lm_head" };
+    let (shortlist, umax2_elided): (Option<Vec<usize>>, f32) = match shortlist_k {
+        Some(k) if k > 0 && k < vocab => {
+            let (ush, ud) = b.f32_array(unembed_name); // [vocab, d]
+            let dc = ush[1];
+            let mut norms: Vec<(usize, f32)> = (0..vocab)
+                .map(|v| (v, (0..dc).map(|j| { let x = ud[v * dc + j]; x * x }).sum::<f32>()))
+                .collect();
+            norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // desc by ‖U_v‖²
+            let keep: Vec<usize> = norms[..k].iter().map(|&(v, _)| v).collect();
+            (Some(keep), norms[k].1) // umax²_elided = the (k+1)-th largest row-norm²
+        }
+        _ => (None, 0.0),
+    };
 
     // RoPE inverse frequencies, computed in f32 exactly as src/rope.rs does.
     let inv: Vec<f32> = (0..half).map(|j| 1.0f32 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
@@ -100,7 +120,10 @@ pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
     for i in 0..d { w!("dim_d({i})."); }
     for i in 0..nkv * hd { w!("kvout({i})."); }
     for i in 0..ffn { w!("ffnout({i})."); }
-    for i in 0..vocab { w!("vocab({i})."); }
+    match &shortlist {                                   // output tokens: the PO-T3 shortlist, or all vocab
+        Some(keep) => for &v in keep { w!("vocab({v})."); },
+        None => for i in 0..vocab { w!("vocab({i})."); },
+    }
     for i in 0..hd { w!("cidx({i})."); }
     for i in 0..h { w!("headq({i})."); }
     for i in 0..h { w!("head_kv({i}, {}).", i / rep); }
@@ -136,15 +159,15 @@ pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
 
     // ---- weight facts ----
     // emit a 2D weight stored [in, out] (row-major) as rel(in, out, val)
-    let emit_mat = |rel: &str, name: &str, o: &mut String| -> Result<(), String> {
+    let emit_mat = |rel: &str, name: &str, rows: Option<&[usize]>, o: &mut String| -> Result<(), String> {
         let (shape, data) = b.f32_array(name);
         if shape.len() != 2 { return Err(format!("logic-whole: {name} is not 2D")); }
         let (ni, no) = (shape[0], shape[1]);
         let _ = writeln!(o, ".decl {rel}(i:number, o:number, v:float)");
-        for i in 0..ni {
-            for j in 0..no {
-                let _ = writeln!(o, "{rel}({i}, {j}, {}).", ff(data[i * no + j]));
-            }
+        let emit_row = |i: usize, o: &mut String| { for j in 0..no { let _ = writeln!(o, "{rel}({i}, {j}, {}).", ff(data[i * no + j])); } };
+        match rows {                                    // None = all rows; Some = just those (the unembed shortlist)
+            Some(rs) => for &i in rs { emit_row(i, o); },
+            None => for i in 0..ni { emit_row(i, o); },
         }
         Ok(())
     };
@@ -161,25 +184,26 @@ pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
         if b.has(&bn) { emit_vec(rel, &bn, o); true } else { false }
     };
 
-    emit_mat("embed_w", "embed", &mut o)?;
-    if !tied { emit_mat("lmhead_w", "lm_head", &mut o)?; }
+    emit_mat("embed_w", "embed", None, &mut o)?;        // embed: ALL rows (any input token can appear in the context)
+    // lm_head (untied unembed): just the shortlist rows when shortlisting — this is the LE-T4 size win (vocab×d → K×d).
+    if !tied { emit_mat("lmhead_w", "lm_head", shortlist.as_deref(), &mut o)?; }
     let mut has_qb = vec![false; n_layer];
     let mut has_kb = vec![false; n_layer];
     let mut has_vb = vec![false; n_layer];
     for l in 0..n_layer {
         let p = format!("l{l}.");
         emit_vec(&format!("inln{l}"), &format!("{p}in_ln"), &mut o);
-        emit_mat(&format!("qw{l}"), &format!("{p}self_attn.q_proj"), &mut o)?;
-        emit_mat(&format!("kw{l}"), &format!("{p}self_attn.k_proj"), &mut o)?;
-        emit_mat(&format!("vw{l}"), &format!("{p}self_attn.v_proj"), &mut o)?;
+        emit_mat(&format!("qw{l}"), &format!("{p}self_attn.q_proj"), None, &mut o)?;
+        emit_mat(&format!("kw{l}"), &format!("{p}self_attn.k_proj"), None, &mut o)?;
+        emit_mat(&format!("vw{l}"), &format!("{p}self_attn.v_proj"), None, &mut o)?;
         has_qb[l] = emit_bias(&format!("qb{l}"), &format!("{p}self_attn.q_proj"), &mut o);
         has_kb[l] = emit_bias(&format!("kb{l}"), &format!("{p}self_attn.k_proj"), &mut o);
         has_vb[l] = emit_bias(&format!("vb{l}"), &format!("{p}self_attn.v_proj"), &mut o);
-        emit_mat(&format!("ow{l}"), &format!("{p}self_attn.o_proj"), &mut o)?;
+        emit_mat(&format!("ow{l}"), &format!("{p}self_attn.o_proj"), None, &mut o)?;
         emit_vec(&format!("postln{l}"), &format!("{p}post_ln"), &mut o);
-        emit_mat(&format!("gatew{l}"), &format!("{p}mlp.gate_proj"), &mut o)?;
-        emit_mat(&format!("upw{l}"), &format!("{p}mlp.up_proj"), &mut o)?;
-        emit_mat(&format!("downw{l}"), &format!("{p}mlp.down_proj"), &mut o)?;
+        emit_mat(&format!("gatew{l}"), &format!("{p}mlp.gate_proj"), None, &mut o)?;
+        emit_mat(&format!("upw{l}"), &format!("{p}mlp.up_proj"), None, &mut o)?;
+        emit_mat(&format!("downw{l}"), &format!("{p}mlp.down_proj"), None, &mut o)?;
     }
     emit_vec("normw", "norm", &mut o);
     w!();
@@ -273,6 +297,17 @@ pub fn emit_whole(b: &Bundle, maxpos: usize) -> Result<String, String> {
     w!("decide(V) :- logit(V,S), S = max S2 : {{ logit(_,S2) }}.");
     w!(".output decide");
     w!(".output logit");
+    if shortlist.is_some() {
+        // PO-T3 / LE-T4 certificate: the shortlist argmax == the full-vocab argmax when the winner's logit S exceeds
+        // ‖x‖·max‖U_elided‖ — because every elided token's logit ⟨x,U_v⟩ ≤ ‖x‖·‖U_v‖ ≤ ‖x‖·max‖U_elided‖ < S, so no
+        // dropped token can beat it. `certified()` true ⇒ decide is exact; false ⇒ thin-margin, fall back to full vocab.
+        w!("// ---------- LE-T4 shortlist certificate (umax²_elided = {}) ----------", ff(umax2_elided));
+        w!(".decl xfn(s:float)");
+        w!("xfn(N) :- lastpos(LP), N = sum (V*V) : {{ xf(LP,_,V) }}.   // ‖x‖² at the predicting position");
+        w!(".decl certified()");
+        w!("certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN*{}.   // S > ‖x‖·max‖U_elided‖", ff(umax2_elided));
+        w!(".output certified");
+    }
     Ok(o)
 }
 

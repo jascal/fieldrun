@@ -2630,19 +2630,25 @@ fn main() {
         // embed/unembed fact count vocab×d is the dense-Gram wall, LE-T4 — correct but not compact at scale).
         if args.iter().any(|a| a == "export") && has_flag(&args, "--logic-whole") {
             let maxpos: usize = flag(&args, "--maxpos").and_then(|s| s.parse().ok()).unwrap_or(64);
+            // --shortlist K (LE-T4 option 2): emit the unembed for only the top-K tokens by ‖U_v‖ + a PO-T3 certificate
+            // (`certified()` ⇒ the shortlist argmax provably equals the full-vocab argmax). For untied models this shrinks
+            // the dense unembed vocab×d → K×d where the certificate fires; embed stays full (any input token can appear).
+            let shortlist_k: Option<usize> = flag(&args, "--shortlist").and_then(|s| s.parse().ok());
             let b = match Bundle::load(&stem) {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[fieldrun] export --logic-whole: couldn't reload bundle: {e}"); return; }
             };
             let (vc, dd) = (b.config.get(6).copied().unwrap_or(0) as usize, b.config.get(4).copied().unwrap_or(0) as usize);
-            let est = vc.saturating_mul(dd);
+            // the shortlist shrinks the UNEMBED, so the LE-T4 size estimate is bounded by K (the embed is still vocab×d for input)
+            let est = shortlist_k.map(|k| k.saturating_mul(dd)).unwrap_or_else(|| vc.saturating_mul(dd));
             if est > 4_000_000 && !has_flag(&args, "--force") {
-                eprintln!("[fieldrun] export --logic-whole: vocab×d = {vc}×{dd} ≈ {est} embed facts (×2 if untied) — that is the\n\
+                eprintln!("[fieldrun] export --logic-whole: vocab×d = {vc}×{dd} ≈ {} embed facts (×2 if untied) — that is the\n\
                            dense-Gram / high-treewidth wall (LOGIC_EXPORT LE-T4): the program is correct but not COMPACT at this\n\
-                           scale. Demonstrate on a small rope bundle, or re-run with --force to emit anyway.");
+                           scale. Demonstrate on a small rope bundle, --shortlist K for the certified-compact unembed, or --force.",
+                          vc.saturating_mul(dd));
                 return;
             }
-            match logic_whole::emit_whole(&b, maxpos) {
+            match logic_whole::emit_whole(&b, maxpos, shortlist_k) {
                 Ok(prog) => match flag(&args, "--out") {
                     Some(p) => {
                         if std::fs::write(p, &prog).is_ok() {
