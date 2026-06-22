@@ -295,9 +295,19 @@ as provenance structure vs intervention diffuseness.
     candidate shortlist (~540 tokens) with the PO-T3 margin gate is a **compact *certified* unembed on the
     tokens where `m > 2δ`**: where the margin clears, the argmax provably equals the full-vocab argmax over
     just the shortlist, so the dense `vocab×d` emit shrinks to `shortlist×d` with a Soufflé-checkable
-    certificate. Wiring this shortlist into `export --logic` (so the whole-model emit is *compact-and-certified
-    where the margin clears, full only on the thin-margin tail*) is the concrete next step against the LE-T4
-    wall — noted here as the achievable increment; the lossless whole-`vocab×d` emit stays blocked.
+    certificate.
+  - **The certified-compact unembed is now wired into `--logic-whole`** (`export --logic-whole --shortlist K`): the
+    output `vocab` and the unembed are restricted to the **top-K tokens by ‖U_v‖**, plus a Soufflé certificate
+    `certified() :- decide(V), logit(V,S), S>0, xfn(XN), S*S > XN·umax²_elided.` — true ⇒ the shortlist argmax
+    *provably* equals the full-vocab argmax (no dropped token's logit `⟨x,U_v⟩ ≤ ‖x‖‖U_v‖ ≤ ‖x‖·max‖U_elided‖ < S`).
+    Verified (`lo3a/verify_shortlist.py`, tiny untied rope): **SOUND** — across held-out contexts every `certified()`
+    context has shortlist-decode == full-vocab-decode (0 mismatches); the untied `lm_head` shrinks `vocab×d → K×d`
+    (e.g. 1536→512 facts). **The firing rate scales with the unembed-norm spread** — 0% on a uniform random init,
+    ~40% at a 22× norm ratio; real LLMs have large spread (frequent tokens carry big norms), so it fires broadly there.
+    Honest scope: (a) the bound is **conservative** (Cauchy–Schwarz — it certifies *less* than the shortlist is
+    actually correct, 25/25 here); (b) this is the **OUTPUT half** — the *input* `embed` stays `vocab×d` (any token can
+    appear in the context), so the dense-embed wall is the remaining LE-T4 piece; (c) **tied** models share embed/unembed,
+    so only the *output computation* shrinks (the facts don't), while **untied** models get the real `K×d` fact win.
   - **The margin-routing principle is now wired into the decode trace** (`--export-logic --residue-strategy
     {ring|pic|edb|margin} [--tau t]`): per generated token, high-margin / retrieved tokens emit the *compact* decode-only
     form (Tier B elided — decode-safe above 2δ by PO-T3) and the low-margin tail keeps the full per-block Π. Both round-
