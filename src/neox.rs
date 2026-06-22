@@ -369,6 +369,65 @@ impl Model for Neox {
         Some(xf.row(ids.len() - 1).to_vec())
     }
 
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        let xf = self.hidden(ids);
+        Some(self.b.rowdot_f32("lm_head", &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    /// Per-block DLA decomposition (the `--pil-dump` / source-PR seam for the NeoX family). The residual writes
+    /// — embedding, then each layer's attention `dense` and MLP `fc_out` outputs — sum to the pre-`ln_f` residual.
+    /// `ln_f` is a LayerNorm (unlike rope's RMSNorm), so each block's contribution to a token's logit is
+    /// `inv_std · Σ_d gain_d (write_b_d − mean_b) U_v_d`; the `ln_f` bias constant `Σ_d bias_d U_v_d` is folded into
+    /// the embedding block so the per-block contributions sum to the exact logit. Reuses `attn_block`/`mlp_block`,
+    /// so partial rotary / GELU / parallel residual / biases are all handled.
+    fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        let seq = ids.len();
+        let last = seq - 1;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut writes: Vec<Vec<f32>> = vec![x.row(last).to_vec()];
+        for l in 0..self.n_layer {
+            let attn = self.attn_block(&x, l);
+            // parallel: ln2 reads the SAME pre-attention x; sequential: ln2 reads x+attn. Either way the two
+            // writes (attn, mlp) sum into the residual: x_new = x + attn + mlp.
+            let mlp = if self.parallel { self.mlp_block(&x, l) } else { self.mlp_block(&(&x + &attn), l) };
+            writes.push(attn.row(last).to_vec());
+            labels.push(format!("L{l}.attn"));
+            writes.push(mlp.row(last).to_vec());
+            labels.push(format!("L{l}.mlp"));
+            x = &(&x + &attn) + &mlp;
+        }
+        // final LayerNorm geometry at the last position: ln_f(x)_d = gain_d (x_d − mean) / std + bias_d.
+        let xpre = x.row(last).to_vec();
+        let d = xpre.len();
+        let mean: f32 = xpre.iter().sum::<f32>() / d as f32;
+        let var: f32 = xpre.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+        let inv = 1.0 / (var + self.eps).sqrt();
+        let gain = self.b.arr1("ln_f.weight");
+        let bias = self.b.arr1("ln_f.bias");
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row("lm_head", t as usize)).collect();
+        let bias_contrib: Vec<f32> = urows.iter().map(|u| (0..d).map(|i| bias[i] * u[i]).sum::<f32>()).collect();
+        let contrib: Vec<Vec<f32>> = writes
+            .iter()
+            .enumerate()
+            .map(|(bi, w)| {
+                let mw: f32 = w.iter().sum::<f32>() / d as f32;
+                urows
+                    .iter()
+                    .enumerate()
+                    .map(|(ti, u)| {
+                        let mut s = inv * (0..d).map(|i| gain[i] * (w[i] - mw) * u[i]).sum::<f32>();
+                        if bi == 0 {
+                            s += bias_contrib[ti];
+                        }
+                        s
+                    })
+                    .collect()
+            })
+            .collect();
+        Some((labels, contrib))
+    }
+
     fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
         let xf = self.hidden_ab(ids, heads, neurons);
         let logits = self.b.rowdot_f32("lm_head", &xf.row(ids.len() - 1).to_vec());
