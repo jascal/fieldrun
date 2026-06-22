@@ -539,6 +539,65 @@ pub fn run_source_pr_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Op
 }
 
 /// NATURAL-TEXT alignment dump (the two-regime check): like --source-pr-dump but over a prose corpus and the full vocab.
+/// `--block-ablate`: CAUSAL sufficiency / necessity sweep for the decode-circuit finding. Over natural text, zero
+/// whole attention/MLP blocks by layer-group and RECOMPUTE (downstream re-runs over the modified residual, so this
+/// is causal, not the additive-attribution drop), reporting the fraction of positions whose decode (full-vocab
+/// argmax) is PRESERVED. Tests whether the late-MLP *attribution* circuit is causally SUFFICIENT (keep-late-only)
+/// vs whether the low-attribution EARLY layers are causally NECESSARY (ablate-early) — i.e. mass-vs-causation.
+/// Uses predict_ablated_blocks (rope family only for now).
+pub fn run_block_ablate(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, _stem: &str) {
+    let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --block-ablate needs a tokenizer"); return; } };
+    let (n_layer, _) = match lm.dims() { Some(d) => d, None => { eprintln!("[fieldrun] --block-ablate: arch has no dims()"); return; } };
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(200);
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted. When the evidence contradicts a \
+        theory, the theory must change, however elegant it may seem.";
+    let text = flag(args, "--text").unwrap_or(DEFAULT);
+    let ids = tg.encode(text, false);
+    if ids.len() < 4 { eprintln!("[fieldrun] block-ablate: text too short"); return; }
+    let t = n_layer / 3;
+    let early: Vec<usize> = (0..t).collect();
+    let mid: Vec<usize> = (t..2 * t).collect();
+    let late: Vec<usize> = (2 * t..n_layer).collect();
+    let all: Vec<usize> = (0..n_layer).collect();
+    let earlymid: Vec<usize> = (0..2 * t).collect();
+    let empty: Vec<usize> = vec![];
+    // (label, attn_layers, mlp_layers)
+    let conds: Vec<(&str, &Vec<usize>, &Vec<usize>)> = vec![
+        ("ablate late MLP (the high-mass readout)", &empty, &late),
+        ("ablate late attn+mlp", &late, &late),
+        ("ablate mid attn+mlp", &mid, &mid),
+        ("ablate EARLY attn+mlp (low direct mass)", &early, &early),
+        ("KEEP-LATE-ONLY (ablate early+mid) = sufficiency", &earlymid, &earlymid),
+        ("ablate ALL attn (keep all MLP)", &all, &empty),
+        ("ablate ALL mlp (keep all attn)", &empty, &all),
+    ];
+    let last = (ids.len() - 1).min(nmax + 1);
+    let np = last.saturating_sub(1);
+    let mut agree = vec![0usize; conds.len()];
+    for p in 1..last {
+        let ctx = &ids[..=p];
+        let base = match lm.logits(ctx) {
+            Some(l) => l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64,
+            None => { eprintln!("[fieldrun] block-ablate: no logits (arch)"); return; }
+        };
+        for (ci, (_, al, ml)) in conds.iter().enumerate() {
+            match lm.predict_ablated_blocks(ctx, &[], &[], al, ml) {
+                Some(d) if d == base => agree[ci] += 1,
+                None => { eprintln!("[fieldrun] block-ablate: arch lacks predict_ablated_blocks (rope only)"); return; }
+                _ => {}
+            }
+        }
+    }
+    eprintln!("[fieldrun] block-ablate · {np} positions · {n_layer} layers (thirds: early 0..{t}, mid ..{}, late ..{n_layer})", 2 * t);
+    println!("decode preserved under CAUSAL block ablation (recompute), {np} positions:");
+    for (ci, (label, _, _)) in conds.iter().enumerate() {
+        println!("  {:<50} {:>6.1}%", label, agree[ci] as f32 / np as f32 * 100.0);
+    }
+}
+
 /// `--pil-dump <path>`: the PIL real-DLA seam. Per natural-text position emits the FULL per-block DLA incidence
 /// matrix `contrib[block][cand] = <d_block, U_cand>` over the top-K logit candidates (with the ground-truth target
 /// forced into the candidate set), plus the target index, prediction and margin — as JSON lines. This is the real-model
