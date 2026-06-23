@@ -929,6 +929,7 @@ fn main() {
             if has_flag(&args, "--source-pr-dump") { recursion_probe::run_source_pr_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--natural-pr-dump") { recursion_probe::run_natural_pr_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--pil-dump") { recursion_probe::run_pil_dump(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--source-dump") { recursion_probe::run_source_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--block-ablate") { recursion_probe::run_block_ablate(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--ring-dump") { recursion_probe::run_ring_dump(&args, lm.as_ref(), &tg, &stem); return; }
 

@@ -307,6 +307,16 @@ pub trait Model: Sync {
         None
     }
 
+    /// Per-block *contribution vectors* at the predicting position: returns `(labels, dvec)` where `dvec[b]` is the
+    /// block `b` write with the final norm folded in (`d̃_b`), living in unembed space (dim = d_model). It is the exact
+    /// vector with `⟨d̃_b, U_v⟩ == contrib[b][v]` for every token `v` — i.e. `residual_decomp` is just this projected onto
+    /// the `toks` rows. The raw `d̃_b` (not its projection onto the model's *own* `U`) is what the forge-tax certificate
+    /// needs: re-representing the decoder frame `U → U'` plugs straight into `⟨d̃_b, U'_v⟩`. Emitted by `--source-dump`.
+    /// Default None; rope implements it (and `residual_decomp` derives from it).
+    fn residual_normed_writes(&self, _ids: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        None
+    }
+
     /// Like `predict_ablated`, but also zeroes a *whole* attention block (`attn_layers`) and/or *whole* MLP block
     /// (`mlp_layers`) of the listed layers — for the rescue-localization sweep (ablate {top circuit + downstream layer
     /// ℓ's MLP or attention}). Default None; rope implements it.

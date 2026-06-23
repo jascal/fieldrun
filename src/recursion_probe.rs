@@ -670,6 +670,85 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
     }
 }
 
+/// `--source-dump <path>`: the forge-tax certificate seam. Per natural-text position emits the RAW per-block
+/// contribution vectors `d̃_b ∈ ℝ^d` (final-norm folded, in unembed space; `r_x = Σ_b d̃_b`) — NOT their projection onto
+/// the model's own `U`. The certificate (pic/spec/forge_tax_certificate.md) holds these fixed and frees the decoder
+/// frame `U'`, so faithfulness + single-source become an LP in `U'`; that needs the raw `d̃_b`, which `--pil-dump`
+/// (incidences under the model's own `U`) cannot supply. Emits the target token + top-K competitor ids per position;
+/// a recon self-check (`Σ_b ⟨d̃_b, U_v⟩` vs the model logit argmax) is printed to confirm exactness.
+pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let path = match flag(args, "--source-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-dump needs a path"); return; } };
+    let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(24);
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(64);
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted.";
+    let ids: Vec<i64> = if let Some(idspath) = flag(args, "--ids") {
+        let txt = std::fs::read_to_string(idspath).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let arr = v.get("holdout_ids").and_then(|a| a.as_array()).or_else(|| v.as_array());
+        match arr { Some(a) => a.iter().filter_map(|x| x.as_i64()).collect(), None => { eprintln!("[fieldrun] --ids: no id array"); return; } }
+    } else {
+        match tg { Some(t) => t.encode(flag(args, "--text").unwrap_or(DEFAULT), false),
+                   None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
+    };
+    if ids.len() < 4 { eprintln!("[fieldrun] source-dump: too few ids ({})", ids.len()); return; }
+    let mut out = String::new();
+    let last = (ids.len() - 1).min(nmax + 1);
+    let mut recon_ok = 0usize;
+    let mut npos = 0usize;
+    eprintln!("[fieldrun] source-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
+    for p in 1..last {
+        let ctx = &ids[..=p];
+        let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return; } };
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let target = ids[p + 1];
+        let mut cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
+        if !cand.contains(&target) { cand.pop(); cand.push(target); }
+        let (labels, dvec) = match lm.residual_normed_writes(ctx) {
+            Some(x) => x, None => { eprintln!("[fieldrun] arch lacks residual_normed_writes (rope only)"); return; }
+        };
+        let pred = order[0] as i64;
+        let margin = logits[order[0]] - logits[order[1]];
+        let tgt_idx: i64 = cand.iter().position(|&c| c == target).map(|x| x as i64).unwrap_or(-1);
+        // recon self-check: Σ_b ⟨d̃_b, U_cand⟩ should argmax to `pred` (and match the logit)
+        let urows: Vec<Vec<f32>> = cand.iter().filter_map(|&c| lm.unembed_row(c as usize)).collect();
+        if urows.len() == cand.len() {
+            let mut best = (f32::NEG_INFINITY, -1i64);
+            for (k, u) in urows.iter().enumerate() {
+                let lv: f32 = dvec.iter().map(|d| d.iter().zip(u.iter()).map(|(dd, ud)| dd * ud).sum::<f32>()).sum();
+                if lv > best.0 { best = (lv, cand[k]); }
+            }
+            if best.1 == pred { recon_ok += 1; }
+            npos += 1;
+        }
+        // emit d̃_b vectors (one row per block), compactly
+        let mut dstr = String::from("[");
+        for (b, d) in dvec.iter().enumerate() {
+            if b > 0 { dstr.push(','); }
+            dstr.push('[');
+            for (i, val) in d.iter().enumerate() {
+                if i > 0 { dstr.push(','); }
+                dstr.push_str(&format!("{val:.6}"));
+            }
+            dstr.push(']');
+        }
+        dstr.push(']');
+        let cands_str: Vec<String> = cand.iter().map(|c| c.to_string()).collect();
+        let labels_str: Vec<String> = labels.iter().map(|l| format!("\"{l}\"")).collect();
+        out.push_str(&format!(
+            "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"dim\":{},\"cands\":[{}],\"blocks\":[{}],\"d\":{dstr}}}\n",
+            ids[p], dvec.first().map(|d| d.len()).unwrap_or(0), cands_str.join(","), labels_str.join(",")));
+    }
+    let recon = if npos > 0 { recon_ok as f32 / npos as f32 } else { 0.0 };
+    match std::fs::write(path, &out) {
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon:.2})", last.saturating_sub(1)),
+        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+    }
+}
+
 /// Per position emits the model's source-PR `(Σ_b c_b)²/Σ_b c_b²` over the 57 DLA blocks (the paper's Thm-5 diffuseness
 /// quantity), margin, and μ_t — over the top-K logit candidates. The retrieved-vs-computed (track A) label is built
 /// offline from the dumped token ids (n-gram / induction). Tests whether COMPUTED natural-text tokens are HIGH source-PR
