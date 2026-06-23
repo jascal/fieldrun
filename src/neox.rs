@@ -384,6 +384,21 @@ impl Model for Neox {
     /// the embedding block so the per-block contributions sum to the exact logit. Reuses `attn_block`/`mlp_block`,
     /// so partial rotary / GELU / parallel residual / biases are all handled.
     fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        // = the per-block normed contribution vectors (`residual_normed_writes`) projected onto the token rows.
+        let (labels, dvec) = self.residual_normed_writes(ids)?;
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row("lm_head", t as usize)).collect();
+        let contrib: Vec<Vec<f32>> = dvec
+            .iter()
+            .map(|dd| urows.iter().map(|u| dd.iter().zip(u.iter()).map(|(a, b)| a * b).sum::<f32>()).collect())
+            .collect();
+        Some((labels, contrib))
+    }
+
+    fn residual_normed_writes(&self, ids: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        // Capture each residual write at the last position; fold the final LayerNorm into each into d̃_b living in
+        // unembed space. LayerNorm centres per-block (mean(x)=Σ_b mean(write_b), so x_d−mean=Σ_b(write_b_d−mean_b)),
+        // shares the scale inv_std, and the ln_f bias is folded into the embed block: d̃_b = inv·gain⊙(write_b−mean_b)
+        // (+ bias on embed). Then ⟨d̃_b, U_v⟩ == block b's exact logit contribution, so recon is exact.
         let seq = ids.len();
         let last = seq - 1;
         let mut x = self.b.rows_f32("embed", ids);
@@ -408,27 +423,20 @@ impl Model for Neox {
         let inv = 1.0 / (var + self.eps).sqrt();
         let gain = self.b.arr1("ln_f.weight");
         let bias = self.b.arr1("ln_f.bias");
-        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row("lm_head", t as usize)).collect();
-        let bias_contrib: Vec<f32> = urows.iter().map(|u| (0..d).map(|i| bias[i] * u[i]).sum::<f32>()).collect();
-        let contrib: Vec<Vec<f32>> = writes
+        let dvec: Vec<Vec<f32>> = writes
             .iter()
             .enumerate()
             .map(|(bi, w)| {
                 let mw: f32 = w.iter().sum::<f32>() / d as f32;
-                urows
-                    .iter()
-                    .enumerate()
-                    .map(|(ti, u)| {
-                        let mut s = inv * (0..d).map(|i| gain[i] * (w[i] - mw) * u[i]).sum::<f32>();
-                        if bi == 0 {
-                            s += bias_contrib[ti];
-                        }
-                        s
-                    })
-                    .collect()
+                (0..d).map(|i| inv * gain[i] * (w[i] - mw) + if bi == 0 { bias[i] } else { 0.0 }).collect()
             })
             .collect();
-        Some((labels, contrib))
+        Some((labels, dvec))
+    }
+
+    fn unembed_row(&self, id: usize) -> Option<Vec<f32>> {
+        let r = self.b.weight_row("lm_head", id);
+        if r.is_empty() { None } else { Some(r) }
     }
 
     fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
