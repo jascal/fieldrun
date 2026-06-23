@@ -1009,10 +1009,23 @@ impl Model for Rope {
     }
 
     fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        // `residual_decomp` = the per-block normed contribution vectors (`residual_normed_writes`) projected onto the
+        // requested token rows: contrib[b][i] = ⟨d̃_b, U_{toks[i]}⟩.
+        let (labels, dvec) = self.residual_normed_writes(ids)?;
+        let un = self.unembed_name();
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row(un, t as usize)).collect();
+        let contrib: Vec<Vec<f32>> = dvec
+            .iter()
+            .map(|d| urows.iter().map(|u| d.iter().zip(u.iter()).map(|(dd, ud)| dd * ud).sum::<f32>()).collect())
+            .collect();
+        Some((labels, contrib))
+    }
+
+    fn residual_normed_writes(&self, ids: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
         // Re-run the forward, capturing each residual-stream WRITE at the last position: the embedding, then per layer
         // the attention block's o_proj output and the MLP block's down_proj output. These sum (linearly) to the
-        // pre-final-norm residual, so projecting each through the final RMSNorm + unembed reconstructs each token's
-        // logit exactly. (Mirrors `hidden`; the only addition is recording `.row(last)` of every write.)
+        // pre-final-norm residual; folding the final RMSNorm into each write gives d̃_b = inv_rms · gain ⊙ write_b, the
+        // contribution vector in unembed space (⟨d̃_b, U_v⟩ = block b's exact logit contribution to token v).
         let seq = ids.len();
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
         let rep = h / nkv;
@@ -1064,22 +1077,16 @@ impl Model for Rope {
             x = &x + &mw;
         }
         // final RMSNorm geometry at the last position (no center/bias for rope): logit_v = inv_rms · Σ_d gain_d x_d U_v_d,
-        // and x = Σ_b write_b, so per-block contribution = inv_rms · Σ_d gain_d write_b_d U_v_d.
+        // and x = Σ_b write_b, so the folded contribution vector is d̃_b = inv_rms · gain ⊙ write_b (⟨d̃_b, U_v⟩ = logit).
         let xpre = x.row(last).to_vec();
         let d = xpre.len();
         let inv_rms = 1.0 / (xpre.iter().map(|v| v * v).sum::<f32>() / d as f32 + self.eps).sqrt();
         let gain = self.b.arr1("norm");
-        let un = self.unembed_name();
-        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row(un, t as usize)).collect();
-        let contrib: Vec<Vec<f32>> = writes
+        let dvec: Vec<Vec<f32>> = writes
             .iter()
-            .map(|w| {
-                urows.iter()
-                    .map(|u| inv_rms * w.iter().zip(gain.iter()).zip(u.iter()).map(|((wd, gd), ud)| wd * gd * ud).sum::<f32>())
-                    .collect()
-            })
+            .map(|w| w.iter().zip(gain.iter()).map(|(wd, gd)| inv_rms * wd * gd).collect())
             .collect();
-        Some((labels, contrib))
+        Some((labels, dvec))
     }
 
     fn unembed_cos(&self, a: usize, b: usize) -> Option<f32> {
