@@ -931,6 +931,7 @@ fn main() {
             if has_flag(&args, "--pil-dump") { recursion_probe::run_pil_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--source-dump") { recursion_probe::run_source_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--block-ablate") { recursion_probe::run_block_ablate(&args, lm.as_ref(), &tg, &stem); return; }
+            if has_flag(&args, "--converge-depth") { recursion_probe::run_converge_depth(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--ring-dump") { recursion_probe::run_ring_dump(&args, lm.as_ref(), &tg, &stem); return; }
 
             // ── --discover: discover a recursive function WITHOUT knowing it a priori. Teach the model an operator

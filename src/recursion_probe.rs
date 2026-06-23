@@ -598,6 +598,72 @@ pub fn run_block_ablate(args: &[String], lm: &dyn crate::model::Model, tg: &Opti
     }
 }
 
+/// `--converge-depth`: the GRADED causal forge-tax measure (formalises `--block-ablate`). Per position, the
+/// **causal convergence depth** k* = the smallest prefix of layers `0..k*` whose recompute (ablating the
+/// suffix `k*..L` attn+mlp) already reproduces the model's decode. A *retrieved* token resolves shallow
+/// (small k*); a *computed* token needs the deep build (large k*). We scan the suffix down from the top and
+/// take the deepest layer whose removal flips the decode (robust to non-monotone wobble). Reports the
+/// distribution of `k*/L` (the per-token computational depth) — the causal sibling of the attribution-side
+/// decode circuit. rope + neox (needs `predict_ablated_blocks`). Aggregated across the scale ladder it is
+/// the canonical forge-tax measure (mass != causation: the depth that must be CAUSALLY present).
+pub fn run_converge_depth(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let (n_layer, _) = match lm.dims() { Some(d) => d, None => { eprintln!("[fieldrun] --converge-depth: arch has no dims()"); return; } };
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(150);
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted.";
+    let ids: Vec<i64> = if let Some(idspath) = flag(args, "--ids") {
+        let txt = std::fs::read_to_string(idspath).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let arr = v.get("holdout_ids").and_then(|a| a.as_array()).or_else(|| v.as_array());
+        match arr { Some(a) => a.iter().filter_map(|x| x.as_i64()).collect(), None => { eprintln!("[fieldrun] --ids: no id array"); return; } }
+    } else {
+        match tg { Some(t) => t.encode(flag(args, "--text").unwrap_or(DEFAULT), false),
+                   None => { eprintln!("[fieldrun] --converge-depth needs a tokenizer next to {stem} (or --ids)"); return; } }
+    };
+    if ids.len() < 4 { eprintln!("[fieldrun] converge-depth: too few ids ({})", ids.len()); return; }
+    let last = (ids.len() - 1).min(nmax + 1);
+    let mut fracs: Vec<f32> = Vec::new();
+    let path = flag(args, "--converge-out");
+    let mut out = String::new();
+    for p in 1..last {
+        let ctx = &ids[..=p];
+        let full = match lm.logits(ctx) {
+            Some(l) => l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64,
+            None => { eprintln!("[fieldrun] converge-depth: no logits (arch)"); return; }
+        };
+        // scan the kept-prefix length down from L; first break (decode flips) ⇒ that layer is necessary ⇒ k* = k+1
+        let mut kstar = 0usize;
+        for k in (0..n_layer).rev() {
+            let ablate: Vec<usize> = (k..n_layer).collect(); // ablate layers k..L-1 (keep prefix 0..k-1)
+            let pred = match lm.predict_ablated_blocks(ctx, &[], &[], &ablate, &ablate) {
+                Some(p) => p,
+                None => { eprintln!("[fieldrun] converge-depth: arch lacks predict_ablated_blocks (rope/neox)"); return; }
+            };
+            if pred != full { kstar = k + 1; break; }
+        }
+        let frac = kstar as f32 / n_layer as f32;
+        fracs.push(frac);
+        if path.is_some() {
+            out.push_str(&format!("{{\"pos\":{p},\"pred\":{full},\"kstar\":{kstar},\"L\":{n_layer},\"frac\":{frac:.4}}}\n"));
+        }
+    }
+    let np = fracs.len();
+    if np == 0 { eprintln!("[fieldrun] converge-depth: no positions"); return; }
+    let mean: f32 = fracs.iter().sum::<f32>() / np as f32;
+    let mut sorted = fracs.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[np / 2];
+    let shallow = fracs.iter().filter(|&&f| f <= 0.5).count() as f32 / np as f32; // resolved in the bottom half
+    let deep = fracs.iter().filter(|&&f| f > 0.9).count() as f32 / np as f32;     // need ~the whole stack
+    if let Some(pp) = path {
+        match std::fs::write(pp, &out) { Ok(_) => eprintln!("[fieldrun] wrote {np} records → {pp}"), Err(e) => eprintln!("[fieldrun] cannot write {pp}: {e}") }
+    }
+    println!("causal convergence depth k*/L over {np} positions (L={n_layer}):");
+    println!("  mean {mean:.3}   median {median:.3}   shallow(≤0.5) {:.1}%   deep(>0.9) {:.1}%", shallow * 100.0, deep * 100.0);
+}
+
 /// `--pil-dump <path>`: the PIL real-DLA seam. Per natural-text position emits the FULL per-block DLA incidence
 /// matrix `contrib[block][cand] = <d_block, U_cand>` over the top-K logit candidates (with the ground-truth target
 /// forced into the candidate set), plus the target index, prediction and margin — as JSON lines. This is the real-model
