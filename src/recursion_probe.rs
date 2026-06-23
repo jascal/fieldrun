@@ -641,6 +641,12 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
         let nb = contrib.len();
         let pred = order[0] as i64;
         let margin = logits[order[0]] - logits[order[1]];
+        // full-vocab next-token Shannon entropy (nats), stable softmax; exp(ent) = effective output support (τ* test)
+        let lmax = logits[order[0]];
+        let mut z = 0.0f32;
+        for &l in &logits { z += (l - lmax).exp(); }
+        let mut ent = 0.0f32;
+        for &l in &logits { let p = (l - lmax).exp() / z; if p > 0.0 { ent -= p * p.ln(); } }
         let tgt_idx: i64 = cand.iter().position(|&c| c == target).map(|x| x as i64).unwrap_or(-1);
         let mut cstr = String::from("[");
         for b in 0..nb {
@@ -655,7 +661,7 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
         cstr.push(']');
         let cands_str: Vec<String> = cand.iter().map(|c| c.to_string()).collect();
         out.push_str(&format!(
-            "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"nb\":{nb},\"cands\":[{}],\"contrib\":{cstr}}}\n",
+            "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"ent\":{ent:.4},\"nb\":{nb},\"cands\":[{}],\"contrib\":{cstr}}}\n",
             ids[p], cands_str.join(",")));
     }
     match std::fs::write(path, &out) {
