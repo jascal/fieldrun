@@ -708,7 +708,7 @@ pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
         let mut cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
         if !cand.contains(&target) { cand.pop(); cand.push(target); }
         let (labels, dvec) = match lm.residual_normed_writes(ctx) {
-            Some(x) => x, None => { eprintln!("[fieldrun] arch lacks residual_normed_writes (rope only)"); return; }
+            Some(x) => x, None => { eprintln!("[fieldrun] arch lacks residual_normed_writes (rope/neox)"); return; }
         };
         let pred = order[0] as i64;
         let margin = logits[order[0]] - logits[order[1]];
@@ -742,9 +742,9 @@ pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
             "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"dim\":{},\"cands\":[{}],\"blocks\":[{}],\"d\":{dstr}}}\n",
             ids[p], dvec.first().map(|d| d.len()).unwrap_or(0), cands_str.join(","), labels_str.join(",")));
     }
-    let recon = if npos > 0 { recon_ok as f32 / npos as f32 } else { 0.0 };
+    let recon = if npos > 0 { format!("{:.2}", recon_ok as f32 / npos as f32) } else { "n/a (no unembed_row)".into() };
     match std::fs::write(path, &out) {
-        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon:.2})", last.saturating_sub(1)),
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon})", last.saturating_sub(1)),
         Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
     }
 }
