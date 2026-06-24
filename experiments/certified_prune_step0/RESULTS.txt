@@ -1,0 +1,38 @@
+
+=== SCIENCE prose (Qwen2.5-0.5B)  (N=115 positions, nb=49 blocks) ===
+  margin (within-cands): med 0.886  min 0.018  max 8.629
+  ADAPTIVE prune ratio (budget β):  med 0.08  p10 0.02  p90 0.18  mean 0.09
+  ADAPTIVE prune ratio (signed):    med 0.18  p10 0.02  p90 0.57  mean 0.26
+  sanity: per-position certified sets that flip the decode: 0/115 (must be 0)
+  signed-droppable structure: early-half 1054 drops, late-half 386 drops  -> late share 0.27 (high=early-exit/compute-skippable, low=decode-attribution only)
+  STATIC prune ratio vs residue dropped (smallest-margin positions excluded):
+     residue  0%:  static ratio 0.00  (0/49 blocks)  m_floor 0.018  flips-on-kept 0  mean-dropped-block-frac nan
+     residue  5%:  static ratio 0.00  (0/49 blocks)  m_floor 0.118  flips-on-kept 0  mean-dropped-block-frac nan
+     residue 10%:  static ratio 0.00  (0/49 blocks)  m_floor 0.185  flips-on-kept 0  mean-dropped-block-frac nan
+     residue 20%:  static ratio 0.00  (0/49 blocks)  m_floor 0.409  flips-on-kept 0  mean-dropped-block-frac nan
+     residue 40%:  static ratio 0.02  (1/49 blocks)  m_floor 0.708  flips-on-kept 0  mean-dropped-block-frac 0.02
+
+=== CODE (Qwen2.5-0.5B)  (N=111 positions, nb=49 blocks) ===
+  margin (within-cands): med 3.499  min 0.022  max 10.442
+  ADAPTIVE prune ratio (budget β):  med 0.16  p10 0.02  p90 0.29  mean 0.17
+  ADAPTIVE prune ratio (signed):    med 0.53  p10 0.04  p90 0.82  mean 0.48
+  sanity: per-position certified sets that flip the decode: 0/111 (must be 0)
+  signed-droppable structure: early-half 1756 drops, late-half 871 drops  -> late share 0.33 (high=early-exit/compute-skippable, low=decode-attribution only)
+  STATIC prune ratio vs residue dropped (smallest-margin positions excluded):
+     residue  0%:  static ratio 0.00  (0/49 blocks)  m_floor 0.022  flips-on-kept 0  mean-dropped-block-frac nan
+     residue  5%:  static ratio 0.00  (0/49 blocks)  m_floor 0.178  flips-on-kept 0  mean-dropped-block-frac nan
+     residue 10%:  static ratio 0.00  (0/49 blocks)  m_floor 0.333  flips-on-kept 0  mean-dropped-block-frac nan
+     residue 20%:  static ratio 0.02  (1/49 blocks)  m_floor 1.003  flips-on-kept 0  mean-dropped-block-frac 0.10
+     residue 40%:  static ratio 0.04  (2/49 blocks)  m_floor 2.601  flips-on-kept 0  mean-dropped-block-frac 0.29
+
+=== CONTROL: unchecked magnitude prune (smallest-β, NO margin gate), decode-flip rate ===
+  drop 30% (14/49) blocks  science : flip rate 0.11
+  drop 30% (14/49) blocks  code    : flip rate 0.06
+  drop 50% (24/49) blocks  science : flip rate 0.26
+  drop 50% (24/49) blocks  code    : flip rate 0.12
+  drop 70% (34/49) blocks  science : flip rate 0.40
+  drop 70% (34/49) blocks  code    : flip rate 0.21
+
+=== CROSS-CORPUS: static set certified on A, decode-flip rate on B (corpus-relativity) ===
+  P_science (0 blocks) on CODE  : flip rate 0.00
+  P_code    (0 blocks) on SCIENCE: flip rate 0.00
