@@ -54,6 +54,52 @@ So **v1.5 = certify the embed/read-out via the frame-quant bound** (a `--source-
 emits the raw `U_v`, or a direct embed-requant-and-measure) — that's where the cashable MB are, not the
 write-tensor downgrade.
 
+## v1.5 — the embed/read-out frame-quant certificate (`step1_5_embed.py`) **[done]**
+
+`step1_5_embed.py` consumes a `--source-dump` (raw block vectors `d̃_b`, so `r = Σ_b d̃_b`, plus cands +
+margin) and the bundle's f16 embed rows, quantizes the candidate rows exactly as fieldrun's convert
+(per-row int8, group-32 int4), and applies the margin certificate with the **measured** logit
+perturbation `ΔL(v) = ⟨r, ΔU_v⟩` (`PIC_Quant.quant_decode_preserved`: `2·max_v|ΔL(v)| < margin`).
+
+```bash
+# 1. dump r + cands + margin (raw block vectors; once)
+./target/release/fieldrun --bundle <M> --recursion-explain --source-dump src.jsonl --n 80
+# (optional) slim it to a committable calib (r precomputed, ~0.5 MB):
+python3 experiments/certified_quant/step1_5_embed.py src.jsonl bundles/<M>/<M> --slim calib_embed.jsonl
+# 2. certify + cross-check (exact full-vocab decode + loose Cauchy-Schwarz):
+python3 experiments/certified_quant/step1_5_embed.py calib_embed.jsonl bundles/<M>/<M> --allvocab --exact
+```
+
+### v1.5 result (Qwen2.5-0.5B, science calib, 68 positions) — see `RESULTS_EMBED.txt`
+
+```
+embed f16 -> int8 :  margin-certified at 5% residue (96% per-position); EXACT full-vocab flips 0/68
+embed f16 -> int4 :  NOT certifiable (26% per-position, never static); EXACT full-vocab flips 4/68 = 6%
+embed bytes: f16 272 MB -> int8 136 MB  (saves 136 MB = 21% of the 630 MB bundle)
+combined with v1 writes (-26 MB):  full bundle 630 -> 468 MB  (1.35x, certified, 0 exact decode flips)
+```
+
+**This is the payoff of the whole certified-quant line.** The read-out is the single biggest tensor
+(43%), and the frame-quant bound cashes it: **int8 is decode-safe (0/68 exact flips, margin-certified),
+int4 is not (6% flips)** — the certificate locates the read-out's precision boundary *exactly* at int8.
+The 136 MB it frees dwarfs the 26 MB write-tensor win (v1); together they hit the proposal's §8 go target
+(≥1.3× toward int4 at baseline fidelity).
+
+### Honesty: the bound that cashes is the *measured* δ, not Cauchy-Schwarz
+
+The literal kernel bound `frame_quant_logit_bound` (`δ ≤ ‖r‖·‖ΔU_v‖`, Cauchy-Schwarz) is **far too loose**
+to certify the read-out: `2ρε = 9.05 ≫ min-margin 0.04` for int8. That ~180× gap is exactly the
+**TurboQuant `√d` regime** — quantization noise `ΔU_v` is ≈orthogonal to the residual `r`, so the *actual*
+`⟨r,ΔU_v⟩` is `√d`-smaller than the worst-case product (and `ρ_max`/`ε_max` don't co-occur). What
+certifies is the **measured per-position `⟨r,ΔU_v⟩`**, which `quant_decode_preserved` accepts as `δ`. The
+`--exact` full-vocab decode check (`argmax(Aq8·r)` vs `argmax(A·r)`, no cand-set/no C-S) validates it:
+**0 actual int8 flips**, confirming the cand-set certificate is sound *and conservative*.
+
+**Caveats:** corpus-relative (science calib); the operative certificate ranges over the top-24 cand set
+(the argmax-binding competitors — the `--exact` mode confirms no out-of-cand flip occurs); argmax-lossless,
+not softmax-lossless; the worst-case all-vocab C-S bound does *not* hold (use the measured/TurboQuant δ).
+End-to-end tokens/sec on a rebuilt int8-embed bundle still needs an HF `convert` (source weights). `[empirical]`
+
 ## Status & honest scope
 
 - **Allocator: runs**, real output above. **convert `--dtype-map`: compiles.** Loader: unchanged (already

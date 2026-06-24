@@ -152,3 +152,28 @@ every logit via the tied `U_v`). The cashable MB are there, addressable by the *
 **Revised next step → v1.5:** certify the embed/read-out via frame-quant — a `--source-dump`-style probe
 emitting the raw `U_v` (already proposed for the forge-tax cert), or a direct embed-requant-and-measure.
 v1's write-tensor path stays as the small complementary win; the elephant is the read-out.
+
+## 10. v1.5 — read-out frame-quant certificate **[done; the payoff]** (`experiments/certified_quant/step1_5_embed.py`)
+
+`step1_5_embed.py` consumes a `--source-dump` (`r = Σ_b d̃_b`, cands, margin) + the bundle's f16 embed
+rows, quantizes the candidate rows exactly as convert (per-row int8 / group-32 int4), and applies
+`PIC_Quant.quant_decode_preserved` with the **measured** `δ_v = ⟨r, ΔU_v⟩`.
+
+**Result (Qwen2.5-0.5B, science calib, 68 positions):**
+
+| embed | certificate | exact full-vocab flips | bytes |
+|---|---|---|---|
+| f16→**int8** | **margin-certified @ 5% residue** (96% per-position) | **0/68** | 272 → **136 MB** (−136) |
+| f16→int4 | not certifiable (26% per-position, never static) | 4/68 = 6% | 272 → 68 MB |
+
+Combined with v1's write downgrade (−26 MB): **full bundle 630 → 468 MB (1.35×), certified, 0 exact decode
+flips** — meeting §8's go target, with the read-out (frame-quant) supplying 136 of the 162 MB. The
+elephant is landed: the certificate locates the read-out's precision boundary *exactly* at int8.
+
+**Honesty — the bound that cashes is measured δ, not Cauchy-Schwarz.** The literal kernel bound
+`frame_quant_logit_bound` (`δ ≤ ‖r‖·‖ΔU_v‖`) is far too loose: `2ρε = 9.05 ≫ margin 0.04`. That ~180×
+gap is the **TurboQuant `√d` regime** (quant noise ⊥ residual; `ρ_max`/`ε_max` don't co-occur). The
+operative certificate uses the measured `⟨r,ΔU_v⟩` (which `quant_decode_preserved` accepts as δ); the
+`--exact` full-vocab argmax check (`argmax(Aq8·r)` vs `argmax(A·r)`) confirms 0 int8 flips — the cand-set
+certificate is sound *and conservative*. Corpus-relative; argmax-lossless; end-to-end tokens/sec still
+needs an HF `convert`.
