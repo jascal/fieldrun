@@ -107,6 +107,26 @@ no worse.)
 - **The upstream lever is margins** (`pil`): every ratio here — prune and quant — is margin-bound, capped
   by the small-margin forge-tax residue. Higher / better-conditioned margins raise all of them.
 
+## Implications & roadmap (i-orca → pil → fieldrun)
+
+What this de-risks, in priority order:
+
+1. **Do NOT build a static `--certified-prune`** in fieldrun. (This experiment's main payoff: a build
+   avoided.)
+2. **Build the certified-quant path (Step 1).** Per-position or per-corpus bit-width selection gated by the
+   `PIC_Quant` certificate (`2δ < margin`), with *real* bandwidth/latency measured on the Rust engine — the
+   knob the data shows actually cashes in (≤8-bit ship-able at a small residue, scale-stable).
+3. **Highest ROI is upstream in `pil`:** a margin / simplicity-regularized loss term targeting the *specific*
+   weaknesses found here — raise median margins (especially on prose-like, low-margin data), push *late*-layer
+   prune/quant headroom (the cash-in lives there), and improve quantization tolerance. fieldrun then measures
+   the resulting frames; this closes the i-orca→pil→fieldrun loop.
+4. **`PIC_Prune` keeps a role** — not as a compressor but as a certified **early-exit / decode-attribution
+   probe** (the late-third that *is* skippable) and as the per-token adaptive gate.
+
+Deeper cost measurement (future extensions, not in this Step 0): estimated FLOP savings under realistic
+block-skipping; interaction with MoE expert offload and KV cache; an "effective cost per certified decode"
+metric; and a prune-vs-quant head-to-head on the *same* positions/blocks.
+
 ## Scope / honesty
 
 One small model (0.5B, 49 blocks), CPU, two ≈110-position corpora — **not** the Pythia/Qwen ladder. The
