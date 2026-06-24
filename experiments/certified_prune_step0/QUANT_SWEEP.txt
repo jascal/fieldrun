@@ -1,0 +1,8 @@
+| model (corpus) | nb | N | cert bits med (worst-case) | RMS bits med (p10–p90) | static bits 0%res | static @10%res | static @40%res |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B (sci) | 49 | 115 | 5.8 | 3.5 (2.0–5.8) | 11.4 | 7.7 | 6.0 |
+| Qwen2.5-0.5B (code) | 49 | 111 | 4.3 | 2.0 (0.8–5.0) | 11.1 | 7.1 | 4.5 |
+| Qwen2.5-Coder-0.5B (sci) | 49 | 115 | 5.5 | 3.2 (1.5–5.3) | 12.2 | 7.7 | 6.0 |
+| Qwen2.5-7B (sci) | 57 | 80 | 5.4 | 3.4 (1.8–5.8) | 12.6 | 7.9 | 5.9 |
+
+Read: 'bits' = certified RELATIVE precision of the per-block decode contributions (b bits <-> tolerate 2^-b relative perturbation). Lower = more quantizable. Static = the single global bit-width (worst position); residue drops the hardest q% (forge-tax). Cashes in on every weight (bandwidth), unlike pruning. Worst-case is the certified guarantee; RMS is the realistic (independent-rounding) estimate. Mapping contribution-bits -> weight-bits is a separate, favorable step (a weight error spreads over the hidden dim).

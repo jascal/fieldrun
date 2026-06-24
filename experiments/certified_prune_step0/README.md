@@ -61,6 +61,39 @@ flip rate, and the early-vs-late structure of the droppable set. The committed `
 - **The two caps hold at every scale:** `static ≈ 0` (0–0.05) and `late-share ≈ 0.26` (droppable blocks
   mostly early → decode-attribution sparsity, not skippable FLOPs).
 
+## Step 0-quant: certified quantization precision (`QUANT_SWEEP.txt`, `step0_quant.py`)
+
+Same data, the quantization side of the unified certificate: how few bits of relative precision on the
+per-block decode contributions does each position tolerate? `b = log₂((L1[w]+L1[v]) / gap(w,v))`
+(worst-case; RMS uses L2 — independent rounding).
+
+| model (corpus) | nb | N | cert bits med (worst-case) | RMS bits med (p10–p90) | static 0%res | static @10%res | static @40%res |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B (sci) | 49 | 115 | 5.8 | 3.5 (2.0–5.8) | 11.4 | 7.7 | 6.0 |
+| Qwen2.5-0.5B (code) | 49 | 111 | 4.3 | 2.0 (0.8–5.0) | 11.1 | 7.1 | 4.5 |
+| Qwen2.5-Coder-0.5B (sci) | 49 | 115 | 5.5 | 3.2 (1.5–5.3) | 12.2 | 7.7 | 6.0 |
+| Qwen2.5-7B (sci) | 57 | 80 | 5.4 | 3.4 (1.8–5.8) | 12.6 | 7.9 | 5.9 |
+
+- **Adaptive:** per-position the decode tolerates ~**5–6 bit** (worst-case) / ~**3 bit** (realistic)
+  contributions vs fp16's 16 — large, cashable headroom.
+- **Static is VIABLE:** the worst (near-tie) position needs ~11–13 bits, but at a **10% residue the global
+  bit-width is ~7–8** (≤8-bit ship-able), ~5–6 at 40%. The sharp contrast with static *prune* (~0 blocks).
+- **Scale-flat:** ~5.4–5.8 cert / ~7.7–7.9 static@10% across 0.5B→7B — quantizability tracks the
+  margin/sensitivity ratio (scale-stable), unlike prune's adaptive yield (grew with scale but stayed
+  uncashable).
+
+## Prune vs quant — which knob cashes in
+
+| knob | static viable? | adaptive yield | cashes in as |
+|---|---|---|---|
+| **prune** | NO (~0 blocks) | grows w/ scale (signed 0.18→0.42) | FLOPs — but droppable blocks mostly *early* → little real saving |
+| **quant** | **YES** (~7–8 bit @10% residue) | ~3–6 bits/position | **bandwidth/storage on every weight** ✓ |
+
+**Quantization is the forge's cashable lever** — now measured: certified, scale-stable bit savings on
+every weight, where pruning is static-dead and FLOP-cash-in-capped. (The contribution-bit figures are a
+favorable proxy for weight-bits: a weight error spreads over the hidden dim, so true weight bit-width is
+no worse.)
+
 ## Verdict
 
 - **Static `--certified-prune`: no ore — do not build.** (Step 0's job: it just saved that build.)
@@ -68,9 +101,11 @@ flip rate, and the early-vs-late structure of the droppable set. The committed `
 - **Adaptive per-token prune: thin at 0.5B, grows with scale** (7B signed med 0.42, p90 0.72), but capped
   by the small-margin residue (forge-tax positions, legitimately incompressible) and by **limited compute
   cash-in** (droppable blocks mostly early → not skippable FLOPs) — a cap that does *not* shrink with scale.
-- **The lever is margins:** larger / better-conditioned margins (upstream `pil`) raise every ratio here.
-  Within the unified certificate, **quantization** (`PIC_Quant`) is the more cashable knob than pruning —
-  bit reduction saves storage/bandwidth on every weight regardless of block position.
+- **Quantization is the cashable knob — measured (Step 0-quant).** ~3–6 certified bits/position adaptive,
+  ~7–8 bit static (10% residue) global, scale-flat — real bandwidth savings on every weight, where
+  pruning is static-dead and FLOP-cash-in-capped. Build the **quant** path, not static prune.
+- **The upstream lever is margins** (`pil`): every ratio here — prune and quant — is margin-bound, capped
+  by the small-margin forge-tax residue. Higher / better-conditioned margins raise all of them.
 
 ## Scope / honesty
 
