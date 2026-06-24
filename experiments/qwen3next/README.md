@@ -22,7 +22,8 @@ short-conv + Gated DeltaNet + the 3:1 scheduler + shared-expert MoE + the MTP he
 | # | test | needs | what it proves | runs today? |
 |---|---|---|---|---|
 | 1 | **`deltanet_ref.py`** — Gated DeltaNet recurrence + property tests | numpy | the hardest new kernel is mathematically right (recall, **delta-overwrite vs linear-attn**, decay, β=0). The **oracle** the Rust must match. | ✅ **yes** |
-| 2 | **`make_tiny_qwen3next.py`** — shrink the *real* config, random-init, dump reference logits + per-layer states | transformers* | a faithful toy whole-model reference (arch faithful, dims tiny) | needs transformers |
+| 1b | **`crosscheck_deltanet.py`** — oracle vs transformers' own `torch_recurrent_gated_delta_rule` | transformers* | the oracle **IS** the real Qwen3.6 recurrence (matched to ~1e-7) — **variant pinned** | ✅ **verified** |
+| 2 | **`make_tiny_qwen3next.py`** — shrink the *real* config, random-init, dump reference logits + per-layer states | transformers* | a faithful toy whole-model reference (arch faithful, dims tiny) | ✅ **verified** |
 | 3 | **`compare.py`** — fieldrun vs reference, **per layer** | numpy | parity, and *which block* diverges if not | after the Rust port |
 | 4 | golden vectors (freeze a few `compare.py` passes into CI) | numpy | regression guard, forever, no big weights | after #3 |
 | 5 | end-to-end on the smallest *real* hybrid checkpoint (if one exists) | the model | real weight/routing/numeric coverage | optional |
@@ -69,9 +70,13 @@ python experiments/qwen3next/compare.py experiments/qwen3next/tiny/ref.npz fr.np
 - `deltanet_ref.py`: **built, all 4 properties pass** (numpy-only — the kernel oracle is ready).
 - `make_tiny_qwen3next.py`: **built and RUN-VALIDATED** (transformers 5.12) — builds a faithful 0.99 M toy
   + reference dump; it confirmed the real arch (above).
-- `compare.py`: **built, ready** — needs the Rust arch to produce `fr.npz`. No Rust written yet.
-- **Next validation (now unblocked):** cross-check `deltanet_ref.py` against the transformers Gated DeltaNet
-  layer (extract the layer's q/k/v/gates from the toy, run the oracle, diff) to pin the gate variant — then
-  implement conv1d→DeltaNet + the 3:1 scheduler + shared-expert MoE + MTP in Rust and run `compare.py`.
+- `crosscheck_deltanet.py`: **DONE — variant pinned.** The oracle matches transformers'
+  `torch_recurrent_gated_delta_rule` to ~1e-7 in the real config (`qk_l2norm=True`). Pinned conventions:
+  `α=exp(g)`, `q·(1/√d_k)`, L2-norm(q)&(k), decay→delta-correct-vs-decayed-state→write→read-after-write.
+  `deltanet_ref.gated_deltanet_qwen36()` packages exactly this — the Rust reference.
+- `compare.py`: **built, ready** — needs the Rust arch to produce `fr.npz`.
+- **Next: the Rust port.** With the kernel verified, implement `conv1d(k=4)→Gated DeltaNet` + the 3:1
+  linear/full scheduler + shared-expert MoE + the MTP head, convert the toy, and run `compare.py` (per-layer,
+  f32 first). The DeltaNet math is no longer a risk — it's pinned and tested.
 - This is the verification scaffold that makes the port checkable off the big machine *before* engine work.
-  `[scaffold; python side run-validated]`
+  `[scaffold; kernel verified vs transformers; engine not yet written]`

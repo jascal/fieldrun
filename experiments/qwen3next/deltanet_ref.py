@@ -48,6 +48,17 @@ def gated_deltanet_seq(q, k, v, alpha, beta, normalize_k=True, eps=1e-6):
     return out, S
 
 
+def gated_deltanet_qwen36(q, k, v, g_log, beta, eps=1e-6):
+    """The EXACT Qwen3.6 DeltaNet kernel — verified against transformers to ~1e-7 (crosscheck_deltanet.py).
+    Applies the pinned conventions on top of the core recurrence, then defers to gated_deltanet_seq:
+        α_t = exp(g_log_t)   (g is log-decay)        q ← (1/√d_k) · L2norm(q)        k ← L2norm(k)
+    The Rust port should reproduce THIS (preceded by the short causal conv, kernel=4, on q/k/v)."""
+    dk = k.shape[1]
+    qn = q / (np.linalg.norm(q, axis=1, keepdims=True) + eps) * (1.0 / np.sqrt(dk))
+    kn = k / (np.linalg.norm(k, axis=1, keepdims=True) + eps)
+    return gated_deltanet_seq(qn, kn, v, np.exp(g_log), beta, normalize_k=False, eps=eps)
+
+
 # --------------------------------------------------------------------------- property tests (the oracle)
 def _orthonormal(n, d, seed):
     a = np.random.default_rng(seed).standard_normal((d, d))
