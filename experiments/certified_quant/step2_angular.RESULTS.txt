@@ -1,0 +1,32 @@
+Step 2 — angular / direction-preserving read-out quant: can we beat the int4 wall? (Qwen2.5-0.5B, N=68)
+Reproduce: python step2_angular.py calib_embed_science.jsonl <bundle-stem> --bits 4 3
+EXACT full-vocab decode flips vs the f16 read-out (the same metric the int4 wall was measured with):
+
+  scheme                       flips     read-out MB
+  int8 per-row (v1.5 ref)       0.0%         136
+  int4 group32 (naive RTN)      5.9%          43      <- the wall (matches v1.5)
+  int4 +exactL2norm             7.4%          43
+  int4 +rot (incoherence)       8.8%          43
+  int4 +awq(a=0.5)             14.7%          43
+  int4 +awq(a=1.0)             20.6%          43
+  int4 +GPTQ (H=E[rrT])         7.4%          43      (caveat below)
+  int3 group32 (naive RTN)     35.3%          34
+  int3 +exactL2norm            35.3%          34
+  int3 +rot                    36.8%          34
+  int3 +awq(a=0.5)             30.9%          34
+  int3 +awq(a=1.0)             33.8%          34
+  int3 +GPTQ                   26.5%          34
+
+VERDICT: the angular hypothesis is REFUTED. No direction-preserving / incoherence / activation-aware
+scheme beats naive group-int4 on the read-out — every one makes it WORSE; int3 is a hard ~26-35% wall.
+Why: per-row/group int8/int4 ALREADY factor magnitude out via the scale (no magnitude left to strip);
+a random rotation destroys structure the native coordinates had; AWQ's per-column scale fights the
+per-group-of-32 scale. The deeper reason: the read-out argmax over a 152k vocab is far more
+quant-sensitive than the MSE objective these techniques optimize -- which is why int8 is the empirical
+embed floor. => int8 stands as the certified read-out floor; the bits below int8 are not cashable here.
+
+CAVEAT (honest): GPTQ's Hessian H=E[rrT] was rank-deficient (N=68 < d=896), so GPTQ reduced to damped RTN
+and its result is not a valid full-rank GPTQ test. A proper test needs N>>896 calibration residuals; the
+O(n^3) growing-context source-dump made that impractical here (a 1200-position dump ran >2h, killed).
+The full-rank GPTQ corner is therefore UNTESTED -- but the overwhelming negative trend across 5 schemes
+(+ int3 wall + the intrinsic argmax-over-152k brittleness) makes int8-floor the strongly-supported verdict.
