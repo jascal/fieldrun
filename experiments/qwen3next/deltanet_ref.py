@@ -19,6 +19,11 @@ Formulation (fla `gated_delta_rule` / Gated DeltaNet, decay-then-delta-correct),
 State S ∈ ℝ^{d_k×d_v}.  NOTE: the exact gate placement is a *variant choice* — pin it to the HF
 `transformers` Qwen3-Next impl in the whole-model parity test (make_tiny_qwen3next.py). This file validates
 the recurrence + the delta-rule semantics; the parity test validates the variant.
+
+CONFIRMED from transformers 5.12 (model_type `qwen3_5_moe_text`): the linear layer is a short causal
+depthwise conv (`linear_conv_kernel_dim=4`) on q/k/v FIRST, then Gated DeltaNet — so the full Rust path is
+conv1d→DeltaNet. This file is the DeltaNet-recurrence oracle; the conv is a separate, easy causal depthwise
+conv to add in front (then test the pair against the transformers reference via make_tiny/compare).
 """
 
 from __future__ import annotations

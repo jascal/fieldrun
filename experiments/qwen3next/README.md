@@ -8,6 +8,15 @@ it works without running the 35B?" — is solved by one principle:
 > **Architecture correctness is size-independent.** A 4-layer / hidden-64 toy exercises the *same* Rust
 > code path the 35B uses. The big machine is only for the final confirmatory run, never for development.
 
+**Confirmed arch (from `transformers` 5.12, the real `Qwen/Qwen3.6-35B-A3B` config):** `model_type =
+qwen3_5_moe` with a **nested `text_config`** (`qwen3_5_moe_text` — the 3.5/3.6 family is VL/omni-capable).
+The text path: `layer_types` = **3× `linear_attention` → 1× `full_attention`** (×10 over 40 layers); each
+linear layer is a **short causal depthwise conv (`linear_conv_kernel_dim=4`) → Gated DeltaNet** (32 value /
+16 key heads, head-dim 128); full layers are GQA 16/2; MoE **256 experts, 8 routed + 1 shared**
+(`moe_intermediate_size=512`); **1 MTP layer**; vocab 248320; RMSNorm eps 1e-6. So the Rust port needs:
+short-conv + Gated DeltaNet + the 3:1 scheduler + shared-expert MoE + the MTP head. (The transformers
+"fla fast path not available → torch fallback" is fine — the torch path is the reference we compare to.)
+
 ## The test pyramid (everything except the last step runs on a dev box)
 
 | # | test | needs | what it proves | runs today? |
@@ -19,8 +28,10 @@ it works without running the 35B?" — is solved by one principle:
 | 5 | end-to-end on the smallest *real* hybrid checkpoint (if one exists) | the model | real weight/routing/numeric coverage | optional |
 | 6 | one confirmatory big-machine run | the 35B | perf/memory + final sanity | last, not a dependency |
 
-\* `transformers` recent enough for the Qwen3-Next/3.6 class (`model_type` ≈ `qwen3_next`). This box doesn't
-have it yet: `pip install -U transformers` (or Qwen's build), then steps 2–3 run locally on the toy.
+\* needs `transformers>=5.12` (has the `Qwen3_5Moe` class). **Verified working:** in an isolated venv
+(`pip install torch --index-url …/cpu && pip install "transformers>=5.12"`), `make_tiny_qwen3next.py` built
+a **0.99 M-param faithful toy** (4 layers `[lin,lin,lin,full]`, conv k=4, 8 experts) and dumped `ref.npz`
+(logits (512,256) + per-layer states (5,512,64)) — the Python side of the harness runs end-to-end today.
 
 ## Run order
 
@@ -55,7 +66,12 @@ python experiments/qwen3next/compare.py experiments/qwen3next/tiny/ref.npz fr.np
 
 ## Status
 
-- `deltanet_ref.py`: **built, all properties pass** (numpy-only — the kernel oracle is ready).
-- `make_tiny_qwen3next.py`, `compare.py`: **built, ready**; need `transformers` (toy) and the Rust arch
-  (parity). No Rust written yet — this is the verification scaffold that makes the port checkable off the
-  big machine before any engine work starts. `[scaffold]`
+- `deltanet_ref.py`: **built, all 4 properties pass** (numpy-only — the kernel oracle is ready).
+- `make_tiny_qwen3next.py`: **built and RUN-VALIDATED** (transformers 5.12) — builds a faithful 0.99 M toy
+  + reference dump; it confirmed the real arch (above).
+- `compare.py`: **built, ready** — needs the Rust arch to produce `fr.npz`. No Rust written yet.
+- **Next validation (now unblocked):** cross-check `deltanet_ref.py` against the transformers Gated DeltaNet
+  layer (extract the layer's q/k/v/gates from the toy, run the oracle, diff) to pin the gate variant — then
+  implement conv1d→DeltaNet + the 3:1 scheduler + shared-expert MoE + MTP in Rust and run `compare.py`.
+- This is the verification scaffold that makes the port checkable off the big machine *before* engine work.
+  `[scaffold; python side run-validated]`
