@@ -1,0 +1,22 @@
+{
+ "dtype_map": {
+  "l10.mlp.gate_proj": "int4",
+  "l10.mlp.up_proj": "int4",
+  "l10.mlp.down_proj": "int4",
+  "l8.mlp.gate_proj": "int4",
+  "l8.mlp.up_proj": "int4",
+  "l8.mlp.down_proj": "int4",
+  "l1.mlp.gate_proj": "int4",
+  "l1.mlp.up_proj": "int4",
+  "l1.mlp.down_proj": "int4",
+  "l3.mlp.gate_proj": "int4",
+  "l3.mlp.up_proj": "int4",
+  "l3.mlp.down_proj": "int4"
+ },
+ "meta": {
+  "q4_rel": 0.0625,
+  "residue": 0.1,
+  "n_int4_blocks": 4,
+  "saved_MB": 26.1
+ }
+}

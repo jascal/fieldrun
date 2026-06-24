@@ -14,6 +14,22 @@ use safetensors::{Dtype, SafeTensors};
 /// int4 group size (weights along the input dim share one fp16 scale per group). 32 is the GGUF/AWQ default.
 const I4_GROUP: usize = 32;
 
+/// Optional per-tensor dtype overrides (`--dtype-map alloc.json`): tensor name -> dtype, applied in `put_lin`
+/// so a single bundle can mix precisions per linear (CERTIFIED_QUANT_PROPOSAL.md). The loader already
+/// dispatches per-array dtype (bundle.rs:317), so this is the only convert-side change mixed precision needs.
+static DTYPE_MAP: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
+/// Install the per-tensor dtype overrides (call once in `main`, before `convert`).
+pub fn set_dtype_map(m: HashMap<String, String>) { let _ = DTYPE_MAP.set(m); }
+
+/// The dtype for `name`: the override if present, else the global `dflt`.
+fn dmap_dtype<'a>(name: &str, dflt: &'a str) -> std::borrow::Cow<'a, str> {
+    match DTYPE_MAP.get().and_then(|m| m.get(name)) {
+        Some(d) => std::borrow::Cow::Owned(d.clone()),
+        None => std::borrow::Cow::Borrowed(dflt),
+    }
+}
+
 /// q4a (affine group-int4) group size. 64 (vs int4's 32) keeps the bytes equal — int4 carries one fp16 scale/group
 /// (4 + 16/32 = 4.5 bpw), q4a carries an fp16 scale AND min/group (4 + (16+16)/64 = 4.5 bpw) — so a bench A/B isolates
 /// the *affine* (min-offset) quality win at the SAME bundle size. See the affine quant in `put_q4a`.
@@ -121,6 +137,8 @@ impl BundleWriter {
 
     /// A weight linear from an (out, in) source: int8 (transposed, per-column), or f32/f16 transposed to (in, out).
     fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
+        let dtype = dmap_dtype(name, dtype);       // per-tensor override from --dtype-map, else the global dtype
+        let dtype: &str = &dtype;
         if dtype == "int8" { return self.put_i8(name, data, out, inp, true); }
         if dtype == "int4" { return self.put_i4(name, data, out, inp, true); }
         if dtype == "q4a" { return self.put_q4a(name, data, out, inp, true); }

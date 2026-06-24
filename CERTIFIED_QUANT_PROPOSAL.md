@@ -133,3 +133,22 @@ Build v1; ship-or-stop on: **(a)** certified-mixed bundle is meaningfully smalle
 holds out-of-calibration), with **(c)** a measured tokens/sec gain tracking the bandwidth reduction. If
 (a)–(c) hold → v2 (finer bits, signed δ, per-row). If the residue needed to get below int8 is large
 (forge-tax dominates) → the lever is upstream margins (pil), per the Step 0 verdict.
+
+## 9. v1 build status & the embed finding (`experiments/certified_quant/`)
+
+**Built:** the allocator (`step1_allocate.py`, runs on real data) + the convert `--dtype-map`
+(`src/convert.rs` `DTYPE_MAP`/`dmap_dtype`, `src/main.rs`; `cargo check` clean). Loader unchanged (already
+per-array-dtype). The only untested step is the end-to-end mixed bundle + tokens/sec, which needs source
+safetensors (`convert` reads HF), not the local pre-converted `.fieldrun.bin`.
+
+**v1 result (Qwen2.5-0.5B):** certified int8→int4 on **write tensors** is **modest** — 4/48 blocks at 10%
+residue, `630→604 MB` (~7% of writes); mostly MLP. Consistent with Step 0's margin cap.
+
+**The finding that reshapes the priority:** building v1 surfaced that the **`embed`/unembed read-out is
+272 MB = 43% of the bundle** and the per-block write proxy **cannot** certify it (quantizing `embed` shifts
+every logit via the tied `U_v`). The cashable MB are there, addressable by the **frame-quant bound**
+(`PIC_Quant.frame_quant_logit_bound`), not the write-tensor downgrade.
+
+**Revised next step → v1.5:** certify the embed/read-out via frame-quant — a `--source-dump`-style probe
+emitting the raw `U_v` (already proposed for the forge-tax cert), or a direct embed-requant-and-measure.
+v1's write-tensor path stays as the small complementary win; the elephant is the read-out.
