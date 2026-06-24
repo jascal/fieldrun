@@ -12,6 +12,43 @@ TurboQuant `ρ(b,d) ≈ c·2⁻ᵇ/√d` of [`TURBOQUANT.md`](./TURBOQUANT.md) (
 
 ---
 
+## Current status & go/no-go
+
+**What this is, today:** a research / proof-of-concept of the certified-quant path — an *offline*
+allocator + a minimal convert hook that together produce a **certified bundle spec** (which tensors may
+drop to which dtype while the decode is provably preserved on a calibration corpus). It is **not yet a
+shippable static bundle**: the end-to-end rebuild (`convert` reads HF safetensors, not the local
+`.fieldrun.bin`) and the tokens/sec measurement are the next iteration, not part of this PR.
+
+| component | status |
+|---|---|
+| write-tensor allocator (`step1_allocate.py`) | **built, runs** on real `--pil-dump` |
+| `convert --dtype-map` (per-tensor dtype) | **built, `cargo check` clean**; loader already mixed-capable |
+| embed/read-out frame-quant cert (`step1_5_embed.py`) | **built, runs**; `--exact` full-vocab cross-check |
+| end-to-end mixed bundle + tokens/sec | **not done** — needs HF `convert` (next iteration) |
+| held-out (out-of-calibration) decode fidelity | **not done** — calibration-set only so far |
+
+**Result so far (Qwen2.5-0.5B, science calib, 68 positions):**
+
+| config | embed | writes | bundle | guarantee | measured fidelity |
+|---|---|---|---|---|---|
+| current bundle | f16 272 | int8 358 | 630 MB | — | reference |
+| uniform int8 | int8 136 | int8 358 | 494 MB | none (embed int8 *empirical*) | — |
+| **certified-mixed (v1+v1.5)** | **int8 136 (certified)** | **mixed 332** | **468 MB** | `2Σδ<margin`, calib @5% residue | **0/68 exact embed-int8 flips; 4/48 write blocks int4** |
+| uniform int4 | int4 68 | int4 ~179 | ~247 MB | none | embed int4 **6% flips**; writes unchecked |
+
+**Honest byte accounting:** the headline **−136 MB** (embed) is relative to *this* f16-embed bundle.
+Versus **uniform int8** (which already stores embed at int8, uncertified), certified-mixed's *marginal*
+byte win is the **−26 MB** write→int4; v1.5's distinct contribution on the embed is the **certificate** —
+proving int8 is decode-safe (0 flips) and int4 is **not** (6% flips), i.e. locating the read-out's
+precision floor exactly at int8, which uniform-int8/int4 assume or silently violate.
+
+**Go/no-go (per §8):** the calibration result clears (a) ≥1.3× toward int4 (1.35×) at (b) 0 calib flips.
+The *open* gates before declaring the path shippable: **held-out** flip rate ≈ int8 baseline, and a
+**tokens/sec** gain tracking the bandwidth cut — both require the end-to-end HF rebuild (next iteration).
+
+---
+
 ## 0. Why this is small
 
 The expensive parts already exist:
