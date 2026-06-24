@@ -203,6 +203,22 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        // `--dtype-map <alloc.json>`: per-tensor dtype overrides for CERTIFIED mixed precision
+        // (CERTIFIED_QUANT_PROPOSAL.md). JSON `{"dtype_map": {"l0.mlp.gate_proj":"int4", ...}}`; absent
+        // tensors keep the global --dtype. Produced by experiments/certified_quant/step1_allocate.py.
+        if let Some(mp) = flag(&args, "--dtype-map") {
+            match std::fs::read_to_string(mp).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+                Some(v) => {
+                    let obj = v.get("dtype_map").unwrap_or(&v);
+                    let map: std::collections::HashMap<String, String> = obj.as_object().map(|o|
+                        o.iter().filter_map(|(k, x)| x.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                        .unwrap_or_default();
+                    eprintln!("[fieldrun] convert: --dtype-map {mp} ({} tensor overrides)", map.len());
+                    convert::set_dtype_map(map);
+                }
+                None => { eprintln!("[fieldrun] convert: --dtype-map {mp:?} unreadable / not JSON"); std::process::exit(2); }
+            }
+        }
         if let Err(e) = convert::convert(&model_dir, arch, dtype, embed_dtype, &out) {
             eprintln!("[fieldrun] convert failed: {e}");
             std::process::exit(1);

@@ -1,0 +1,16 @@
+Step 1.5 — EMBED / read-out frame-quant certificate (Qwen2.5-0.5B, science calib)
+command: python3 step1_5_embed.py calib_embed_science.jsonl <bundle-stem> --allvocab --exact
+
+=== embed frame-quant certificate (Qwen2.5-0.5B, N=68 positions, dim=896) ===
+  ADAPTIVE (per-position) certified to drop embed f16 -> :
+     int8 : 65/68 = 96%      int4 : 18/68 = 26%
+  STATIC (one embed dtype for all kept positions), residue sweep:
+     residue  0%:  int8  no   int4  no
+     residue  5%:  int8  OK   int4  no
+     residue 10%:  int8  OK   int4  no
+     residue 20%:  int8  OK   int4  no
+  embed bytes: f16 272 MB  int8 136 MB  int4 68 MB  (of ~630 MB bundle)
+  -> certified embed int8 saves ~136 MB; int4 saves ~204 MB (if certified)
+  ALL-VOCAB worst-case (Cauchy-Schwarz) int8: max||ΔU_v||=0.014  ρ_max=333.06  2ρε=9.050  vs min-margin 0.040 (no)  [loose: TurboQuant √d gap]
+  ALL-VOCAB worst-case (Cauchy-Schwarz) int4: max||ΔU_v||=0.093  ρ_max=333.06  2ρε=61.971  vs min-margin 0.040 (no)  [loose: TurboQuant √d gap]
+  EXACT full-vocab decode flips vs f16-embed:  int8 0/68 (0%)   int4 4/68 (6%)

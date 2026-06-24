@@ -1,0 +1,7 @@
+=== certified mixed-precision allocation (q4_rel=0.0625, residue=10%) ===
+  write blocks: 4/48 -> int4  (rest stay int8; embed stays f16)
+  write tensors: int8 357.8 MB  ->  mixed 331.7 MB  (saved 26.1 MB, 7% of writes)
+  embed (read-out, fixed f16): 272.3 MB  [needs frame-quant bound, v1.5]
+  full bundle: int8-writes 630.1 MB  ->  certified-mixed 603.9 MB
+  int4 breakdown: 0 attn-blocks, 4 mlp-blocks of 24 layers each
+  wrote alloc_science.json (12 tensors -> int4)
