@@ -1,4 +1,6 @@
-//! Gated DeltaNet — the linear-attention kernel for Qwen3.6 (`qwen3_5_moe`)'s hybrid layers.
+//! Gated DeltaNet — the linear-attention kernel for Qwen3.6's hybrid layers.
+//! (`qwen3_5_moe` is the HF/transformers `model_type` for the Qwen3.6 / Qwen3-Next MoE family; the two
+//! names refer to the same architecture throughout this crate.)
 //!
 //! Qwen3.6 interleaves Gated DeltaNet *linear* attention (3 of every 4 layers) with gated full attention.
 //! This is the single-head recurrence; the arch calls it per value-head (GQA: each value-head pairs with
@@ -13,6 +15,8 @@
 //! State `S ∈ ℝ^{d_k×d_v}`. Recurrent form (one token at a time) — exactly what fieldrun's decode needs;
 //! the chunked-parallel form is only a prefill speedup (add later, test against this).
 
+/// L2-norm denominator floor (matches the HF `l2norm(..., eps=1e-6)`). On an all-zero q/k row the
+/// normalized vector is ~0 (denominator = EPS), so that token contributes/reads nothing — benign.
 const EPS: f32 = 1e-6;
 
 /// Single-head Gated DeltaNet over a `t`-token sequence. Flat row-major slices:
@@ -201,6 +205,42 @@ mod tests {
         let (q, k, v, g, beta) = inputs(t, dk, dv);
         let out = gated_deltanet(&q, &k, &v, &g, &beta, t, dk, dv);
         assert!(out.iter().any(|&x| x.abs() > 0.0)); // non-trivial, didn't collapse to zero
+    }
+
+    #[test]
+    fn single_token_decode_closed_form() {
+        // t=1 is THE decode step. With S₀=0: v̂=0, Δ=β·v, S=k̂⊗Δ, o = (k̂·q̂)·β·v exactly.
+        let (dk, dv) = (8, 4);
+        let (q, k, v, _g, beta) = inputs(1, dk, dv);
+        let out = gated_deltanet(&q, &k, &v, &[(-0.3f32)], &beta, 1, dk, dv);
+        // recompute q̂ (l2norm·1/√dk) and k̂ (l2norm) to form the closed form
+        let qd = q.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+        let kd = k.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+        let scale = 1.0 / (dk as f32).sqrt();
+        let kq: f32 = (0..dk).map(|d| (k[d] / kd) * (q[d] / qd * scale)).sum();
+        for e in 0..dv {
+            let want = kq * beta[0] * v[e];
+            assert!((out[e] - want).abs() < 1e-6, "t=1 closed form mismatch at {e}");
+        }
+    }
+
+    #[test]
+    fn full_decay_is_memoryless() {
+        // g_log → −∞ (α→0): the decayed state vanishes each step, so every output equals its own
+        // single-step closed form (no carry-over) — stresses the decay path + read-after-write order.
+        let (t, dk, dv) = (5, 6, 3);
+        let (q, k, v, _g, beta) = inputs(t, dk, dv);
+        let out = gated_deltanet(&q, &k, &v, &vec![-40.0; t], &beta, t, dk, dv);
+        let scale = 1.0 / (dk as f32).sqrt();
+        for i in 0..t {
+            let (qr, kr, vr) = (&q[i * dk..(i + 1) * dk], &k[i * dk..(i + 1) * dk], &v[i * dv..(i + 1) * dv]);
+            let qd = qr.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+            let kd = kr.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+            let kq: f32 = (0..dk).map(|d| (kr[d] / kd) * (qr[d] / qd * scale)).sum();
+            for e in 0..dv {
+                assert!((out[i * dv + e] - kq * beta[i] * vr[e]).abs() < 1e-6);
+            }
+        }
     }
 
     #[test]
