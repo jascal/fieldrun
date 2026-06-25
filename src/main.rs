@@ -19,6 +19,7 @@ mod logic;
 mod logic_whole;
 mod composition;
 mod convert;
+mod deltanet;
 mod device;
 mod dsv4;
 mod explain;
