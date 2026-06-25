@@ -1,0 +1,28 @@
+Qwen3.6 (qwen3_5_moe) forward — parity vs transformers Qwen3_5MoeForCausalLM (tiny, f32)
+
+Reproduce (needs transformers>=5.12 in a venv; see README):
+  python experiments/qwen3next/make_tiny_qwen3next.py --seq 16 --out /tmp/tiny
+  ./target/debug/fieldrun convert --model /tmp/tiny --arch qwen35moe --dtype f32 -o /tmp/tiny_fr --force
+  ./target/debug/fieldrun --bundle /tmp/tiny_fr --recursion-explain --hidden-dump /tmp/fr_hid.bin  --ids /tmp/tiny/ref_ids.json
+  ./target/debug/fieldrun --bundle /tmp/tiny_fr --recursion-explain --logits-dump /tmp/fr_logits.bin --ids /tmp/tiny/ref_ids.json
+  # then diff /tmp/fr_hid.bin & /tmp/fr_logits.bin against /tmp/tiny/ref.npz (hidden_states, logits)
+  python experiments/qwen3next/full_attn_golden.py /tmp/tiny    # isolates the full-attention op
+
+=== full_attn_golden.py (full-attention op, isolated, vs transformers Qwen3_5MoeAttention) ===
+  SPLIT q diff (pre-qnorm)        : 1.19e-07
+  PRE-rope q diff (post-qnorm)    : 7.45e-07
+  ROPE q diff                     : 7.45e-07      (partial RoPE, rotary_dim=4 of head_dim 16)
+  FULL ATTN out diff              : 9.68e-09      => split / qnorm / partial-rope / gate ALL exact
+
+=== whole-model (16-token tiny, 4 layers [lin,lin,lin,full], 8 experts + shared) ===
+  per-layer residual (hidden_states convention, max_abs_diff):
+    embed            : 0.000e+00
+    afterL0 (linear) : 7.43e-05
+    afterL1 (linear) : 8.13e-05
+    afterL2 (linear) : 1.47e-04
+    POST-NORM (L3 full) : 7.36e-03   (f32 accumulation through the gated-attention layer + final norm)
+  logits: max_abs_diff = 1.27e-03,  argmax agreement = 100%   <-- DECODE PARITY
+
+Confirms (the reviewer's questions): MoE top-k is always-renormalized + the sigmoid-gated shared expert,
+the gated full attention (q->[query|gate], x sigmoid(gate)), and partial RoPE are all correct end-to-end —
+the golden test pins the attention op to 9.7e-9 and the model argmax matches transformers 100%.

@@ -1,9 +1,19 @@
-//! Qwen3.6 (`qwen3_5_moe`) — hybrid Gated-DeltaNet / full-attention MoE. Every 4th layer is full GQA
-//! attention (QK-norm + RoPE, like qwen3moe); the other 3 are Gated DeltaNet *linear* attention
-//! (`crate::deltanet`, verified vs transformers in #112–#114). Every layer's FFN is a SparseMoeBlock:
-//! softmax top-k routed experts (qwen3moe-style) PLUS a sigmoid-gated shared expert. `layer_types` (per
-//! layer, from config) selects linear vs full. Faithful port of `Qwen3_5MoeForCausalLM`'s text path;
-//! validated per-layer against transformers via `experiments/qwen3next/` (make_tiny → convert → compare).
+//! Qwen3.6 (`qwen3_5_moe`) — hybrid Gated-DeltaNet / full-attention MoE. Layout: the `3×(GatedDeltaNet→MoE)
+//! → 1×(GatedAttention→MoE)` pattern (per `layer_types`); 3 of every 4 layers are Gated DeltaNet *linear*
+//! attention (`crate::deltanet`, golden-tested vs transformers in #112–#114), the 4th is full GQA attention.
+//!
+//! Architecture quirks this port implements (each verified against `Qwen3_5MoeForCausalLM`):
+//!   • full attention is GATED: `q_proj → [query | gate]` per head; `attn_out ·= sigmoid(gate)` before o_proj
+//!   • PARTIAL RoPE: only the first `rotary_dim = head_dim·partial_rotary_factor` of each head is rotated
+//!   • MoE every layer: softmax top-k, ALWAYS-renormalized weights (independent of norm_topk_prob) + a
+//!     sigmoid-gated shared expert
+//!   • RMSNorm is GEMMA-style `·(1+weight)` (the gating bug that took the longest); the linear path's output
+//!     gate is the separate `Qwen3_5MoeRMSNormGated` = plain `·weight` (see `deltanet::rmsnorm_gated`)
+//!
+//! Validated to DECODE PARITY vs transformers on a tiny model (`experiments/qwen3next/`): the full-attention
+//! op matches to 9.7e-9 (`full_attn_golden.py`), and end-to-end logits argmax = 100% (max diff 1.27e-3),
+//! per-layer residual ≤ 7e-3 — so the MoE renorm, gated attention, shared expert, and partial RoPE are
+//! confirmed correct, not just asserted. Harness: make_tiny → convert → `--hidden-dump`/`--logits-dump` → compare.
 
 use std::collections::HashMap;
 
