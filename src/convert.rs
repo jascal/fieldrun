@@ -349,6 +349,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "gemma3" => convert_gemma3(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "qwen35moe" => convert_qwen35moe(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
@@ -779,6 +780,112 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
                 lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
             }
         }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
+}
+
+/// Qwen3.6 (`qwen3_5_moe`) — hybrid: 3-of-4 layers are Gated DeltaNet *linear* attention, the rest full GQA
+/// attention; every layer has a SparseMoeBlock (softmax top-k routed experts + a sigmoid-gated shared expert).
+/// The text config is NESTED under `text_config` (the family is VL/omni-capable). Experts ship as PACKED 3D
+/// tensors (`experts.gate_up_proj` [E, 2·moe_inter, d], `experts.down_proj` [E, d, moe_inter]); we unpack them
+/// into the per-expert `l{l}.experts.{e}.{gate,up,down}` layout so the runtime reuses the qwen3moe MoE path.
+/// config_i: [nl, nh, nkv, hd, d, vocab, tied, n_exp, topk, moe_inter, shared_inter, norm_topk,
+///            num_v_heads, num_k_heads, head_k_dim, head_v_dim, conv_k, <nl layer_types: 0=full 1=linear>]
+fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    let tc = c.get("text_config").unwrap_or(c); // text dims are nested in the composite config
+    let nh = geti(tc, "num_attention_heads").unwrap();
+    let nkv = geti(tc, "num_key_value_heads").unwrap_or(nh);
+    let d = geti(tc, "hidden_size").unwrap();
+    let hd = geti(tc, "head_dim").unwrap_or(d / nh);
+    let (nl, vocab) = (geti(tc, "num_hidden_layers").unwrap(), geti(tc, "vocab_size").unwrap());
+    let (theta, eps) = rope_theta_eps(tc);
+    let tie = tc.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_exp = geti(tc, "num_experts").unwrap_or(0);
+    let topk = geti(tc, "num_experts_per_tok").unwrap_or(0);
+    let moe_inter = geti(tc, "moe_intermediate_size").unwrap_or(0);
+    let shared_inter = geti(tc, "shared_expert_intermediate_size").unwrap_or(0);
+    let norm_topk = tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (nvh, nkh) = (geti(tc, "linear_num_value_heads").unwrap(), geti(tc, "linear_num_key_heads").unwrap());
+    let (hkd, hvd) = (geti(tc, "linear_key_head_dim").unwrap(), geti(tc, "linear_value_head_dim").unwrap());
+    let conv_k = geti(tc, "linear_conv_kernel_dim").unwrap_or(4);
+    let ltypes: Vec<String> = tc.get("layer_types").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    let is_linear = |l: usize| ltypes.get(l).map(|s| s == "linear_attention").unwrap_or(false);
+
+    let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, vocab, tie as usize, n_exp, topk, moe_inter,
+                                      shared_inter, norm_topk as usize, nvh, nkh, hkd, hvd, conv_k];
+    for l in 0..nl { config.push(if is_linear(l) { 1 } else { 0 }); } // layer_types at config[17..17+nl]
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen35moe",
+        "config": config, "config_f": [theta, eps] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight");
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
+    }
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
+        if is_linear(l) {
+            let q = format!("{p}linear_attn.");
+            for proj in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"] {
+                lin(&mut w, &format!("l{l}.linear_attn.{proj}"), &format!("{q}{proj}.weight"))?;
+            }
+            let (cs, cd) = m.read(&format!("{q}conv1d.weight")); // [conv_dim, 1, k] -> store flat [conv_dim, k]
+            w.put_small(&format!("l{l}.linear_attn.conv1d"), &cd, &[cs[0], cs[2]], dtype)?;
+            // dt_bias / A_log are bare params; norm carries a `.weight` suffix
+            for (nm, hf, sz) in [("dt_bias", "dt_bias", nvh), ("A_log", "A_log", nvh), ("norm", "norm.weight", hvd)] {
+                let (_, td) = m.read(&format!("{q}{hf}"));
+                w.put_small(&format!("l{l}.linear_attn.{nm}"), &td, &[sz], dtype)?;
+            }
+        } else {
+            for nm in ["q_norm", "k_norm"] {
+                norm(&mut w, &format!("l{l}.{nm}"), &format!("{p}self_attn.{nm}.weight"))?;
+            }
+            for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
+                lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+            }
+        }
+        // MoE (every layer): router + experts (handle BOTH on-disk layouts) + sigmoid-gated shared expert
+        lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?;
+        if m.has(&format!("{p}mlp.experts.gate_up_proj")) {
+            // packed 3D: gate_up_proj [E, 2*moe_inter, d], down_proj [E, d, moe_inter] — slice per expert
+            let (gs, gd) = m.read(&format!("{p}mlp.experts.gate_up_proj"));
+            let (ds, dd) = m.read(&format!("{p}mlp.experts.down_proj"));
+            let (gu_stride, dn_stride) = (gs[1] * gs[2], ds[1] * ds[2]);
+            for e in 0..n_exp {
+                let gu = &gd[e * gu_stride..(e + 1) * gu_stride]; // [2*moe_inter, d] row-major
+                w.put_lin(&format!("l{l}.experts.{e}.gate"), &gu[..moe_inter * d], moe_inter, d, dtype)?;
+                w.put_lin(&format!("l{l}.experts.{e}.up"), &gu[moe_inter * d..], moe_inter, d, dtype)?;
+                let dn = &dd[e * dn_stride..(e + 1) * dn_stride]; // [d, moe_inter]
+                w.put_lin(&format!("l{l}.experts.{e}.down"), dn, d, moe_inter, dtype)?;
+            }
+        } else {
+            // per-expert 2D (the canonical HF on-disk format; what save_pretrained emits)
+            for e in 0..n_exp {
+                for (fr, hf) in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")] {
+                    lin(&mut w, &format!("l{l}.experts.{e}.{fr}"), &format!("{p}mlp.experts.{e}.{hf}.weight"))?;
+                }
+            }
+        }
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            lin(&mut w, &format!("l{l}.shared.{proj}"), &format!("{p}mlp.shared_expert.{proj}.weight"))?;
+        }
+        lin(&mut w, &format!("l{l}.shared_gate"), &format!("{p}mlp.shared_expert_gate.weight"))?;
     }
     let n = w.arrays.len();
     w.finish(stem, manifest)?;

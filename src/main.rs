@@ -147,7 +147,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
