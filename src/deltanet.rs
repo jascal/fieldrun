@@ -19,6 +19,22 @@
 /// normalized vector is ~0 (denominator = EPS), so that token contributes/reads nothing — benign.
 const EPS: f32 = 1e-6;
 
+/// SiLU / swish: `z·σ(z)`. f32-graceful at ±inf.
+#[inline]
+fn silu(z: f32) -> f32 {
+    z / (1.0 + (-z).exp())
+}
+
+/// Numerically-stable softplus `ln(1+eᶻ)` (= `logaddexp(0, z)`).
+#[inline]
+fn stable_softplus(z: f32) -> f32 {
+    if z > 0.0 {
+        z + (1.0 + (-z).exp()).ln()
+    } else {
+        (1.0 + z.exp()).ln()
+    }
+}
+
 /// Single-head Gated DeltaNet over a `t`-token sequence. Flat row-major slices:
 /// `q,k` are `t·d_k`, `v` is `t·d_v`, `g_log` and `beta` are `t`. Returns `t·d_v` outputs.
 #[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment; tested standalone for now
@@ -99,7 +115,7 @@ pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, con
                     acc += x[src as usize * conv_dim + c] * weight[c * k + j];
                 }
             }
-            out[ti * conv_dim + c] = acc / (1.0 + (-acc).exp()); // SiLU
+            out[ti * conv_dim + c] = silu(acc);
         }
     }
     out
@@ -148,7 +164,7 @@ pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: us
         let inv = 1.0 / (ms + eps).sqrt();
         for i in 0..d {
             let z = gate[base + i];
-            out[base + i] = weight[i] * (x[base + i] * inv) * (z / (1.0 + (-z).exp())); // ·silu(z)
+            out[base + i] = weight[i] * (x[base + i] * inv) * silu(z);
         }
     }
     out
@@ -163,8 +179,7 @@ pub fn delta_gate(a: &[f32], a_log: &[f32], dt_bias: &[f32], t: usize, n_v_heads
     for i in 0..t {
         for vh in 0..n_v_heads {
             let z = a[i * n_v_heads + vh] + dt_bias[vh];
-            let softplus = if z > 0.0 { z + (1.0 + (-z).exp()).ln() } else { (1.0 + z.exp()).ln() };
-            g[i * n_v_heads + vh] = -a_log[vh].exp() * softplus;
+            g[i * n_v_heads + vh] = -a_log[vh].exp() * stable_softplus(z);
         }
     }
     g
