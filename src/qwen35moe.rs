@@ -126,7 +126,20 @@ impl Qwen35Moe {
         let rep = h / nkv;
         let seq = a.nrows();
         let p = format!("l{l}.");
-        let mut q = self.b.mm(a, &format!("{p}self_attn.q_proj"));
+        // q_proj is GATED: it outputs h*head_dim*2 = per head [query(hd) | gate(hd)]; the gate sigmoid-scales
+        // the attention output (Qwen3_5MoeAttention). Split per head into query and gate.
+        let qg = self.b.mm(a, &format!("{p}self_attn.q_proj")); // (seq, h*2*hd)
+        let mut q = Array2::<f32>::zeros((seq, h * hd));
+        let mut gate = Array2::<f32>::zeros((seq, h * hd));
+        for t in 0..seq {
+            for head in 0..h {
+                let src = head * 2 * hd;
+                for c in 0..hd {
+                    q[[t, head * hd + c]] = qg[[t, src + c]];
+                    gate[[t, head * hd + c]] = qg[[t, src + hd + c]];
+                }
+            }
+        }
         let mut k = self.b.mm(a, &format!("{p}self_attn.k_proj"));
         let v = self.b.mm(a, &format!("{p}self_attn.v_proj"));
         self.head_norm(&mut q, &format!("{p}q_norm"), h);
@@ -149,6 +162,9 @@ impl Qwen35Moe {
             }
             softmax_rows(&mut scores);
             attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+        }
+        for (o, g) in attn_out.iter_mut().zip(gate.iter()) {
+            *o *= sigmoid(*g); // gated attention
         }
         self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"))
     }
@@ -269,12 +285,13 @@ impl Qwen35Moe {
         self.norm(&x, "norm")
     }
 
-    /// Debug: the residual stream snapshots [embed, after-L0, …, after-L{n-1}] (each flat seq·d, row-major),
-    /// matching transformers `output_hidden_states` — for per-layer parity localization via compare.py.
+    /// Debug: residual-stream snapshots in transformers `output_hidden_states` convention — [input-to-L0
+    /// (=embed), input-to-L1, …, input-to-L{n-1}, POST-final-norm] (each flat seq·d, row-major). The last
+    /// entry is post-final-norm (HF appends it), so it lines up with the reference's last hidden state.
     pub fn hiddens(&self, ids: &[i64]) -> Vec<Vec<f32>> {
         let mut snaps = Vec::with_capacity(self.n_layer + 1);
         let mut x = self.b.rows_f32("embed", ids);
-        snaps.push(x.iter().cloned().collect());
+        snaps.push(x.iter().cloned().collect()); // hs[0] = embed = input to L0
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}in_ln"));
@@ -282,8 +299,11 @@ impl Qwen35Moe {
             x = &x + &attn;
             let a2 = self.norm(&x, &format!("{p}post_ln"));
             x = &x + &self.moe_branch(l, &a2);
-            snaps.push(x.iter().cloned().collect());
+            if l + 1 < self.n_layer {
+                snaps.push(x.iter().cloned().collect()); // input to L{l+1}
+            }
         }
+        snaps.push(self.norm(&x, "norm").iter().cloned().collect()); // hs[N] = post-final-norm
         snaps
     }
 }
