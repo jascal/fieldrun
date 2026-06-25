@@ -77,6 +77,8 @@ impl Qwen35Moe {
         if self.tied { "embed" } else { "lm_head" }
     }
 
+    // Qwen3.5 RMSNorm is GEMMA-style: out = normed · (1 + weight) (weight init 0), NOT the plain `· weight`
+    // of Qwen3/Llama. (The linear path's gated norm is plain `· weight` — see deltanet::rmsnorm_gated.)
     fn norm(&self, x: &Array2<f32>, name: &str) -> Array2<f32> {
         let w = self.b.arr1o(name);
         let mut out = x.clone();
@@ -85,7 +87,7 @@ impl Qwen35Moe {
             let ms = row.iter().map(|v| v * v).sum::<f32>() / n;
             let inv = 1.0 / (ms + self.eps).sqrt();
             for (i, v) in row.iter_mut().enumerate() {
-                *v = *v * inv * w[i];
+                *v = *v * inv * (1.0 + w[i]);
             }
         }
         out
@@ -100,7 +102,7 @@ impl Qwen35Moe {
                 let ms = (0..hd).map(|c| row[base + c] * row[base + c]).sum::<f32>() / hd as f32;
                 let inv = 1.0 / (ms + self.eps).sqrt();
                 for c in 0..hd {
-                    row[base + c] = row[base + c] * inv * w[c];
+                    row[base + c] = row[base + c] * inv * (1.0 + w[c]);
                 }
             }
         }
