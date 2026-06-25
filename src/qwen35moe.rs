@@ -22,6 +22,7 @@ pub struct Qwen35Moe {
     d: usize,
     eps: f32,
     scale: f32,
+    rotary_dim: usize, // partial RoPE: only the first rotary_dim of each head_dim is rotated
     inv: Vec<f32>,
     n_exp: usize,
     topk: usize,
@@ -64,10 +65,12 @@ impl Qwen35Moe {
         let (nvh, nkh, hkd, hvd, conv_k) =
             (c[12] as usize, c[13] as usize, c[14] as usize, c[15] as usize, c[16] as usize);
         let linear: Vec<bool> = (0..n_layer).map(|l| c[17 + l] != 0).collect();
+        let rotary_dim = if c.len() > 17 + n_layer { c[17 + n_layer] as usize } else { hd }; // default = full
         let (theta, eps) = (b.config_f[0] as f32, b.config_f[1] as f32);
-        let inv = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
-        Qwen35Moe { b, n_layer, h, nkv, hd, d, eps, scale: (hd as f32).powf(-0.5), inv, n_exp, topk,
-                    shared_inter, nvh, nkh, hkd, hvd, conv_k, linear, tied }
+        // inv frequencies over the ROTARY dim (partial RoPE), rotary_dim/2 entries
+        let inv = (0..rotary_dim / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / rotary_dim as f32)).collect();
+        Qwen35Moe { b, n_layer, h, nkv, hd, d, eps, scale: (hd as f32).powf(-0.5), rotary_dim, inv, n_exp,
+                    topk, shared_inter, nvh, nkh, hkd, hvd, conv_k, linear, tied }
     }
 
     fn unembed(&self) -> &str {
@@ -103,8 +106,10 @@ impl Qwen35Moe {
         }
     }
 
+    /// Partial RoPE (Qwen3.5): rotate only the first `rotary_dim` of each head_dim via rotate_half over that
+    /// sub-block (pairs (j, j+rotary_dim/2)); dims [rotary_dim..head_dim] pass through un-rotated.
     fn rope(&self, x: &mut Array2<f32>, n_heads: usize, pos0: usize) {
-        let (hd, half) = (self.hd, self.hd / 2);
+        let (hd, half) = (self.hd, self.rotary_dim / 2);
         for (i, mut row) in x.rows_mut().into_iter().enumerate() {
             let pos = pos0 + i;
             for head in 0..n_heads {

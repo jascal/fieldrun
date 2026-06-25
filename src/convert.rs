@@ -810,6 +810,9 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
     let (nvh, nkh) = (geti(tc, "linear_num_value_heads").unwrap(), geti(tc, "linear_num_key_heads").unwrap());
     let (hkd, hvd) = (geti(tc, "linear_key_head_dim").unwrap(), geti(tc, "linear_value_head_dim").unwrap());
     let conv_k = geti(tc, "linear_conv_kernel_dim").unwrap_or(4);
+    // partial RoPE: only the first `rotary_dim` of each head_dim is rotated (full attention only)
+    let prf = tc.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let rotary_dim = (hd as f64 * prf) as usize;
     let ltypes: Vec<String> = tc.get("layer_types").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
     let is_linear = |l: usize| ltypes.get(l).map(|s| s == "linear_attention").unwrap_or(false);
@@ -817,6 +820,7 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
     let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, vocab, tie as usize, n_exp, topk, moe_inter,
                                       shared_inter, norm_topk as usize, nvh, nkh, hkd, hvd, conv_k];
     for l in 0..nl { config.push(if is_linear(l) { 1 } else { 0 }); } // layer_types at config[17..17+nl]
+    config.push(rotary_dim); // config[17+nl] = rotary_dim (partial RoPE width)
     let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen35moe",
         "config": config, "config_f": [theta, eps] });
 
