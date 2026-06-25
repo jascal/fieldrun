@@ -42,6 +42,7 @@ mod mla;
 mod model;
 mod neox;
 mod qwen3moe;
+mod qwen35moe;
 mod recursion_dl;
 #[cfg(feature = "api")]
 mod recursion_probe;
@@ -147,7 +148,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "mla", "minimax", "dsv4"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
@@ -560,6 +561,7 @@ fn main() {
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
             "gemma4" => Box::new(Gemma4::new(bundle, route, kv_int8)),
             "qwen3moe" => Box::new(Qwen3Moe::new(bundle, route, kv_int8)),
+            "qwen35moe" => Box::new(qwen35moe::Qwen35Moe::new(bundle, route, kv_int8)),
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
@@ -932,6 +934,30 @@ fn main() {
             // exprs of increasing nesting, get the model's answer, abduce its effective recursion depth + cut, and
             // report: model accuracy vs depth (the cliff), faithfulness (abduction reproduces the model), and the
             // recursive-vs-broken-cut-vs-semiring split. Tests "errs iff depth>D" and "error == retrieved cut". ──
+            // debug: dump per-position full-vocab logits (raw f32, [pos][vocab]) for the loaded --ids — used by
+            // experiments/qwen3next/compare.py to check whole-model parity vs the transformers reference.
+            if let Some(out) = flag(&args, "--logits-dump") {
+                let mut buf: Vec<u8> = Vec::new();
+                for p in 0..ids.len() {
+                    let lg = lm.logits(&ids[..=p]).expect("[fieldrun] --logits-dump: arch has no logits hook");
+                    for v in lg { buf.extend_from_slice(&v.to_le_bytes()); }
+                }
+                std::fs::write(out, &buf).unwrap();
+                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
+                return;
+            }
+            // debug: per-layer residual-stream snapshots (qwen35moe only) for compare.py per-layer localization.
+            if let Some(out) = flag(&args, "--hidden-dump") {
+                let b = bundle::Bundle::load(&stem).expect("reload bundle for --hidden-dump");
+                let snaps = qwen35moe::Qwen35Moe::new(b, route, kv_int8).hiddens(&ids);
+                let mut buf: Vec<u8> = Vec::new();
+                for s in &snaps {
+                    for v in s { buf.extend_from_slice(&v.to_le_bytes()); }
+                }
+                std::fs::write(out, &buf).unwrap();
+                eprintln!("[fieldrun] --hidden-dump: {} snapshots (each seq*d f32 LE) -> {out}", snaps.len());
+                return;
+            }
             if has_flag(&args, "--measure") { recursion_probe::run_measure(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--value-probe-dump") { recursion_probe::run_value_probe_dump(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--value-patch") { recursion_probe::run_value_patch(&args, lm.as_ref(), &tg, &stem); return; }
