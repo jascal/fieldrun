@@ -866,6 +866,8 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
             // packed 3D: gate_up_proj [E, 2*moe_inter, d], down_proj [E, d, moe_inter] — slice per expert
             let (gs, gd) = m.read(&format!("{p}mlp.experts.gate_up_proj"));
             let (ds, dd) = m.read(&format!("{p}mlp.experts.down_proj"));
+            assert_eq!(gs, [n_exp, 2 * moe_inter, d], "l{l} gate_up_proj shape (E, 2*moe_inter, d)");
+            assert_eq!(ds, [n_exp, d, moe_inter], "l{l} down_proj shape (E, d, moe_inter)");
             let (gu_stride, dn_stride) = (gs[1] * gs[2], ds[1] * ds[2]);
             for e in 0..n_exp {
                 let gu = &gd[e * gu_stride..(e + 1) * gu_stride]; // [2*moe_inter, d] row-major
