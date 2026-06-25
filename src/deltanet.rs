@@ -135,6 +135,41 @@ pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f3
     out
 }
 
+/// Gated RMSNorm — Qwen3.6's linear-layer output gate (`Qwen3_5MoeRMSNormGated`). Per row of size `d`
+/// (a value-head's `head_v_dim`): `out = weight · (x · rsqrt(mean(x²)+eps)) · silu(gate)`. Note the order
+/// — RMS-normalize FIRST, then apply the SiLU gate. `weight` is `d`; `x`/`gate` are row-major `rows·d`.
+#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
+pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: usize,
+                     eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; rows * d];
+    for r in 0..rows {
+        let base = r * d;
+        let ms = (0..d).map(|i| x[base + i] * x[base + i]).sum::<f32>() / d as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for i in 0..d {
+            let z = gate[base + i];
+            out[base + i] = weight[i] * (x[base + i] * inv) * (z / (1.0 + (-z).exp())); // ·silu(z)
+        }
+    }
+    out
+}
+
+/// The DeltaNet decay gate: `g = −exp(a_log)·softplus(a + dt_bias)`, per value-head — produces the
+/// `g_log` the kernel consumes (`α = exp(g)`). `a` is `t·n_v_heads` (the dt projection); `a_log`,
+/// `dt_bias` are `n_v_heads` per-head params. softplus is the numerically-stable `ln(1+eᶻ)`.
+#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
+pub fn delta_gate(a: &[f32], a_log: &[f32], dt_bias: &[f32], t: usize, n_v_heads: usize) -> Vec<f32> {
+    let mut g = vec![0f32; t * n_v_heads];
+    for i in 0..t {
+        for vh in 0..n_v_heads {
+            let z = a[i * n_v_heads + vh] + dt_bias[vh];
+            let softplus = if z > 0.0 { z + (1.0 + (-z).exp()).ln() } else { (1.0 + z.exp()).ln() };
+            g[i * n_v_heads + vh] = -a_log[vh].exp() * softplus;
+        }
+    }
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +331,51 @@ mod tests {
             }
         }
         assert!(e < 1e-5, "multi-head GQA DeltaNet diverges from the oracle: maxerr {e:e}");
+    }
+
+    #[test]
+    fn rmsnorm_gated_matches_torch_golden() {
+        // golden from the exact Qwen3_5MoeRMSNormGated torch ops (experiments/qwen3next)
+        let (rows, d) = (3, 4);
+        let f = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let x: Vec<f32> = (0..rows).flat_map(|r| (0..d).map(move |i| f(r * 5 + i * 3, 13))).collect();
+        let w: Vec<f32> = (0..d).map(|i| 0.5 + f(i * 7, 11)).collect();
+        let gate: Vec<f32> = (0..rows).flat_map(|r| (0..d).map(move |i| f(r * 3 + i * 5, 13))).collect();
+        let out = rmsnorm_gated(&x, &w, &gate, rows, d, 1e-6);
+        let expected: [[f32; 4]; 3] = [
+            [0.0, 3.10081746e-02, -5.32961125e-03, -8.34661350e-02],
+            [0.0, 1.57070104e-02, -6.24770932e-02, 7.33087957e-02],
+            [0.0, -2.04900041e-01, 2.71954276e-02, -6.77670771e-03],
+        ];
+        let mut e = 0f32;
+        for r in 0..rows {
+            for i in 0..d {
+                e = e.max((out[r * d + i] - expected[r][i]).abs());
+            }
+        }
+        assert!(e < 1e-5, "gated RMSNorm diverges from torch: maxerr {e:e}");
+    }
+
+    #[test]
+    fn delta_gate_matches_golden() {
+        // golden: g = -exp(a_log)·softplus(a + dt_bias) (experiments/qwen3next)
+        let (t, nv) = (3, 4);
+        let f = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let a: Vec<f32> = (0..t).flat_map(|i| (0..nv).map(move |vh| f(i * 5 + vh * 3, 13) * 2.0)).collect();
+        let a_log: Vec<f32> = (0..nv).map(|vh| f(vh * 7, 11) - 0.5).collect();
+        let dt_bias: Vec<f32> = (0..nv).map(|vh| f(vh * 3, 7)).collect();
+        let g = delta_gate(&a, &a_log, &dt_bias, t, nv);
+        let expected: [[f32; 4]; 3] = [
+            [-7.40958041e-02, -3.01688733e-01, -4.07378321e-01, -7.13984646e-01],
+            [-1.44606430e-01, -5.39423235e-01, -6.52185451e-01, -2.71522122e-01],
+            [-2.62137223e-01, -2.04752970e-01, -2.93120362e-01, -5.09606860e-01],
+        ];
+        let mut e = 0f32;
+        for i in 0..t {
+            for vh in 0..nv {
+                e = e.max((g[i * nv + vh] - expected[i][vh]).abs());
+            }
+        }
+        assert!(e < 1e-6, "delta gate diverges from golden: maxerr {e:e}");
     }
 }
