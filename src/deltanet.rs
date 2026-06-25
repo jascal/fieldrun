@@ -77,6 +77,60 @@ pub fn gated_deltanet(
     out
 }
 
+/// Short causal depthwise conv1d + SiLU on the concatenated `[q,k,v]` channels (Qwen3.6's linear layer
+/// prelude). `x` is row-major `t·conv_dim`; `weight` is `conv_dim·k` (per-channel kernel), `bias` is
+/// `conv_dim`. Causal: out[t,c] depends on x[t-(k-1)..t, c] (left-pad zeros). Matches `nn.Conv1d(groups=
+/// conv_dim, padding=k-1)[:, :, :t]` then SiLU — verified against torch (test `conv_matches_torch_golden`).
+#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
+pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, conv_dim: usize,
+                          k: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), t * conv_dim);
+    let mut out = vec![0f32; t * conv_dim];
+    for ti in 0..t {
+        for c in 0..conv_dim {
+            let mut acc = bias[c];
+            for j in 0..k {
+                let src = ti as isize - (k as isize - 1) + j as isize; // causal: left-pad zeros
+                if src >= 0 {
+                    acc += x[src as usize * conv_dim + c] * weight[c * k + j];
+                }
+            }
+            out[ti * conv_dim + c] = acc / (1.0 + (-acc).exp()); // SiLU
+        }
+    }
+    out
+}
+
+/// Multi-head GQA Gated DeltaNet: runs `gated_deltanet` per value-head, each paired with its grouped key-
+/// head (transformers `repeat_interleave(num_v/num_k)`). `q,k` are `t·(n_k_heads·hk)`, `v` is
+/// `t·(n_v_heads·hv)`, `g,beta` are `t·n_v_heads` (per value-head). Returns `t·(n_v_heads·hv)`.
+#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
+pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], t: usize,
+                          n_k_heads: usize, n_v_heads: usize, hk: usize, hv: usize) -> Vec<f32> {
+    let r = n_v_heads / n_k_heads; // value-heads per key-head (repeat_interleave factor)
+    let mut out = vec![0f32; t * n_v_heads * hv];
+    let (mut qh, mut kh) = (vec![0f32; t * hk], vec![0f32; t * hk]);
+    let (mut vh, mut gh, mut bh) = (vec![0f32; t * hv], vec![0f32; t], vec![0f32; t]);
+    for vhead in 0..n_v_heads {
+        let khead = vhead / r; // GQA: value-head vhead reads key-head vhead//r
+        for ti in 0..t {
+            let qbase = ti * n_k_heads * hk + khead * hk;
+            let vbase = ti * n_v_heads * hv + vhead * hv;
+            qh[ti * hk..ti * hk + hk].copy_from_slice(&q[qbase..qbase + hk]);
+            kh[ti * hk..ti * hk + hk].copy_from_slice(&k[qbase..qbase + hk]);
+            vh[ti * hv..ti * hv + hv].copy_from_slice(&v[vbase..vbase + hv]);
+            gh[ti] = g[ti * n_v_heads + vhead];
+            bh[ti] = beta[ti * n_v_heads + vhead];
+        }
+        let oh = gated_deltanet(&qh, &kh, &vh, &gh, &bh, t, hk, hv);
+        for ti in 0..t {
+            let ob = ti * n_v_heads * hv + vhead * hv;
+            out[ob..ob + hv].copy_from_slice(&oh[ti * hv..ti * hv + hv]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +201,60 @@ mod tests {
         let (q, k, v, g, beta) = inputs(t, dk, dv);
         let out = gated_deltanet(&q, &k, &v, &g, &beta, t, dk, dv);
         assert!(out.iter().any(|&x| x.abs() > 0.0)); // non-trivial, didn't collapse to zero
+    }
+
+    #[test]
+    fn conv_matches_torch_golden() {
+        // golden from torch nn.Conv1d(groups=conv_dim, padding=k-1)[:, :, :t] + SiLU (experiments/qwen3next)
+        let (t, cd, k) = (5, 3, 4);
+        let g = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let x: Vec<f32> = (0..t).flat_map(|ti| (0..cd).map(move |c| g(c * 3 + ti * 5, 13))).collect();
+        let w: Vec<f32> = (0..cd).flat_map(|c| (0..k).map(move |j| g(c * 2 + j * 7, 11))).collect();
+        let b: Vec<f32> = (0..cd).map(|c| g(c * 5, 7)).collect();
+        let out = causal_conv1d_silu(&x, &w, &b, t, cd, k);
+        let expected: [[f32; 3]; 5] = [
+            [-2.33067304e-01, 1.88297376e-01, -3.03615537e-02],
+            [-1.70510843e-01, 9.76778418e-02, -7.16514513e-02],
+            [-1.70003459e-01, 1.90605924e-01, 2.88861338e-02],
+            [-1.80367693e-01, 2.44066134e-01, -1.28440201e-01],
+            [-1.31578267e-01, -4.13411260e-02, 7.79500380e-02],
+        ];
+        let mut e = 0f32;
+        for ti in 0..t {
+            for c in 0..cd {
+                e = e.max((out[ti * cd + c] - expected[ti][c]).abs());
+            }
+        }
+        assert!(e < 1e-5, "causal conv1d+silu diverges from torch: maxerr {e:e}");
+    }
+
+    #[test]
+    fn mha_matches_oracle_golden() {
+        // golden: per value-head gated_deltanet_qwen36 with GQA repeat_interleave (experiments/qwen3next)
+        let (t, nk, nv, hk, hv) = (4, 2, 4, 3, 2);
+        let f = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let q: Vec<f32> = (0..t).flat_map(|i| (0..nk * hk).map(move |j| f(i * 7 + j * 5, 13))).collect();
+        let k: Vec<f32> = (0..t).flat_map(|i| (0..nk * hk).map(move |j| f(i * 3 + j * 11, 13))).collect();
+        let v: Vec<f32> = (0..t).flat_map(|i| (0..nv * hv).map(move |j| f(i * 5 + j * 7, 13))).collect();
+        let g: Vec<f32> = (0..t)
+            .flat_map(|i| (0..nv).map(move |vh| -((((i * 2 + vh) % 5) + 1) as f32) / 10.0))
+            .collect();
+        let beta: Vec<f32> = (0..t)
+            .flat_map(|i| (0..nv).map(move |vh| ((((i * 4 + vh) % 7) + 1) as f32) / 8.0))
+            .collect();
+        let out = gated_deltanet_mha(&q, &k, &v, &g, &beta, t, nk, nv, hk, hv);
+        let expected: [[f32; 8]; 4] = [
+            [-2.55630077e-02, 1.96638521e-03, -4.32604745e-02, 1.17983112e-02, 6.09471667e-02, -3.38595371e-02, 6.32044692e-02, -6.32044692e-02],
+            [2.62730114e-02, -1.34264722e-01, -2.19625037e-03, 1.96182288e-01, -2.12298473e-02, 5.25713204e-03, -3.36882808e-02, 3.31517910e-02],
+            [-4.62090139e-02, 8.21297941e-02, -6.60442062e-02, -1.26936124e-01, -3.81816041e-03, 4.33765223e-02, -7.71871087e-02, 4.38512297e-02],
+            [-2.63870312e-03, 3.43525633e-02, 2.61399669e-02, -7.29618900e-02, -7.80981770e-02, 1.21141041e-02, 9.21856499e-02, 1.19378679e-02],
+        ];
+        let mut e = 0f32;
+        for i in 0..t {
+            for j in 0..nv * hv {
+                e = e.max((out[i * nv * hv + j] - expected[i][j]).abs());
+            }
+        }
+        assert!(e < 1e-5, "multi-head GQA DeltaNet diverges from the oracle: maxerr {e:e}");
     }
 }
