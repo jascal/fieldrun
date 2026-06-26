@@ -56,6 +56,53 @@ pub fn build(lm: &dyn Model, c: &[i64], store: Option<&Store>, cfg: &CandCfg, ca
     })
 }
 
+/// Fast path of `build`: one lean forward via `Model::decision_decomp` (no `explain` capture, no second
+/// `residual_decomp` forward) → ~4× cheaper per decision, for whole-corpus logic export. Identical Provenance to
+/// `build` (same candidates/blocks/route/rule). Returns None when the arch hasn't wired `decision_decomp`; callers
+/// fall back to `build`.
+pub fn build_decomp(lm: &dyn Model, c: &[i64], store: Option<&Store>, cfg: &CandCfg, cap: usize) -> Option<Provenance> {
+    let store_cands: Vec<i64> = store.map(|st| st.candidates(c, cfg)).unwrap_or_default();
+    let (t, v, pred_logit, ru_logit, candidates, blocks) = lm.decision_decomp(c, &store_cands, cap)?;
+    Some(provenance(c, t, v, pred_logit, ru_logit, candidates, blocks, store, &store_cands))
+}
+
+/// All-positions fast path: ONE forward (`Model::decomp_all`) → a Provenance per position of `c` (entry `p` is the
+/// model's prediction of token p+1 given c[..=p]). Amortizes the fixed-cost prefill across the whole sequence. None
+/// when the arch hasn't wired `decomp_all`.
+pub fn build_decomp_all(lm: &dyn Model, c: &[i64], store: Option<&Store>, cfg: &CandCfg, cap: usize) -> Option<Vec<Provenance>> {
+    let per_pos = lm.decomp_all(c, cap)?;
+    Some(per_pos.into_iter().enumerate().map(|(p, (t, v, pl, rl, cands, blocks))| {
+        let ctx = &c[..=p]; // the context that produced this position's decision
+        let store_cands: Vec<i64> = store.map(|st| st.candidates(ctx, cfg)).unwrap_or_default();
+        provenance(ctx, t, v, pl, rl, cands, blocks, store, &store_cands)
+    }).collect())
+}
+
+/// Assemble a `Provenance` from a decomposed decision + the cheap (forward-free) route/rule/induction classification.
+#[allow(clippy::too_many_arguments)]
+fn provenance(c: &[i64], t: i64, v: i64, pred_logit: f32, ru_logit: f32, candidates: Vec<i64>,
+              blocks: Vec<(String, Vec<f32>)>, store: Option<&Store>, store_cands: &[i64]) -> Provenance {
+    let ind = induction_rule(c, t);
+    let route = match store {
+        Some(st) => {
+            let (kb, _) = st.predict(c);
+            if kb == t { 0u8 } else if store_cands.contains(&t) { 1 } else { 2 }
+        }
+        None => if ind.is_some() { 0 } else { 3 },
+    };
+    Provenance {
+        predicted: t,
+        runner_up: v,
+        pred_logit,
+        margin: pred_logit - ru_logit,
+        route,
+        candidates,
+        rule: store.and_then(|st| st.rule_for(c, t)).or_else(|| induction_rule(c, t)),
+        induction: ind.is_some(),
+        blocks,
+    }
+}
+
 pub fn route_name(route: u8) -> &'static str {
     match route {
         0 => "RETRIEVED",

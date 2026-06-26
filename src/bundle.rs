@@ -152,6 +152,31 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(_mm_add_ss(d, _mm_shuffle_ps(d, d, 1)))
 }
 
+/// AVX2 signed-int8 × f32 dot for one unembed row (the rowi8 embed/unembed path): 8 i8 → i32 → f32, FMA against the
+/// activations. The per-row scale is applied by the caller. The big-vocab unembed is the dominant per-decision cost
+/// once the forward is amortized (all-positions export), so vectorising it ~halves that share vs the scalar loop.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn rowi8_dot_avx2(w: &[i8], a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let k = w.len();
+    let (wp, ap) = (w.as_ptr(), a.as_ptr());
+    let mut acc = _mm256_setzero_ps();
+    let mut kk = 0usize;
+    while kk + 8 <= k {
+        let wi = _mm_loadl_epi64(wp.add(kk) as *const __m128i); // 8 i8 in the low 64 bits
+        let wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wi)); // 8 i8 → 8 i32 → 8 f32
+        acc = _mm256_fmadd_ps(wf, _mm256_loadu_ps(ap.add(kk)), acc);
+        kk += 8;
+    }
+    let mut sum = hsum256(acc);
+    while kk < k {
+        sum += *wp.add(kk) as f32 * *ap.add(kk);
+        kk += 1;
+    }
+    sum
+}
+
 /// Unpack 8 packed nibbles (4 bytes at `prow[byte..]`) into kk-order: load 4 bytes, mask the low nibbles and the
 /// per-byte high nibbles (`srli_epi16(.,4) & 0x0F` extracts each byte's high nibble — the cross-byte carry lands in
 /// bits 4-7 which the mask drops), then `unpacklo_epi8` interleaves them to [lo0,hi0,lo1,hi1,…] = nibble(kk=0..7).
@@ -900,7 +925,14 @@ impl Bundle {
                     Arr::RowI8(w) => {
                         // scale*Σ q·x — pull the per-row scale out of the dot (W8A_f32, like the i4 path).
                         let s = rscale.as_ref().unwrap()[r];
-                        s * w.data[base..base + d].iter().zip(x).map(|(&q, &xi)| q as f32 * xi).sum::<f32>()
+                        let row = &w.data[base..base + d];
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                                return s * unsafe { rowi8_dot_avx2(row, x) };
+                            }
+                        }
+                        s * row.iter().zip(x).map(|(&q, &xi)| q as f32 * xi).sum::<f32>()
                     }
                     Arr::I8(_) | Arr::I4(_) | Arr::Q4A(_) => panic!("rowdot_f32: column-major quant unembed unsupported (use rowi8)"),
                 }
