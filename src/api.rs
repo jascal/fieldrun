@@ -91,6 +91,20 @@ impl TextGen {
             .unwrap_or_default()
     }
 
+    /// Encode raw text, prepending the model's `<bos>` when it has one and the encoding doesn't already start with it.
+    /// Some tokenizer.json files (notably Gemma's) carry NO bos post-processor, yet the model REQUIRES a leading `<bos>`
+    /// — without it next-token prediction is incoherent (e.g. Gemma copies prompt fragments instead of continuing). The
+    /// guard avoids a double-bos for tokenizers that DO add it. Used by the raw-text completion / logic-export paths.
+    pub fn encode_bos(&self, text: &str) -> Vec<i64> {
+        let mut ids = self.encode(text, true);
+        if let Some(b) = self.tok.token_to_id("<bos>").map(|u| u as i64) {
+            if ids.first() != Some(&b) {
+                ids.insert(0, b);
+            }
+        }
+        ids
+    }
+
     /// The token string for an id, including special tokens (e.g. 151644 → "<|im_start|>") — for explain labels, where
     /// `decode` blanks special tokens. Returns the raw vocab token; None if the id is out of range.
     fn id_to_token(&self, id: i64) -> Option<String> {

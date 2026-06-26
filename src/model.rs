@@ -317,6 +317,28 @@ pub trait Model: Sync {
         None
     }
 
+    /// LEAN single-forward decision + residual decomposition for the logic export — the fast corpus path. ONE forward
+    /// (no `explain` circuit capture: no attention matrices, head/MLP attribution), a single full-vocab argmax for
+    /// predicted/runner-up, then per-block contributions projected onto the candidate set `{predicted, runner-up} ∪
+    /// extra` (deduped, capped at `cap`). Returns `(predicted, runner_up, pred_logit, ru_logit, candidates, blocks)`
+    /// with `blocks[b] = (label, contrib-to-each-candidate)` and (by residual additivity) `Σ_b blocks[b].1[i] ==
+    /// logit(candidates[i])`. Costs ~one forward instead of `explain`'s forward + ~14 s of capture — `logic::build_decomp`
+    /// uses it and falls back to the `explain`+`residual_decomp` path when an arch returns None (default).
+    fn decision_decomp(&self, _ids: &[i64], _extra: &[i64], _cap: usize)
+        -> Option<(i64, i64, f32, f32, Vec<i64>, Vec<(String, Vec<f32>)>)> {
+        None
+    }
+
+    /// ALL-POSITIONS teacher-forced decomposition from ONE forward — the corpus throughput path. The per-decision cost
+    /// is a fixed (int4-dequant-bound) prefill that does NOT scale with context length, so amortize it: one forward over
+    /// `ids` yields a decision at EVERY position (entry `p` = the model's prediction of token p+1 given ids[..=p]).
+    /// Each entry is `(predicted, runner_up, pred_logit, ru_logit, candidates(top-`cap` by logit), blocks)` with
+    /// `Σ_b blocks[b].1[i] == logit(candidates[i])`. Turns ~L prefills into one. Default None.
+    fn decomp_all(&self, _ids: &[i64], _cap: usize)
+        -> Option<Vec<(i64, i64, f32, f32, Vec<i64>, Vec<(String, Vec<f32>)>)>> {
+        None
+    }
+
     /// Like `predict_ablated`, but also zeroes a *whole* attention block (`attn_layers`) and/or *whole* MLP block
     /// (`mlp_layers`) of the listed layers — for the rescue-localization sweep (ablate {top circuit + downstream layer
     /// ℓ's MLP or attention}). Default None; rope implements it.
