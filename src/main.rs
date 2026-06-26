@@ -2792,7 +2792,10 @@ fn main() {
                     Ok(f) => std::io::BufReader::new(f),
                     Err(e) => { eprintln!("[fieldrun] --export-logic-corpus: cannot read {corpus_path}: {e}"); return; }
                 };
-                let lbl = |id: i64| -> String { format!("[{id}]") };
+                // Label tokens with their text ("<text>" [id]) — like --export-logic — so emitted .dl carry the token
+                // text in the `model predicts` / candidate comments. This keeps the downstream package converter
+                // (sgiandubh dl2package) tokenizer-free: it reads the answer text straight from the comments.
+                let lbl = |id: i64| -> String { tg.token_label(id) };
                 // `--out <dir>`: write each decision's full (Soufflé-runnable) .dl, so the WHOLE corpus is exported in ONE
                 // warm process (no per-line bundle reload). Without it, the command just reports the size/route sweep.
                 let out_dir = flag(&args, "--out");
