@@ -14,9 +14,12 @@
 //!     and use `num_global_key_value_heads` KV heads; sliding layers are unaffected (per-layer `nkv_of(l)`).
 //!   - **KV-sharing** (`num_kv_shared_layers`): the last N layers carry no k_proj/v_proj/k_norm — they keep their own
 //!     q_proj/q_norm but borrow the assembled K/V of the LAST non-shared layer of their own type (`kv_src[l]`).
-//! Validated top-1 against a tiny random-init `Gemma4ForCausalLM` (the faithfulness gate), dense and MoE. Incremental
-//! KV-cache `generate`/`generate_stream` (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and
-//! `explain` are wired.
+//! Validated to FULL parity (per-layer residual + per-position logits, not just top-1) against a tiny random-init
+//! `Gemma4ForCausalLM`, dense AND MoE, via `experiments/gemma4/` (make_tiny → convert → `--hidden-dump`/`--logits-dump`
+//! → compare): per-layer ≤ ~1e-5, logits ≤ ~6e-6, argmax 100%. Incremental KV-cache `generate`/`generate_stream`
+//! (f32 + int8-KV; per-layer GQA width, since local/global head_dim differ) and `explain` are wired. The big embedding
+//! tables (main embed + the multi-GB PLE table) and the packed experts are converted STREAMED (see `convert.rs`), so
+//! `fieldrun convert --arch gemma4` stays within RAM on a small box even for the 26B+/31B checkpoints.
 
 use std::collections::HashMap;
 
@@ -259,6 +262,9 @@ impl Gemma4 {
     /// (`embed_per_layer`, scaled √ple) with the context projection of the √d-scaled input embedding
     /// (`per_layer_model_projection` · 1/√d, RMSNorm'd over ple), then `(proj + tok) · 1/√2`.
     fn per_layer_inputs(&self, ids: &[i64], emb_scaled: &Array2<f32>) -> Vec<Array2<f32>> {
+        if self.ple == 0 {
+            return Vec::new(); // PLE off (ple=0, e.g. 26B-A4B): no per-layer inputs; the gated-residual block is skipped
+        }
         let seq = ids.len();
         let tok = self.b.rows_f32("embed_per_layer", ids); // (seq, nl*ple), un-scaled
         let proj = self.b.mm(emb_scaled, "per_layer_model_projection"); // (seq, nl*ple)
@@ -389,15 +395,100 @@ impl Gemma4 {
             };
             x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
 
-            // --- PLE gated-residual block ---
-            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate")); // (seq, ple)
-            g.mapv_inplace(gelu_tanh);
-            g = &g * &pli[l]; // gate by the per-layer embedding
-            let proj = self.b.mm(&g, &format!("{p}per_layer_projection")); // (seq, d)
-            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            // --- PLE gated-residual block (skipped when ple=0, e.g. 26B-A4B) ---
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate")); // (seq, ple)
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l]; // gate by the per-layer embedding
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection")); // (seq, d)
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
             x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
+    }
+
+    /// Debug: residual-stream snapshots in transformers `output_hidden_states` convention — [inputs_embeds (=√d·embed),
+    /// out-L0, …, out-L{n-2}, POST-final-norm] (each flat seq·d, row-major), nl+1 entries. Gemma4's last hidden_state
+    /// IS the post-final-norm output (verified hs[-1] == last_hidden_state), so the final slot is normed, matching HF.
+    /// Mirrors `hidden()` exactly — kept as a separate walk (like the qwen35moe harness) so the hot path stays clean.
+    pub fn hiddens(&self, ids: &[i64]) -> Vec<Vec<f32>> {
+        let seq = ids.len();
+        let h = self.h;
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let mut snaps = Vec::with_capacity(self.n_layer + 1);
+        snaps.push(x.iter().cloned().collect()); // hs[0] = inputs_embeds
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] {
+                    kv_store[l] = Some(kv.clone());
+                }
+                kv
+            };
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) {
+                            scores[[i, j]] = -1e30;
+                        }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = gelu_tanh(*hv) * uv;
+            }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            if self.ple > 0 { // PLE gated-residual block — skipped when ple=0 (e.g. 26B-A4B)
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
+            x *= self.layer_scalar[l];
+            if l + 1 < self.n_layer {
+                snaps.push(x.iter().cloned().collect()); // hs[l+1] = out-L{l}
+            }
+        }
+        snaps.push(self.norm(&x, "norm").iter().cloned().collect()); // hs[N] = post-final-norm
+        snaps
     }
 
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
@@ -473,11 +564,13 @@ impl Gemma4 {
                 mlp
             };
             x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
-            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
-            g.mapv_inplace(gelu_tanh);
-            g = &g * &pli[l];
-            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
-            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            if self.ple > 0 { // PLE gated-residual block — skipped when ple=0 (e.g. 26B-A4B)
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
             x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         let xf = self.norm(&x, "norm");
@@ -564,11 +657,13 @@ impl Gemma4 {
                 mlp
             };
             x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
-            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
-            g.mapv_inplace(gelu_tanh);
-            g = &g * &pli[l];
-            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
-            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            if self.ple > 0 { // PLE gated-residual block — skipped when ple=0 (e.g. 26B-A4B)
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
             x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
@@ -649,11 +744,13 @@ impl Gemma4 {
                 mlp
             };
             x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
-            let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
-            g.mapv_inplace(gelu_tanh);
-            g = &g * &pli[l];
-            let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
-            x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            if self.ple > 0 { // PLE gated-residual block — skipped when ple=0 (e.g. 26B-A4B)
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
             x *= self.layer_scalar[l]; // per-layer output scalar — the last op of the layer (Gemma4ForCausalLM)
         }
         self.norm(&x, "norm")
@@ -689,6 +786,303 @@ impl Model for Gemma4 {
         let last = xf.row(ids.len() - 1).to_vec();
         let logits = self.b.rowdot_f32(self.unembed(), &last);
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+    }
+
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        let xf = self.hidden(ids);
+        Some(self.b.rowdot_f32(self.unembed(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    /// Per-block residual-stream WRITES at the last position, folded through the final RMSNorm so that
+    /// ⟨write_b, U_v⟩ is block `b`'s EXACT additive logit contribution to token `v` (this is the substrate
+    /// `--export-logic` / Density-Minimization consume; see `residual_decomp`). Gemma 4's residual is richer than
+    /// the rope backbone, so three extra factors are folded in vs `rope::residual_normed_writes`:
+    ///   • the √d **embed scale** (the embed write is `√d·embed`);
+    ///   • each block write is **post-block-normed** (`post_attention_layernorm` / `post_feedforward_layernorm` /
+    ///     `post_per_layer_input_norm`) before it enters the residual — so the captured write IS that normed vector;
+    ///   • the per-layer **`layer_scalar`** rescales the WHOLE residual at each layer's end, so a write created in
+    ///     layer `l` carries the cumulative factor `Π_{j≥l} ls_j`. Folding that in keeps the decomposition exact:
+    ///       x_pre_final_norm = (Π ls)·(√d·embed) + Σ_l (Π_{j≥l} ls_j)·(attn_l + ffn_l + ple_l).
+    /// PLE-off models (ple=0) simply emit no `L{l}.ple` write. The FFN write is one block (dense + MoE combined,
+    /// like qwen3moe). Mirrors `hidden()` exactly as a separate walk (the precedent set by the other archs).
+    fn residual_normed_writes(&self, ids: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        let seq = ids.len();
+        let h = self.h;
+        let last = seq - 1;
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut writes: Vec<Vec<f32>> = vec![x.row(last).to_vec()];
+        let mut wlayer: Vec<usize> = vec![0]; // the layer each write belongs to (embed → 0, i.e. cumll over all layers)
+        let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] {
+                    kv_store[l] = Some(kv.clone());
+                }
+                kv
+            };
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) {
+                            scores[[i, j]] = -1e30;
+                        }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let aw = self.norm(&o, &format!("{p}post_attention_layernorm"));
+            writes.push(aw.row(last).to_vec());
+            labels.push(format!("L{l}.attn"));
+            wlayer.push(l);
+            x = &x + &aw;
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = gelu_tanh(*hv) * uv;
+            }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            let fw = self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            writes.push(fw.row(last).to_vec());
+            labels.push(format!("L{l}.ffn"));
+            wlayer.push(l);
+            x = &x + &fw;
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                let pw = self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+                writes.push(pw.row(last).to_vec());
+                labels.push(format!("L{l}.ple"));
+                wlayer.push(l);
+                x = &x + &pw;
+            }
+            x *= self.layer_scalar[l];
+        }
+        // cumulative layer_scalar from layer l onward: cumll[l] = Π_{j=l}^{nl-1} ls_j (cumll[nl] = 1).
+        let mut cumll = vec![1.0f32; self.n_layer + 1];
+        for l in (0..self.n_layer).rev() {
+            cumll[l] = cumll[l + 1] * self.layer_scalar[l];
+        }
+        for (wi, w) in writes.iter_mut().enumerate() {
+            let factor = cumll[wlayer[wi]];
+            if factor != 1.0 {
+                for v in w.iter_mut() {
+                    *v *= factor;
+                }
+            }
+        }
+        // final RMSNorm geometry at the last position (Gemma-4 norm = weight-direct, no center/bias): with the cumll
+        // factors applied, Σ_b write_b == the pre-final-norm residual `x.row(last)`, so the folded contribution vector
+        // is d̃_b = inv_rms · gain ⊙ write_b and ⟨d̃_b, U_v⟩ is block b's exact logit contribution to token v.
+        let xpre = x.row(last).to_vec();
+        let dlen = xpre.len();
+        let inv_rms = 1.0 / (xpre.iter().map(|v| v * v).sum::<f32>() / dlen as f32 + self.eps).sqrt();
+        let gain = self.b.arr1("norm");
+        let dvec: Vec<Vec<f32>> = writes
+            .iter()
+            .map(|w| w.iter().zip(gain.iter()).map(|(wd, gd)| inv_rms * wd * gd).collect())
+            .collect();
+        Some((labels, dvec))
+    }
+
+    fn residual_decomp(&self, ids: &[i64], toks: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        // The per-block folded contribution vectors projected onto the requested token rows: contrib[b][i] =
+        // ⟨d̃_b, U_{toks[i]}⟩. By construction Σ_b contrib[b][i] == logit(toks[i]). Enables `--export-logic` for gemma4.
+        let (labels, dvec) = self.residual_normed_writes(ids)?;
+        let un = self.unembed();
+        let urows: Vec<Vec<f32>> = toks.iter().map(|&t| self.b.weight_row(un, t as usize)).collect();
+        let contrib: Vec<Vec<f32>> = dvec
+            .iter()
+            .map(|d| urows.iter().map(|u| d.iter().zip(u.iter()).map(|(dd, ud)| dd * ud).sum::<f32>()).collect())
+            .collect();
+        Some((labels, contrib))
+    }
+
+    fn decision_decomp(&self, ids: &[i64], extra: &[i64], cap: usize)
+        -> Option<(i64, i64, f32, f32, Vec<i64>, Vec<(String, Vec<f32>)>)> {
+        // ONE forward (no explain capture): folded per-block writes d̃_b at the predicting position.
+        let (labels, dvec) = self.residual_normed_writes(ids)?;
+        // Σ_b d̃_b is the folded residual; U·(Σ d̃_b) is the exact full-vocab logit vector → argmax + runner-up.
+        let d = dvec[0].len();
+        let mut full = vec![0f32; d];
+        for v in &dvec {
+            for (i, &x) in v.iter().enumerate() { full[i] += x; }
+        }
+        let logits = self.b.rowdot_f32(self.unembed(), &full);
+        let (mut pred, mut p1, mut runner, mut p2) = (0usize, f32::MIN, 0usize, f32::MIN);
+        for (i, &l) in logits.iter().enumerate() {
+            if l > p1 { p2 = p1; runner = pred; p1 = l; pred = i; }
+            else if l > p2 { p2 = l; runner = i; }
+        }
+        // candidate set = {predicted, runner-up} ∪ extra (store/n-gram proposed), deduped, capped.
+        let mut cands = vec![pred as i64];
+        if runner != pred { cands.push(runner as i64); }
+        for &x in extra {
+            if cands.len() >= cap { break; }
+            if !cands.contains(&x) { cands.push(x); }
+        }
+        // per-block contribution to each candidate's logit: ⟨d̃_b, U_cand⟩ (candidate-only unembed → cheap).
+        let un = self.unembed();
+        let urows: Vec<Vec<f32>> = cands.iter().map(|&c| self.b.weight_row(un, c as usize)).collect();
+        let blocks: Vec<(String, Vec<f32>)> = labels
+            .iter()
+            .zip(dvec.iter())
+            .map(|(lab, dv)| (lab.clone(), urows.iter().map(|u| dv.iter().zip(u).map(|(a, b)| a * b).sum::<f32>()).collect()))
+            .collect();
+        Some((pred as i64, runner as i64, p1, p2, cands, blocks))
+    }
+
+    fn decomp_all(&self, ids: &[i64], cap: usize)
+        -> Option<Vec<(i64, i64, f32, f32, Vec<i64>, Vec<(String, Vec<f32>)>)>> {
+        // ONE forward over the whole sentence, keeping each block's write at ALL positions (seq×d matrices). Mirrors
+        // `residual_normed_writes` but captures full matrices instead of the last row — so every position's decision
+        // comes out of this single (fixed-cost) forward.
+        let seq = ids.len();
+        let h = self.h;
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut wmats: Vec<Array2<f32>> = vec![x.clone()];
+        let mut wlayer: Vec<usize> = vec![0];
+        let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] { kv_store[l] = Some(kv.clone()); }
+                kv
+            };
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let aw = self.norm(&o, &format!("{p}post_attention_layernorm"));
+            x = &x + &aw;
+            wmats.push(aw); labels.push(format!("L{l}.attn")); wlayer.push(l);
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else { mlp };
+            let fw = self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            x = &x + &fw;
+            wmats.push(fw); labels.push(format!("L{l}.ffn")); wlayer.push(l);
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                let pw = self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+                x = &x + &pw;
+                wmats.push(pw); labels.push(format!("L{l}.ple")); wlayer.push(l);
+            }
+            x *= self.layer_scalar[l];
+        }
+        // cumulative layer_scalar from layer l onward, folded into each write (so Σ_b wmats[b] == x at every position).
+        let mut cumll = vec![1.0f32; self.n_layer + 1];
+        for l in (0..self.n_layer).rev() { cumll[l] = cumll[l + 1] * self.layer_scalar[l]; }
+        for (wi, w) in wmats.iter_mut().enumerate() {
+            let f = cumll[wlayer[wi]];
+            if f != 1.0 { w.mapv_inplace(|v| v * f); }
+        }
+        // x is now the pre-final-norm residual at all positions. Per position: fold the final norm, full unembed for the
+        // argmax + top-`cap` candidates, then project each block onto those candidates.
+        let gain = self.b.arr1("norm");
+        let gain = gain.as_slice().unwrap();
+        let un = self.unembed();
+        let dlen = self.d;
+        let mut out = Vec::with_capacity(seq);
+        for pos in 0..seq {
+            let xp = x.row(pos);
+            let inv_rms = 1.0 / (xp.iter().map(|v| v * v).sum::<f32>() / dlen as f32 + self.eps).sqrt();
+            let normed: Vec<f32> = xp.iter().zip(gain).map(|(v, g)| inv_rms * v * g).collect();
+            let logits = self.b.rowdot_f32(un, &normed);
+            let vocab = logits.len();
+            let k = cap.min(vocab).max(1);
+            let mut order: Vec<usize> = (0..vocab).collect();
+            order.select_nth_unstable_by(k - 1, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            order.truncate(k);
+            order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            let pred = order[0] as i64;
+            let runner = if order.len() > 1 { order[1] as i64 } else { pred };
+            let (pl, rl) = (logits[order[0]], logits[*order.get(1).unwrap_or(&order[0])]);
+            let cands: Vec<i64> = order.iter().map(|&i| i as i64).collect();
+            let urows: Vec<Vec<f32>> = cands.iter().map(|&c| self.b.weight_row(un, c as usize)).collect();
+            let blocks: Vec<(String, Vec<f32>)> = labels
+                .iter()
+                .zip(wmats.iter())
+                .map(|(lab, w)| {
+                    let wp = w.row(pos);
+                    // d̃_b at this position = inv_rms · gain ⊙ write_b[pos]; contrib = ⟨d̃_b, U_cand⟩
+                    let dv: Vec<f32> = wp.iter().zip(gain).map(|(v, g)| inv_rms * v * g).collect();
+                    (lab.clone(), urows.iter().map(|u| dv.iter().zip(u).map(|(a, b)| a * b).sum::<f32>()).collect())
+                })
+                .collect();
+            out.push((pred, runner, pl, rl, cands, blocks));
+        }
+        Some(out)
     }
 
     fn explain(&self, ids: &[i64]) -> Option<crate::explain::Explanation> {

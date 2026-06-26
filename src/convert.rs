@@ -79,6 +79,41 @@ impl Model {
         };
         (t.shape().to_vec(), v)
     }
+
+    /// Shape of `name` without materializing its data (just parses the safetensors header).
+    fn shape(&self, name: &str) -> Vec<usize> {
+        let i = *self.idx.get(name).unwrap_or_else(|| panic!("convert: missing tensor {name}"));
+        let st = SafeTensors::deserialize(&self.mmaps[i]).unwrap();
+        st.tensor(name).unwrap().shape().to_vec()
+    }
+
+    /// Read rows `[row0, row0+nrows)` of `name` viewed as 2D `[shape[0], prod(shape[1..])]`, as f32, WITHOUT
+    /// materializing the whole tensor — slices the mmap'd bytes directly. Lets convert quantise giant embedding /
+    /// per-expert tensors block-by-block so peak RAM is one block, not prod(shape)*4 bytes (the Gemma-4 PLE table is
+    /// several GB; its f32 materialisation would OOM a small box).
+    fn read_rows(&self, name: &str, row0: usize, nrows: usize) -> Vec<f32> {
+        let i = *self.idx.get(name).unwrap_or_else(|| panic!("convert: missing tensor {name}"));
+        let st = SafeTensors::deserialize(&self.mmaps[i]).unwrap();
+        let t = st.tensor(name).unwrap();
+        let shape = t.shape();
+        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        let (esz, dt) = match t.dtype() {
+            Dtype::F32 => (4usize, Dtype::F32),
+            Dtype::F16 => (2, Dtype::F16),
+            Dtype::BF16 => (2, Dtype::BF16),
+            d => panic!("convert: unsupported dtype {d:?} for {name}"),
+        };
+        let b = t.data();
+        let start = row0 * inner * esz;
+        let end = (row0 + nrows) * inner * esz;
+        let slice = &b[start..end];
+        match dt {
+            Dtype::F32 => slice.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            Dtype::F16 => slice.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            Dtype::BF16 => slice.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn mmap(path: &str) -> Mmap {
@@ -251,6 +286,57 @@ impl BundleWriter {
             "int8" if shape.len() == 2 => self.put_embed_i8(name, data, shape[0], shape[1]),
             _ => self.put_small(name, data, shape, dtype),
         }
+    }
+
+    /// Stream a big 2D embedding-like tensor (`rows × inner`) straight from the source mmap to the bundle in row
+    /// BLOCKS, so convert never holds the whole thing as f32 (the Gemma-4 PLE table is multi-GB). Output dtype mirrors
+    /// the non-streamed `put_embed`: `embed_dtype=="int8"` → per-row int8 (`rowi8` + f16 row scale, byte-identical to
+    /// `put_embed_i8`); else f16 (or f32 when `dtype=="f32"`, byte-identical to `put_small`). The runtime gathers these
+    /// via `rows_f32`, which already dequantises rowi8/f16/f32, so the on-disk format is unchanged — only the peak RAM is.
+    fn put_embed_streamed(&mut self, m: &Model, name: &str, hf: &str, embed_dtype: &str, dtype: &str) -> std::io::Result<()> {
+        let shape = m.shape(hf);
+        let rows = shape[0];
+        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        const BLK: usize = 8192; // rows per block — caps the transient f32 buffer at BLK*inner
+        let rowi8 = embed_dtype == "int8" && shape.len() == 2;
+        let f32_out = !rowi8 && dtype == "f32";
+        let mut scale = if rowi8 { vec![0f32; rows] } else { Vec::new() };
+        let mut total = 0usize;
+        let mut r = 0;
+        while r < rows {
+            let nb = BLK.min(rows - r);
+            let blk = m.read_rows(hf, r, nb); // nb*inner f32 (one block, bounded)
+            if rowi8 {
+                let mut q = vec![0u8; nb * inner];
+                for rr in 0..nb {
+                    let amax = (0..inner).fold(0f32, |mx, c| mx.max(blk[rr * inner + c].abs()));
+                    let s = (amax / 127.0).max(1e-8);
+                    scale[r + rr] = s;
+                    for c in 0..inner {
+                        q[rr * inner + c] = ((blk[rr * inner + c] / s).round_ties_even().clamp(-127.0, 127.0) as i8) as u8;
+                    }
+                }
+                self.bin.write_all(&q)?;
+                total += q.len();
+            } else if f32_out {
+                let mut buf = Vec::with_capacity(nb * inner * 4);
+                for &v in &blk { buf.extend_from_slice(&v.to_le_bytes()); }
+                self.bin.write_all(&buf)?;
+                total += buf.len();
+            } else {
+                let mut buf = Vec::with_capacity(nb * inner * 2);
+                for &v in &blk { buf.extend_from_slice(&half::f16::from_f32(v).to_le_bytes()); }
+                self.bin.write_all(&buf)?;
+                total += buf.len();
+            }
+            r += nb;
+        }
+        let dt = if rowi8 { "rowi8" } else if f32_out { "f32" } else { "f16" };
+        self.entry(name, dt, &shape, total);
+        if rowi8 {
+            self.put_f16(&format!("{name}__scale"), &scale, &[rows])?;
+        }
+        Ok(())
     }
 
     /// int8 from a (rows, cols) f32 source, scale per output column `j`. `transpose`: source is (out, in) (nn.Linear) →
@@ -579,32 +665,40 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
 /// block. attention_k_eq_v (global layers drop v_proj) and KV-sharing (the last num_kv_shared_layers drop k/v/k_norm) are
 /// both supported.
 fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    // The released checkpoints ship the multimodal composite `Gemma4Config` (model_type "gemma4") with all the text
+    // params under `text_config`; a standalone `Gemma4ForCausalLM` saves the flat `Gemma4TextConfig` (no nesting). Read
+    // text params from `text_config` when present, else the top level. `tie_word_embeddings` lives at the TOP level on
+    // the composite, so it falls back to `c`.
+    let tc = c.get("text_config").unwrap_or(c);
+    // Tensor-name prefix: the multimodal composite checkpoints nest the text model under `model.language_model.*`
+    // (alongside `vision_tower`/`audio_tower`, which we ignore); a standalone `Gemma4ForCausalLM` uses `model.*`.
+    let lmp = if m.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
     // attention_k_eq_v: GLOBAL layers carry no v_proj — V is the k_proj output (value-normed) — and use
     // num_global_key_value_heads KV heads. We record the flag and skip the absent v_proj weights below.
-    let k_eq_v = c.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false);
+    let k_eq_v = tc.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(false);
     // KV-sharing: the last `n_kv_shared` layers carry no k_proj/v_proj/k_norm — they reuse an earlier same-type layer's
     // assembled K/V. We record the count and skip those absent weights below (the kernel resolves the source layer).
-    let n_kv_shared = geti(c, "num_kv_shared_layers").unwrap_or(0);
-    let moe = c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false);
-    let n_exp = geti(c, "num_experts").unwrap_or(0);
-    let topk = geti(c, "top_k_experts").unwrap_or(0);
-    let moe_inter = geti(c, "moe_intermediate_size").unwrap_or(0);
-    let nh = geti(c, "num_attention_heads").unwrap();
-    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
-    let nkv_g = geti(c, "num_global_key_value_heads").unwrap_or(nkv);
-    let d = geti(c, "hidden_size").unwrap();
-    let hd = geti(c, "head_dim").unwrap_or(d / nh);
-    let hd_g = geti(c, "global_head_dim").unwrap_or(hd);
-    let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
-    let ple = geti(c, "hidden_size_per_layer_input").unwrap_or(256);
-    let eps = getf(c, "rms_norm_eps").unwrap_or(1e-6);
-    let window = geti(c, "sliding_window").unwrap_or(512);
-    let pattern = geti(c, "sliding_window_pattern").unwrap_or(6);
-    let (theta_local, theta_global) = gemma3_thetas(c);
-    let prf = c.get("rope_parameters").and_then(|v| v.get("full_attention")).and_then(|t| t.get("partial_rotary_factor"))
+    let n_kv_shared = geti(tc, "num_kv_shared_layers").unwrap_or(0);
+    let moe = tc.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_exp = geti(tc, "num_experts").unwrap_or(0);
+    let topk = geti(tc, "top_k_experts").unwrap_or(0);
+    let moe_inter = geti(tc, "moe_intermediate_size").unwrap_or(0);
+    let nh = geti(tc, "num_attention_heads").unwrap();
+    let nkv = geti(tc, "num_key_value_heads").unwrap_or(nh);
+    let nkv_g = geti(tc, "num_global_key_value_heads").unwrap_or(nkv);
+    let d = geti(tc, "hidden_size").unwrap();
+    let hd = geti(tc, "head_dim").unwrap_or(d / nh);
+    let hd_g = geti(tc, "global_head_dim").unwrap_or(hd);
+    let (nl, ffn, vocab) = (geti(tc, "num_hidden_layers").unwrap(), geti(tc, "intermediate_size").unwrap(), geti(tc, "vocab_size").unwrap());
+    let ple = geti(tc, "hidden_size_per_layer_input").unwrap_or(256);
+    let eps = getf(tc, "rms_norm_eps").unwrap_or(1e-6);
+    let window = geti(tc, "sliding_window").unwrap_or(512);
+    let pattern = geti(tc, "sliding_window_pattern").unwrap_or(6);
+    let (theta_local, theta_global) = gemma3_thetas(tc);
+    let prf = tc.get("rope_parameters").and_then(|v| v.get("full_attention")).and_then(|t| t.get("partial_rotary_factor"))
         .and_then(|t| t.as_f64()).unwrap_or(0.25);
-    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true);
-    let lt = c.get("layer_types").and_then(|v| v.as_array());
+    let tie = tc.get("tie_word_embeddings").or_else(|| c.get("tie_word_embeddings")).and_then(|v| v.as_bool()).unwrap_or(true);
+    let lt = tc.get("layer_types").and_then(|v| v.as_array());
     let full_of = |l: usize| lt.and_then(|a| a.get(l)).and_then(|s| s.as_str())
         .map(|s| s == "full_attention").unwrap_or((l + 1) % pattern == 0);
     // Gemma 4 forces the last layer to full_attention.
@@ -613,7 +707,7 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
     // `Gemma4ForCausalLM`; default 1.0). Read it per layer so a checkpoint that ships a non-1.0 value runs faithfully
     // instead of silently diverging; appended to config_f after the 4 rope/eps scalars.
     let layer_scalar: Vec<f64> = (0..nl).map(|l| {
-        let k = format!("model.layers.{l}.layer_scalar");
+        let k = format!("{lmp}.layers.{l}.layer_scalar");
         if m.has(&k) { m.read(&k).1.first().copied().unwrap_or(1.0) as f64 } else { 1.0 }
     }).collect();
     let mut config: Vec<usize> = vec![nl, nh, nkv, nkv_g, hd, hd_g, d, ffn, vocab, tie as usize, window, ple,
@@ -639,31 +733,37 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
         let (s, dt) = m.read(hf); // (out, in)
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
-    // main + PLE embeddings (both f16/f32, never int8 — embed stays low-precision)
-    let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_embed("embed", &ed, &es, edt, dtype)?;
-    let (es2, ed2) = m.read("model.embed_tokens_per_layer.weight"); // (vocab_per_layer, nl*ple)
-    w.put_small("embed_per_layer", &ed2, &es2, dtype)?;
-    norm(&mut w, "norm", "model.norm.weight")?;
-    norm(&mut w, "per_layer_projection_norm", "model.per_layer_projection_norm.weight")?;
-    // per_layer_model_projection: Linear(d -> nl*ple); the int8 W8A8 path needs the weight, so keep it f16/f32 like a norm
-    {
-        let (s, dt) = m.read("model.per_layer_model_projection.weight"); // (nl*ple, d)
+    // main + PLE embeddings — STREAMED (block-by-block) so the multi-GB Gemma-4 tables never materialise as f32 in
+    // convert (the f32 peak of `embed_tokens_per_layer` alone is ~prod(shape)*4 = many GB and would OOM a small box).
+    // Both follow `embed_dtype`: default f16 (byte-identical to the old put_embed/put_small), `--embed-dtype int8`
+    // halves them to rowi8. The runtime gathers both via `rows_f32`, which dequantises rowi8/f16/f32 transparently.
+    w.put_embed_streamed(&m, "embed", &format!("{lmp}.embed_tokens.weight"), edt, dtype)?;
+    norm(&mut w, "norm", &format!("{lmp}.norm.weight"))?;
+    // Per-Layer-Embedding tables — ONLY when PLE is enabled (`hidden_size_per_layer_input>0`). The 26B-A4B MoE ships
+    // ple=0 (no PLE), so these tensors are absent in the checkpoint; reading them unconditionally would panic.
+    if ple > 0 {
+        w.put_embed_streamed(&m, "embed_per_layer", &format!("{lmp}.embed_tokens_per_layer.weight"), edt, dtype)?; // (vocab_per_layer, nl*ple)
+        norm(&mut w, "per_layer_projection_norm", &format!("{lmp}.per_layer_projection_norm.weight"))?;
+        // per_layer_model_projection: Linear(d -> nl*ple); the int8 W8A8 path needs the weight, so keep it f16/f32 like a norm
+        let (s, dt) = m.read(&format!("{lmp}.per_layer_model_projection.weight")); // (nl*ple, d)
         let (out, inp) = (s[0], s[1]);
         let mut t = vec![0f32; inp * out];
         for o in 0..out { for i in 0..inp { t[i * out + o] = dt[o * inp + i]; } }
         w.put_small("per_layer_model_projection", &t, &[inp, out], dtype)?;
     }
     if !tie {
-        let (s, dt) = m.read("lm_head.weight"); // (vocab, d) — raw for rowdot_f32, low-precision
-        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
+        w.put_embed_streamed(&m, "lm_head", "lm_head.weight", edt, dtype)?; // (vocab, d) — streamed like embed
     }
     for l in 0..nl {
-        let p = format!("model.layers.{l}.");
+        let p = format!("{lmp}.layers.{l}.");
         for nm in ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm",
                    "self_attn.q_norm", "self_attn.k_norm", "post_per_layer_input_norm"] {
             // KV-shared layers reuse an earlier layer's K, so they have no k_norm.
             if nm == "self_attn.k_norm" && is_shared(l) {
+                continue;
+            }
+            // PLE-off models (ple=0, e.g. 26B-A4B) have no post_per_layer_input_norm.
+            if nm == "post_per_layer_input_norm" && ple == 0 {
                 continue;
             }
             norm(&mut w, &format!("l{l}.{nm}"), &format!("{p}{nm}.weight"))?;
@@ -673,6 +773,10 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
                      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"] {
             // attention_k_eq_v global layers have no v_proj (the kernel reuses k_proj as V) → skip the absent weight.
             if proj == "self_attn.v_proj" && k_eq_v && is_full(l) {
+                continue;
+            }
+            // PLE-off models (ple=0) have no per-layer-input gate/projection.
+            if (proj == "per_layer_input_gate" || proj == "per_layer_projection") && ple == 0 {
                 continue;
             }
             // KV-shared layers have no k_proj/v_proj (they reuse an earlier same-type layer's assembled K/V).
@@ -693,16 +797,18 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
             let (ps, pd) = m.read(&format!("{p}router.per_expert_scale"));
             w.put_small(&format!("l{l}.router.per_expert_scale"), &pd, &ps, dtype)?;
             // experts: gate_up_proj (E, 2*moe_inter, d), down_proj (E, d, moe_inter) — write EACH expert as its own
-            // int8 array so a single expert can be paged in independently (the mmap-offload contract).
-            let (gus, gud) = m.read(&format!("{p}experts.gate_up_proj")); // (E, 2*mi, d)
-            let (dns, dnd) = m.read(&format!("{p}experts.down_proj"));     // (E, d, mi)
+            // int8/int4 array so a single expert can be paged in independently (the mmap-offload contract). Read each
+            // expert's slice STREAMED (one expert at a time) rather than materialising all E experts as f32 — for a
+            // many-expert MoE the whole 3D tensor is several GB of f32 and would OOM a small box.
+            let gus = m.shape(&format!("{p}experts.gate_up_proj")); // (E, 2*mi, d)
+            let dns = m.shape(&format!("{p}experts.down_proj"));    // (E, d, mi)
             let (gu_out, gu_in) = (gus[1], gus[2]); // (2*mi, d)
             let (dn_out, dn_in) = (dns[1], dns[2]); // (d, mi)
             for e in 0..n_exp {
-                let gu = &gud[e * gu_out * gu_in..(e + 1) * gu_out * gu_in];
-                w.put_lin(&format!("l{l}.experts.{e}.gate_up"), gu, gu_out, gu_in, dtype)?;
-                let dn = &dnd[e * dn_out * dn_in..(e + 1) * dn_out * dn_in];
-                w.put_lin(&format!("l{l}.experts.{e}.down"), dn, dn_out, dn_in, dtype)?;
+                let gu = m.read_rows(&format!("{p}experts.gate_up_proj"), e, 1); // expert e, flat (2*mi*d)
+                w.put_lin(&format!("l{l}.experts.{e}.gate_up"), &gu, gu_out, gu_in, dtype)?;
+                let dn = m.read_rows(&format!("{p}experts.down_proj"), e, 1); // expert e, flat (d*mi)
+                w.put_lin(&format!("l{l}.experts.{e}.down"), &dn, dn_out, dn_in, dtype)?;
             }
         }
     }

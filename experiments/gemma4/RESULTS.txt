@@ -1,0 +1,64 @@
+Gemma 4 (gemma4_text) forward — parity vs transformers Gemma4ForCausalLM (tiny, f32), + low-RAM convert
+
+Reproduce (needs transformers>=5.12 — has Gemma4 — in a venv):
+  python experiments/gemma4/make_tiny_gemma4.py --out /tmp/tiny_g4 --seq 12            # dense backbone
+  python experiments/gemma4/make_tiny_gemma4.py --out /tmp/tiny_g4_moe --seq 12 --moe  # + MoE branch
+  ./target/debug/fieldrun convert --model /tmp/tiny_g4 --arch gemma4 --dtype f32 -o /tmp/tiny_g4_fr --force
+  ./target/debug/fieldrun --bundle /tmp/tiny_g4_fr --recursion-explain --hidden-dump /tmp/h.bin --ids /tmp/tiny_g4/ref_ids.json
+  ./target/debug/fieldrun --bundle /tmp/tiny_g4_fr --recursion-explain --logits-dump /tmp/l.bin --ids /tmp/tiny_g4/ref_ids.json
+  python experiments/gemma4/compare.py /tmp/tiny_g4 /tmp/h.bin /tmp/l.bin
+  # variants: --k-eq-v [--global-kv-heads N] | --kv-shared N | --moe  exercise the small/MoE-model paths one at a time
+
+What the f32 parity covers (every Gemma-4 quirk verified, not asserted):
+  - RMSNorm = normed*weight (weight-direct, NOT (1+w); eps inside) — the norm weights are re-inited to non-1.0 so this is tested
+  - embed scale √d; the Per-Layer-Embedding pipeline: token-identity *√ple, context proj *1/√d → RMSNorm(ple) → (ctx+tok)*1/√2
+  - per-type head_dim (local head_dim vs global_head_dim), attention scaling = 1.0, q/k-norm, value-norm (RMS, no weight, no RoPE)
+  - proportional/partial RoPE on global layers (first int((prf*global_head_dim)//2) freqs rotate, tail zero-padded = identity)
+  - per-layer layer_scalar (re-inited != 1.0) applied as the LAST op of each decoder layer
+  - MoE: router (norm no-weight *scale*1/√d → softmax → top-k → renorm → per_expert_scale), gelu_tanh experts, h1+h2 combine
+
+=== dense backbone (4 layers [sliding,full,sliding,full], seq 12, f32) ===
+  per-snapshot residual (output_hidden_states convention):  embed 0.0e0 | out-L0 1.6e-6 | out-L1 6.6e-6 | out-L2 9.5e-6 | POST-norm 9.8e-6
+  logits: max_abs_diff = 6.26e-6   argmax agreement = 100%   <-- PARITY
+
+=== MoE (enable_moe_block, 4 experts top-2 + shared dense MLP, f32) ===
+  per-snapshot residual:  embed 0.0e0 | out-L0 3.3e-6 | out-L1 1.0e-5 | out-L2 1.4e-5 | POST-norm 6.2e-6
+  logits: max_abs_diff = 4.26e-6   argmax agreement = 100%   <-- PARITY (streamed per-expert convert + moe_branch + router)
+
+=== quantized convert (same tiny model; quant quality is arch-independent — int8 confirms the convert path) ===
+  --dtype int8        : logits diff 1.7e-1   argmax 100%   top5-overlap 97%
+  --embed-dtype int8  : logits diff 1.3e-1   argmax 100%   (streamed rowi8 main-embed + PLE table)
+  --dtype int4        : logits diff 8.8e-1   argmax 50%    top5-overlap 63%   (int4's coarse grid on a TINY RANDOM model
+                        with d=64 / only 2 groups per row — expected; real 31B dims + trained weights hold >95% top-1)
+
+=== low-RAM convert (the fix that makes 26B+/31B convertible on a small box) ===
+  convert no longer materialises any whole tensor as f32. The giant Gemma-4 embedding tables (main embed + the PLE table
+  `embed_tokens_per_layer`, [vocab_per_layer, n_layers*ple] — several GB; its f32 copy alone would OOM a 14 GB box) and the
+  packed experts are read STREAMED — embeds block-by-block (rowi8/f16/f32, byte-identical to the old put_embed/put_small),
+  experts one-at-a-time. Peak convert RAM is now max(one row-block, one expert), not prod(shape)*4. The f32 result is
+  byte-identical (parity unchanged); `--embed-dtype int8` additionally halves both embed tables to rowi8.
+
+=== logic export (model → Datalog → Soufflé), gemma4 ===
+The logic export (--export-logic / --export-logic-corpus) is no longer rope-only: gemma4 implements residual_decomp
+(per-block contributions, final-norm folded, Σ_block == logit — exact). Verified FAITHFUL on dense / MoE / PLE-off
+tiny models, and Soufflé reproduces the model's argmax (`decide(t) == model prediction`).
+
+Real model (gemma-4-e4b-it, int4) over a German grammar corpus (de.wikipedia grammar articles):
+  - BOS: Gemma's tokenizer.json has no bos post-processor and the model is incoherent without <bos> — encode_bos
+    prepends it. With <bos>: "Die Hauptstadt von Deutschland ist" → " Berlin" (logit 44.5); "…Genus, Kasus und" →
+    " und Numerus" (correct grammar). Without: degraded fragments.
+  - Soufflé faithfulness: 150/150 (and every sample) decide() == model argmax.
+  - Dominant residual block over German-grammar decisions: L41.ffn (~52%) + L41.ple (~36%) — the last layer drives it.
+
+=== speed (per-decision logic export, e4b int4 on a 16-core CPU) ===
+  baseline (explain + residual_decomp, 2 forwards + capture)        : ~22.9 s/decision
+  lean decision_decomp (1 forward, no explain capture)              : ~9–12 s/decision
+  + all-positions (one forward/sentence → a decision per position)  : amortizes the fixed int4-dequant prefill
+  + SIMD unembed (rowi8_dot_avx2; bit-identical, verified)          : full-vocab argmax ~halved
+  COMBINED (--all-positions): 40 sentences → 1355 decisions in 6:43 = ~0.30 s/decision  (~76× vs baseline)
+
+  NOT a win (measured): a KV-cache for the forward. Short (4-tok) and long (55-tok) contexts both cost ~12 s, so the
+  forward is fixed int4-dequant cost, NOT prefill-length-bound — KV-cache only helps by amortizing one prefill across
+  positions, which `--all-positions` already does. Honest negative.
+
+  The corpus reader streams line-by-line (BufReader), so corpus size is bounded by time + disk, not RAM.

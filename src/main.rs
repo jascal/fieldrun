@@ -433,7 +433,7 @@ fn main() {
     let ids: Vec<i64> = if let Some(text) = flag(&args, "--text") {
         #[cfg(feature = "api")]
         let r = match flag(&args, "--bundle").map(resolve_bundle).and_then(|s| api::TextGen::load(&s, Vec::new())) {
-            Some(tg) => tg.encode(text, false),
+            Some(tg) => tg.encode_bos(text), // prepend <bos> when the model needs it (Gemma's tokenizer omits it → incoherent without)
             None => { eprintln!("[fieldrun] --text needs --bundle <stem> with a .tokenizer.json next to it"); Vec::new() }
         };
         #[cfg(not(feature = "api"))]
@@ -949,7 +949,10 @@ fn main() {
             // debug: per-layer residual-stream snapshots (qwen35moe only) for compare.py per-layer localization.
             if let Some(out) = flag(&args, "--hidden-dump") {
                 let b = bundle::Bundle::load(&stem).expect("reload bundle for --hidden-dump");
-                let snaps = qwen35moe::Qwen35Moe::new(b, route, kv_int8).hiddens(&ids);
+                let snaps = match b.arch.as_str() {
+                    "gemma4" => gemma4::Gemma4::new(b, route, kv_int8).hiddens(&ids),
+                    _ => qwen35moe::Qwen35Moe::new(b, route, kv_int8).hiddens(&ids),
+                };
                 let mut buf: Vec<u8> = Vec::new();
                 for s in &snaps {
                     for v in s { buf.extend_from_slice(&v.to_le_bytes()); }
@@ -2781,32 +2784,76 @@ fn main() {
                 let Some(tg) = api::TextGen::load(&stem, eos.clone()) else {
                     eprintln!("[fieldrun] --export-logic-corpus: no tokenizer next to {stem}"); return;
                 };
-                let text = match std::fs::read_to_string(corpus_path) {
-                    Ok(t) => t, Err(e) => { eprintln!("[fieldrun] --export-logic-corpus: cannot read {corpus_path}: {e}"); return; }
+                // STREAM the corpus line-by-line (BufReader) — never hold the whole file in RAM, so the corpus can be
+                // arbitrarily large (a multi-GB German dump) bounded only by export time, not memory. (read_to_string +
+                // Vec<&str> would OOM on a corpus bigger than free RAM.)
+                use std::io::BufRead;
+                let reader = match std::fs::File::open(corpus_path) {
+                    Ok(f) => std::io::BufReader::new(f),
+                    Err(e) => { eprintln!("[fieldrun] --export-logic-corpus: cannot read {corpus_path}: {e}"); return; }
                 };
-                let prompts: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-                let lbl = |id: i64| -> String { format!("[{id}]") };
+                // Label tokens with their text ("<text>" [id]) — like --export-logic — so emitted .dl carry the token
+                // text in the `model predicts` / candidate comments. This keeps the downstream package converter
+                // (sgiandubh dl2package) tokenizer-free: it reads the answer text straight from the comments.
+                let lbl = |id: i64| -> String { tg.token_label(id) };
+                // `--out <dir>`: write each decision's full (Soufflé-runnable) .dl, so the WHOLE corpus is exported in ONE
+                // warm process (no per-line bundle reload). Without it, the command just reports the size/route sweep.
+                let out_dir = flag(&args, "--out");
+                if let Some(d) = out_dir { let _ = std::fs::create_dir_all(d); }
+                // --all-positions: ONE forward per line emits a decision at EVERY position (teacher-forced) instead of
+                // `--steps` autoregressive re-forwards — amortizes the fixed-cost prefill (the big corpus throughput win).
+                let all_positions = has_flag(&args, "--all-positions");
                 // per token: (margin, full_bytes, compact_bytes, route) — collected once; the τ-sweep just re-thresholds.
                 let mut toks: Vec<(f32, usize, usize, usize)> = Vec::new();
-                eprintln!("[fieldrun] export-logic-corpus: {} prompts × {steps} steps · strategy={strategy} …", prompts.len());
-                for p in &prompts {
-                    let enc = tg.encode(p, false);
+                eprintln!("[fieldrun] export-logic-corpus: streaming {corpus_path} · {} · strategy={strategy}{} …",
+                          if all_positions { "ALL positions/line (1 forward)".to_string() } else { format!("{steps} steps") },
+                          out_dir.map(|d| format!(" · writing .dl → {d}")).unwrap_or_default());
+                let mut pi = 0usize; // index over non-empty prompt lines (also the .dl filename index)
+                for line in reader.lines() {
+                    let line = match line { Ok(l) => l, Err(_) => break }; // stop on a read error (e.g. invalid UTF-8)
+                    let p = line.trim();
+                    if p.is_empty() { continue; }
+                    let enc = tg.encode_bos(p); // <bos> prepended — Gemma is incoherent without it
                     if enc.is_empty() { continue; }
                     let mut ctx_v: Vec<i64> = if enc.len() > ctx_window { enc[..ctx_window].to_vec() } else { enc };
-                    for _ in 0..steps {
-                        let Some(prov) = logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) else { break };
-                        let full = logic::emit_dl_mode(&prov, &ctx_v, &lbl, false).len();
-                        let comp = logic::emit_dl_mode(&prov, &ctx_v, &lbl, true).len();
-                        toks.push((prov.margin, full, comp, (prov.route as usize).min(3)));
-                        ctx_v.push(prov.predicted);
+                    if all_positions {
+                        // one forward → a Provenance for every position; emit each (decision at position si uses ctx[..=si])
+                        if let Some(provs) = logic::build_decomp_all(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) {
+                            for (si, prov) in provs.iter().enumerate() {
+                                let dctx = &ctx_v[..=si];
+                                let full_s = logic::emit_dl_mode(prov, dctx, &lbl, false);
+                                let comp = logic::emit_dl_mode(prov, dctx, &lbl, true).len();
+                                if let Some(d) = out_dir {
+                                    let _ = std::fs::write(format!("{d}/p{pi:06}_{si:03}.dl"), &full_s);
+                                }
+                                toks.push((prov.margin, full_s.len(), comp, (prov.route as usize).min(3)));
+                            }
+                        }
                     }
+                    if !all_positions {
+                        for si in 0..steps {
+                            // fast lean path (one forward, no explain capture) when the arch wires it; else the explain path
+                            let Some(prov) = logic::build_decomp(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c)
+                                .or_else(|| logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c)) else { break };
+                            let full_s = logic::emit_dl_mode(&prov, &ctx_v, &lbl, false);
+                            let comp = logic::emit_dl_mode(&prov, &ctx_v, &lbl, true).len();
+                            if let Some(d) = out_dir {
+                                let _ = std::fs::write(format!("{d}/p{pi:06}_{si:02}.dl"), &full_s);
+                            }
+                            toks.push((prov.margin, full_s.len(), comp, (prov.route as usize).min(3)));
+                            ctx_v.push(prov.predicted);
+                        }
+                    }
+                    pi += 1;
+                    if pi % 20 == 0 { eprintln!("[fieldrun]   …{pi} prompts"); }
                 }
+                let n_prompts = pi;
                 let tot = toks.len();
                 if tot == 0 { eprintln!("[fieldrun] --export-logic-corpus: no tokens (empty corpus?)"); return; }
                 // a token is compact under `strategy`: edb=always, margin=margin≥τ, ring/pic=never
                 let is_compact = |m: f32, tau: f32| -> bool { match strategy { "edb" => true, "margin" => m >= tau, _ => false } };
                 let bytes_full: usize = toks.iter().map(|t| t.1).sum();
-                println!("# export-logic-corpus · {} prompts · {tot} tokens · strategy={strategy} · all-Π size {} KB", prompts.len(), bytes_full / 1024);
+                println!("# export-logic-corpus · {n_prompts} prompts · {tot} tokens · strategy={strategy} · all-Π size {} KB", bytes_full / 1024);
                 if strategy == "margin" {
                     println!("#   margin-localization sweep (compact = decode-robust → memorised; the rest pay the dense Π):");
                     println!("#     {:>5}  {:>10}  {:>9}", "τ", "compact", "bytes saved");
@@ -2859,7 +2906,8 @@ fn main() {
             let tau: f32 = flag(&args, "--tau").and_then(|s| s.parse().ok()).unwrap_or(5.0);
             let (mut written, mut faithful, mut n_compact, mut bytes) = (0usize, 0usize, 0usize, 0usize);
             for step in 0..steps {
-                let Some(prov) = logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c) else {
+                let Some(prov) = logic::build_decomp(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c)
+                    .or_else(|| logic::build(lm.as_ref(), &ctx_v, store.as_ref(), &cfg, cap_c)) else {
                     eprintln!("[fieldrun] --export-logic: arch {arch} has no residual_decomp (rope only)");
                     return;
                 };
