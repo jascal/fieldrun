@@ -1,7 +1,11 @@
 //! GPU-resident RoPE-family forward (Llama-3.2 / Qwen2.5) via wgpu, opt-in. The RoPE counterpart of `gpu_gpt2.rs`:
 //! RMSNorm + rotary position embedding + grouped-query attention + SwiGLU, all as WGSL compute shaders over weights
 //! uploaded once, the residual kept on-device, only the logits read back. Validated top-1 vs the CPU RoPE kernel
-//! (`--gpu-check`). hd ≤ 64 (the attention accumulator) — fits Qwen2.5-0.5B; bigger head_dim bumps the array.
+//! (`--gpu-check`).
+//!
+//! Quantized weights: matmul weights kept **int8 in VRAM** and dequantised in the kernel (`matmul_i8`, per-output-col
+//! scale) — so an int8 bundle (e.g. Qwen2.5-3B ≈ 3 GB) fits an 8 GB card where f32 (4×) would not. Norms/biases are
+//! f16→f32; the rowi8 embed/unembed is dequantised to f32 once at upload. Attention accumulator holds head_dim ≤ 128.
 
 use std::collections::HashMap;
 
@@ -20,6 +24,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let m=dims.x; let k=dims.y; let n=dims.z; let row=gid.x; let col=gid.y;
   if (row>=m || col>=n) { return; }
   var acc=0.0; for (var i=0u;i<k;i++){ acc=acc+a[row*k+i]*w[i*n+col]; } c[row*n+col]=acc;
+}"#;
+
+// int8 matmul: weight kept int8 (4 codes/u32, output-column-major `wt[col*k+i]`), dequantised inline by the
+// per-output-column scale. c[row,col] = scale[col] * Σ_i a[row,i] * int8(wt[col*k+i]).
+const MATMUL_I8: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;        // (m, k) f32 activations
+@group(0) @binding(1) var<storage, read> wq: array<u32>;       // i8 codes, 4 per u32, logical index col*k+i
+@group(0) @binding(2) var<storage, read> scale: array<f32>;    // (n) per-output-column scale
+@group(0) @binding(3) var<storage, read_write> c: array<f32>;  // (m, n)
+@group(0) @binding(4) var<uniform> dims: vec4<u32>;            // m,k,n,_
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let m=dims.x; let k=dims.y; let n=dims.z; let row=gid.x; let col=gid.y;
+  if (row>=m || col>=n) { return; }
+  let base=col*k; var acc=0.0;
+  for (var i=0u;i<k;i++){
+    let e=base+i; let word=wq[e>>2u]; let bb=(word>>((e&3u)*8u))&0xFFu;
+    let s8=i32(bb)-select(0,256,bb>127u);
+    acc=acc+a[row*k+i]*f32(s8);
+  }
+  c[row*n+col]=acc*scale[col];
 }"#;
 
 const ADDBIAS: &str = r#"
@@ -65,6 +90,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }"#;
 
+// attention accumulator sized for head_dim ≤ 128 (Qwen2.5 0.5B=64, 1.5B/3B/7B=128).
 const GQA: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<f32>;   // (seq, H*hd)
 @group(0) @binding(1) var<storage, read> k: array<f32>;   // (seq, nkv*hd)
@@ -79,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let qo=i*nh*hd + h*hd; let scale=1.0/sqrt(f32(hd));
   var mx=-1e30;
   for (var j=0u;j<=i;j++){ let ko=j*nkv*hd+kv*hd; var s=0.0; for (var c=0u;c<hd;c++){ s=s+q[qo+c]*k[ko+c]; } mx=max(mx,s*scale); }
-  var acc: array<f32,64>; for (var c=0u;c<hd;c++){ acc[c]=0.0; } var den=0.0;
+  var acc: array<f32,128>; for (var c=0u;c<hd;c++){ acc[c]=0.0; } var den=0.0;
   for (var j=0u;j<=i;j++){ let ko=j*nkv*hd+kv*hd; var s=0.0; for (var c=0u;c<hd;c++){ s=s+q[qo+c]*k[ko+c]; }
     let w=exp(s*scale-mx); den=den+w; for (var c=0u;c<hd;c++){ acc[c]=acc[c]+w*v[ko+c]; } }
   for (var c=0u;c<hd;c++){ out[i*nh*hd + h*hd + c]=acc[c]/den; }
@@ -106,13 +132,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var s=0.0; for (var c=0u;c<d;c++){ s=s+xf[off+c]*wte[vrow*d+c]; } logits[vrow]=s;
 }"#;
 
-struct W { buf: wgpu::Buffer }
+/// An uploaded weight: either f32 (norms, biases, dequantised embed) or int8 kept in VRAM with its per-column scale.
+enum Wt {
+    F32(wgpu::Buffer),
+    I8 { q: wgpu::Buffer, scale: wgpu::Buffer },
+}
 
 pub struct GpuRope {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pl: HashMap<&'static str, wgpu::ComputePipeline>,
-    w: HashMap<String, W>,
+    w: HashMap<String, Wt>,
     embed: wgpu::Buffer,
     inv: wgpu::Buffer,
     n_layer: usize,
@@ -138,7 +168,7 @@ impl GpuRope {
         lim.max_storage_buffer_binding_size = 1 << 31;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: lim, ..Default::default() }, None)).ok()?;
         let mut pl = HashMap::new();
-        for (k, src) in [("matmul", MATMUL), ("addbias", ADDBIAS), ("add", ADD), ("rmsnorm", RMSNORM),
+        for (k, src) in [("matmul", MATMUL), ("matmul_i8", MATMUL_I8), ("addbias", ADDBIAS), ("add", ADD), ("rmsnorm", RMSNORM),
                          ("rope", ROPE), ("gqa", GQA), ("swiglu", SWIGLU), ("rowdot", ROWDOT)] {
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(k), source: wgpu::ShaderSource::Wgsl(src.into()) });
             pl.insert(k, device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -148,13 +178,24 @@ impl GpuRope {
         let c = &b.config; // [n_layer, H, nkv, hd, d, ffn, vocab, tied]
         let (n_layer, h, nkv, hd, d, ffn, vocab) =
             (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize, c[4] as usize, c[5] as usize, c[6] as usize);
+        assert!(hd <= 128, "gpu_rope: head_dim {hd} > 128 (GQA accumulator cap)");
         let (theta, eps) = (b.config_f[0] as f32, b.config_f[1] as f32);
         let invf: Vec<f32> = (0..hd / 2).map(|j| 1.0 / theta.powf(2.0 * j as f32 / hd as f32)).collect();
         let store = |data: &[f32]| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: cast(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
-        let embed = store(&b.f32_array("embed").1);
+        let store_i8 = |q: &[i8]| {
+            let mut bytes: Vec<u8> = q.iter().map(|&x| x as u8).collect();
+            while bytes.len() % 4 != 0 { bytes.push(0); } // pad to whole u32 words
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None, contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        // embed/unembed: dequantise the rowi8 (or f16/f32) table to f32 once for the unembed rowdot.
+        let embed_ids: Vec<i64> = (0..vocab as i64).collect();
+        let embed = store(b.rows_f32("embed", &embed_ids).as_slice().unwrap());
         let inv = store(&invf);
         let mut w = HashMap::new();
         let mut names = vec!["norm".to_string()];
@@ -165,7 +206,14 @@ impl GpuRope {
                 if b.has(&nm) { names.push(nm); }
             }
         }
-        for nm in names { w.insert(nm.clone(), W { buf: store(&b.f32_array(&nm).1) }); }
+        for nm in names {
+            let wt = if let Some((q, scale, _n, _k)) = b.i8_for_gpu(&nm) {
+                Wt::I8 { q: store_i8(&q), scale: store(&scale) }
+            } else {
+                Wt::F32(store(&b.f32_array(&nm).1)) // f16/f32 (norms, biases) → f32
+            };
+            w.insert(nm, wt);
+        }
         Some(GpuRope { device, queue, pl, w, embed, inv, n_layer, h, nkv, hd, d, ffn, vocab, eps, name })
     }
 
@@ -227,29 +275,39 @@ impl GpuRope {
         let (su, du) = (seq as u32, d as u32);
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
-            let wb = |s: &str| &self.w[&format!("{p}{s}")].buf;
+            let wf = |s: &str| match &self.w[&format!("{p}{s}")] { Wt::F32(b) => b, _ => panic!("gpu_rope: {s} expected f32") };
             let bias = |s: &str| self.w.contains_key(&format!("{p}{s}.bias"));
-            let mut r = |name, bufs: &[&wgpu::Buffer], dims, groups| self.record(&mut enc, &mut ku, &mut kb, name, bufs, dims, groups);
-            r("rmsnorm", &[&x, wb("in_ln"), &a], [su, du, epsb, 0], g1(seq));
-            r("matmul", &[&a, wb("self_attn.q_proj"), &q], [su, du, qd as u32, 0], mm(seq, qd));
-            r("matmul", &[&a, wb("self_attn.k_proj"), &k], [su, du, kvd as u32, 0], mm(seq, kvd));
-            r("matmul", &[&a, wb("self_attn.v_proj"), &v], [su, du, kvd as u32, 0], mm(seq, kvd));
-            if bias("self_attn.q_proj") { r("addbias", &[&q, wb("self_attn.q_proj.bias")], [su, qd as u32, 0, 0], g1(seq * qd)); }
-            if bias("self_attn.k_proj") { r("addbias", &[&k, wb("self_attn.k_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
-            if bias("self_attn.v_proj") { r("addbias", &[&v, wb("self_attn.v_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
+            let mut r = |name: &str, bufs: &[&wgpu::Buffer], dims: [u32; 4], groups: (u32, u32)|
+                self.record(&mut enc, &mut ku, &mut kb, name, bufs, dims, groups);
+            // matmul against a weight that may be f32 or int8 (dequant-in-kernel).
+            let mw = |r: &mut dyn FnMut(&str, &[&wgpu::Buffer], [u32; 4], (u32, u32)),
+                          s: &str, a: &wgpu::Buffer, out: &wgpu::Buffer, dims: [u32; 4], groups: (u32, u32)| {
+                match &self.w[&format!("{p}{s}")] {
+                    Wt::F32(wb) => r("matmul", &[a, wb, out], dims, groups),
+                    Wt::I8 { q, scale } => r("matmul_i8", &[a, q, scale, out], dims, groups),
+                }
+            };
+            r("rmsnorm", &[&x, wf("in_ln"), &a], [su, du, epsb, 0], g1(seq));
+            mw(&mut r, "self_attn.q_proj", &a, &q, [su, du, qd as u32, 0], mm(seq, qd));
+            mw(&mut r, "self_attn.k_proj", &a, &k, [su, du, kvd as u32, 0], mm(seq, kvd));
+            mw(&mut r, "self_attn.v_proj", &a, &v, [su, du, kvd as u32, 0], mm(seq, kvd));
+            if bias("self_attn.q_proj") { r("addbias", &[&q, wf("self_attn.q_proj.bias")], [su, qd as u32, 0, 0], g1(seq * qd)); }
+            if bias("self_attn.k_proj") { r("addbias", &[&k, wf("self_attn.k_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
+            if bias("self_attn.v_proj") { r("addbias", &[&v, wf("self_attn.v_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
             r("rope", &[&q, &self.inv], [su, h as u32, hd as u32, 0], ((seq * h).div_ceil(64) as u32, 1));
             r("rope", &[&k, &self.inv], [su, nkv as u32, hd as u32, 0], ((seq * nkv).div_ceil(64) as u32, 1));
             r("gqa", &[&q, &k, &v, &attn], [su, hd as u32, h as u32, nkv as u32], ((seq * h).div_ceil(64) as u32, 1));
-            r("matmul", &[&attn, wb("self_attn.o_proj"), &proj], [su, qd as u32, du, 0], mm(seq, d));
+            mw(&mut r, "self_attn.o_proj", &attn, &proj, [su, qd as u32, du, 0], mm(seq, d));
             r("add", &[&x, &proj], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
-            r("rmsnorm", &[&x, wb("post_ln"), &a2], [su, du, epsb, 0], g1(seq));
-            r("matmul", &[&a2, wb("mlp.gate_proj"), &gate], [su, du, ffn as u32, 0], mm(seq, ffn));
-            r("matmul", &[&a2, wb("mlp.up_proj"), &up], [su, du, ffn as u32, 0], mm(seq, ffn));
+            r("rmsnorm", &[&x, wf("post_ln"), &a2], [su, du, epsb, 0], g1(seq));
+            mw(&mut r, "mlp.gate_proj", &a2, &gate, [su, du, ffn as u32, 0], mm(seq, ffn));
+            mw(&mut r, "mlp.up_proj", &a2, &up, [su, du, ffn as u32, 0], mm(seq, ffn));
             r("swiglu", &[&gate, &up, &hbuf], [(seq * ffn) as u32, 0, 0, 0], g1(seq * ffn));
-            r("matmul", &[&hbuf, wb("mlp.down_proj"), &down], [su, ffn as u32, du, 0], mm(seq, d));
+            mw(&mut r, "mlp.down_proj", &hbuf, &down, [su, ffn as u32, du, 0], mm(seq, d));
             r("add", &[&x, &down], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
         }
-        self.record(&mut enc, &mut ku, &mut kb, "rmsnorm", &[&x, &self.w["norm"].buf, &xf], [su, du, epsb, 0], g1(seq));
+        let normw = match &self.w["norm"] { Wt::F32(b) => b, _ => panic!("gpu_rope: norm expected f32") };
+        self.record(&mut enc, &mut ku, &mut kb, "rmsnorm", &[&x, normw, &xf], [su, du, epsb, 0], g1(seq));
         self.record(&mut enc, &mut ku, &mut kb, "rowdot", &[&xf, &self.embed, &logits],
                     [self.vocab as u32, du, ((seq - 1) * d) as u32, 0], (self.vocab.div_ceil(64) as u32, 1));
         self.queue.submit(Some(enc.finish()));
