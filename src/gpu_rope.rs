@@ -14,37 +14,57 @@ use wgpu::util::DeviceExt;
 
 use crate::bundle::Bundle;
 
+// Shared-memory tiled GEMM (16×16): each A/B element is read from global memory once per tile and reused by all 16
+// threads in its row/col (~16× less traffic than the naive one-thread-per-output kernel). a:(m,k), w:(k,n), c:(m,n).
 const MATMUL: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<uniform> dims: vec4<u32>;
-@compute @workgroup_size(8,8,1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let m=dims.x; let k=dims.y; let n=dims.z; let row=gid.x; let col=gid.y;
-  if (row>=m || col>=n) { return; }
-  var acc=0.0; for (var i=0u;i<k;i++){ acc=acc+a[row*k+i]*w[i*n+col]; } c[row*n+col]=acc;
+const TILE = 16u;
+var<workgroup> As: array<f32, 256>;
+var<workgroup> Bs: array<f32, 256>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let m=dims.x; let k=dims.y; let n=dims.z; let lx=lid.x; let ly=lid.y;
+  let row=wid.x*TILE+lx; let col=wid.y*TILE+ly;
+  var acc=0.0; let nt=(k+TILE-1u)/TILE;
+  for (var t=0u;t<nt;t++){
+    let kx=t*TILE+ly; var av=0.0; if (row<m && kx<k){ av=a[row*k+kx]; } As[lx*TILE+ly]=av;
+    let kr=t*TILE+lx; var bv=0.0; if (kr<k && col<n){ bv=w[kr*n+col]; } Bs[lx*TILE+ly]=bv;
+    workgroupBarrier();
+    for (var kk=0u;kk<TILE;kk++){ acc=acc+As[lx*TILE+kk]*Bs[kk*TILE+ly]; }
+    workgroupBarrier();
+  }
+  if (row<m && col<n){ c[row*n+col]=acc; }
 }"#;
 
-// int8 matmul: weight kept int8 (4 codes/u32, output-column-major `wt[col*k+i]`), dequantised inline by the
-// per-output-column scale. c[row,col] = scale[col] * Σ_i a[row,i] * int8(wt[col*k+i]).
+// int8 tiled GEMM: weight kept int8 (4 codes/u32, output-column-major `wt[col*k+i]`), dequantised into the shared
+// tile, then the per-output-column scale applied once at the end. c[row,col] = scale[col] * Σ_i a[row,i]*int8(wt[..]).
 const MATMUL_I8: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<f32>;        // (m, k) f32 activations
 @group(0) @binding(1) var<storage, read> wq: array<u32>;       // i8 codes, 4 per u32, logical index col*k+i
 @group(0) @binding(2) var<storage, read> scale: array<f32>;    // (n) per-output-column scale
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;  // (m, n)
 @group(0) @binding(4) var<uniform> dims: vec4<u32>;            // m,k,n,_
-@compute @workgroup_size(8,8,1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let m=dims.x; let k=dims.y; let n=dims.z; let row=gid.x; let col=gid.y;
-  if (row>=m || col>=n) { return; }
-  let base=col*k; var acc=0.0;
-  for (var i=0u;i<k;i++){
-    let e=base+i; let word=wq[e>>2u]; let bb=(word>>((e&3u)*8u))&0xFFu;
-    let s8=i32(bb)-select(0,256,bb>127u);
-    acc=acc+a[row*k+i]*f32(s8);
+const TILE = 16u;
+var<workgroup> As: array<f32, 256>;
+var<workgroup> Bs: array<f32, 256>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let m=dims.x; let k=dims.y; let n=dims.z; let lx=lid.x; let ly=lid.y;
+  let row=wid.x*TILE+lx; let col=wid.y*TILE+ly;
+  var acc=0.0; let nt=(k+TILE-1u)/TILE;
+  for (var t=0u;t<nt;t++){
+    let kx=t*TILE+ly; var av=0.0; if (row<m && kx<k){ av=a[row*k+kx]; } As[lx*TILE+ly]=av;
+    let kr=t*TILE+lx; var bv=0.0;
+    if (kr<k && col<n){ let e=col*k+kr; let word=wq[e>>2u]; let bb=(word>>((e&3u)*8u))&0xFFu; bv=f32(i32(bb)-select(0,256,bb>127u)); }
+    Bs[lx*TILE+ly]=bv;
+    workgroupBarrier();
+    for (var kk=0u;kk<TILE;kk++){ acc=acc+As[lx*TILE+kk]*Bs[kk*TILE+ly]; }
+    workgroupBarrier();
   }
-  c[row*n+col]=acc*scale[col];
+  if (row<m && col<n){ c[row*n+col]=acc*scale[col]; }
 }"#;
 
 const ADDBIAS: &str = r#"
@@ -269,7 +289,7 @@ impl GpuRope {
         let logits = self.storage(self.vocab);
         let mut enc = self.device.create_command_encoder(&Default::default());
         let (mut ku, mut kb) = (Vec::new(), Vec::new());
-        let mm = |m: usize, n: usize| (m.div_ceil(8) as u32, n.div_ceil(8) as u32);
+        let mm = |m: usize, n: usize| (m.div_ceil(16) as u32, n.div_ceil(16) as u32); // 16×16 tiled matmul workgroups
         let g1 = |n: usize| (n.div_ceil(64) as u32, 1u32);
         let epsb = self.eps.to_bits();
         let (su, du) = (seq as u32, d as u32);
