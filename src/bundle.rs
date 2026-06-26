@@ -515,6 +515,16 @@ impl Bundle {
         (shape.clone(), self.upcast(arr))
     }
 
+    /// For the GPU i8 matmul: `(wt, scale, n, k)` where `wt` is the (n,k) row-major int8 store (`wt[j*k+kk] = W[kk,j]`)
+    /// and `scale` the per-output-column f32 scale (n). `None` if `name` isn't an i8 weight. Lets the GPU keep the
+    /// weight int8 in VRAM (vs `f32_array`, which 4×'s it and panics on quant).
+    pub fn i8_for_gpu(&self, name: &str) -> Option<(Vec<i8>, Vec<f32>, usize, usize)> {
+        match &self.arrays.get(name)?.1 {
+            Arr::I8(w) => Some((w.wt.clone(), self.arr1o(&format!("{name}__scale")).to_vec(), w.n, w.k)),
+            _ => None,
+        }
+    }
+
     /// Logical row r of a (rows, cols) weight as f32, dtype-agnostic (i8 is dequantised from its transposed store via
     /// the per-column scale). Used for explain's neuron labels so they work on int8 bundles too.
     /// Raw integer codes for one weight VECTOR of an int8/rowi8 array — the integer domain the

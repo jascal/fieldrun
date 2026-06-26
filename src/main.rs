@@ -487,15 +487,19 @@ fn main() {
             let n = n_eval.min(50);
             let last = (ctx_window + n).min(ids.len());
             let ctxs: Vec<&[i64]> = (ctx_window..last).map(|i| &ids[i.saturating_sub(ctx_window)..i]).collect();
-            // CPU reference predictions + the matching GPU kernel + name
-            let (cp, name, t0, gp) = match b1.arch.as_str() {
+            // CPU reference predictions + the matching GPU kernel + name. `diverge` carries, for each position where
+            // the GPU argmax differs from CPU, how much the CPU preferred its own pick over the GPU's pick
+            // (cpu_logit[cpu_argmax] - cpu_logit[gpu_argmax]): a tiny gap == near-tie (float accumulation order),
+            // a large gap == a real kernel bug.
+            let (cp, name, t0, gp, diverge): (Vec<i64>, String, std::time::Instant, Vec<i64>, Vec<f32>) =
+            match b1.arch.as_str() {
                 "gpt2" => {
                     let g = gpu_gpt2::GpuGpt2::new(&b1).expect("no GPU adapter");
                     let cpu = Gpt2::new(Bundle::load(&stem).expect("load"), 0.0, false);
                     let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
                     let t0 = std::time::Instant::now();
                     let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
-                    (cp, g.name.clone(), t0, gp)
+                    (cp, g.name.clone(), t0, gp, vec![])
                 }
                 "rope" => {
                     let g = gpu_rope::GpuRope::new(&b1).expect("no GPU adapter");
@@ -503,7 +507,11 @@ fn main() {
                     let cp: Vec<i64> = ctxs.iter().map(|c| cpu.predict(c)).collect();
                     let t0 = std::time::Instant::now();
                     let gp: Vec<i64> = ctxs.iter().map(|c| g.predict(c, &b1)).collect();
-                    (cp, g.name.clone(), t0, gp)
+                    // For the positions that disagree, measure the CPU logit gap the GPU flipped (near-tie diagnosis).
+                    let diverge: Vec<f32> = (0..gp.len()).filter(|&i| gp[i] != cp[i]).filter_map(|i| {
+                        cpu.logits(ctxs[i]).map(|lg| lg[cp[i] as usize] - lg[gp[i] as usize])
+                    }).collect();
+                    (cp, g.name.clone(), t0, gp, diverge)
                 }
                 other => { println!("[fieldrun] --gpu-check: arch {other} not supported (gpt2, rope)"); return; }
             };
@@ -511,6 +519,16 @@ fn main() {
             let agree = gp.iter().zip(&cp).filter(|(a, b)| a == b).count();
             println!("[fieldrun] GPU [{}] vs CPU forward: {}/{} top-1 agree · {:.1} GPU fwd/s",
                      name, agree, gp.len(), gp.len() as f64 / gsec);
+            if !diverge.is_empty() {
+                let mut g: Vec<f32> = diverge.clone();
+                g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let max = *g.last().unwrap();
+                let med = g[g.len() / 2];
+                let near = g.iter().filter(|&&x| x < 0.5).count(); // gap < 0.5 logit ≈ a near-tie at the head
+                println!("[fieldrun]   divergences: {} · CPU logit gap the GPU flipped: median {:.3}, max {:.3} · {}/{} are near-ties (<0.5)",
+                         g.len(), med, max, near, g.len());
+                println!("[fieldrun]   (small gaps == float accumulation order at near-tied logits, expected; large gaps would indicate a kernel bug)");
+            }
             return;
         }
 
