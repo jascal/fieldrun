@@ -156,9 +156,13 @@ pub fn emit_dl_mode(p: &Provenance, ctx: &[i64], label: &dyn Fn(i64) -> String, 
         o.push_str(&format!(" {}", label(id)));
     }
     o.push_str(&format!(
-        "\n// model predicts: {}  (logit {:.3}, margin {:+.3} over runner-up {})\n\n",
+        "\n// model predicts: {}  (logit {:.3}, margin {:+.3} over runner-up {})\n",
         label(p.predicted), p.pred_logit, p.margin, label(p.runner_up)
     ));
+    // Machine-parseable provenance tier: the LOGIC_EXPORT route (RETRIEVED/SELECTED/COMPOSED, or — when no KB store)
+    // + margin. This is the per-answer confidence signal the package + serving layers surface: recall is trustworthy,
+    // a thin-margin COMPOSED token is the forge tax (may not generalize). margin is meaningful even without a store.
+    o.push_str(&format!("// route: {}  margin: {:+.3}\n\n", route_name(p.route), p.margin));
     o.push_str(&format!("// ---- candidate set (predicted ∪ runner-up ∪ KB-proposed), |C| = {} ----\n", p.candidates.len()));
     for &id in &p.candidates {
         o.push_str(&format!("candidate({}).   // {}\n", id, label(id)));
