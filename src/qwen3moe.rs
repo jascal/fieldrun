@@ -205,6 +205,58 @@ impl Qwen3Moe {
         self.norm(&x, "norm")
     }
 
+    /// Forward capturing the recursion substrate (mirrors `Rope::recursion_capture` for the Qwen3-MoE backbone):
+    /// per-layer post-block residual (for the per-layer logit-lens) + the element-wise max over late-layer heads of
+    /// the attention matrix (the binding signal; late = last third). MoE/dense FFN per layer exactly as in `hidden`.
+    fn recursion_capture(&self, ids: &[i64]) -> (Vec<Array2<f32>>, Array2<f32>) {
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let late0 = 2 * self.n_layer / 3;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut resids: Vec<Array2<f32>> = Vec::with_capacity(self.n_layer);
+        let mut maxback = Array2::<f32>::zeros((seq, seq));
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, &format!("{p}q_norm"), h);
+            self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) * self.scale;
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (self.window > 0 && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                if l >= late0 {
+                    for i in 0..seq {
+                        for j in 0..=i {
+                            if scores[[i, j]] > maxback[[i, j]] { maxback[[i, j]] = scores[[i, j]]; }
+                        }
+                    }
+                }
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let mlp = if self.moe[l] { self.moe_branch(l, &a2) } else { self.dense_mlp(l, &a2) };
+            x = &x + &mlp;
+            resids.push(x.clone());
+        }
+        (resids, maxback)
+    }
+
     fn unembed_argmax(&self, xfn: &Array2<f32>) -> i64 {
         let logits = self.b.rowdot_f32(self.unembed(), &xfn.row(xfn.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
@@ -468,6 +520,67 @@ impl Model for Qwen3Moe {
 
     fn dims(&self) -> Option<(usize, usize)> {
         Some((self.n_layer, self.h))
+    }
+
+    fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
+        use crate::model::RecPos;
+        let seq = ids.len();
+        if seq < 3 { return Some(vec![]); }
+        let (resids, mut maxback) = self.recursion_capture(ids);
+        let nl = self.n_layer;
+        let late0 = 2 * nl / 3;
+        let un = self.unembed();
+        // per-layer logit-lens argmax per position (apply the FINAL norm to each layer's residual, then unembed)
+        let mut lens = vec![vec![0i64; seq]; nl];
+        for l in 0..nl {
+            let normed = self.norm(&resids[l], "norm");
+            for p in 0..seq {
+                let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
+                lens[l][p] = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+            }
+        }
+        // zero the attention SINK (cols 0/1) so the binding signal is a real distant fold, not sink mass
+        for i in 0..seq {
+            maxback[[i, 0]] = 0.0;
+            if seq > 1 { maxback[[i, 1]] = 0.0; }
+        }
+        let mut out = Vec::new();
+        for p in 0..seq.saturating_sub(1) {
+            let final_top1 = lens[nl - 1][p];
+            let mut resolve = nl;
+            for l in 0..nl {
+                if lens[l][p] == final_top1 { resolve = l + 1; break; }
+            }
+            let lens_late: Vec<(usize, i64)> = (late0..nl).map(|l| (l + 1, lens[l][p])).collect();
+            let lens_full: Vec<(usize, i64)> = (0..nl).map(|l| (l + 1, lens[l][p])).collect();
+            let (mut back, mut conc) = (p, 0f32);
+            for k in 0..p {
+                if maxback[[p, k]] > conc { conc = maxback[[p, k]]; back = k; }
+            }
+            out.push(RecPos { pos: p, final_top1, resolve_layer: resolve, n_layer: nl, lens_late, lens_full, back, conc });
+        }
+        Some(out)
+    }
+
+    fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
+        let (resids, _) = self.recursion_capture(ids);
+        let nl = self.n_layer;
+        let late0 = 2 * nl / 3;
+        let un = self.unembed();
+        let mut out = Vec::with_capacity(positions.len());
+        for &p in positions {
+            let mut late = Vec::new();
+            for l in late0..nl {
+                if p >= resids[l].nrows() { continue; }
+                let row = resids[l].slice(s![p..p + 1, ..]).to_owned();
+                let normed = self.norm(&row, "norm");
+                let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
+                let am = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
+                late.push((l + 1, am));
+            }
+            out.push(late);
+        }
+        Some(out)
     }
 
     /// Per-block DLA decomposition (the `--pil-dump` seam for the Qwen3-MoE family). Same rope-style RMSNorm

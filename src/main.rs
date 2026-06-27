@@ -1181,10 +1181,14 @@ fn main() {
             // whether it's correct. No ground-truth check — the value the model produced is the point.
             let mut gids = rec_ids.clone();
             let mut cont = String::new();
-            for _ in 0..8 {
+            for _ in 0..16 {
                 let t = lm.predict(&gids);
                 let s = lbl(t);
-                if s.contains('\n') { break; }
+                // skip LEADING blank/newline/special-decoded-empty tokens (instruct chat templates often emit a
+                // newline or stop token before the answer); break on a newline only once we have real content.
+                if s.trim().is_empty() {
+                    if cont.trim().is_empty() { gids.push(t); continue; } else { break; }
+                }
                 cont.push_str(&s);
                 gids.push(t);
             }
