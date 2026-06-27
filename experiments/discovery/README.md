@@ -41,6 +41,28 @@ block/circuit profile** via `residual_decomp`). `k` is a fixed knob (not swept).
 signature and k* — it does **not** mean 95% of the model's computation is understood. Some residual is tokenization
 noise, not idioms — the critic must filter.
 
+## Residual-driven enrichment — the loop closing on itself (7B)
+The 7B residual flagged an **early-resolution** idiom (decisions committed in the first few layers, `resolve_frac` ≈
+0.1–0.4) too rare to cluster. The loop's response: add a corpus *targeting* it and re-cluster —
+`./collect.sh <bundle> corpus_enrich.txt 100` (append; formulaic / forced-continuation text). Re-clustering the
+combined 24 prompts (257 decisions) **falsified the hypothesis and refined the idiom** — which is the loop working as
+science, not just clustering:
+
+- **Falsified:** "predictable ⇒ early resolution" is **wrong**. Predictable *content* (`…quick brown fox jumps over the
+  → lazy`, `…four five → six`, `red orange yellow green → blue`) still resolves **late** (`rf` ≈ 0.9). Predictability
+  did **not** move resolution earlier.
+- **Refined — predictability shows up as low *churn*, not early resolve.** The enrichment populated a clean **new**
+  cluster: *settled continuation* (n=30, `churn` ≈ 0.25 vs the deliberated-compute cluster's ≈ 0.65) — predictable
+  sequences lock in with little layer-to-layer revision, but still over the full stack.
+- **Early-resolution is a function/format-token reflex, and genuinely sparse.** The true `rf` ≈ 0.04–0.4 cases are
+  syntactic-glue tokens (`…at the end → of` rf 0.04; `…bird → =` rf 0.11; `…not → to`; `…bread → and`) — predicted in
+  the earliest layers. They stayed a 2-point cluster + residual: sparse *and* spread across `reach`, so **k-means is the
+  wrong grouper** — a 1-D threshold on `resolve_frac` isolates them better. (Methodological note for the loop: rare
+  residual idioms need targeted isolation, not just more `k`.)
+
+Net: the residual → targeted-corpus → re-cluster loop is a **falsifiable hypothesis test** that self-corrected
+(predictability = settled/low-churn, *not* early-resolve; early-resolve = a separate glue-reflex).
+
 ## Next
-richer signature (DLA circuit profile) → idioms beyond binding · bigger/cleaner model · k-sweep + stability ·
+richer signature (DLA circuit profile) → idioms beyond binding · 1-D / density isolation for sparse residual idioms ·
 auto-route residual exemplars into the probe harness (`PROBES.md`) so discovery and characterization compose.
