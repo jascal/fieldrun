@@ -63,6 +63,20 @@ science, not just clustering:
 Net: the residual → targeted-corpus → re-cluster loop is a **falsifiable hypothesis test** that self-corrected
 (predictability = settled/low-churn, *not* early-resolve; early-resolve = a separate glue-reflex).
 
+## Sparse-idiom isolation — naming the rare dances (axis pass)
+k-means forces every decision into a ball, so an idiom dense along ONE dimension but spread across others lands in the
+residual (the early-resolution glue-reflex: low `resolve_frac`, but spread in `reach`). `discover.py` now runs an **axis
+pass** after clustering — a gap-based 1-D tail detector that flags tails whose members were mostly k-means residual as
+**newly named**:
+- `resolve_frac < 0.46` → **early-resolution glue-reflex**, NEWLY NAMED (4/6 were k-means residual): `…at the end → of`
+  (rf 0.04), `…bird → =` (rf 0.11), `…not → to`, `…bread → and` — syntactic-glue tokens emitted in the first layers.
+- `conc < 0.22`, `copy > 0.50` → correctly tagged *"overlaps a cluster"* (no-fold, induction-copy already named). The
+  1-D `copy` axis even re-unifies the atypical copies k-means split off.
+
+So the loop now has **three tiers**: k-means (dense, populated idioms) · axis isolation (sparse 1-D-separable idioms) ·
+residual (genuine multi-D frontier outliers, e.g. the deep subject-retrieval fold — high reach *and* conc *and* context,
+not 1-D-separable, correctly still flagged).
+
 ## Next
-richer signature (DLA circuit profile) → idioms beyond binding · 1-D / density isolation for sparse residual idioms ·
-auto-route residual exemplars into the probe harness (`PROBES.md`) so discovery and characterization compose.
+richer signature (DLA circuit profile) → idioms beyond binding · auto-route residual exemplars into the probe harness
+(`PROBES.md`) so discovery and characterization compose.

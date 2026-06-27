@@ -83,6 +83,36 @@ def kmeans(X, k, iters=100):
     return a, c
 
 
+def axis_idioms(rows, X0, residual, feats, min_tail=4, max_frac=0.35, min_gap=0.12):
+    """Catch idioms that are dense along ONE signature dimension but spread across others — k-means scatters these into
+    the residual (e.g. the early-resolution glue-reflex: low resolve_frac, but spread in reach). For each feature, find
+    the largest GAP in the sorted values that carves off a minority tail; report tails whose members were mostly
+    k-means residual as NEWLY NAMED idioms (the ones clustering missed)."""
+    n = len(rows)
+    print(f"\n=== AXIS IDIOMS — 1-D tail isolation (catches sparse/spread idioms k-means scatters) ===")
+    for fi, f in enumerate(feats):
+        v = X0[:, fi]; order = np.argsort(v); sv = v[order]
+        for lo in (True, False):
+            best_gap, best_cut = 0.0, None
+            for cut in range(min_tail, int(max_frac * n) + 1):
+                gap = (sv[cut] - sv[cut - 1]) if lo else (sv[n - cut] - sv[n - cut - 1])
+                if gap > best_gap:
+                    best_gap, best_cut = gap, cut
+            if not best_cut or best_gap < min_gap:
+                continue
+            idx = order[:best_cut] if lo else order[n - best_cut:]
+            thr = (sv[best_cut] + sv[best_cut - 1]) / 2 if lo else (sv[n - best_cut] + sv[n - best_cut - 1]) / 2
+            res_n = int(residual[idx].sum())
+            tag = "NEWLY NAMED (k-means missed it)" if res_n >= 0.5 * len(idx) else "(overlaps a k-means cluster)"
+            print(f"--- {f} {'<' if lo else '>'} {thr:.2f}  n={len(idx)}  gap={best_gap:.2f}  "
+                  f"residual-overlap={res_n}/{len(idx)}  {tag}")
+            for i in idx[:5]:
+                r = rows[i]
+                print(f"      [{r['pid']}] …{r['ctx']!r} → {r['pred']!r}   "
+                      f"rf={r['resolve_frac']:.2f} reach={r['reach_norm']:.2f} conc={r['conc']:.2f} "
+                      f"copy={int(r['copy'])} churn={r['lens_churn']:.2f}")
+
+
 def main():
     rows = load(DUMPS)
     if not rows:
@@ -121,6 +151,8 @@ def main():
         print(f"      [{r['pid']}] …{r['ctx']!r} → {r['pred']!r}   "
               f"rf={r['resolve_frac']:.2f} reach={r['reach_norm']:.2f} conc={r['conc']:.2f} "
               f"copy={int(r['copy'])} churn={r['lens_churn']:.2f}")
+
+    axis_idioms(rows, X0, residual, FEATS)
 
 
 if __name__ == "__main__":
