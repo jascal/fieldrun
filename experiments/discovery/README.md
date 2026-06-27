@@ -23,6 +23,25 @@ Signature (all content-agnostic, from the faithful forward pass):
 python3 discover.py [dumps_dir] [k]            # cluster + residual critic
 ```
 
+## Dump schemas (JSONL, one decision per line) & method details
+Field names/types are stable; the Rust emitters live in `main.rs` (`--recursion-dump` / `--dla-dump` / `--causal-dump`).
+```jsonc
+// --recursion-dump : header line, then one per position
+{"ids":[...], "n_layer":24}
+{"pos":12,"tok":362,"tok_s":" a","final":407,"final_s":" w","resolve":20,"n_layer":24,"back":4,"conc":0.96,"lens":[...]}
+// --dla-dump : header (block labels), then one per position; contrib[b] = block b's contribution to the predicted logit
+{"labels":["embed","L0.attn","L0.ffn", ...]}
+{"pos":12,"pred":407,"pred_s":" w","contrib":[0.00, -0.01, 0.33, ...]}
+// --causal-dump : one object per prompt (last-position decision). parity self-certifies the ablation forward.
+{"pred_s":" w","n_layer":24,"parity":true,"n_flip":4,"flips":[{"l":0,"kind":"attn","to":" b"}, ...]}
+```
+**`parity`** = `predict_ablated_blocks(no ablation) == predict` — `false` flags a broken ablation forward (the key
+correctness gate for the gemma4 port). **Residual critic** (`discover*.py`): a decision is *residual* iff its distance to
+its own k-means centroid (in z-scored signature space) exceeds `mean + 1.5·std` of all such distances. **Axis pass**
+(`discover.py`): per feature, the largest sorted-value GAP that carves a minority tail (size 4..35% of n) with
+gap ≥ 0.12 — tails whose members were mostly k-means residual are flagged *newly named*. Clustering seeds are pinned
+(`seed=0`). Overhead is zero when the flags are off (each dump is behind an `if let Some(path) = flag(...)`).
+
 ## v0 result (Qwen2.5-0.5B, 12 prompts, 129 decisions, k=5)
 Unsupervised, the loop recovered ~5 interpretable idioms — **finer than the RETRIEVED/SELECTED/COMPOSED route**:
 - **local continuation / no-fold** (reach≈0, conc≈0) — immediate-context next token;

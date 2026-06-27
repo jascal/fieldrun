@@ -1074,6 +1074,9 @@ fn main() {
                     eprintln!("[fieldrun] --causal-dump: arch {arch} has no predict_ablated_blocks (rope family)"); return;
                 }
                 let base = lm.predict(&rec_ids);
+                // self-certify the ablation forward: with NO blocks ablated it must reproduce predict() exactly. A
+                // false here means the arch's predict_ablated_blocks forward diverges from hidden() (a broken port).
+                let parity = lm.predict_ablated_blocks(&rec_ids, &[], &[], &[], &[]) == Some(base);
                 let mut flips = String::new();
                 let mut nf = 0usize;
                 for l in 0..nl {
@@ -1087,7 +1090,7 @@ fn main() {
                         }
                     }
                 }
-                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
+                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"parity\":{parity},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
                 match std::fs::write(&dpath, &o) {
                     Ok(_) => eprintln!("[fieldrun] wrote causal profile ({nf}/{} blocks flip) to {dpath}", 2 * nl),
                     Err(e) => eprintln!("[fieldrun] --causal-dump {dpath}: {e}"),
