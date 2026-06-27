@@ -77,6 +77,29 @@ So the loop now has **three tiers**: k-means (dense, populated idioms) · axis i
 residual (genuine multi-D frontier outliers, e.g. the deep subject-retrieval fold — high reach *and* conc *and* context,
 not 1-D-separable, correctly still flagged).
 
+## DLA-profile signature — idioms beyond binding (`discover_dla.py`, `--dla-dump`)
+The recursion signature lives in the binding/fold subspace. The **DLA profile** clusters each decision by its per-block
+contribution to the predicted logit (`fieldrun --dla-dump`, via `decomp_all`/`residual_decomp`; gemma PLE blocks dropped
+as gemma-specific structural). Signature = `conc` (peakedness / PIC support number), `embed/attn/mlp_frac` (block KIND),
+`early/late_frac` (depth), `neg_frac` (suppression share).
+
+**What it found (gemma-4-e4b-it, 24 prompts, 350 decisions, k=6) — a NEW axis the recursion signature lacked:**
+the **attn-vs-MLP circuit split + suppression structure**, yielding circuit-level idioms —
+- **copy/induction** = attn-heavy with a `L41.attn(+) / L41.ffn(−)` **push-pull** (`na`, `orp`, `cherry`);
+- **MLP content-recall** = MLP-dominated, **high suppression** (neg ≈ 0.3–0.6) — the last MLP down-weights the winner
+  (`six`, `raining`, `story`);
+- **MLP format/function** = MLP-dominated, **low suppression** (neg ≈ 0.1), `L40.ffn`-driven (`.` `)` `,` `the` `a`).
+The critic also (correctly) isolated an **artifact** cluster: every `pos:0` decision is identical (`L41.ffn −24.99 →`
+",") — a first-token degeneracy, not an idiom.
+
+**The honest limitation — direct logit attribution is depth-degenerate.** `early_frac ≈ 0`, `late_frac ≈ 0.99`,
+`embed_frac = 0` for *every* cluster: ~all DIRECT contribution to the final logit comes from the last 2–3 layers (the
+unembed-proximity / logit-lens effect — earlier writes are read out *through* later layers, so their direct projection
+is tiny). So the DLA profile **cannot find early/mid circuit idioms**; the depth axis is dead. The recursion signature's
+`resolve_layer` captured depth far better. **The two signatures are complementary: recursion = *when* (timing/depth),
+DLA = *which block-kind* (attn vs MLP + suppression).** Finding early/mid circuits needs a different attribution
+(activation/path patching), not direct-logit DLA.
+
 ## Next
-richer signature (DLA circuit profile) → idioms beyond binding · auto-route residual exemplars into the probe harness
-(`PROBES.md`) so discovery and characterization compose.
+combine the recursion (*when*) and DLA (*which*) signatures into one decision vector · activation-patching attribution
+for the dead depth axis · auto-route residual exemplars into the probe harness (`PROBES.md`).
