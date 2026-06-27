@@ -113,7 +113,7 @@ def main():
     feats = REC + DLA + CAU
     X0 = np.array([[{**rec[p], **dla[p], **cau[p]}[f] for f in feats] for p in pids], float)
     X = (X0 - X0.mean(0)) / (X0.std(0) + 1e-9)
-    K = 4
+    K = min(4, len(pids))
     a, c = kmeans(X, K)
     print(f"\n=== FUSED signature · {len(pids)} prompts · k={K} ===")
     print(f"  WHEN  {REC}\n  WHICH {DLA}\n  WHERE {CAU}\n")

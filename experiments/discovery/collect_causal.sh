@@ -16,7 +16,7 @@ while IFS= read -r line; do
   [ -z "$line" ] && continue
   printf -v id "%03d" "$i"
   echo "[$id] $line"
-  timeout 300 "$FR" --bundle "$BUNDLE" --recursion-explain --causal-dump "$HERE/dumps_causal/$id.jsonl" --text "$line" 2>&1 \
+  timeout 650 "$FR" --bundle "$BUNDLE" --recursion-explain --causal-dump "$HERE/dumps_causal/$id.jsonl" --text "$line" 2>&1 \
     | grep -E "wrote causal|no predict_ablated|no dims|error" || echo "  (no output)"
   i=$((i+1))
 done < "$CORPUS"

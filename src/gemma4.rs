@@ -902,6 +902,93 @@ impl Model for Gemma4 {
         }))
     }
 
+    fn dims(&self) -> Option<(usize, usize)> {
+        Some((self.n_layer, self.h))
+    }
+
+    /// CAUSAL ablation forward (mirrors `hidden`): zero a listed head / whole-attn-block / mlp-neuron / whole-mlp-block
+    /// write before it enters the residual, then predict. By gemma RMSNorm, `norm(0) = 0`, so zeroing a block's
+    /// pre-norm write removes its residual contribution exactly. PLE + `layer_scalar` are kept (we ablate the attn/mlp
+    /// block, not the per-layer-embedding term). Enables `--causal-dump` (load-bearing-block discovery) on Gemma 4.
+    fn predict_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)], attn_layers: &[usize], mlp_layers: &[usize]) -> Option<i64> {
+        let seq = ids.len();
+        let h = self.h;
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] { kv_store[l] = Some(kv.clone()); }
+                kv
+            };
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kvh = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kvh * hd..(kvh + 1) * hd]);
+                let vh = v.slice(s![.., kvh * hd..(kvh + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            for &(al, ah) in heads {
+                if al == l && ah < h { attn_out.slice_mut(s![.., ah * hd..(ah + 1) * hd]).fill(0.0); }
+            }
+            if attn_layers.contains(&l) { attn_out.fill(0.0); }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            for &(nl, nn) in neurons {
+                if nl == l && nn < hidden.ncols() { for r in 0..seq { hidden[[r, nn]] = 0.0; } }
+            }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let mut combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            if mlp_layers.contains(&l) { combined.fill(0.0); }
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
+            x *= self.layer_scalar[l];
+        }
+        let xf = self.norm(&x, "norm");
+        let logits = self.b.rowdot_f32(self.unembed(), &xf.row(seq - 1).to_vec());
+        Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
     /// Per-block residual-stream WRITES at the last position, folded through the final RMSNorm so that
     /// ⟨write_b, U_v⟩ is block `b`'s EXACT additive logit contribution to token `v` (this is the substrate
     /// `--export-logic` / Density-Minimization consume; see `residual_decomp`). Gemma 4's residual is richer than

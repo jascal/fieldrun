@@ -158,6 +158,30 @@ So the clusters are crisper than any single signature gives; the three lenses co
 
 Caveats: n=24 (thin for k=4 / 10-D), the off-by-one alignment, 0.5B.
 
+## Cross-architecture — is the taxonomy rope-specific? (0.5B / 7B / gemma-4)
+Ran the full 3-way on **gemma-4-e4b-it** (Gemma arch, instruct) — the first non-rope full fusion (required porting
+`predict_ablated_blocks` to gemma4). **Cost finding:** gemma causal is ~7 min/prompt (84 blocks × ~5 s forward); the 3
+*longer* prompts timed out at 650 s — causal scales as `n_layer × forward-cost`, so it's borderline on deep models (this
+is *why* causal is the practically-rope-restricted lens). The 3 short prompts completed and map to the same taxonomy:
+is-a = attn-heavy + most-critical (real recursion); factual = MLP-recall + robust + high-suppression; code = near-redundant.
+
+**Cross-arch causal `flip_frac` (the fragile ↔ redundant axis):**
+| prompt | 0.5B | 7B | gemma-4 |
+|---|---|---|---|
+| factual recall (`…France is`) | 0.167 | 0.071 | **0.048** |
+| is-a chain (`…zorp is a`) | 0.083 | 0.036 | **0.131** |
+| code/format (`…return a +`) | 0.021 | 0.000 | 0.012 |
+
+**Findings:**
+1. **The lens structure is architecture-general.** gemma-4 shows the *same* behavior — early-critical causal
+   (`earliest≈0`), MLP-dominated DLA readout, suppression on recall (neg 0.31 for `Paris`), copy/resolve recursion. The
+   when × which × where decomposition is **not** rope-specific.
+2. **Redundancy tracks CAPABILITY, not raw layer count.** Factual-recall robustness rises 0.5B → 7B → gemma-4
+   (flip 0.167 → 0.071 → 0.048); gemma-4 (~4B, strong) is **robust like 7B, not fragile like 0.5B**.
+3. **Causal corroborates behavior on is-a.** gemma commits **more** critical blocks to the chain (0.131) than 7B (0.036)
+   — causal evidence that **gemma genuinely recurses while 7B base recency-shortcuts**, independently matching the GAPS
+   behavioral probe (gemma cleared ≥4-hop is-a; 7B base did not). More load-bearing blocks = real computation; few = shortcut.
+
 ## Next
-multi-block / path-patching for distributed early circuits (single-block ablation's blind spot) · bigger model ·
-auto-route residual exemplars into the probe harness (`PROBES.md`).
+multi-block / path-patching for distributed early circuits (single-block ablation's blind spot) · cheaper causal for
+deep models (layer-group ablation) · auto-route residual exemplars into the probe harness (`PROBES.md`).
