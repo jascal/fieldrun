@@ -131,6 +131,20 @@ the resident set is the shared layers + a working set of hot experts, not the wh
 arch — the incremental KV-cache decode is byte-identical to the naive full recompute (the f32 generation gate in
 `scripts/validate_all.sh`).
 
+**`--recursion-explain`** (the recursion spectrum — COMPUTED / DEFERRED / BINDING long-range binds + nested-fold
+detection — and the value-stack logit-lens) additionally needs the per-position substrate `recursion_trace`, currently
+implemented for:
+
+| arch | recursion tracing |
+|------|-------------------|
+| `rope` (Llama-3.x · Qwen2.5 · Qwen3 dense · Mistral · Phi) | ✅ |
+| `qwen3moe` (Qwen3-MoE, e.g. 30B-A3B) | ✅ |
+| `gemma4` (Gemma-4 E2B / E4B / 26B-A4B) | ✅ |
+| all other arches (`gpt2`, `gemma`, `gemma3`, `mla`, `minimax`, …) | — (`--recursion-explain` prints `no recursion_trace`) |
+
+For `gemma4` the long-range binding signal is read only from the **global** (full-attention) layers — the
+sliding-window layers mask distant keys, so a distant fold can register only there.
+
 ## Running a big model on a Mac (M3 / M4, unified memory)
 
 The build is pure-CPU and cross-platform — **`cargo build --release` compiles on stable Rust everywhere** (Apple
