@@ -1063,6 +1063,38 @@ fn main() {
                 return;
             }
 
+            // ── --causal-dump: CAUSAL signature for the last-position decision — ablate each layer's attn / mlp block
+            // and record which FLIP the prediction (load-bearing blocks). Unlike DLA (direct-logit, late-biased), this
+            // sees EARLY/MID circuits: a block matters if removing it changes the answer, regardless of its logit share.
+            // One JSON object per prompt. Rope family (needs predict_ablated_blocks). ──
+            if let Some(dpath) = flag(&args, "--causal-dump") {
+                use std::fmt::Write as _;
+                let nl = match lm.dims() { Some((nl, _)) => nl, None => { eprintln!("[fieldrun] --causal-dump: arch {arch} has no dims"); return; } };
+                if lm.predict_ablated_blocks(&rec_ids, &[], &[], &[0], &[]).is_none() {
+                    eprintln!("[fieldrun] --causal-dump: arch {arch} has no predict_ablated_blocks (rope family)"); return;
+                }
+                let base = lm.predict(&rec_ids);
+                let mut flips = String::new();
+                let mut nf = 0usize;
+                for l in 0..nl {
+                    for (kind, al, ml) in [("attn", vec![l], Vec::<usize>::new()), ("mlp", Vec::<usize>::new(), vec![l])] {
+                        if let Some(new) = lm.predict_ablated_blocks(&rec_ids, &[], &[], &al, &ml) {
+                            if new != base {
+                                if nf > 0 { flips.push(','); }
+                                let _ = write!(flips, "{{\"l\":{l},\"kind\":{kind:?},\"to\":{:?}}}", lbl(new).trim());
+                                nf += 1;
+                            }
+                        }
+                    }
+                }
+                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
+                match std::fs::write(&dpath, &o) {
+                    Ok(_) => eprintln!("[fieldrun] wrote causal profile ({nf}/{} blocks flip) to {dpath}", 2 * nl),
+                    Err(e) => eprintln!("[fieldrun] --causal-dump {dpath}: {e}"),
+                }
+                return;
+            }
+
             let trace = match lm.recursion_trace(&rec_ids) {
                 Some(t) => t,
                 None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }

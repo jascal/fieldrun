@@ -100,6 +100,40 @@ is tiny). So the DLA profile **cannot find early/mid circuit idioms**; the depth
 DLA = *which block-kind* (attn vs MLP + suppression).** Finding early/mid circuits needs a different attribution
 (activation/path patching), not direct-logit DLA.
 
+## Causal signature — cracking the dead depth axis (`discover_causal.py`, `--causal-dump`)
+DLA can't see early/mid circuits (direct logit attribution is late-biased). The **causal** signature asks the
+counterfactual: ablate each layer's attn/mlp block at the decision; which **flip** the prediction? A load-bearing early
+block shows up regardless of its logit share. Signature: `flip_frac`, `earliest` (shallowest flipping layer / n_layer),
+`early/mid/late_frac` (where the critical blocks sit), `attn/mlp_frac`. (Rope family; `predict_ablated_blocks`.)
+
+**Headline (Qwen2.5-0.5B, 24 last-position decisions) — causal is the *near-opposite* of DLA on depth:**
+- **23/24** decisions have an **early-third** load-bearing block; **median earliest critical layer = L0.** DLA said
+  `early_frac = 0`; causally the early layers are critical almost everywhere.
+- Only **1/24** fully redundant (no single block flips).
+
+**The decompilation insight:** *where the logit comes from ≠ where the computation that determines it happens.* Late
+layers **read out** (high logit contribution, but ablating one rarely flips — redundant); early layers **compute** (low
+logit contribution, but ablating flips — critical). **Attribution is late-biased, causal is early-biased — faithful
+decompilation needs both.**
+
+**Idioms by criticality-depth + redundancy (a decomposition neither prior signature gave):**
+- **early-bottleneck / redundant-readout** (n=10): a few *early* blocks critical, deep stack redundant — copy, format,
+  and the **is-a recursion** (the chain is resolved in L0–L2; the answer is "decided early").
+- **early-attention-critical** (n=4): early *attention* is the bottleneck (`na`, `wet`, `September`).
+- **distributed multi-depth** (n=4): critical blocks across the stack — deep recall/counting (`Paris`, `eleven`).
+- **fragile / broadly-critical** (n=6): many blocks each necessary (n_flip up to 32/48) — weakly-held, full-context
+  predictions (`purple`, `twinkle…`); low redundancy = the causal "forge tax" (no clean circuit).
+
+**Honest caveats:** single-block ablation finds *bottlenecks*, not distributed computation (collective early circuits
+with no single critical block read as redundant); 0.5B, last-position only, n=24 (thin for k=4, but the 23/24 headline is
+robust).
+
+## The signature triad
+Three complementary lenses on one decision: **recursion = *when*** (resolve-timing / fold-depth) · **DLA = *which
+block-kind*** (attn vs MLP + suppression) · **causal = *where the load-bearing computation is*** (early vs late,
+bottleneck vs redundant). Each is blind where another sees: DLA misses early (late-biased), causal misses distributed
+(bottleneck-only), recursion misses circuit-kind. Fused, they're a far fuller decompiler.
+
 ## Next
-combine the recursion (*when*) and DLA (*which*) signatures into one decision vector · activation-patching attribution
-for the dead depth axis · auto-route residual exemplars into the probe harness (`PROBES.md`).
+fuse the three signatures into one decision vector + re-cluster · multi-block / path-patching for distributed early
+circuits · bigger model · auto-route residual exemplars into the probe harness (`PROBES.md`).
