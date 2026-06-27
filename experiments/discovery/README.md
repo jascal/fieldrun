@@ -36,7 +36,7 @@ Field names/types are stable; the Rust emitters live in `main.rs` (`--recursion-
 {"pred_s":" w","n_layer":24,"parity":true,"n_flip":4,"flips":[{"l":0,"kind":"attn","to":" b"}, ...]}
 ```
 **`parity`** = `predict_ablated_blocks(no ablation) == predict` — `false` flags a broken ablation forward (the key
-correctness gate for the gemma4 port). **Residual critic** (`discover*.py`): a decision is *residual* iff its distance to
+correctness gate for the gemma4 port; confirmed **`True`** on both 0.5B rope and gemma-4-e4b-it). **Residual critic** (`discover*.py`): a decision is *residual* iff its distance to
 its own k-means centroid (in z-scored signature space) exceeds `mean + 1.5·std` of all such distances. **Axis pass**
 (`discover.py`): per feature, the largest sorted-value GAP that carves a minority tail (size 4..35% of n) with
 gap ≥ 0.12 — tails whose members were mostly k-means residual are flagged *newly named*. Clustering seeds are pinned
