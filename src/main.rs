@@ -1032,6 +1032,28 @@ fn main() {
                 None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }
             };
 
+            // ── --recursion-dump: serialize the raw per-position substrate as JSONL (one decision per line) for the
+            // idiom-DISCOVERY harness (unsupervised clustering in mechanism-signature space). We dump the raw RecPos +
+            // the token ids; the harness computes copy/gate/nesting/features in Python, so this stays minimal. ──
+            if let Some(dpath) = flag(&args, "--recursion-dump") {
+                use std::fmt::Write as _;
+                let mut o = String::new();
+                let ids_csv: String = rec_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                let _ = writeln!(o, "{{\"ids\":[{}],\"n_layer\":{}}}", ids_csv,
+                                 trace.first().map(|r| r.n_layer).unwrap_or(0));
+                for r in &trace {
+                    let lens: String = r.lens_full.iter().map(|(_, t)| t.to_string()).collect::<Vec<_>>().join(",");
+                    let _ = writeln!(o, "{{\"pos\":{},\"tok\":{},\"tok_s\":{:?},\"final\":{},\"final_s\":{:?},\"resolve\":{},\"n_layer\":{},\"back\":{},\"conc\":{:.4},\"lens\":[{}]}}",
+                                     r.pos, rec_ids[r.pos], lbl(rec_ids[r.pos]).trim(), r.final_top1,
+                                     lbl(r.final_top1).trim(), r.resolve_layer, r.n_layer, r.back, r.conc, lens);
+                }
+                match std::fs::write(&dpath, &o) {
+                    Ok(_) => eprintln!("[fieldrun] wrote {} decisions to {dpath}", trace.len()),
+                    Err(e) => eprintln!("[fieldrun] --recursion-dump {dpath}: {e}"),
+                }
+                return;
+            }
+
             // ── --induce: MEASURE which rules are LEGIBLE in the trace. Read each subtree node's value off the
             // value-stack (logit-lens at the node's token positions) and grade it against the true value. What reads
             // cleanly is an extractable rule; what doesn't stays the Datalog KERNEL backstop (the cut / semiring).
