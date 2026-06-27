@@ -408,6 +408,88 @@ impl Gemma4 {
         self.norm(&x, "norm")
     }
 
+    /// Forward capturing the recursion substrate (mirrors `hidden` for Gemma 4): per-layer post-block residual (for the
+    /// per-layer logit-lens) + the element-wise max over late-layer heads of the attention matrix (the binding signal).
+    /// Sliding-window layers mask distant keys (their distant scores are -inf → 0 after softmax), so a *distant* fold
+    /// can only register on the GLOBAL (full-attention) layers — those are what the late-third maxback picks up.
+    fn recursion_capture(&self, ids: &[i64]) -> (Vec<Array2<f32>>, Array2<f32>) {
+        let seq = ids.len();
+        let h = self.h;
+        let late0 = 2 * self.n_layer / 3;
+        let emb = self.b.rows_f32("embed", ids);
+        let mut x = Array2::<f32>::zeros((seq, self.d));
+        for t in 0..seq {
+            x.row_mut(t).assign(&(&emb.row(t) * self.escale));
+        }
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut kv_store: Vec<Option<(Array2<f32>, Array2<f32>)>> = vec![None; self.n_layer];
+        let mut resids: Vec<Array2<f32>> = Vec::with_capacity(self.n_layer);
+        let mut maxback = Array2::<f32>::zeros((seq, seq));
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, 0);
+            let (k, v) = if self.is_shared(l) {
+                kv_store[self.kv_src[l]].clone().expect("KV-shared source computed in an earlier layer")
+            } else {
+                let kv = self.derive_kv(l, &a, 0);
+                if self.stores_kv[l] { kv_store[l] = Some(kv.clone()); }
+                kv
+            };
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kvh = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kvh * hd..(kvh + 1) * hd]);
+                let vh = v.slice(s![.., kvh * hd..(kvh + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()); // scaling = 1.0 in Gemma 4
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (sliding && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                if l >= late0 {
+                    for i in 0..seq {
+                        for j in 0..=i {
+                            if scores[[i, j]] > maxback[[i, j]] { maxback[[i, j]] = scores[[i, j]]; }
+                        }
+                    }
+                }
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &self.moe_branch(l, &x)
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
+            x *= self.layer_scalar[l];
+            resids.push(x.clone());
+        }
+        (resids, maxback)
+    }
+
     /// Debug: residual-stream snapshots in transformers `output_hidden_states` convention — [inputs_embeds (=√d·embed),
     /// out-L0, …, out-L{n-2}, POST-final-norm] (each flat seq·d, row-major), nl+1 entries. Gemma4's last hidden_state
     /// IS the post-final-norm output (verified hs[-1] == last_hidden_state), so the final slot is normed, matching HF.
@@ -791,6 +873,33 @@ impl Model for Gemma4 {
     fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
         let xf = self.hidden(ids);
         Some(self.b.rowdot_f32(self.unembed(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
+        if ids.len() < 3 { return Some(vec![]); }
+        let (resids, maxback) = self.recursion_capture(ids);
+        let un = self.unembed();
+        // arch-specific lens only: final RMSNorm ("norm") then unembed argmax (gemma's final logit softcap is monotone
+        // so it does not change the argmax → omitted). The rest of the assembly is shared (build_rec_trace).
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |resid| {
+            let normed = self.norm(resid, "norm");
+            (0..normed.nrows())
+                .map(|p| {
+                    let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
+                    lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+                })
+                .collect()
+        }))
+    }
+
+    fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
+        let (resids, _) = self.recursion_capture(ids);
+        let un = self.unembed();
+        Some(crate::model::build_rec_lens_at(&resids, positions, 2 * self.n_layer / 3, |resid, p| {
+            let normed = self.norm(&resid.slice(s![p..p + 1, ..]).to_owned(), "norm");
+            let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
+            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+        }))
     }
 
     /// Per-block residual-stream WRITES at the last position, folded through the final RMSNorm so that

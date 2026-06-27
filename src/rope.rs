@@ -751,76 +751,31 @@ impl Model for Rope {
     }
 
     fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
-        use crate::model::RecPos;
-        let seq = ids.len();
-        if seq < 3 {
+        if ids.len() < 3 {
             return Some(vec![]);
         }
-        let (resids, mut maxback) = self.recursion_capture(ids);
-        let nl = self.n_layer;
-        let late0 = 2 * nl / 3;
+        let (resids, maxback) = self.recursion_capture(ids);
         let un = self.unembed_name();
-        // per-layer logit-lens argmax per position (apply the FINAL norm to each layer's residual, then unembed)
-        let mut lens = vec![vec![0i64; seq]; nl];
-        for l in 0..nl {
-            let normed = rmsnorm(&resids[l], self.b.arr1("norm"), self.eps);
-            for p in 0..seq {
-                let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
-                lens[l][p] = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
-            }
-        }
-        // zero the attention SINK (cols 0/1) so the binding signal is a real distant fold, not sink mass
-        for i in 0..seq {
-            maxback[[i, 0]] = 0.0;
-            if seq > 1 {
-                maxback[[i, 1]] = 0.0;
-            }
-        }
-        let mut out = Vec::new();
-        for p in 0..seq.saturating_sub(1) {
-            // logit lens at p predicts token p+1; the model's prediction = the last-layer lens
-            let final_top1 = lens[nl - 1][p];
-            let mut resolve = nl;
-            for l in 0..nl {
-                if lens[l][p] == final_top1 {
-                    resolve = l + 1;
-                    break;
-                }
-            }
-            let lens_late: Vec<(usize, i64)> = (late0..nl).map(|l| (l + 1, lens[l][p])).collect();
-            let lens_full: Vec<(usize, i64)> = (0..nl).map(|l| (l + 1, lens[l][p])).collect();
-            let (mut back, mut conc) = (p, 0f32);
-            for k in 0..p {
-                if maxback[[p, k]] > conc {
-                    conc = maxback[[p, k]];
-                    back = k;
-                }
-            }
-            out.push(RecPos { pos: p, final_top1, resolve_layer: resolve, n_layer: nl, lens_late, lens_full, back, conc });
-        }
-        Some(out)
+        // arch-specific lens only: final RMSNorm ("norm") then unembed argmax; the rest is shared (build_rec_trace).
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |resid| {
+            let normed = rmsnorm(resid, self.b.arr1("norm"), self.eps);
+            (0..normed.nrows())
+                .map(|p| {
+                    let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
+                    lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+                })
+                .collect()
+        }))
     }
 
     fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
-        use ndarray::s;
         let (resids, _) = self.recursion_capture(ids);
-        let nl = self.n_layer;
-        let late0 = 2 * nl / 3;
         let un = self.unembed_name();
-        let mut out = Vec::with_capacity(positions.len());
-        for &p in positions {
-            let mut late = Vec::new();
-            for l in late0..nl {
-                if p >= resids[l].nrows() { continue; }
-                let row = resids[l].slice(s![p..p + 1, ..]).to_owned(); // 1×d
-                let normed = rmsnorm(&row, self.b.arr1("norm"), self.eps);
-                let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
-                let am = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64;
-                late.push((l + 1, am));
-            }
-            out.push(late);
-        }
-        Some(out)
+        Some(crate::model::build_rec_lens_at(&resids, positions, 2 * self.n_layer / 3, |resid, p| {
+            let normed = rmsnorm(&resid.slice(s![p..p + 1, ..]).to_owned(), self.b.arr1("norm"), self.eps);
+            let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
+            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+        }))
     }
 
     fn predict_patched(&self, ids: &[i64], layer: usize, positions: &[usize], donors: &[Vec<f32>]) -> Option<i64> {

@@ -1179,12 +1179,19 @@ fn main() {
             // trace from the given ids and never generates, so the model's own answer would otherwise be invisible.
             // Greedily generate the continuation (stop at the first newline) and show it verbatim; the reader decides
             // whether it's correct. No ground-truth check — the value the model produced is the point.
+            // greedily decode a short continuation to show what the model actually answers. Cap the budget so a model
+            // that never emits real content (only stop/blank tokens) can't loop forever.
+            const REC_CONT_MAX_TOKENS: usize = 16;
             let mut gids = rec_ids.clone();
             let mut cont = String::new();
-            for _ in 0..8 {
+            for _ in 0..REC_CONT_MAX_TOKENS {
                 let t = lm.predict(&gids);
                 let s = lbl(t);
-                if s.contains('\n') { break; }
+                // skip LEADING blank/newline/special-decoded-empty tokens (instruct chat templates often emit a
+                // newline or stop token before the answer); break on a newline only once we have real content.
+                if s.trim().is_empty() {
+                    if cont.trim().is_empty() { gids.push(t); continue; } else { break; }
+                }
                 cont.push_str(&s);
                 gids.push(t);
             }

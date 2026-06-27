@@ -186,6 +186,73 @@ pub struct RecPos {
     pub conc: f32,                    // attention weight on `back` (max over late layers+heads); high = real bind
 }
 
+/// Assemble the per-position recursion trace from an arch's captured substrate. This is the **architecture-agnostic**
+/// half of `recursion_trace`: only `recursion_capture` (the forward) and `lens_argmax` (the arch's final-norm +
+/// unembed) are arch-specific, so every arch shares this one assembly and there is a single place to keep correct.
+/// - `resids[l]` = the post-block residual at layer `l` (seq × d); `maxback` = the late-layer attention max (seq × seq).
+/// - `lens_argmax(resids[l])` = the logit-lens top-1 token id per position for one layer (arch's final norm + unembed).
+/// - `late0` = first "late" layer the binding signal is read from. Convention `2·nl/3` (last third): for Gemma 4 the
+///   sliding-window layers can't carry long-range binding so a distant fold only registers on the global layers there;
+///   for the rope/MoE families it is simply where return/fold attention concentrates. Bump it per-arch if needed.
+pub fn build_rec_trace(
+    resids: &[Array2<f32>],
+    mut maxback: Array2<f32>,
+    late0: usize,
+    lens_argmax: impl Fn(&Array2<f32>) -> Vec<i64>,
+) -> Vec<RecPos> {
+    let nl = resids.len();
+    let seq = resids.first().map(|r| r.nrows()).unwrap_or(0);
+    if seq < 3 || nl == 0 {
+        return vec![];
+    }
+    // per-layer logit-lens argmax per position (the only arch-specific step is `lens_argmax`)
+    let lens: Vec<Vec<i64>> = resids.iter().map(&lens_argmax).collect();
+    // zero the attention SINK (cols 0/1) so the binding signal is a real distant fold, not sink mass
+    for i in 0..seq {
+        maxback[[i, 0]] = 0.0;
+        if seq > 1 {
+            maxback[[i, 1]] = 0.0;
+        }
+    }
+    let mut out = Vec::with_capacity(seq.saturating_sub(1));
+    for p in 0..seq.saturating_sub(1) {
+        // logit lens at p predicts token p+1; the model's prediction = the last-layer lens
+        let final_top1 = lens[nl - 1][p];
+        let resolve = (0..nl).find(|&l| lens[l][p] == final_top1).map(|l| l + 1).unwrap_or(nl);
+        let lens_late: Vec<(usize, i64)> = (late0..nl).map(|l| (l + 1, lens[l][p])).collect();
+        let lens_full: Vec<(usize, i64)> = (0..nl).map(|l| (l + 1, lens[l][p])).collect();
+        let (mut back, mut conc) = (p, 0f32);
+        for k in 0..p {
+            if maxback[[p, k]] > conc {
+                conc = maxback[[p, k]];
+                back = k;
+            }
+        }
+        out.push(RecPos { pos: p, final_top1, resolve_layer: resolve, n_layer: nl, lens_late, lens_full, back, conc });
+    }
+    out
+}
+
+/// The `recursion_lens_at` companion (arch-agnostic): the late-layer logit-lens reads at specific positions, for the
+/// `--induce` value-stack sweeps. `lens_argmax_at(resids[l], p)` = the logit-lens top-1 for one position at one layer.
+pub fn build_rec_lens_at(
+    resids: &[Array2<f32>],
+    positions: &[usize],
+    late0: usize,
+    lens_argmax_at: impl Fn(&Array2<f32>, usize) -> i64,
+) -> Vec<Vec<(usize, i64)>> {
+    let nl = resids.len();
+    positions
+        .iter()
+        .map(|&p| {
+            (late0..nl)
+                .filter(|&l| p < resids[l].nrows())
+                .map(|l| (l + 1, lens_argmax_at(&resids[l], p)))
+                .collect()
+        })
+        .collect()
+}
+
 pub trait Model: Sync {
     /// Top-1 next-token id for a context.
     fn predict(&self, ids: &[i64]) -> i64;

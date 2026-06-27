@@ -205,6 +205,58 @@ impl Qwen3Moe {
         self.norm(&x, "norm")
     }
 
+    /// Forward capturing the recursion substrate (mirrors `Rope::recursion_capture` for the Qwen3-MoE backbone):
+    /// per-layer post-block residual (for the per-layer logit-lens) + the element-wise max over late-layer heads of
+    /// the attention matrix (the binding signal; late = last third). MoE/dense FFN per layer exactly as in `hidden`.
+    fn recursion_capture(&self, ids: &[i64]) -> (Vec<Array2<f32>>, Array2<f32>) {
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let late0 = 2 * self.n_layer / 3;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut resids: Vec<Array2<f32>> = Vec::with_capacity(self.n_layer);
+        let mut maxback = Array2::<f32>::zeros((seq, seq));
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let mut q = self.b.mm(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.b.mm(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.b.mm(&a, &format!("{p}self_attn.v_proj"));
+            self.head_norm(&mut q, &format!("{p}q_norm"), h);
+            self.head_norm(&mut k, &format!("{p}k_norm"), nkv);
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) * self.scale;
+                for i in 0..seq {
+                    for j in 0..seq {
+                        if j > i || (self.window > 0 && j + self.window <= i) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                if l >= late0 {
+                    for i in 0..seq {
+                        for j in 0..=i {
+                            if scores[[i, j]] > maxback[[i, j]] { maxback[[i, j]] = scores[[i, j]]; }
+                        }
+                    }
+                }
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let mlp = if self.moe[l] { self.moe_branch(l, &a2) } else { self.dense_mlp(l, &a2) };
+            x = &x + &mlp;
+            resids.push(x.clone());
+        }
+        (resids, maxback)
+    }
+
     fn unembed_argmax(&self, xfn: &Array2<f32>) -> i64 {
         let logits = self.b.rowdot_f32(self.unembed(), &xfn.row(xfn.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
@@ -468,6 +520,32 @@ impl Model for Qwen3Moe {
 
     fn dims(&self) -> Option<(usize, usize)> {
         Some((self.n_layer, self.h))
+    }
+
+    fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
+        if ids.len() < 3 { return Some(vec![]); }
+        let (resids, maxback) = self.recursion_capture(ids);
+        let un = self.unembed();
+        // arch-specific lens only: final RMSNorm ("norm") then unembed argmax; the rest is shared (build_rec_trace).
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |resid| {
+            let normed = self.norm(resid, "norm");
+            (0..normed.nrows())
+                .map(|p| {
+                    let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
+                    lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+                })
+                .collect()
+        }))
+    }
+
+    fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {
+        let (resids, _) = self.recursion_capture(ids);
+        let un = self.unembed();
+        Some(crate::model::build_rec_lens_at(&resids, positions, 2 * self.n_layer / 3, |resid, p| {
+            let normed = self.norm(&resid.slice(s![p..p + 1, ..]).to_owned(), "norm");
+            let lg = self.b.rowdot_f32(un, &normed.row(0).to_vec());
+            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+        }))
     }
 
     /// Per-block DLA decomposition (the `--pil-dump` seam for the Qwen3-MoE family). Same rope-style RMSNorm
