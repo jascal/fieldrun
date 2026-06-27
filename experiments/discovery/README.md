@@ -134,6 +134,30 @@ block-kind*** (attn vs MLP + suppression) · **causal = *where the load-bearing 
 bottleneck vs redundant). Each is blind where another sees: DLA misses early (late-biased), causal misses distributed
 (bottleneck-only), recursion misses circuit-kind. Fused, they're a far fuller decompiler.
 
+## Fused signature — re-clustering on WHEN × WHICH × WHERE (`fuse.py`)
+All three collected on the SAME model (Qwen2.5-0.5B), aligned per prompt at the end-of-prompt decision (impurity:
+recursion is the last *in-prompt* decision, DLA/causal the continuation — an off-by-one proxy). Fused vector = recursion
+{resolve, reach, copy, churn} + DLA {conc, mlp_frac, neg} + causal {flip_frac, earliest, early_frac}. k=4 over 24 prompts:
+
+- **induction / copy** (n=5): `copy=1` · MLP, low-suppression · **early-bottleneck** (flip 0.08, early 0.88). `na→na`,
+  `banana→cherry`, is-a `→w(ug)`.
+- **early-decided sequence/format** (n=7): no copy, **earliest resolve** (0.78) · MLP · early-bottleneck, low flip.
+  counting/`=`/`August→September`.
+- **fragile / distributed** (n=8): **high flip_frac (0.38)**, critical blocks spread across depth. factual recall
+  (`Paris`), in-context maps (`bird`), `eleven`, `twinkle…`.
+- **deliberated-local** (n=4): **highest churn (0.75)**, latest resolve, local reach. narrative/`Britain→and`.
+
+**The payoff — fusion adds resolving power: each lens splits what the others conflate.**
+- The **causal** lens splits *fragile* (cluster 2, flip 0.38) from *robust-early* (clusters 0/3, flip ~0.05) — and those
+  look **identical** to DLA (all conc≈0.2, mlp≈0.7) and similar to recursion. Causal does the discriminating.
+- The **recursion** lens splits *copy* (cluster 1) and *high-churn deliberated* (cluster 3) — which the causal lens
+  conflates (both early-critical, low flip).
+So the clusters are crisper than any single signature gives; the three lenses contribute **orthogonal** discriminations.
+(Also confirmed: early-criticality is near-universal — `earliest≈0`, `early≈0.5–1.0` everywhere — so the discriminator
+*within* "early matters" is `flip_frac`: how many blocks / how fragile.)
+
+Caveats: n=24 (thin for k=4 / 10-D), the off-by-one alignment, 0.5B.
+
 ## Next
-fuse the three signatures into one decision vector + re-cluster · multi-block / path-patching for distributed early
-circuits · bigger model · auto-route residual exemplars into the probe harness (`PROBES.md`).
+multi-block / path-patching for distributed early circuits (single-block ablation's blind spot) · bigger model ·
+auto-route residual exemplars into the probe harness (`PROBES.md`).
