@@ -1027,10 +1027,103 @@ fn main() {
                     None => { eprintln!("[fieldrun] --recursion-explain: give --text or --ids (no tokenizer for the default demo)"); return; } }
             };
             let lbl = |id: i64| -> String { match &tg { Some(t) => t.decode(&[id]), None => format!("[{id}]") } };
+
+            // ── --dla-dump: per-decision DLA PROFILE (which blocks/circuit drive the prediction) as JSONL, for the
+            // idiom-discovery harness's richer signature — clustering here finds idioms BEYOND the recursion/binding
+            // subspace. decomp_all (all positions, one forward) where available; residual_decomp (last position) else. ──
+            if let Some(dpath) = flag(&args, "--dla-dump") {
+                use std::fmt::Write as _;
+                let mut o = String::new();
+                let emit = |o: &mut String, pos: usize, pred: i64, blocks: &[(String, Vec<f32>)]| {
+                    let contrib: Vec<String> = blocks.iter().map(|(_, c)| format!("{:.4}", c.first().copied().unwrap_or(0.0))).collect();
+                    let _ = writeln!(o, "{{\"pos\":{pos},\"pred\":{pred},\"pred_s\":{:?},\"contrib\":[{}]}}",
+                                     lbl(pred).trim(), contrib.join(","));
+                };
+                if let Some(all) = lm.decomp_all(&rec_ids, 2) {
+                    if let Some((_, _, _, _, _, blocks)) = all.first() {
+                        let labels: Vec<String> = blocks.iter().map(|(l, _)| format!("{l:?}")).collect();
+                        let _ = writeln!(o, "{{\"labels\":[{}]}}", labels.join(","));
+                    }
+                    for (p, (pred, _ru, _pl, _rl, _cands, blocks)) in all.iter().enumerate() {
+                        emit(&mut o, p, *pred, blocks);
+                    }
+                } else if let Some((labels, contrib)) = lm.residual_decomp(&rec_ids, &[lm.predict(&rec_ids)]) {
+                    // last-position fallback: contrib[b][0] is block b's contribution to the predicted token
+                    let labs: Vec<String> = labels.iter().map(|l| format!("{l:?}")).collect();
+                    let _ = writeln!(o, "{{\"labels\":[{}]}}", labs.join(","));
+                    let blocks: Vec<(String, Vec<f32>)> = labels.iter().cloned().zip(contrib.iter().cloned()).collect();
+                    emit(&mut o, rec_ids.len() - 1, lm.predict(&rec_ids), &blocks);
+                } else {
+                    eprintln!("[fieldrun] --dla-dump: arch {arch} has no decomp_all/residual_decomp"); return;
+                }
+                match std::fs::write(&dpath, &o) {
+                    Ok(_) => eprintln!("[fieldrun] wrote DLA profiles to {dpath}"),
+                    Err(e) => eprintln!("[fieldrun] --dla-dump {dpath}: {e}"),
+                }
+                return;
+            }
+
+            // ── --causal-dump: CAUSAL signature for the last-position decision — ablate each layer's attn / mlp block
+            // and record which FLIP the prediction (load-bearing blocks). Unlike DLA (direct-logit, late-biased), this
+            // sees EARLY/MID circuits: a block matters if removing it changes the answer, regardless of its logit share.
+            // One JSON object per prompt. Rope family (needs predict_ablated_blocks). ──
+            if let Some(dpath) = flag(&args, "--causal-dump") {
+                use std::fmt::Write as _;
+                let nl = match lm.dims() { Some((nl, _)) => nl, None => { eprintln!("[fieldrun] --causal-dump: arch {arch} has no dims"); return; } };
+                if lm.predict_ablated_blocks(&rec_ids, &[], &[], &[0], &[]).is_none() {
+                    eprintln!("[fieldrun] --causal-dump: arch {arch} has no predict_ablated_blocks (rope family)"); return;
+                }
+                let base = lm.predict(&rec_ids);
+                // self-certify the ablation forward: with NO blocks ablated it must reproduce predict() exactly. A
+                // false here means the arch's predict_ablated_blocks forward diverges from hidden() (a broken port).
+                let parity = lm.predict_ablated_blocks(&rec_ids, &[], &[], &[], &[]) == Some(base);
+                let mut flips = String::new();
+                let mut nf = 0usize;
+                for l in 0..nl {
+                    for (kind, al, ml) in [("attn", vec![l], Vec::<usize>::new()), ("mlp", Vec::<usize>::new(), vec![l])] {
+                        if let Some(new) = lm.predict_ablated_blocks(&rec_ids, &[], &[], &al, &ml) {
+                            if new != base {
+                                if nf > 0 { flips.push(','); }
+                                let _ = write!(flips, "{{\"l\":{l},\"kind\":{kind:?},\"to\":{:?}}}", lbl(new).trim());
+                                nf += 1;
+                            }
+                        }
+                    }
+                }
+                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"parity\":{parity},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
+                match std::fs::write(&dpath, &o) {
+                    Ok(_) => eprintln!("[fieldrun] wrote causal profile ({nf}/{} blocks flip) to {dpath}", 2 * nl),
+                    Err(e) => eprintln!("[fieldrun] --causal-dump {dpath}: {e}"),
+                }
+                return;
+            }
+
             let trace = match lm.recursion_trace(&rec_ids) {
                 Some(t) => t,
                 None => { eprintln!("[fieldrun] --recursion-explain: arch {arch} has no recursion_trace (rope family only)"); return; }
             };
+
+            // ── --recursion-dump: serialize the raw per-position substrate as JSONL (one decision per line) for the
+            // idiom-DISCOVERY harness (unsupervised clustering in mechanism-signature space). We dump the raw RecPos +
+            // the token ids; the harness computes copy/gate/nesting/features in Python, so this stays minimal. ──
+            if let Some(dpath) = flag(&args, "--recursion-dump") {
+                use std::fmt::Write as _;
+                let mut o = String::new();
+                let ids_csv: String = rec_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                let _ = writeln!(o, "{{\"ids\":[{}],\"n_layer\":{}}}", ids_csv,
+                                 trace.first().map(|r| r.n_layer).unwrap_or(0));
+                for r in &trace {
+                    let lens: String = r.lens_full.iter().map(|(_, t)| t.to_string()).collect::<Vec<_>>().join(",");
+                    let _ = writeln!(o, "{{\"pos\":{},\"tok\":{},\"tok_s\":{:?},\"final\":{},\"final_s\":{:?},\"resolve\":{},\"n_layer\":{},\"back\":{},\"conc\":{:.4},\"lens\":[{}]}}",
+                                     r.pos, rec_ids[r.pos], lbl(rec_ids[r.pos]).trim(), r.final_top1,
+                                     lbl(r.final_top1).trim(), r.resolve_layer, r.n_layer, r.back, r.conc, lens);
+                }
+                match std::fs::write(&dpath, &o) {
+                    Ok(_) => eprintln!("[fieldrun] wrote {} decisions to {dpath}", trace.len()),
+                    Err(e) => eprintln!("[fieldrun] --recursion-dump {dpath}: {e}"),
+                }
+                return;
+            }
 
             // ── --induce: MEASURE which rules are LEGIBLE in the trace. Read each subtree node's value off the
             // value-stack (logit-lens at the node's token positions) and grade it against the true value. What reads
