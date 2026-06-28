@@ -2819,21 +2819,54 @@ fn main() {
             // (`certified()` ⇒ the shortlist argmax provably equals the full-vocab argmax). For untied models this shrinks
             // the dense unembed vocab×d → K×d where the certificate fires; embed stays full (any input token can appear).
             let shortlist_k: Option<usize> = flag(&args, "--shortlist").and_then(|s| s.parse().ok());
+            // --embed-tokens <corpus.json>: restrict the input embed to the tokens that actually appear (the embed-side
+            // dense-Gram mitigation; exact for contexts over that token set). With no --shortlist it also restricts the
+            // OUTPUT candidate set to those tokens (faithful when every context's argmax is in the set — a greedy/self-
+            // generated corpus). Accepts {"ids":[…]}, {"holdout_ids":[…]}, or a bare [ …ints… ] of token ids.
+            let mut embed_tokens: Option<Vec<usize>> = None;
+            if let Some(p) = flag(&args, "--embed-tokens") {
+                let parsed = std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}")).and_then(|s| {
+                    let j: serde_json::Value = serde_json::from_str(&s).map_err(|e| format!("parse {p} as JSON: {e}"))?;
+                    let arr = j.get("ids").or_else(|| j.get("holdout_ids")).or(Some(&j))
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| format!("{p}: expected an \"ids\"/\"holdout_ids\" array or a bare [int,…]"))?;
+                    let mut set = std::collections::BTreeSet::<usize>::new();
+                    for v in arr { if let Some(n) = v.as_u64() { set.insert(n as usize); } }
+                    if set.is_empty() { return Err(format!("{p}: no integer token ids found")); }
+                    Ok(set.into_iter().collect::<Vec<usize>>())
+                });
+                match parsed {
+                    Ok(v) => embed_tokens = Some(v),
+                    Err(e) => { eprintln!("[fieldrun] export --logic-whole --embed-tokens: {e}"); return; }
+                }
+            }
+            // --facts-dir <dir>: PACKAGE/BUCKETED export — emit weights as <rel>.facts DATA modules in <dir> (full vocab,
+            // faithful, no norm-shortlist), the rules go to --out. souffle bulk-loads the data; the per-file inline wall
+            // doesn't apply. Each weight matrix is its own file (its own "gram"). The faithful path past the wall.
+            let facts_dir: Option<String> = flag(&args, "--facts-dir").map(|s| s.to_string());
+            if let Some(d) = &facts_dir { let _ = std::fs::create_dir_all(d); }
+            // --multi: MULTI-INSTANCE forward — input ctx(inst,pos,id), output decide(inst,v); one souffle run does all
+            // contexts, loading the (shared) weights once. The throughput fix; pairs with --facts-dir for big models.
+            let multi = has_flag(&args, "--multi");
             let b = match Bundle::load(&stem) {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[fieldrun] export --logic-whole: couldn't reload bundle: {e}"); return; }
             };
             let (vc, dd) = (b.config.get(6).copied().unwrap_or(0) as usize, b.config.get(4).copied().unwrap_or(0) as usize);
-            // the shortlist shrinks the UNEMBED, so the LE-T4 size estimate is bounded by K (the embed is still vocab×d for input)
-            let est = shortlist_k.map(|k| k.saturating_mul(dd)).unwrap_or_else(|| vc.saturating_mul(dd));
-            if est > 4_000_000 && !has_flag(&args, "--force") {
-                eprintln!("[fieldrun] export --logic-whole: vocab×d = {vc}×{dd} ≈ {} embed facts (×2 if untied) — that is the\n\
-                           dense-Gram / high-treewidth wall (LOGIC_EXPORT LE-T4): the program is correct but not COMPACT at this\n\
-                           scale. Demonstrate on a small rope bundle, --shortlist K for the certified-compact unembed, or --force.",
-                          vc.saturating_mul(dd));
+            let tied_m = b.config.get(7).copied().unwrap_or(0) != 0;
+            // emitted embed-side facts: --shortlist bounds the unembed (K), --embed-tokens bounds the input embed. Tied
+            // models reuse embed_w for both (union of input+output rows); untied emit them separately (the larger bounds).
+            let unembed_rows = shortlist_k.unwrap_or(vc);
+            let embed_input_rows = embed_tokens.as_ref().map(|e| e.len()).unwrap_or(vc);
+            let est = if tied_m { embed_input_rows.saturating_add(unembed_rows) } else { embed_input_rows.max(unembed_rows) }.saturating_mul(dd);
+            if est > 4_000_000 && facts_dir.is_none() && !has_flag(&args, "--force") {
+                eprintln!("[fieldrun] export --logic-whole: ≈ {est} emitted embed-side facts (vocab×d = {vc}×{dd}) — that is the\n\
+                           dense-Gram / high-treewidth wall (LOGIC_EXPORT LE-T4): correct but not COMPACT at this scale.\n\
+                           Use --facts-dir <dir> (faithful package export, weights as data) and/or --shortlist K / \
+                           --embed-tokens <corpus.json> (compact), demonstrate on a small bundle, or --force.");
                 return;
             }
-            match logic_whole::emit_whole(&b, maxpos, shortlist_k) {
+            match logic_whole::emit_whole(&b, maxpos, shortlist_k, embed_tokens.as_deref(), facts_dir.as_deref(), multi) {
                 Ok(prog) => match flag(&args, "--out") {
                     Some(p) => {
                         if std::fs::write(p, &prog).is_ok() {
