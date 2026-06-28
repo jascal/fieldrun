@@ -1069,30 +1069,47 @@ fn main() {
             // One JSON object per prompt. Rope family (needs predict_ablated_blocks). ──
             if let Some(dpath) = flag(&args, "--causal-dump") {
                 use std::fmt::Write as _;
-                let nl = match lm.dims() { Some((nl, _)) => nl, None => { eprintln!("[fieldrun] --causal-dump: arch {arch} has no dims"); return; } };
+                let (nl, nh) = match lm.dims() { Some(d) => d, None => { eprintln!("[fieldrun] --causal-dump: arch {arch} has no dims"); return; } };
                 if lm.predict_ablated_blocks(&rec_ids, &[], &[], &[0], &[]).is_none() {
                     eprintln!("[fieldrun] --causal-dump: arch {arch} has no predict_ablated_blocks (rope family)"); return;
                 }
+                let grain = flag(&args, "--grain").unwrap_or("block");   // block (attn/mlp per layer) | head (per attn head)
                 let base = lm.predict(&rec_ids);
-                // self-certify the ablation forward: with NO blocks ablated it must reproduce predict() exactly. A
-                // false here means the arch's predict_ablated_blocks forward diverges from hidden() (a broken port).
+                // self-certify the ablation forward: with NO ablation it must reproduce predict() exactly. A false here
+                // means the arch's predict_ablated_blocks forward diverges from hidden() (a broken port).
                 let parity = lm.predict_ablated_blocks(&rec_ids, &[], &[], &[], &[]) == Some(base);
                 let mut flips = String::new();
                 let mut nf = 0usize;
-                for l in 0..nl {
-                    for (kind, al, ml) in [("attn", vec![l], Vec::<usize>::new()), ("mlp", Vec::<usize>::new(), vec![l])] {
-                        if let Some(new) = lm.predict_ablated_blocks(&rec_ids, &[], &[], &al, &ml) {
-                            if new != base {
-                                if nf > 0 { flips.push(','); }
-                                let _ = write!(flips, "{{\"l\":{l},\"kind\":{kind:?},\"to\":{:?}}}", lbl(new).trim());
-                                nf += 1;
+                let mut total = 0usize;
+                let mut emit = |flips: &mut String, nf: &mut usize, l: usize, kind: &str, idx: i64, new: i64| {
+                    if new != base {
+                        if *nf > 0 { flips.push(','); }
+                        let _ = write!(flips, "{{\"l\":{l},\"kind\":{kind:?},\"idx\":{idx},\"to\":{:?}}}", lbl(new).trim());
+                        *nf += 1;
+                    }
+                };
+                if grain == "head" {
+                    for l in 0..nl {
+                        for h in 0..nh {
+                            total += 1;
+                            if let Some(new) = lm.predict_ablated_blocks(&rec_ids, &[(l, h)], &[], &[], &[]) {
+                                emit(&mut flips, &mut nf, l, "head", h as i64, new);
+                            }
+                        }
+                    }
+                } else {
+                    for l in 0..nl {
+                        total += 2;
+                        for (kind, al, ml) in [("attn", vec![l], Vec::<usize>::new()), ("mlp", Vec::<usize>::new(), vec![l])] {
+                            if let Some(new) = lm.predict_ablated_blocks(&rec_ids, &[], &[], &al, &ml) {
+                                emit(&mut flips, &mut nf, l, kind, -1, new);
                             }
                         }
                     }
                 }
-                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"parity\":{parity},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
+                let o = format!("{{\"pred_s\":{:?},\"n_layer\":{nl},\"n_head\":{nh},\"grain\":{grain:?},\"parity\":{parity},\"n_flip\":{nf},\"flips\":[{flips}]}}\n", lbl(base).trim());
                 match std::fs::write(&dpath, &o) {
-                    Ok(_) => eprintln!("[fieldrun] wrote causal profile ({nf}/{} blocks flip) to {dpath}", 2 * nl),
+                    Ok(_) => eprintln!("[fieldrun] wrote causal profile ({nf}/{total} {grain} units flip) to {dpath}"),
                     Err(e) => eprintln!("[fieldrun] --causal-dump {dpath}: {e}"),
                 }
                 return;
