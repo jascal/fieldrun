@@ -2821,6 +2821,9 @@ fn main() {
             // doesn't apply. Each weight matrix is its own file (its own "gram"). The faithful path past the wall.
             let facts_dir: Option<String> = flag(&args, "--facts-dir").map(|s| s.to_string());
             if let Some(d) = &facts_dir { let _ = std::fs::create_dir_all(d); }
+            // --multi: MULTI-INSTANCE forward — input ctx(inst,pos,id), output decide(inst,v); one souffle run does all
+            // contexts, loading the (shared) weights once. The throughput fix; pairs with --facts-dir for big models.
+            let multi = has_flag(&args, "--multi");
             let b = match Bundle::load(&stem) {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[fieldrun] export --logic-whole: couldn't reload bundle: {e}"); return; }
@@ -2839,7 +2842,7 @@ fn main() {
                            --embed-tokens <corpus.json> (compact), demonstrate on a small bundle, or --force.");
                 return;
             }
-            match logic_whole::emit_whole(&b, maxpos, shortlist_k, embed_tokens.as_deref(), facts_dir.as_deref()) {
+            match logic_whole::emit_whole(&b, maxpos, shortlist_k, embed_tokens.as_deref(), facts_dir.as_deref(), multi) {
                 Ok(prog) => match flag(&args, "--out") {
                     Some(p) => {
                         if std::fs::write(p, &prog).is_ok() {

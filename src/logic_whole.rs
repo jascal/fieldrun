@@ -52,7 +52,10 @@ fn ff(x: f32) -> String {
 /// in the returned rules program) instead of inline facts — the faithful PACKAGE/BUCKETED export: full vocab, no
 /// norm-shortlist heuristic, each matrix its own data file (so souffle bulk-loads weights and no per-file inline-fact
 /// wall applies). The returned String is just the forward rules + decls + inputs.
-pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_tokens: Option<&[usize]>, facts_dir: Option<&str>) -> Result<String, String> {
+/// `multi` = emit the MULTI-INSTANCE forward: input `ctx(inst,pos,id)` (many contexts stacked), output `decide(inst,v)`
+/// — one souffle run computes every context's argmax, loading the (shared) weights ONCE. The throughput fix: the
+/// per-call weight load is amortized across all instances. Composes with `facts_dir`. No unembed certificate in this mode.
+pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_tokens: Option<&[usize]>, facts_dir: Option<&str>, multi: bool) -> Result<String, String> {
     if b.arch != "rope" {
         return Err(format!(
             "logic-whole: arch {:?} unsupported — the whole-model emit targets the rope family (Llama/Qwen2.5/Qwen3/Mistral)",
@@ -156,8 +159,13 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_t
     w!();
 
     // ---- input ----
-    w!(".decl token(pos:number, id:number)");
-    w!(".input token");
+    if multi {
+        w!(".decl ctx(inst:number, pos:number, id:number)   // MULTI-INSTANCE: many contexts stacked; weights shared/loaded once");
+        w!(".input ctx");
+    } else {
+        w!(".decl token(pos:number, id:number)");
+        w!(".input token");
+    }
     w!();
 
     // ---- structural index relations (context-free) ----
@@ -277,8 +285,88 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_t
     emit_vec("normw", "norm", &mut o);
     w!();
 
-    // ---- forward-pass rules (layers unrolled — fixed depth, still context-free) ----
     let (dv, epsv, invsqhd) = (ff(d as f32), ff(eps), ff(1.0 / (hd as f32).sqrt()));
+
+    // ---- MULTI-INSTANCE forward: thread instance N through every activation; weights stay shared (loaded ONCE) ----
+    if multi {
+        w!(".decl x0(inst:number, pos:number, d:number, v:float)");
+        w!("x0(N,P,D,V) :- ctx(N,P,Id), embed_w(Id,D,V).");
+        w!();
+        for l in 0..n_layer {
+            let (xin, xmid, xout) = (format!("x{l}"), format!("xmid{l}"), format!("x{}", l + 1));
+            w!("// ---------- layer {l} (multi) ----------");
+            w!(".decl ssin{l}(inst:number, pos:number, s:float)");
+            w!("ssin{l}(N,P,S) :- ctx(N,P,_), S = sum (V*V) : {{ {xin}(N,P,_,V) }}.");
+            w!(".decl a{l}(inst:number, pos:number, d:number, v:float)");
+            w!("a{l}(N,P,D, V*(((SS/{dv})+{epsv})^(-0.5))*G) :- {xin}(N,P,D,V), ssin{l}(N,P,SS), inln{l}(D,G).");
+            let qadd = if has_qb[l] { ", qb{l}(O,B)".replace("{l}", &l.to_string()) } else { String::new() };
+            let qsum = if has_qb[l] { "+B" } else { "" };
+            w!(".decl q{l}(inst:number, pos:number, o:number, v:float)");
+            w!("q{l}(N,P,O,S{qsum}) :- ctx(N,P,_), dim_d(O){qadd}, S = sum (AV*WV) : {{ a{l}(N,P,I,AV), qw{l}(I,O,WV) }}.");
+            let kadd = if has_kb[l] { ", kb{l}(O,B)".replace("{l}", &l.to_string()) } else { String::new() };
+            let ksum = if has_kb[l] { "+B" } else { "" };
+            w!(".decl k{l}(inst:number, pos:number, o:number, v:float)");
+            w!("k{l}(N,P,O,S{ksum}) :- ctx(N,P,_), kvout(O){kadd}, S = sum (AV*WV) : {{ a{l}(N,P,I,AV), kw{l}(I,O,WV) }}.");
+            let vadd = if has_vb[l] { ", vb{l}(O,B)".replace("{l}", &l.to_string()) } else { String::new() };
+            let vsum = if has_vb[l] { "+B" } else { "" };
+            w!(".decl v{l}(inst:number, pos:number, o:number, v:float)");
+            w!("v{l}(N,P,O,S{vsum}) :- ctx(N,P,_), kvout(O){vadd}, S = sum (AV*WV) : {{ a{l}(N,P,I,AV), vw{l}(I,O,WV) }}.");
+            w!(".decl qr{l}(inst:number, pos:number, o:number, v:float)");
+            w!("qr{l}(N,P,O,NV) :- q{l}(N,P,O,V), qrope(O,OP,J,SG), q{l}(N,P,OP,VP), rope_cos(P,J,C), rope_sin(P,J,SN), NV = V*C + SG*VP*SN.");
+            w!(".decl kr{l}(inst:number, pos:number, o:number, v:float)");
+            w!("kr{l}(N,P,O,NV) :- k{l}(N,P,O,V), krope(O,OP,J,SG), k{l}(N,P,OP,VP), rope_cos(P,J,C), rope_sin(P,J,SN), NV = V*C + SG*VP*SN.");
+            w!(".decl score{l}(inst:number, h:number, i:number, j:number, s:float)");
+            w!("score{l}(N,HH,I,J, RAW*{invsqhd}) :- headq(HH), head_kv(HH,KV), ctx(N,I,_), ctx(N,J,_), J<=I, \
+                RAW = sum (QV*KV2) : {{ cidx(C), qr{l}(N,I,OQ,QV), OQ=HH*{hd}+C, kr{l}(N,J,OK,KV2), OK=KV*{hd}+C }}.");
+            w!(".decl smax{l}(inst:number, h:number, i:number, m:float)");
+            w!("smax{l}(N,HH,I,M) :- score{l}(N,HH,I,_,_), M = max SC : {{ score{l}(N,HH,I,_,SC) }}.");
+            w!(".decl sexp{l}(inst:number, h:number, i:number, j:number, e:float)");
+            w!("sexp{l}(N,HH,I,J,E) :- score{l}(N,HH,I,J,SC), smax{l}(N,HH,I,M), E = {E}^(SC-M).");
+            w!(".decl sden{l}(inst:number, h:number, i:number, z:float)");
+            w!("sden{l}(N,HH,I,Z) :- smax{l}(N,HH,I,_), Z = sum EE : {{ sexp{l}(N,HH,I,_,EE) }}.");
+            w!(".decl prob{l}(inst:number, h:number, i:number, j:number, p:float)");
+            w!("prob{l}(N,HH,I,J,P) :- sexp{l}(N,HH,I,J,E), sden{l}(N,HH,I,Z), P = E/Z.");
+            w!(".decl attno{l}(inst:number, pos:number, o:number, v:float)");
+            w!("attno{l}(N,I,O,S) :- headq(HH), head_kv(HH,KV), cidx(C), O=HH*{hd}+C, ctx(N,I,_), \
+                S = sum (P*VV) : {{ ctx(N,J,_), prob{l}(N,HH,I,J,P), v{l}(N,J,OV,VV), OV=KV*{hd}+C }}.");
+            w!(".decl oproj{l}(inst:number, pos:number, d:number, v:float)");
+            w!("oproj{l}(N,P,D,S) :- ctx(N,P,_), dim_d(D), S = sum (AV*WV) : {{ attno{l}(N,P,I,AV), ow{l}(I,D,WV) }}.");
+            w!(".decl {xmid}(inst:number, pos:number, d:number, v:float)");
+            w!("{xmid}(N,P,D, XV+OV) :- {xin}(N,P,D,XV), oproj{l}(N,P,D,OV).");
+            w!(".decl ssm{l}(inst:number, pos:number, s:float)");
+            w!("ssm{l}(N,P,S) :- ctx(N,P,_), S = sum (V*V) : {{ {xmid}(N,P,_,V) }}.");
+            w!(".decl a2_{l}(inst:number, pos:number, d:number, v:float)");
+            w!("a2_{l}(N,P,D, V*(((SS/{dv})+{epsv})^(-0.5))*G) :- {xmid}(N,P,D,V), ssm{l}(N,P,SS), postln{l}(D,G).");
+            w!(".decl gate{l}(inst:number, pos:number, f:number, v:float)");
+            w!("gate{l}(N,P,F,S) :- ctx(N,P,_), ffnout(F), S = sum (AV*WV) : {{ a2_{l}(N,P,I,AV), gatew{l}(I,F,WV) }}.");
+            w!(".decl up{l}(inst:number, pos:number, f:number, v:float)");
+            w!("up{l}(N,P,F,S) :- ctx(N,P,_), ffnout(F), S = sum (AV*WV) : {{ a2_{l}(N,P,I,AV), upw{l}(I,F,WV) }}.");
+            w!(".decl hid{l}(inst:number, pos:number, f:number, v:float)");
+            w!("hid{l}(N,P,F, (G/(1.0+{E}^(0.0-G)))*U) :- gate{l}(N,P,F,G), up{l}(N,P,F,U).");
+            w!(".decl down{l}(inst:number, pos:number, d:number, v:float)");
+            w!("down{l}(N,P,D,S) :- ctx(N,P,_), dim_d(D), S = sum (HV*WV) : {{ hid{l}(N,P,F,HV), downw{l}(F,D,WV) }}.");
+            w!(".decl {xout}(inst:number, pos:number, d:number, v:float)");
+            w!("{xout}(N,P,D, XV+DV) :- {xmid}(N,P,D,XV), down{l}(N,P,D,DV).");
+            w!();
+        }
+        let xn = format!("x{n_layer}");
+        let unembed_rel = if tied { "embed_w" } else { "lmhead_w" };
+        w!("// ---------- final norm + unembed ({}) + per-instance argmax ----------", if tied { "tied" } else { "lm_head" });
+        w!(".decl ssf(inst:number, pos:number, s:float)");
+        w!("ssf(N,P,S) :- ctx(N,P,_), S = sum (V*V) : {{ {xn}(N,P,_,V) }}.");
+        w!(".decl xf(inst:number, pos:number, d:number, v:float)");
+        w!("xf(N,P,D, V*(((SS/{dv})+{epsv})^(-0.5))*G) :- {xn}(N,P,D,V), ssf(N,P,SS), normw(D,G).");
+        w!(".decl lastpos(inst:number, p:number)");
+        w!("lastpos(N,P) :- ctx(N,_,_), P = max Q : {{ ctx(N,Q,_) }}.");
+        w!(".decl logit(inst:number, v:number, s:float)");
+        w!("logit(N,V,S) :- vocab(V), lastpos(N,LP), S = sum (XV*EV) : {{ xf(N,LP,D,XV), {unembed_rel}(V,D,EV) }}.");
+        w!(".decl decide(inst:number, v:number)");
+        w!("decide(N,V) :- logit(N,V,S), S = max S2 : {{ logit(N,_,S2) }}.");
+        w!(".output decide");
+        return Ok(o);
+    }
+
+    // ---- forward-pass rules (layers unrolled — fixed depth, still context-free) ----
     w!(".decl x0(pos:number, d:number, v:float)");
     w!("x0(P, D, V) :- token(P, Id), embed_w(Id, D, V).");
     w!();
