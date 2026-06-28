@@ -234,22 +234,23 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_t
         }
         Ok(())
     };
-    let emit_vec = |rel: &str, name: &str, o: &mut String| {
+    let emit_vec = |rel: &str, name: &str, o: &mut String| -> Result<(), String> {
         let v = b.arr1(name);
         let _ = writeln!(o, ".decl {rel}(d:number, v:float)");
         if let Some(dir) = facts_dir {
             let _ = writeln!(o, ".input {rel}");
             let mut s = String::new();
             for (i, &val) in v.iter().enumerate() { let _ = writeln!(s, "{i}\t{}", ff(val)); }
-            let _ = std::fs::write(format!("{dir}/{rel}.facts"), s);
+            std::fs::write(format!("{dir}/{rel}.facts"), s).map_err(|e| format!("logic-whole: write {rel}.facts: {e}"))?;
         } else {
             for (i, &val) in v.iter().enumerate() { let _ = writeln!(o, "{rel}({i}, {}).", ff(val)); }
         }
+        Ok(())
     };
     // optional bias vector (q/k/v proj on Qwen2.5); returns whether it was present
-    let emit_bias = |rel: &str, name: &str, o: &mut String| -> bool {
+    let emit_bias = |rel: &str, name: &str, o: &mut String| -> Result<bool, String> {
         let bn = format!("{name}.bias");
-        if b.has(&bn) { emit_vec(rel, &bn, o); true } else { false }
+        if b.has(&bn) { emit_vec(rel, &bn, o)?; Ok(true) } else { Ok(false) }
     };
 
     // embed rows: ALL by default (any input token can appear). With --embed-tokens, restrict to those input rows; tied
@@ -269,20 +270,20 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_t
     let mut has_vb = vec![false; n_layer];
     for l in 0..n_layer {
         let p = format!("l{l}.");
-        emit_vec(&format!("inln{l}"), &format!("{p}in_ln"), &mut o);
+        emit_vec(&format!("inln{l}"), &format!("{p}in_ln"), &mut o)?;
         emit_mat(&format!("qw{l}"), &format!("{p}self_attn.q_proj"), None, &mut o)?;
         emit_mat(&format!("kw{l}"), &format!("{p}self_attn.k_proj"), None, &mut o)?;
         emit_mat(&format!("vw{l}"), &format!("{p}self_attn.v_proj"), None, &mut o)?;
-        has_qb[l] = emit_bias(&format!("qb{l}"), &format!("{p}self_attn.q_proj"), &mut o);
-        has_kb[l] = emit_bias(&format!("kb{l}"), &format!("{p}self_attn.k_proj"), &mut o);
-        has_vb[l] = emit_bias(&format!("vb{l}"), &format!("{p}self_attn.v_proj"), &mut o);
+        has_qb[l] = emit_bias(&format!("qb{l}"), &format!("{p}self_attn.q_proj"), &mut o)?;
+        has_kb[l] = emit_bias(&format!("kb{l}"), &format!("{p}self_attn.k_proj"), &mut o)?;
+        has_vb[l] = emit_bias(&format!("vb{l}"), &format!("{p}self_attn.v_proj"), &mut o)?;
         emit_mat(&format!("ow{l}"), &format!("{p}self_attn.o_proj"), None, &mut o)?;
-        emit_vec(&format!("postln{l}"), &format!("{p}post_ln"), &mut o);
+        emit_vec(&format!("postln{l}"), &format!("{p}post_ln"), &mut o)?;
         emit_mat(&format!("gatew{l}"), &format!("{p}mlp.gate_proj"), None, &mut o)?;
         emit_mat(&format!("upw{l}"), &format!("{p}mlp.up_proj"), None, &mut o)?;
         emit_mat(&format!("downw{l}"), &format!("{p}mlp.down_proj"), None, &mut o)?;
     }
-    emit_vec("normw", "norm", &mut o);
+    emit_vec("normw", "norm", &mut o)?;
     w!();
 
     let (dv, epsv, invsqhd) = (ff(d as f32), ff(eps), ff(1.0 / (hd as f32).sqrt()));

@@ -246,6 +246,32 @@ fieldrun eval decision.dl --semiring log                   #                    
 A bare `fieldrun` (or `--help`) prints the full flag list. The default build includes HF pull (`hub`) and the
 OpenAI/Anthropic API + `--chat` (`api`); build `--no-default-features` for a lean, offline, token-id-only binary.
 
+## Whole-model Datalog export (`export --logic-whole`)
+
+Emit the entire rope-family forward pass (RMSNorm + RoPE attention + SwiGLU MLP + unembed + argmax) as **one Soufflé
+Datalog program** whose only input is `token(pos,id)` — weights are facts, the forward is rules, no FFI. Swap the token
+facts and Soufflé recomputes the next token; it's bit-faithful to the model's argmax. Rope family only
+(Llama/Qwen2.5/Mistral; Qwen3 QK-norm is refused).
+
+```bash
+fieldrun --bundle <stem> export --logic-whole --out whole.dl --maxpos 64
+printf '0\t<id0>\n1\t<id1>\n…' > ctx/token.facts && souffle whole.dl -F ctx -D -   # decide.csv = argmax id
+```
+
+The embed/unembed are `vocab×d` facts — the **dense-Gram wall** (~4M facts). Beyond a tiny model, pick a flag:
+
+| flag | what it does | when | faithful? |
+|------|--------------|------|-----------|
+| `--facts-dir <dir>` | **package export**: each weight matrix → a `<dir>/<rel>.facts` data module (+ `.input` in the rules), not inline. Soufflé bulk-loads; the per-file inline wall lifts. Full vocab. | large/large-vocab models; the default way past the wall | **yes** (exact, full vocab) |
+| `--embed-tokens <corpus.json>` | **corpus-restricted embed**: emit embed rows only for tokens in the corpus; with no `--shortlist` it also restricts the output candidate set to them. Tied models reuse the matrix for both. | self-generated / greedy / closed-domain corpora (huge size cut, e.g. 9.2M→17.5k) | **yes** *iff* every context's argmax is in the corpus vocab (guaranteed for a greedy corpus) |
+| `--shortlist K` | keep top-K unembed rows by ‖U_v‖ + a rank-1 certificate | only where the certificate fires | **partial** — argmaxes are often low-norm; prefer the two above |
+| `--multi` | **multi-instance forward**: input `ctx(inst,pos,id)`, output `decide(inst,v)` — one run does all contexts, loading weights once (amortizes the per-call weight load). Pair with `--facts-dir` (inline-fact multi won't compile). | computing many contexts' argmax (e.g. building a reference set) | yes |
+| `--force` | emit past the wall as inline facts anyway | small experiments only | yes (but unwieldy) |
+
+`--embed-tokens` accepts `{"ids":[…]}`, `{"holdout_ids":[…]}`, or a bare `[int,…]`. The faithful path for a real model
+is `--facts-dir` (+ `--multi` for throughput, + `--embed-tokens` for a compact greedy-corpus gram). The `~4M` threshold
+guards inline-fact emission; `--facts-dir` bypasses it (data is tractable).
+
 ## Background / further reading
 
 fieldrun is the distribution form of an ongoing interpretability research program — decompiling an LLM into a flat

@@ -2805,17 +2805,24 @@ fn main() {
             // --embed-tokens <corpus.json>: restrict the input embed to the tokens that actually appear (the embed-side
             // dense-Gram mitigation; exact for contexts over that token set). With no --shortlist it also restricts the
             // OUTPUT candidate set to those tokens (faithful when every context's argmax is in the set — a greedy/self-
-            // generated corpus). Crude int-scan: the corpus is {"ids":[…]} (ids-only), so every integer IS a token id.
-            let embed_tokens: Option<Vec<usize>> = flag(&args, "--embed-tokens").and_then(|p| std::fs::read_to_string(p).ok()).map(|s| {
-                let mut set = std::collections::BTreeSet::<usize>::new();
-                let mut num = String::new();
-                for ch in s.chars() {
-                    if ch.is_ascii_digit() { num.push(ch); }
-                    else if !num.is_empty() { if let Ok(v) = num.parse() { set.insert(v); } num.clear(); }
+            // generated corpus). Accepts {"ids":[…]}, {"holdout_ids":[…]}, or a bare [ …ints… ] of token ids.
+            let mut embed_tokens: Option<Vec<usize>> = None;
+            if let Some(p) = flag(&args, "--embed-tokens") {
+                let parsed = std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}")).and_then(|s| {
+                    let j: serde_json::Value = serde_json::from_str(&s).map_err(|e| format!("parse {p} as JSON: {e}"))?;
+                    let arr = j.get("ids").or_else(|| j.get("holdout_ids")).or(Some(&j))
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| format!("{p}: expected an \"ids\"/\"holdout_ids\" array or a bare [int,…]"))?;
+                    let mut set = std::collections::BTreeSet::<usize>::new();
+                    for v in arr { if let Some(n) = v.as_u64() { set.insert(n as usize); } }
+                    if set.is_empty() { return Err(format!("{p}: no integer token ids found")); }
+                    Ok(set.into_iter().collect::<Vec<usize>>())
+                });
+                match parsed {
+                    Ok(v) => embed_tokens = Some(v),
+                    Err(e) => { eprintln!("[fieldrun] export --logic-whole --embed-tokens: {e}"); return; }
                 }
-                if let Ok(v) = num.parse() { set.insert(v); }
-                set.into_iter().collect()
-            });
+            }
             // --facts-dir <dir>: PACKAGE/BUCKETED export — emit weights as <rel>.facts DATA modules in <dir> (full vocab,
             // faithful, no norm-shortlist), the rules go to --out. souffle bulk-loads the data; the per-file inline wall
             // doesn't apply. Each weight matrix is its own file (its own "gram"). The faithful path past the wall.
