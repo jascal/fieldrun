@@ -45,7 +45,14 @@ fn ff(x: f32) -> String {
 
 /// Emit the whole-model forward pass for a `rope` bundle as one Datalog program.
 /// `maxpos` = how many RoPE position rows to precompute (the max context length the program supports).
-pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Result<String, String> {
+/// `embed_tokens` = if Some, the input embed is restricted to just those token rows (corpus-restricted embed, the
+/// embed-side dense-Gram mitigation — exact for contexts over that token set). Tied models reuse the embed as the
+/// unembed, so for them the emitted rows are the union with the output set (shortlist, or all vocab if not shortlisting).
+/// `facts_dir` = if Some, emit each weight matrix/vector as a `<rel>.facts` DATA module in that dir (with `.input <rel>`
+/// in the returned rules program) instead of inline facts — the faithful PACKAGE/BUCKETED export: full vocab, no
+/// norm-shortlist heuristic, each matrix its own data file (so souffle bulk-loads weights and no per-file inline-fact
+/// wall applies). The returned String is just the forward rules + decls + inputs.
+pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>, embed_tokens: Option<&[usize]>, facts_dir: Option<&str>) -> Result<String, String> {
     if b.arch != "rope" {
         return Err(format!(
             "logic-whole: arch {:?} unsupported — the whole-model emit targets the rope family (Llama/Qwen2.5/Qwen3/Mistral)",
@@ -116,6 +123,15 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
             (Some(keep), Some(ShortCert { mu, amax, amin, rhomax: (rho2 * RHO_SLACK).sqrt() }))
         }
         _ => (None, None),
+    };
+
+    // corpus-restricted output: with --embed-tokens and no --shortlist, restrict the output candidate set to those tokens
+    // too (faithful when every context's argmax lies in the set — e.g. a greedy / self-generated corpus). The guarantee
+    // is the corpus-vocab restriction, not a norm bound, so there is no rank-1 certificate (cert stays None). For tied
+    // models this makes embed_w = the corpus vocab for BOTH input and output — the compact faithful path past the wall.
+    let shortlist = match (&shortlist, embed_tokens) {
+        (None, Some(et)) => { let mut s: Vec<usize> = et.iter().copied().filter(|&v| v < vocab).collect(); s.sort_unstable(); s.dedup(); Some(s) }
+        _ => shortlist,
     };
 
     // RoPE inverse frequencies, computed in f32 exactly as src/rope.rs does.
@@ -199,18 +215,27 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
         if shape.len() != 2 { return Err(format!("logic-whole: {name} is not 2D")); }
         let (ni, no) = (shape[0], shape[1]);
         let _ = writeln!(o, ".decl {rel}(i:number, o:number, v:float)");
-        let emit_row = |i: usize, o: &mut String| { for j in 0..no { let _ = writeln!(o, "{rel}({i}, {j}, {}).", ff(data[i * no + j])); } };
-        match rows {                                    // None = all rows; Some = just those (the unembed shortlist)
-            Some(rs) => for &i in rs { emit_row(i, o); },
-            None => for i in 0..ni { emit_row(i, o); },
+        let row_iter: Vec<usize> = match rows { Some(rs) => rs.to_vec(), None => (0..ni).collect() };
+        if let Some(dir) = facts_dir {                  // PACKAGE export: data file + .input, not inline
+            let _ = writeln!(o, ".input {rel}");
+            let mut s = String::new();
+            for &i in &row_iter { for j in 0..no { let _ = writeln!(s, "{i}\t{j}\t{}", ff(data[i * no + j])); } }
+            std::fs::write(format!("{dir}/{rel}.facts"), s).map_err(|e| format!("logic-whole: write {rel}.facts: {e}"))?;
+        } else {
+            for &i in &row_iter { for j in 0..no { let _ = writeln!(o, "{rel}({i}, {j}, {}).", ff(data[i * no + j])); } }
         }
         Ok(())
     };
     let emit_vec = |rel: &str, name: &str, o: &mut String| {
         let v = b.arr1(name);
         let _ = writeln!(o, ".decl {rel}(d:number, v:float)");
-        for (i, &val) in v.iter().enumerate() {
-            let _ = writeln!(o, "{rel}({i}, {}).", ff(val));
+        if let Some(dir) = facts_dir {
+            let _ = writeln!(o, ".input {rel}");
+            let mut s = String::new();
+            for (i, &val) in v.iter().enumerate() { let _ = writeln!(s, "{i}\t{}", ff(val)); }
+            let _ = std::fs::write(format!("{dir}/{rel}.facts"), s);
+        } else {
+            for (i, &val) in v.iter().enumerate() { let _ = writeln!(o, "{rel}({i}, {}).", ff(val)); }
         }
     };
     // optional bias vector (q/k/v proj on Qwen2.5); returns whether it was present
@@ -219,7 +244,16 @@ pub fn emit_whole(b: &Bundle, maxpos: usize, shortlist_k: Option<usize>) -> Resu
         if b.has(&bn) { emit_vec(rel, &bn, o); true } else { false }
     };
 
-    emit_mat("embed_w", "embed", None, &mut o)?;        // embed: ALL rows (any input token can appear in the context)
+    // embed rows: ALL by default (any input token can appear). With --embed-tokens, restrict to those input rows; tied
+    // models reuse embed_w as the unembed, so they also need the output rows (the shortlist, or all vocab if none).
+    let embed_rows: Option<Vec<usize>> = embed_tokens.map(|et| {
+        let mut set: std::collections::BTreeSet<usize> = et.iter().copied().filter(|&v| v < vocab).collect();
+        if tied {
+            match &shortlist { Some(s) => set.extend(s.iter().copied()), None => set.extend(0..vocab) }
+        }
+        set.into_iter().collect()
+    });
+    emit_mat("embed_w", "embed", embed_rows.as_deref(), &mut o)?;
     // lm_head (untied unembed): just the shortlist rows when shortlisting — this is the LE-T4 size win (vocab×d → K×d).
     if !tied { emit_mat("lmhead_w", "lm_head", shortlist.as_deref(), &mut o)?; }
     let mut has_qb = vec![false; n_layer];
