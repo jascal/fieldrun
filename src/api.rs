@@ -2,6 +2,7 @@
 //!
 //!  - **native** (always available) — token ids in/out, no tokenizer:
 //!      POST /predict   {"ids":[...]}            -> {"next": <id>}
+//!      POST /topk      {"ids":[...],"k":K}      -> {"topk": [[<id>,<logit>],…]}  (top-K of the next-token scoreboard)
 //!      POST /generate  {"prompt":[...],"n":N}   -> {"tokens":[...]}
 //!      POST /explain   {"ids":[...]}            -> <Explanation JSON>   (archs with explain; else {"error":...})
 //!      GET  /health                             -> {"ok": true}
@@ -33,6 +34,17 @@ use crate::retrieval::{context_candidates, induction_rule, RuleHit};
 #[derive(Deserialize)]
 struct PredictReq {
     ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct TopkReq {
+    ids: Vec<i64>,
+    #[serde(default = "default_k")]
+    k: usize,
+}
+
+fn default_k() -> usize {
+    40
 }
 
 #[derive(Deserialize)]
@@ -230,7 +242,7 @@ pub fn serve(lm: Box<dyn Model>, arch: &str, port: u16, textgen: Option<TextGen>
     } else {
         " (token-id API; build --features api + a tokenizer for OpenAI/Anthropic text endpoints)"
     };
-    eprintln!("[fieldrun] serving {arch} on http://0.0.0.0:{port}  (POST /predict /generate /explain · GET /health{openai})");
+    eprintln!("[fieldrun] serving {arch} on http://0.0.0.0:{port}  (POST /predict /topk /generate /explain · GET /health{openai})");
     for mut req in server.incoming_requests() {
         let method = req.method().to_string();
         let url = req.url().to_string();
@@ -575,6 +587,18 @@ fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen
             Ok(r) if !r.ids.is_empty() => format!("{{\"next\":{}}}", lm.predict(&r.ids)),
             _ => err("bad body; expected {\"ids\":[...]}"),
         },
+        "/topk" => match serde_json::from_str::<TopkReq>(body) {
+            Ok(r) if !r.ids.is_empty() => match lm.logits(&r.ids) {
+                Some(lg) => {
+                    let mut idx: Vec<usize> = (0..lg.len()).collect();
+                    idx.sort_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
+                    let top: Vec<(usize, f32)> = idx.into_iter().take(r.k).map(|i| (i, lg[i])).collect();
+                    serde_json::json!({ "topk": top }).to_string()
+                }
+                None => err("logits not supported for this arch"),
+            },
+            _ => err("bad body; expected {\"ids\":[...],\"k\":K}"),
+        },
         "/generate" => match serde_json::from_str::<GenerateReq>(body) {
             Ok(r) if !r.prompt.is_empty() => serde_json::json!({ "tokens": lm.generate(&r.prompt, r.n) }).to_string(),
             _ => err("bad body; expected {\"prompt\":[...],\"n\":N}"),
@@ -597,7 +621,7 @@ fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen
         "/v1/chat/completions" | "/v1/completions" | "/v1/messages" => {
             err("text endpoints need a build with `--features api` (the default build serves the token-id API)")
         }
-        _ => err("unknown route (POST /predict /generate /explain /v1/chat/completions /v1/completions /v1/messages, GET /health /v1/models)"),
+        _ => err("unknown route (POST /predict /topk /generate /explain /v1/chat/completions /v1/completions /v1/messages, GET /health /v1/models)"),
     }
 }
 
