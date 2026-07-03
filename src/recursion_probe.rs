@@ -669,7 +669,9 @@ pub fn run_converge_depth(args: &[String], lm: &dyn crate::model::Model, tg: &Op
 /// forced into the candidate set), plus the target index, prediction and margin — as JSON lines. This is the real-model
 /// analogue of the synthetic compositional sources: each DLA block is a "rule", its per-candidate contribution the
 /// incidence. Consumed by `pil/fieldrun_io.py::load_pil_dump` to re-run the rank / coherence / margin analyses
-/// (§5e–§5g) on a real model instead of planted XOR.
+/// (§5e–§5g) on a real model instead of planted XOR. Prints a faithfulness self-check: the fraction of positions
+/// where `Σ_b contrib[b][k]` argmaxes to the model decision `pred` (should be 1.0 for a bias-free unembed);
+/// `--strict` exits non-zero on any shortfall so a broken dump cannot silently seed the PIL/picard loop.
 pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
     let path = match flag(args, "--pil-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --pil-dump needs a path"); return; } };
     let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -692,8 +694,15 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
                    None => { eprintln!("[fieldrun] --pil-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
     };
     if ids.len() < 4 { eprintln!("[fieldrun] pil-dump: too few ids ({})", ids.len()); return; }
+    let strict = crate::has_flag(args, "--strict");
     let mut out = String::new();
     let last = (ids.len() - 1).min(nmax + 1);
+    // faithfulness self-check: Σ_b contrib[b][k] = ⟨r, U_cand_k⟩ (the bias-free logit), so its argmax over
+    // candidates must be `pred`. If it isn't, the emitted incidences do not reconstruct the model's decision
+    // and the dump is unfit for the PIL seam — surface it (and fail under --strict) rather than feed picard P1
+    // a silently-wrong oracle (cf. the rosetta silent-oracle-failure lesson).
+    let mut recon_ok = 0usize;
+    let mut npos = 0usize;
     eprintln!("[fieldrun] pil-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
     for p in 1..last {
         let ctx = &ids[..=p];
@@ -707,6 +716,14 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
         let nb = contrib.len();
         let pred = order[0] as i64;
         let margin = logits[order[0]] - logits[order[1]];
+        // recon: sum incidences across blocks per candidate, argmax over candidates, compare to `pred`
+        let mut best = (f32::NEG_INFINITY, 0usize);
+        for k in 0..cand.len() {
+            let s: f32 = (0..nb).map(|b| contrib[b][k]).sum();
+            if s > best.0 { best = (s, k); }
+        }
+        if cand[best.1] == pred { recon_ok += 1; }
+        npos += 1;
         // full-vocab next-token Shannon entropy (nats), stable softmax; exp(ent) = effective output support (τ* test)
         let lmax = logits[order[0]];
         let mut z = 0.0f32;
@@ -730,9 +747,15 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
             "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"ent\":{ent:.4},\"nb\":{nb},\"cands\":[{}],\"contrib\":{cstr}}}\n",
             ids[p], cands_str.join(",")));
     }
+    let recon = if npos > 0 { recon_ok as f32 / npos as f32 } else { f32::NAN };
     match std::fs::write(path, &out) {
-        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}", last.saturating_sub(1)),
-        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon:.3} of {npos})", last.saturating_sub(1)),
+        Err(e) => { eprintln!("[fieldrun] cannot write {path}: {e}"); return; }
+    }
+    if npos > 0 && recon < 1.0 {
+        eprintln!("[fieldrun] WARNING: pil-dump recon {recon:.3} < 1.0 — Σ_b⟨d_b,U⟩ does not argmax to the model \
+                   decision at {} / {npos} positions (final bias? non-faithful decomp?); incidences are unfit for the PIL seam", npos - recon_ok);
+        if strict { std::process::exit(2); }
     }
 }
 
