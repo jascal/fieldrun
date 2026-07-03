@@ -668,8 +668,27 @@ pub fn run_converge_depth(args: &[String], lm: &dyn crate::model::Model, tg: &Op
 /// matrix `contrib[block][cand] = <d_block, U_cand>` over the top-K logit candidates (with the ground-truth target
 /// forced into the candidate set), plus the target index, prediction and margin — as JSON lines. This is the real-model
 /// analogue of the synthetic compositional sources: each DLA block is a "rule", its per-candidate contribution the
+/// Reconstructed decision from a per-block incidence matrix: since `Σ_b contrib[b][k] = ⟨r, U_cand_k⟩` is the
+/// bias-free logit, its argmax over candidates is the token the incidences decode to. Returns the winning
+/// candidate INDEX, or `None` when the check cannot be trusted — an empty candidate set, or any non-finite
+/// block-sum (a `NaN` compares false against everything and would otherwise silently keep the initial argmax,
+/// falsely passing). Faithfulness-only: `O(K·nb)`, never on a hot path. Unit-tested in `pil_dump_tests`.
+fn pil_recon_argmax(contrib: &[Vec<f32>], ncand: usize) -> Option<usize> {
+    if ncand == 0 { return None; }
+    let nb = contrib.len();
+    let mut best = (f32::NEG_INFINITY, 0usize);
+    for k in 0..ncand {
+        let s: f32 = (0..nb).map(|b| contrib[b][k]).sum();
+        if !s.is_finite() { return None; } // NaN/Inf must fail loudly, not slip through the argmax
+        if s > best.0 { best = (s, k); }
+    }
+    Some(best.1)
+}
+
 /// incidence. Consumed by `pil/fieldrun_io.py::load_pil_dump` to re-run the rank / coherence / margin analyses
-/// (§5e–§5g) on a real model instead of planted XOR.
+/// (§5e–§5g) on a real model instead of planted XOR. Prints a faithfulness self-check: the fraction of positions
+/// where `Σ_b contrib[b][k]` argmaxes to the model decision `pred` (should be 1.0 for a bias-free unembed);
+/// `--strict` exits non-zero on any shortfall so a broken dump cannot silently seed the PIL/picard loop.
 pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
     let path = match flag(args, "--pil-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --pil-dump needs a path"); return; } };
     let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -692,8 +711,16 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
                    None => { eprintln!("[fieldrun] --pil-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
     };
     if ids.len() < 4 { eprintln!("[fieldrun] pil-dump: too few ids ({})", ids.len()); return; }
+    let strict = crate::has_flag(args, "--strict");
     let mut out = String::new();
     let last = (ids.len() - 1).min(nmax + 1);
+    // faithfulness self-check: Σ_b contrib[b][k] = ⟨r, U_cand_k⟩ (the bias-free logit), so its argmax over
+    // candidates must be `pred`. If it isn't, the emitted incidences do not reconstruct the model's decision
+    // and the dump is unfit for the PIL seam — surface it (and fail under --strict) rather than feed picard P1
+    // a silently-wrong oracle (cf. the rosetta silent-oracle-failure lesson).
+    let mut recon_ok = 0usize;
+    let mut npos = 0usize;
+    let mut first_bad: Option<(usize, i64, Option<i64>)> = None; // (pos, pred, reconstructed token or None)
     eprintln!("[fieldrun] pil-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
     for p in 1..last {
         let ctx = &ids[..=p];
@@ -707,6 +734,12 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
         let nb = contrib.len();
         let pred = order[0] as i64;
         let margin = logits[order[0]] - logits[order[1]];
+        // recon: the incidences must decode to the model's own argmax (see pil_recon_argmax)
+        match pil_recon_argmax(&contrib, cand.len()) {
+            Some(k) if cand[k] == pred => recon_ok += 1,
+            other => if first_bad.is_none() { first_bad = Some((p, pred, other.map(|k| cand[k]))); }
+        }
+        npos += 1;
         // full-vocab next-token Shannon entropy (nats), stable softmax; exp(ent) = effective output support (τ* test)
         let lmax = logits[order[0]];
         let mut z = 0.0f32;
@@ -730,9 +763,18 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
             "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"ent\":{ent:.4},\"nb\":{nb},\"cands\":[{}],\"contrib\":{cstr}}}\n",
             ids[p], cands_str.join(",")));
     }
+    let recon = if npos > 0 { recon_ok as f32 / npos as f32 } else { f32::NAN };
     match std::fs::write(path, &out) {
-        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}", last.saturating_sub(1)),
-        Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon:.3} of {npos})", last.saturating_sub(1)),
+        Err(e) => { eprintln!("[fieldrun] cannot write {path}: {e}"); return; }
+    }
+    if npos > 0 && recon < 1.0 {
+        let (bp, bpred, brecon) = first_bad.unwrap_or((0, -1, None));
+        let got = brecon.map(|t| t.to_string()).unwrap_or_else(|| "non-finite".into());
+        eprintln!("[fieldrun] WARNING: pil-dump recon {recon:.3} < 1.0 — Σ_b⟨d_b,U⟩ does not argmax to the model \
+                   decision at {} / {npos} positions (first: pos {bp} pred {bpred} → recon {got}; final bias? \
+                   non-faithful decomp?); incidences are unfit for the PIL seam", npos - recon_ok);
+        if strict { std::process::exit(2); } // exit 2 = failed precondition, matching main.rs house style
     }
 }
 
@@ -1716,4 +1758,42 @@ pub fn run_induce(args: &[String], lm: &dyn crate::model::Model, tg: &Option<cra
         println!("  algorithms (one legible component when it succeeds, others when it fails) — each an ensemble member.");
         println!("  Whatever doesn't read as a clean rule → the Datalog KERNEL backstop (faithful to OUTPUT regardless).");
         return;
+}
+
+#[cfg(test)]
+mod pil_dump_tests {
+    use super::pil_recon_argmax;
+
+    // faithful: candidate 0 (the model's `pred` = cands[0]) has the largest column sum
+    #[test]
+    fn argmax_is_the_largest_blocksum() {
+        let contrib = vec![vec![1.0, 0.2, 0.1], vec![2.0, 0.3, 0.0]]; // col sums: 3.0, 0.5, 0.1
+        assert_eq!(pil_recon_argmax(&contrib, 3), Some(0));
+    }
+
+    // mismatch: a non-pred candidate reconstructs highest → caller's `cand[k] == pred` fails
+    #[test]
+    fn argmax_can_land_off_candidate_zero() {
+        let contrib = vec![vec![0.1, 5.0], vec![0.0, 1.0]]; // col sums: 0.1, 6.0 → index 1
+        assert_eq!(pil_recon_argmax(&contrib, 2), Some(1));
+    }
+
+    // a NaN column-sum must NOT silently keep the initial argmax and pass as faithful
+    #[test]
+    fn nan_blocksum_is_rejected() {
+        let contrib = vec![vec![f32::NAN, 1.0], vec![0.0, 1.0]]; // col 0 sum = NaN
+        assert_eq!(pil_recon_argmax(&contrib, 2), None);
+    }
+
+    #[test]
+    fn inf_blocksum_is_rejected() {
+        let contrib = vec![vec![f32::INFINITY, 1.0], vec![0.0, 1.0]];
+        assert_eq!(pil_recon_argmax(&contrib, 2), None);
+    }
+
+    #[test]
+    fn empty_candidate_set_is_none() {
+        let contrib: Vec<Vec<f32>> = vec![vec![]];
+        assert_eq!(pil_recon_argmax(&contrib, 0), None);
+    }
 }
