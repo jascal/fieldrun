@@ -434,6 +434,70 @@ pub fn run_export(inp: &str, out: &str) {
     );
 }
 
+/// The model OUTPUT tensors pil's J-lens sweep needs alongside `{J_l}`: the unembedding `U` (V,d) whose rows score
+/// tokens, and the final-norm gain `gamma` (d,). `norm_type` tells pil whether its folded-basis conjugation
+/// `diag(gamma) J diag(1/gamma)` is EXACT ("rmsnorm") or approximate ("layernorm": omits the mean-centering rank-1
+/// term + the ln_f bias). Model-constant, EMPIRICAL, off the forward path / faithfulness gate.
+pub struct UnembedExport {
+    pub u: Array2<f32>,          // (V, d) unembedding rows; U[id] scores token id
+    pub gamma: Vec<f32>,         // (d,) final-norm gain
+    pub norm_type: &'static str, // "rmsnorm" | "layernorm"
+    pub tied: bool,
+}
+
+/// `--tensors-export <out.npz>`: write the model's unembedding `U` (V,d) and final-norm gain `gamma` (d,) onto the numpy
+/// channel — the two model constants pil's `experiments/jlens_correction_sweep.py` needs (`--U` / `--gamma`) alongside a
+/// `--jlens-export` `{J_l}`. Unlike `--jlens-export` this needs the LOADED model (it reads the weights), not a
+/// transcode. Writes a stored-zip `.npz` (`U`/`gamma` arrays) + a `.meta.json` sidecar (`norm_type`, `tied`, apply).
+pub fn run_tensors_export(model: &dyn Model, out: &str) {
+    let ex = match model.export_unembed() {
+        Some(x) => x,
+        None => {
+            eprintln!("[jlens] --tensors-export: this arch does not expose the unembedding (rope / neox only)");
+            return;
+        }
+    };
+    let (v, d) = (ex.u.nrows(), ex.u.ncols());
+    let mut udata: Vec<u8> = Vec::with_capacity(v * d * 4);
+    for &val in ex.u.iter() {
+        udata.extend_from_slice(&val.to_le_bytes());
+    }
+    let mut gdata: Vec<u8> = Vec::with_capacity(d * 4);
+    for &val in &ex.gamma {
+        gdata.extend_from_slice(&val.to_le_bytes());
+    }
+    let members = [
+        ("U.npy", npy_bytes("<f4", &[v, d], &udata)),
+        ("gamma.npy", npy_bytes("<f4", &[d], &gdata)),
+    ];
+    if let Err(e) = npz_write(out, &members) {
+        eprintln!("[jlens] --tensors-export: write {out}: {e}");
+        return;
+    }
+    let meta_path = out.strip_suffix(".npz").map(|s| format!("{s}.meta.json")).unwrap_or_else(|| format!("{out}.meta.json"));
+    let meta = serde_json::json!({
+        "format": "fieldrun-tensors-v1",
+        "vocab": v,
+        "d": d,
+        "dtype": "float32",
+        "tied": ex.tied,
+        "norm_type": ex.norm_type,
+        "arrays": {
+            "U": "[vocab, d] unembedding rows; U[id] scores token id (rows indexed by token id)",
+            "gamma": "[d] final-norm gain"
+        },
+        "apply": "pil jcorrect_sources(gamma=gamma) forms the folded-basis operator diag(gamma) J diag(1/gamma)",
+        "gamma_exact": ex.norm_type == "rmsnorm",
+        "note": "gamma-conjugation is EXACT for rmsnorm; for layernorm it omits the mean-centering rank-1 term and the ln_f bias (approximate). Feed to experiments/jlens_correction_sweep.py --U/--gamma."
+    });
+    let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+    eprintln!(
+        "[jlens] --tensors-export: wrote {out}  (U [{v},{d}] f32 + gamma[{d}]; norm={norm}, tied={tied}) + {meta_path}",
+        norm = ex.norm_type,
+        tied = ex.tied
+    );
+}
+
 // ── CLI drivers (need the tokenizer → api build, like the rest of the --recursion-explain probe surface) ─────────────
 #[cfg(feature = "api")]
 mod cli {
@@ -686,6 +750,9 @@ mod cli {
             true
         } else if has_flag(args, "--jlens-eval") {
             run_eval(args, model, tg, stem, ids);
+            true
+        } else if let Some(out) = flag(args, "--tensors-export") {
+            run_tensors_export(model, out);
             true
         } else {
             false

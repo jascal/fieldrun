@@ -1117,6 +1117,17 @@ impl Model for Rope {
         if r.is_empty() { None } else { Some(r) }
     }
 
+    fn export_unembed(&self) -> Option<crate::jlens::UnembedExport> {
+        // U = the unembedding rows (tied `embed`, else `lm_head`); gamma = the final RMSNorm gain `norm`.
+        // RMSNorm folds as a pure diagonal, so pil's diag(gamma) J diag(1/gamma) conjugation is EXACT here.
+        Some(crate::jlens::UnembedExport {
+            u: self.b.arr2o(self.unembed_name()),
+            gamma: self.b.arr1("norm").to_vec(),
+            norm_type: "rmsnorm",
+            tied: self.b.config[7] != 0, // config = [n_layer, H, nkv, hd, d, ffn, vocab, tied]
+        })
+    }
+
     fn generate(&self, prompt: &[i64], n_new: usize) -> Vec<i64> {
         if self.kv_int8 {
             return self.generate_kv_int8(prompt, n_new);

@@ -460,6 +460,13 @@ pub trait Model: Sync {
         None
     }
 
+    /// The model OUTPUT tensors pil's J-lens sweep needs alongside `{J_l}`: the unembedding `U` (V,d) and the
+    /// final-norm gain `gamma` (d,), written by `--tensors-export` (see `crate::jlens::UnembedExport`). Default None;
+    /// rope + neox implement it. Model-constant, EMPIRICAL, off the forward path / faithfulness gate.
+    fn export_unembed(&self) -> Option<crate::jlens::UnembedExport> {
+        None
+    }
+
     /// Greedy generation up to `max_tokens`, stopping early at any `eos` id (the stop token is NOT included in the
     /// output). `emit(id)` is called for each generated token *as it is produced* (for streaming / a live chat);
     /// returning `false` (e.g. the HTTP client disconnected) stops generation. Default: naive — recompute the whole

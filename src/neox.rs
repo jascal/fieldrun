@@ -535,6 +535,17 @@ impl Model for Neox {
         if r.is_empty() { None } else { Some(r) }
     }
 
+    fn export_unembed(&self) -> Option<crate::jlens::UnembedExport> {
+        // U = the untied `lm_head`; gamma = the final LayerNorm gain `ln_f.weight`. LayerNorm also mean-centers and
+        // adds `ln_f.bias`, which a diagonal fold omits, so pil's gamma-conjugation is APPROXIMATE for neox.
+        Some(crate::jlens::UnembedExport {
+            u: self.b.arr2o("lm_head"),
+            gamma: self.b.arr1("ln_f.weight").to_vec(),
+            norm_type: "layernorm",
+            tied: false,
+        })
+    }
+
     fn predict_ablated(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)]) -> Option<i64> {
         let xf = self.hidden_ab(ids, heads, neurons, &[], &[]);
         let logits = self.b.rowdot_f32("lm_head", &xf.row(ids.len() - 1).to_vec());
