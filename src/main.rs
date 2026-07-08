@@ -23,6 +23,7 @@ mod deltanet;
 mod device;
 mod dsv4;
 mod explain;
+mod jlens;
 #[cfg(feature = "gpu")]
 mod gpu_gpt2;
 #[cfg(feature = "gpu")]
@@ -416,6 +417,17 @@ fn main() {
             },
             None => print!("{prog}"),
         }
+        return;
+    }
+
+    // --jlens-export <out.npz>: transcode the fitted {J_l} (the internal JLN1 binary that --jlens-eval reads) onto the
+    // numpy channel pil's fieldrun_io.py consumes — a stored-zip .npz (J [n_layer,d,d] f32 + fitted[n_layer]) + a
+    // .meta.json sidecar. Pure file transcode: no model/tokenizer load. Source = --jlens-in, else <bundle-stem>.jlens.
+    if let Some(out) = flag(&args, "--jlens-export") {
+        let inp = flag(&args, "--jlens-in").map(|s| s.to_string()).unwrap_or_else(|| {
+            flag(&args, "--bundle").map(resolve_bundle).map(|s| format!("{s}.jlens")).unwrap_or_else(|| "model.jlens".to_string())
+        });
+        jlens::run_export(&inp, out);
         return;
     }
 
@@ -997,6 +1009,10 @@ fn main() {
             if has_flag(&args, "--block-ablate") { recursion_probe::run_block_ablate(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--converge-depth") { recursion_probe::run_converge_depth(&args, lm.as_ref(), &tg, &stem); return; }
             if has_flag(&args, "--ring-dump") { recursion_probe::run_ring_dump(&args, lm.as_ref(), &tg, &stem); return; }
+            // ── J-lens (Jacobian-lens) probe: --jlens-fit estimates {J_l} offline; --jlens-eval compares the J-lens
+            // recursion trace against the logit-lens one (resolve-layer + across-depth stability). EMPIRICAL readout
+            // aid — off the forward path, off the faithfulness gate. rope family only, for now. See src/jlens.rs. ──
+            if jlens::dispatch(&args, lm.as_ref(), &tg, &stem, &ids) { return; }
 
             // ── --discover: discover a recursive function WITHOUT knowing it a priori. Teach the model an operator
             // under a NOVEL symbol via few-shot (the induction code is BLIND to its meaning), then (1) PROBE flat

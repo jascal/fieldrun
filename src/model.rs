@@ -190,7 +190,9 @@ pub struct RecPos {
 /// half of `recursion_trace`: only `recursion_capture` (the forward) and `lens_argmax` (the arch's final-norm +
 /// unembed) are arch-specific, so every arch shares this one assembly and there is a single place to keep correct.
 /// - `resids[l]` = the post-block residual at layer `l` (seq × d); `maxback` = the late-layer attention max (seq × seq).
-/// - `lens_argmax(resids[l])` = the logit-lens top-1 token id per position for one layer (arch's final norm + unembed).
+/// - `lens_argmax(l, resids[l])` = the top-1 token id per position for layer `l` (arch's final norm + unembed). The layer
+///   index lets a lens depend on the depth — the plain logit-lens ignores it (`|_l, r| …`); the J-lens (`recursion_trace_lens`)
+///   uses it to pre-multiply by the layer's averaged causal Jacobian `J_l` before the final norm + unembed.
 /// - `late0` = first "late" layer the binding signal is read from. Convention `2·nl/3` (last third): for Gemma 4 the
 ///   sliding-window layers can't carry long-range binding so a distant fold only registers on the global layers there;
 ///   for the rope/MoE families it is simply where return/fold attention concentrates. Bump it per-arch if needed.
@@ -198,15 +200,15 @@ pub fn build_rec_trace(
     resids: &[Array2<f32>],
     mut maxback: Array2<f32>,
     late0: usize,
-    lens_argmax: impl Fn(&Array2<f32>) -> Vec<i64>,
+    lens_argmax: impl Fn(usize, &Array2<f32>) -> Vec<i64>,
 ) -> Vec<RecPos> {
     let nl = resids.len();
     let seq = resids.first().map(|r| r.nrows()).unwrap_or(0);
     if seq < 3 || nl == 0 {
         return vec![];
     }
-    // per-layer logit-lens argmax per position (the only arch-specific step is `lens_argmax`)
-    let lens: Vec<Vec<i64>> = resids.iter().map(&lens_argmax).collect();
+    // per-layer lens argmax per position (the only arch-specific step is `lens_argmax`; the layer index feeds the J-lens)
+    let lens: Vec<Vec<i64>> = resids.iter().enumerate().map(|(l, r)| lens_argmax(l, r)).collect();
     // zero the attention SINK (cols 0/1) so the binding signal is a real distant fold, not sink mass
     for i in 0..seq {
         maxback[[i, 0]] = 0.0;
@@ -259,6 +261,30 @@ pub trait Model: Sync {
 
     /// Per-position recursion substrate (`--recursion-explain`). Default None; the RoPE family implements it.
     fn recursion_trace(&self, _ids: &[i64]) -> Option<Vec<RecPos>> {
+        None
+    }
+
+    /// The recursion trace read through an arbitrary per-layer lens instead of the plain logit-lens. `jmats`, if given,
+    /// is one `d×d` averaged causal Jacobian `J_l` per layer (the Jacobian-lens of `jlens.rs`, fit offline): before the
+    /// final norm + unembed argmax, layer `l`'s residual is pre-multiplied by `J_l`. `jmats = None` is exactly the plain
+    /// logit-lens (so `recursion_trace` delegates here with None). Default None; the RoPE family implements it. The
+    /// J-lens is an EMPIRICAL readout aid (approximate: first-order + context-averaged) — it never touches the forward
+    /// path or the faithfulness gate. See `jlens.rs` and the J-Lens discussion in the transformer-circuits workspace note.
+    fn recursion_trace_lens(&self, _ids: &[i64], _jmats: Option<&[Array2<f32>]>) -> Option<Vec<RecPos>> {
+        None
+    }
+
+    /// Post-block residual stream of EVERY layer (seq × d, pre-final-norm) — the `resids` half of `recursion_capture`
+    /// without the attention `maxback`. The base state a J-lens fit perturbs (`jlens::fit`). Default None; RoPE wires it.
+    fn jlens_capture(&self, _ids: &[i64]) -> Option<Vec<Array2<f32>>> {
+        None
+    }
+
+    /// Run the forward from JUST AFTER `layer` — i.e. take a (possibly perturbed) post-block-`layer` residual `x0`
+    /// (seq × d) and push it through blocks `layer+1..n_layer`, returning the pre-final-norm final residual (seq × d).
+    /// For `layer >= n_layer-1` this is `x0` itself. This is the JVP primitive the finite-difference J-lens estimator
+    /// calls (perturb one row of `x0`, forward, read the change at the final layer). Default None; RoPE wires it.
+    fn jlens_forward_from(&self, _layer: usize, _x0: &Array2<f32>) -> Option<Array2<f32>> {
         None
     }
 

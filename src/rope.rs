@@ -751,14 +751,26 @@ impl Model for Rope {
     }
 
     fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
+        self.recursion_trace_lens(ids, None) // plain logit-lens is the J-lens with J_l = I at every layer
+    }
+
+    fn recursion_trace_lens(&self, ids: &[i64], jmats: Option<&[ndarray::Array2<f32>]>) -> Option<Vec<crate::model::RecPos>> {
         if ids.len() < 3 {
             return Some(vec![]);
         }
         let (resids, maxback) = self.recursion_capture(ids);
         let un = self.unembed_name();
-        // arch-specific lens only: final RMSNorm ("norm") then unembed argmax; the rest is shared (build_rec_trace).
-        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |resid| {
-            let normed = rmsnorm(resid, self.b.arr1("norm"), self.eps);
+        // arch-specific lens only: (optional J_l pre-multiply) then final RMSNorm ("norm") + unembed argmax; the depth
+        // sweep + resolve/binding assembly is shared (build_rec_trace). J_l maps a layer-l residual through the AVERAGED
+        // downstream Jacobian before read-out, so a mid-stack activation is scored by what it is disposed to make the
+        // model emit — not by the identity-path logit-lens, which the workspace note reports is noisy at mid layers.
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |l, resid| {
+            // apply J_l row-wise: (J_l @ resid[p]) for every position p  ==  resid · J_l^T  (None ⇒ plain logit-lens)
+            let read = match jmats {
+                Some(js) if l < js.len() => resid.dot(&js[l].t()),
+                _ => resid.clone(),
+            };
+            let normed = rmsnorm(&read, self.b.arr1("norm"), self.eps);
             (0..normed.nrows())
                 .map(|p| {
                     let lg = self.b.rowdot_f32(un, &normed.row(p).to_vec());
@@ -766,6 +778,54 @@ impl Model for Rope {
                 })
                 .collect()
         }))
+    }
+
+    fn jlens_capture(&self, ids: &[i64]) -> Option<Vec<ndarray::Array2<f32>>> {
+        Some(self.recursion_capture(ids).0) // post-block residual of every layer (pre-final-norm); drop the maxback
+    }
+
+    /// Forward from just after `layer`: push a (possibly perturbed) post-block-`layer` residual through blocks
+    /// `layer+1..n_layer` and return the pre-final-norm final residual. Same block body as `recursion_capture` /
+    /// `predict_patched` (full-prefill, rope offset 0) — the JVP primitive the J-lens estimator perturbs one row of.
+    fn jlens_forward_from(&self, layer: usize, x0: &ndarray::Array2<f32>) -> Option<ndarray::Array2<f32>> {
+        let seq = x0.nrows();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = x0.clone();
+        for l in (layer + 1)..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq { scores[[i, j]] = -1e30; }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = silu(*hv) * uv; }
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        Some(x)
     }
 
     fn recursion_lens_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<(usize, i64)>>> {

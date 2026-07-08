@@ -354,6 +354,55 @@ impl Neox {
         let logits = self.b.rowdot_f32("lm_head", &xfn.row(xfn.nrows() - 1).to_vec());
         logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
     }
+
+    /// Forward (full prefill, like `hidden`) capturing the recursion substrate: the post-block residual of EVERY layer
+    /// (pre-`ln_f` — for the per-layer lens) and the element-wise MAX over late-layer heads of the causal attention
+    /// matrix (the binding signal; late = last third). The attention loop is inlined (to reach the per-head scores);
+    /// the combine is the parallel residual `x + attn + mlp`, matching `hidden`. Shared by the recursion trace and the
+    /// J-lens capture.
+    fn recursion_capture(&self, ids: &[i64]) -> (Vec<Array2<f32>>, Array2<f32>) {
+        let seq = ids.len();
+        let (h, hd) = (self.h, self.hd);
+        let late0 = 2 * self.n_layer / 3;
+        let mut x = self.b.rows_f32("embed", ids);
+        let mut resids: Vec<Array2<f32>> = Vec::with_capacity(self.n_layer);
+        let mut maxback = Array2::<f32>::zeros((seq, seq));
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.ln(&x, &format!("{p}ln1"));
+            let mut q = self.proj(&a, &format!("{p}q_proj"));
+            let mut k = self.proj(&a, &format!("{p}k_proj"));
+            let v = self.proj(&a, &format!("{p}v_proj"));
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, h, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., head * hd..(head + 1) * hd]);
+                let vh = v.slice(s![.., head * hd..(head + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq { scores[[i, j]] = -1e30; }
+                }
+                softmax_rows(&mut scores);
+                if l >= late0 {
+                    for i in 0..seq {
+                        for j in 0..=i {
+                            if scores[[i, j]] > maxback[[i, j]] { maxback[[i, j]] = scores[[i, j]]; }
+                        }
+                    }
+                }
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let attn = self.proj(&attn_out, &format!("{p}dense"));
+            // parallel: ln2 reads the SAME pre-attention x; sequential: ln2 reads x+attn. Residual sum is x+attn+mlp either way.
+            let mlp_in = if self.parallel { x.clone() } else { &x + &attn };
+            let mlp = self.mlp_block(&mlp_in, l);
+            x = &(&x + &attn) + &mlp;
+            resids.push(x.clone());
+        }
+        (resids, maxback)
+    }
 }
 
 impl Model for Neox {
@@ -370,6 +419,53 @@ impl Model for Neox {
     fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
         let xf = self.hidden(ids); // post-ln_f residual; row(last) is the exact vector the unembedding dots
         Some(xf.row(ids.len() - 1).to_vec())
+    }
+
+    fn recursion_trace(&self, ids: &[i64]) -> Option<Vec<crate::model::RecPos>> {
+        self.recursion_trace_lens(ids, None) // plain logit-lens is the J-lens with J_l = I at every layer
+    }
+
+    fn recursion_trace_lens(&self, ids: &[i64], jmats: Option<&[ndarray::Array2<f32>]>) -> Option<Vec<crate::model::RecPos>> {
+        if ids.len() < 3 {
+            return Some(vec![]);
+        }
+        let (resids, maxback) = self.recursion_capture(ids);
+        // arch-specific lens: (optional J_l pre-multiply) then final LayerNorm ("ln_f") + `lm_head` unembed argmax.
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |l, resid| {
+            let read = match jmats {
+                Some(js) if l < js.len() => resid.dot(&js[l].t()), // (J_l @ resid[p]) per position; None ⇒ logit-lens
+                _ => resid.clone(),
+            };
+            let normed = self.ln(&read, "ln_f");
+            (0..normed.nrows())
+                .map(|pp| {
+                    let lg = self.b.rowdot_f32("lm_head", &normed.row(pp).to_vec());
+                    lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+                })
+                .collect()
+        }))
+    }
+
+    fn jlens_capture(&self, ids: &[i64]) -> Option<Vec<ndarray::Array2<f32>>> {
+        Some(self.recursion_capture(ids).0) // post-block residual of every layer (pre-ln_f); drop the maxback
+    }
+
+    /// Forward from just after `layer` through blocks `layer+1..n_layer`, returning the pre-`ln_f` final residual.
+    /// Reuses `attn_block`/`mlp_block` with the parallel-residual combine — the JVP primitive the J-lens fit perturbs.
+    fn jlens_forward_from(&self, layer: usize, x0: &ndarray::Array2<f32>) -> Option<ndarray::Array2<f32>> {
+        let mut x = x0.clone();
+        for l in (layer + 1)..self.n_layer {
+            let attn = self.attn_block(&x, l);
+            if self.parallel {
+                let mlp = self.mlp_block(&x, l); // ln2 reads the SAME pre-attention x
+                x = &(&x + &attn) + &mlp;
+            } else {
+                x = &x + &attn;
+                let mlp = self.mlp_block(&x, l);
+                x = &x + &mlp;
+            }
+        }
+        Some(x)
     }
 
     fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
