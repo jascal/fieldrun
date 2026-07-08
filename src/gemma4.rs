@@ -881,7 +881,7 @@ impl Model for Gemma4 {
         let un = self.unembed();
         // arch-specific lens only: final RMSNorm ("norm") then unembed argmax (gemma's final logit softcap is monotone
         // so it does not change the argmax → omitted). The rest of the assembly is shared (build_rec_trace).
-        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |resid| {
+        Some(crate::model::build_rec_trace(&resids, maxback, 2 * self.n_layer / 3, |_l, resid| {
             let normed = self.norm(resid, "norm");
             (0..normed.nrows())
                 .map(|p| {
