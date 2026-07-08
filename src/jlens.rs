@@ -422,6 +422,7 @@ pub fn run_export(inp: &str, out: &str) {
             "fitted": "[n_layer] int32: 1 if this layer was fit, 0 = identity (reads as the plain logit-lens)"
         },
         "apply": "route a layer-l residual r through  J[l] @ r   (numpy: r @ J[l].T), then the model's final norm + unembed",
+        "capture_point": "h_l = the POST-block residual of layer l (after the attn+MLP residual add, PRE final-norm); h_final = the post-last-block residual (pre final-norm), so J[n_layer-1] = I",
         "fitted_layers": fitted,
         "note": "EMPIRICAL readout: a first-order, context-averaged approximation of the downstream map. NOT faithfulness-gated; off the forward path."
     });

@@ -58,6 +58,10 @@ plus a `.meta.json` sidecar:
 **Apply convention:** route a layer-`l` residual `r` through `J[l] @ r` (numpy: `r @ J[l].T`), then the model's final
 norm + unembed. The last layer is the identity by construction (`J_last = I`).
 
+**Capture point:** `h_l` is the **post-block** residual of layer `l` (after the attn+MLP residual add, **pre** final-norm)
+— the same tensor `recursion_capture` records; `h_final` is the post-last-block residual (pre final-norm). (Also in the
+`.meta.json` `capture_point` field.)
+
 ## Status (2026-07)
 
 Fit on Qwen2.5-0.5B (300-prompt corpus, all 23 layers): `‖J_l − I‖_F` decays monotonically toward the output (the
