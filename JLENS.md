@@ -39,6 +39,10 @@ fieldrun --bundle <model> --text "…" --recursion-explain --jlens-eval \
 
 # 3. export {J_l} to the numpy channel (for pil / fieldrun_io.py)
 fieldrun --jlens-export model.npz --jlens-in model.jlens
+
+# 4. export the model's unembedding U (V,d) + final-norm gain gamma (d,) — the two constants pil's sweep also
+#    needs (--U / --gamma). Needs the loaded model (reads weights), so pass --bundle (rope/neox archs).
+fieldrun --bundle <model> --recursion-explain --tensors-export model.tensors.npz
 ```
 
 **Shrinkage** (`--jlens-shrink λ`, eval-time, sweepable): reads through `J' = (1−λ)I + λ·J`. `λ=1` is the raw fit,
@@ -57,6 +61,26 @@ plus a `.meta.json` sidecar:
 
 **Apply convention:** route a layer-`l` residual `r` through `J[l] @ r` (numpy: `r @ J[l].T`), then the model's final
 norm + unembed. The last layer is the identity by construction (`J_last = I`).
+
+## Tensors export (`--tensors-export`, for pil's sweep)
+
+pil's `jcorrect_sources` corrects the DLA vectors, but to turn the corrected read into token logits its sweep also
+needs the model's **unembedding** `U`, and — for the *exact* correction — the **final-norm gain** `γ`. `--tensors-export`
+writes both onto the same numpy channel (a stored-zip `.npz` + `.meta.json`):
+
+| array | dtype | shape | meaning |
+|-------|-------|-------|---------|
+| `U` | `float32` | `[vocab, d]` | unembedding rows; `U[id]` scores token `id` (rows indexed by token id) |
+| `gamma` | `float32` | `[d]` | the final-norm gain |
+
+The meta carries `norm_type` and `gamma_exact`: `SourceBundle.D` is final-norm-**folded**, so pil applies `J` in that
+basis via the conjugation `diag(γ) J diag(1/γ)`. For **RMSNorm** archs (rope) that fold is a pure diagonal, so the
+conjugation is **exact**; for **LayerNorm** archs (neox) it omits the mean-centering rank-1 term and the `ln_f` bias, so
+`gamma_exact=false` (a documented approximation). Unlike `--jlens-export` (a pure transcode), this reads the loaded
+model's weights — pass `--bundle`. Implemented for the **rope** and **neox** families (others report unsupported).
+
+Feed the two files to the sweep (`--U`/`--gamma` read the `U`/`gamma` arrays from the same `.npz`):
+`jlens_correction_sweep.py run.source.jsonl --jlens model.npz --U model.tensors.npz --gamma model.tensors.npz`.
 
 **Capture point:** `h_l` is the **post-block** residual of layer `l` (after the attn+MLP residual add, **pre** final-norm)
 — the same tensor `recursion_capture` records; `h_final` is the post-last-block residual (pre final-norm). (Also in the
