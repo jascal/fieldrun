@@ -538,8 +538,10 @@ impl Model for Neox {
     fn export_unembed(&self) -> Option<crate::jlens::UnembedExport> {
         // U = the untied `lm_head`; gamma = the final LayerNorm gain `ln_f.weight`. LayerNorm also mean-centers and
         // adds `ln_f.bias`, which a diagonal fold omits, so pil's gamma-conjugation is APPROXIMATE for neox.
+        // `rows_f32` DEQUANTISES f32/f16/RowI8 rows (arr2o would hit the quantised-upcast guard on an int8 lm_head).
+        let vocab = self.b.config[5] as usize; // config = [n_layer, H, hd, d, ffn, vocab, rot, parallel]
         Some(crate::jlens::UnembedExport {
-            u: self.b.arr2o("lm_head"),
+            u: self.b.rows_f32("lm_head", &(0..vocab as i64).collect::<Vec<_>>()),
             gamma: self.b.arr1("ln_f.weight").to_vec(),
             norm_type: "layernorm",
             tied: false,
