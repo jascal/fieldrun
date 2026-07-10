@@ -530,6 +530,10 @@ impl Model for Neox {
         Some((labels, dvec))
     }
 
+    fn unembed_project(&self, v: &[f32]) -> Option<Vec<f32>> {
+        Some(self.b.rowdot_f32("lm_head", v)) // logit-lens of any residual vector
+    }
+
     fn unembed_row(&self, id: usize) -> Option<Vec<f32>> {
         let r = self.b.weight_row("lm_head", id);
         if r.is_empty() { None } else { Some(r) }

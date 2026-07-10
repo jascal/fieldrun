@@ -1215,6 +1215,127 @@ mod cli {
         println!("    matches the oracle (high flip + high cap). Low cap ⇒ that basis misses the concept.  (behavioral; no lens.)");
     }
 
+    /// `--recursion-explain --jlens-trajectory`: the FAITHFUL residual-trajectory explain for the predicting position.
+    /// Per residual-stream write (embed, then each layer's attn / mlp), it reports: the write magnitude `‖d̃_b‖`, that
+    /// block's EXACT direct logit contribution to the predicted token `Δ→pred`, the CUMULATIVE logit-lens read (top-k
+    /// vocab tokens the residual points at after this block — tagged empirical), and a MEASURED causal flag (does
+    /// zeroing this whole block flip the prediction, via `predict_ablated_blocks`). The `resolve` marker is the first
+    /// block whose cumulative read locks to the final token. Everything is exact (`residual_normed_writes`) or measured
+    /// (block ablation) — no named "concepts", no J-space amplification claims. Knobs: `--traj-topk`, `--traj-causal 0`,
+    /// `--traj-json`. rope/neox families.
+    pub fn run_trajectory(args: &[String], model: &dyn Model, tg: &Option<TextGen>, ids: &[i64]) {
+        let Some(tg) = tg.as_ref() else {
+            eprintln!("[jlens] --jlens-trajectory needs a tokenizer");
+            return;
+        };
+        if ids.len() < 2 {
+            eprintln!("[jlens] --jlens-trajectory needs a context (--text/--ids)");
+            return;
+        }
+        let topk: usize = flag(args, "--traj-topk").and_then(|s| s.parse().ok()).unwrap_or(3);
+        let do_causal = flag(args, "--traj-causal").map(|s| s != "0" && s != "off").unwrap_or(true);
+        let (labels, dvec) = match model.residual_normed_writes(ids) {
+            Some(x) => x,
+            None => {
+                eprintln!("[jlens] --jlens-trajectory: arch lacks residual_normed_writes (rope/neox for now)");
+                return;
+            }
+        };
+        let logits = match model.logits(ids) {
+            Some(l) => l,
+            None => {
+                eprintln!("[jlens] --jlens-trajectory: no logits hook");
+                return;
+            }
+        };
+        let pred = argmax(&logits);
+        let (mut ru, mut rul) = (0i64, f32::MIN);
+        for (i, &v) in logits.iter().enumerate() {
+            if i as i64 != pred && v > rul {
+                rul = v;
+                ru = i as i64;
+            }
+        }
+        let u_pred = match model.unembed_row(pred as usize) {
+            Some(u) => u,
+            None => return,
+        };
+        // token_label already renders with quotes + id; flatten control chars so a code token can't break the table row.
+        let dec = |t: i64| tg.token_label(t).replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+        let d = dvec[0].len();
+        // parse "L18.attn" → (layer, is_attn); "embed" → None
+        let parse = |lab: &str| -> Option<(usize, bool)> {
+            let (num, kind) = lab.strip_prefix('L')?.split_once('.')?;
+            Some((num.parse().ok()?, kind == "attn"))
+        };
+        println!(
+            "[jlens] trajectory · predicts {} (logit {:.2}, margin {:+.2} vs {}) · {} writes · cum-lens=logit (empirical)",
+            dec(pred), logits[pred as usize], logits[pred as usize] - rul, dec(ru), labels.len()
+        );
+        println!("  block         write‖    Δ→pred   cum-lens top{topk}                     ablate→flip?");
+        let mut cum = vec![0f32; d];
+        let mut resolve: Option<usize> = None;
+        // (label, write_l2, dla, top-k ids, flip)
+        let mut rec: Vec<(String, f32, f32, Vec<i64>, Option<bool>)> = Vec::new();
+        for (b, (lab, w)) in labels.iter().zip(&dvec).enumerate() {
+            for (c, &wv) in w.iter().enumerate() {
+                cum[c] += wv;
+            }
+            let wl2 = w.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let dla = w.iter().zip(&u_pred).map(|(a, b)| a * b).sum::<f32>();
+            let lens = model.unembed_project(&cum).unwrap();
+            let top = crate::explain::top_promoted(&lens, 1.0, topk);
+            if top.first() == Some(&pred) && resolve.is_none() {
+                resolve = Some(b);
+            }
+            let (caus, flip) = if do_causal {
+                match parse(lab) {
+                    Some((l, is_attn)) => {
+                        let (al, ml): (Vec<usize>, Vec<usize>) = if is_attn { (vec![l], vec![]) } else { (vec![], vec![l]) };
+                        match model.predict_ablated_blocks(ids, &[], &[], &al, &ml) {
+                            Some(t) => {
+                                let f = t != pred;
+                                (if f { format!("FLIP→{}", dec(t)) } else { "·".into() }, Some(f))
+                            }
+                            None => ("—".into(), None),
+                        }
+                    }
+                    None => ("—".into(), None), // embed: no block ablation
+                }
+            } else {
+                (String::new(), None)
+            };
+            let toks = top.iter().map(|&t| dec(t)).collect::<Vec<_>>().join("  ");
+            let rmark = if Some(b) == resolve { " ◄resolve" } else { "" };
+            println!("  {:<12}  {:>6.2}   {:>+7.2}   {:<30}{:<9} {}", lab, wl2, dla, toks, rmark, caus);
+            rec.push((lab.clone(), wl2, dla, top, flip));
+        }
+        // ---- summary ----
+        let rb = resolve.map(|b| format!("{} (write {}/{})", rec[b].0, b + 1, rec.len())).unwrap_or_else(|| "never (last write only)".into());
+        println!("  → resolves to {} at {rb}", dec(pred));
+        let mut order: Vec<usize> = (0..rec.len()).collect();
+        order.sort_by(|&a, &b| rec[b].2.total_cmp(&rec[a].2));
+        let writers: Vec<String> = order.iter().take(4).map(|&i| format!("{} {:+.2}", rec[i].0, rec[i].2)).collect();
+        println!("  → top exact writers to {}: {}", dec(pred), writers.join(", "));
+        if do_causal {
+            let flips: Vec<String> = rec.iter().filter(|r| r.4 == Some(true)).map(|r| r.0.clone()).collect();
+            println!("  → single-block ablations that FLIP the prediction: {}", if flips.is_empty() { "(none singly — the write is distributed)".into() } else { flips.join(", ") });
+        }
+        println!("  (‖·‖ + Δ→pred are EXACT block contributions; cum-lens is the logit-lens readout — empirical, VOCAB tokens not named concepts; ablate→flip is MEASURED.)");
+        if crate::has_flag(args, "--traj-json") {
+            let blocks: Vec<serde_json::Value> = rec.iter().map(|(lab, wl2, dla, top, flip)| {
+                serde_json::json!({ "block": lab, "write_l2": wl2, "dla_pred": dla,
+                    "cum_lens_top": top.iter().map(|&t| dec(t)).collect::<Vec<_>>(), "ablate_flips": flip })
+            }).collect();
+            let out = serde_json::json!({
+                "predicted": dec(pred), "predicted_id": pred, "runner_up": dec(ru), "margin": logits[pred as usize] - rul,
+                "resolve_block": resolve.map(|b| rec[b].0.clone()),
+                "lens": {"type": "logit-lens", "tag": "empirical", "note": "cumulative-write read; VOCAB tokens, not named/J-space concepts"},
+                "blocks": blocks });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        }
+    }
+
     /// Dispatch: returns true if it handled a `--jlens-*` subcommand.
     pub fn dispatch(args: &[String], model: &dyn Model, tg: &Option<TextGen>, stem: &str, ids: &[i64]) -> bool {
         if has_flag(args, "--jlens-fit") {
@@ -1222,6 +1343,9 @@ mod cli {
             true
         } else if has_flag(args, "--jlens-eval") {
             run_eval(args, model, tg, stem, ids);
+            true
+        } else if has_flag(args, "--jlens-trajectory") {
+            run_trajectory(args, model, tg, ids);
             true
         } else if has_flag(args, "--jlens-causal-jspace") {
             run_causal_jspace(args, model, tg, stem);
