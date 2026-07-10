@@ -1124,11 +1124,15 @@ impl Model for Rope {
     fn export_unembed(&self) -> Option<crate::jlens::UnembedExport> {
         // U = the unembedding rows (tied `embed`, else `lm_head`); gamma = the final RMSNorm gain `norm`.
         // RMSNorm folds as a pure diagonal, so pil's diag(gamma) J diag(1/gamma) conjugation is EXACT here.
+        // `rows_f32` DEQUANTISES f32/f16/RowI8 rows → the same (vocab, d) f32 on a quantised bundle as on an f32 one;
+        // `arr2o` would hit the quantised-upcast guard on an int8/RowI8 embed (the deep bundles are all int8-quantised).
+        let un = self.unembed_name();
+        let vocab = self.b.config[6] as usize; // config = [n_layer, H, nkv, hd, d, ffn, vocab, tied]
         Some(crate::jlens::UnembedExport {
-            u: self.b.arr2o(self.unembed_name()),
+            u: self.b.rows_f32(un, &(0..vocab as i64).collect::<Vec<_>>()),
             gamma: self.b.arr1("norm").to_vec(),
             norm_type: "rmsnorm",
-            tied: self.b.config[7] != 0, // config = [n_layer, H, nkv, hd, d, ffn, vocab, tied]
+            tied: self.b.config[7] != 0,
         })
     }
 
