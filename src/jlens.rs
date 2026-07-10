@@ -1228,9 +1228,109 @@ mod cli {
             eprintln!("[jlens] --jlens-trajectory needs a tokenizer");
             return;
         };
+        if crate::has_flag(args, "--traj-multi") {
+            run_trajectory_multi(args, model, tg, ids);
+            return;
+        }
         let topk: usize = flag(args, "--traj-topk").and_then(|s| s.parse().ok()).unwrap_or(3);
         let do_causal = flag(args, "--traj-causal").map(|s| s != "0" && s != "off").unwrap_or(true);
         trajectory(model, tg, ids, topk, do_causal, crate::has_flag(args, "--traj-json"));
+    }
+
+    /// Lightweight per-decision trajectory summary (no per-block print, no causal): the prediction + margin, the
+    /// resolve write (first cumulative-lens lock to the prediction) with its depth, and the top EXACT writer (max DLA
+    /// block). Shared by the multi-token view. Projects the cumulative lens only until it resolves (early-stop).
+    struct TrajSummary {
+        pred: i64,
+        margin: f32,
+        resolve: Option<(String, usize)>, // (label, write index)
+        total: usize,
+        writer: String,
+        wdla: f32,
+    }
+    fn traj_summary(model: &dyn Model, ids: &[i64]) -> Option<TrajSummary> {
+        let (labels, dvec) = model.residual_normed_writes(ids)?;
+        let logits = model.logits(ids)?;
+        let pred = argmax(&logits);
+        let mut rul = f32::MIN;
+        for (i, &v) in logits.iter().enumerate() {
+            if i as i64 != pred && v > rul {
+                rul = v;
+            }
+        }
+        let u_pred = model.unembed_row(pred as usize)?;
+        let d = dvec[0].len();
+        let mut cum = vec![0f32; d];
+        let mut resolve = None;
+        let (mut best, mut writer) = (f32::MIN, String::new());
+        for (b, (lab, w)) in labels.iter().zip(&dvec).enumerate() {
+            for (c, &wv) in w.iter().enumerate() {
+                cum[c] += wv;
+            }
+            let dla: f32 = w.iter().zip(&u_pred).map(|(a, b)| a * b).sum();
+            if dla > best {
+                best = dla;
+                writer = lab.clone();
+            }
+            if resolve.is_none() {
+                let lens = model.unembed_project(&cum)?; // vocab projection — skipped once resolved
+                if argmax(&lens) == pred {
+                    resolve = Some((lab.clone(), b));
+                }
+            }
+        }
+        Some(TrajSummary { pred, margin: logits[pred as usize] - rul, resolve, total: labels.len(), writer, wdla: best })
+    }
+
+    /// `--jlens-trajectory --traj-multi`: the MULTI-token trajectory — one compact row per predicting position, showing
+    /// how each next-token decision assembles: the prediction (+ whether it matches the actual next token), the resolve
+    /// write and its DEPTH (fraction of the stack — low = decided early / copy-like, high = decided late / computed),
+    /// the top exact writer, and the margin. Lens-only (causal ablations × every position would be hundreds of
+    /// forwards); it's a batch view — run the single-position `--jlens-trajectory` for a full per-block + causal dive.
+    /// Knobs: `--traj-from N`, `--traj-max-pos N`. rope/neox.
+    pub fn run_trajectory_multi(args: &[String], model: &dyn Model, tg: &TextGen, ids: &[i64]) {
+        let seq = ids.len();
+        if seq < 3 {
+            eprintln!("[jlens] --traj-multi needs a context of ≥3 tokens");
+            return;
+        }
+        let from: usize = flag(args, "--traj-from").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+        let cap: usize = flag(args, "--traj-max-pos").and_then(|s| s.parse().ok()).unwrap_or(32);
+        let dec = |t: i64| tg.token_label(t).replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+        // predicting-position `p` (0-indexed) reads context ids[..=p] and predicts token p+1; loop p over from..seq.
+        let last = (from + cap).min(seq);
+        println!("[jlens] multi-token trajectory · positions {from}..{} · lens-only · resolve = first write locking to the prediction (depth = fraction of the stack)", last.saturating_sub(1));
+        println!("  pos  token           →pred          actual        resolve         depth  top-writer     margin");
+        let (mut sum_depth, mut hits, mut n) = (0f32, 0usize, 0usize);
+        for p in from..last {
+            let Some(s) = traj_summary(model, &ids[..=p]) else {
+                eprintln!("[jlens] --traj-multi: skipped position {p} (residual_normed_writes / logits hook returned None)");
+                continue;
+            };
+            let cur = dec(ids[p]);
+            let (actual, hit) = if p + 1 < seq {
+                let a = ids[p + 1];
+                (format!("{}{}", dec(a), if a == s.pred { "✓" } else { "✗" }), a == s.pred)
+            } else {
+                ("—".into(), false)
+            };
+            if hit {
+                hits += 1;
+            }
+            let (rlabel, depth) = match &s.resolve {
+                Some((lab, idx)) => (lab.clone(), (*idx + 1) as f32 / s.total as f32),
+                None => ("never".into(), 1.0),
+            };
+            sum_depth += depth;
+            n += 1;
+            println!(
+                "  {:>3}  {:<14}  {:<13}  {:<13}  {:<13}  {:>4.0}%  {:<12} {:+.2}",
+                p, trunc(&cur, 14), trunc(&dec(s.pred), 13), trunc(&actual, 13), rlabel, depth * 100.0, s.writer, s.margin
+            );
+        }
+        let nn = n.max(1) as f32;
+        println!("  → mean resolve depth {:.0}% of the stack · predicts the actual next token at {hits}/{n} positions", sum_depth / nn * 100.0);
+        println!("  (exact writers + margin; resolve depth is the logit-lens read — empirical. Run --jlens-trajectory (single position) for the full per-block + causal dive.)");
     }
 
     /// The trajectory-explain core, shared by the CLI probe (`--jlens-trajectory`) and the chat REPL's `/trajectory`.
