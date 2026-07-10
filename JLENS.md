@@ -126,6 +126,10 @@ Knobs: `--traj-topk`, `--traj-causal 0` (skip the ~2·n_layer ablation forwards)
 named "concepts" or J-space "amplification" numbers — the readout is vocab tokens (concept dictionaries are the
 `sm-sae`/`polygram` stack), and every field is exact, measured, or tagged-empirical. rope/neox families.
 
+Also in the `--chat` REPL: **`/trajectory [causal] <text>`** runs it on the model's next-token decision in the current
+chat context. Lens-only is interactive (~one forward); `causal` opts into the block ablations (a few seconds, so it is
+an on-demand deep-dive, *not* a per-token overlay like `/explain circuits`).
+
 ## Eval-time denoising knobs (`--jlens-rank`, `--jlens-logit-rank`, `--jlens-shrink`)
 
 Applied to a loaded `{J_l}` before the read (no re-fit): `--jlens-shrink λ` blends toward the logit-lens;

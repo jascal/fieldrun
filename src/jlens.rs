@@ -1228,12 +1228,19 @@ mod cli {
             eprintln!("[jlens] --jlens-trajectory needs a tokenizer");
             return;
         };
-        if ids.len() < 2 {
-            eprintln!("[jlens] --jlens-trajectory needs a context (--text/--ids)");
-            return;
-        }
         let topk: usize = flag(args, "--traj-topk").and_then(|s| s.parse().ok()).unwrap_or(3);
         let do_causal = flag(args, "--traj-causal").map(|s| s != "0" && s != "off").unwrap_or(true);
+        trajectory(model, tg, ids, topk, do_causal, crate::has_flag(args, "--traj-json"));
+    }
+
+    /// The trajectory-explain core, shared by the CLI probe (`--jlens-trajectory`) and the chat REPL's `/trajectory`.
+    /// Prints the per-write residual trajectory for the predicting position of `ids`. `do_causal` runs the 2·n_layer
+    /// block-ablation forwards (the slow part — ~seconds; the lens-only pass is interactive).
+    pub fn trajectory(model: &dyn Model, tg: &TextGen, ids: &[i64], topk: usize, do_causal: bool, json: bool) {
+        if ids.len() < 2 {
+            eprintln!("[jlens] trajectory needs a context of ≥2 tokens");
+            return;
+        }
         let (labels, dvec) = match model.residual_normed_writes(ids) {
             Some(x) => x,
             None => {
@@ -1272,7 +1279,7 @@ mod cli {
             "[jlens] trajectory · predicts {} (logit {:.2}, margin {:+.2} vs {}) · {} writes · cum-lens=logit (empirical)",
             dec(pred), logits[pred as usize], logits[pred as usize] - rul, dec(ru), labels.len()
         );
-        println!("  block         write‖    Δ→pred   cum-lens top{topk}                     ablate→flip?");
+        println!("  block         write‖    Δ→pred   cum-lens top{topk}                     {}", if do_causal { "ablate→flip?" } else { "(causal off — /trajectory causal)" });
         let mut cum = vec![0f32; d];
         let mut resolve: Option<usize> = None;
         // (label, write_l2, dla, top-k ids, flip)
@@ -1322,7 +1329,7 @@ mod cli {
             println!("  → single-block ablations that FLIP the prediction: {}", if flips.is_empty() { "(none singly — the write is distributed)".into() } else { flips.join(", ") });
         }
         println!("  (‖·‖ + Δ→pred are EXACT block contributions; cum-lens is the logit-lens readout — empirical, VOCAB tokens not named concepts; ablate→flip is MEASURED.)");
-        if crate::has_flag(args, "--traj-json") {
+        if json {
             let blocks: Vec<serde_json::Value> = rec.iter().map(|(lab, wl2, dla, top, flip)| {
                 serde_json::json!({ "block": lab, "write_l2": wl2, "dla_pred": dla,
                     "cum_lens_top": top.iter().map(|&t| dec(t)).collect::<Vec<_>>(), "ablate_flips": flip })
@@ -1363,7 +1370,7 @@ mod cli {
 }
 
 #[cfg(feature = "api")]
-pub use cli::dispatch;
+pub use cli::{dispatch, trajectory};
 
 #[cfg(test)]
 mod tests {
