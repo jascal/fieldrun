@@ -114,8 +114,10 @@ concept evolve through the block" record. For each residual-stream write (embed,
 - **`cum-lens top-k`** — the cumulative logit-lens read (the top-k **vocabulary tokens** the residual points at after
   this block). Tagged `empirical`; it converges exactly to the model's prediction at the last write. `◄resolve` marks
   the first block whose read locks to the final token.
-- **`ablate→flip?`** — a **measured** causal flag: does zeroing this whole block (`predict_ablated_blocks`) flip the
-  prediction, and to what.
+- **`ablate Δ→pred (flip)`** — a **measured** causal signal (`logits_ablated_blocks`): the *continuous* logit shift of
+  the predicted token when this whole block is zeroed (negative ⇒ the block was supporting the prediction), plus whether
+  the top-1 flips. This can diverge from the exact `Δ→pred` (a block can write toward the token directly yet have a small
+  net causal effect after downstream compensation) — and early blocks are often the most load-bearing by cascade.
 
 ```bash
 fieldrun --bundle <model> --text "The capital of France is" --recursion-explain --jlens-trajectory --traj-topk 2
