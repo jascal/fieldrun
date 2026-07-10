@@ -839,6 +839,11 @@ impl Model for Rope {
     }
 
     fn predict_patched(&self, ids: &[i64], layer: usize, positions: &[usize], donors: &[Vec<f32>]) -> Option<i64> {
+        let lg = self.logits_patched(ids, layer, positions, donors)?;
+        Some(lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+    }
+
+    fn logits_patched(&self, ids: &[i64], layer: usize, positions: &[usize], donors: &[Vec<f32>]) -> Option<Vec<f32>> {
         let seq = ids.len();
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
         let rep = h / nkv;
@@ -886,8 +891,7 @@ impl Model for Rope {
         }
         let normed = rmsnorm(&x, self.b.arr1("norm"), self.eps);
         let un = self.unembed_name();
-        let lg = self.b.rowdot_f32(un, &normed.row(seq - 1).to_vec());
-        Some(lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
+        Some(self.b.rowdot_f32(un, &normed.row(seq - 1).to_vec()))
     }
 
     fn residuals_at(&self, ids: &[i64], positions: &[usize]) -> Option<Vec<Vec<Vec<f32>>>> {

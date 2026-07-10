@@ -86,10 +86,44 @@ Feed the two files to the sweep (`--U`/`--gamma` read the `U`/`gamma` arrays fro
 — the same tensor `recursion_capture` records; `h_final` is the post-last-block residual (pre final-norm). (Also in the
 `.meta.json` `capture_point` field.)
 
-## Status (2026-07)
+## Causal validation (`--jlens-causal`, `--jlens-causal-jspace`)
 
-Fit on Qwen2.5-0.5B (300-prompt corpus, all 23 layers): `‖J_l − I‖_F` decays monotonically toward the output (the
-right shape — the downstream map → identity near the final layer). Eval shows the J-lens **resolves the final token
-earlier** than the logit-lens (the paper's core claim), best at **λ ≈ 0.25–0.5** — on arithmetic contexts a clean win
-on *both* earlier-resolve and fewer across-depth flips; raw `λ=1` goes earlier but is noise-dominated (hence shrinkage).
-The Pythia ladder (14m→2.8b, learned-positional) is wired for the scale study.
+The resolve-layer/flips readout turned out to be **context-fragile** (see findings), so the faithful test of the paper's
+claims is causal — and fieldrun already owns the machinery (`residuals_at` + `logits_patched`, a real forward with a
+swapped residual; no lens, no resolve-layer).
+
+- **`--jlens-causal`** — interchange tracing (paper 5.3/5.4). Aligned prompt pairs ("capital of France is"→Paris vs
+  "…China is"), patch the base's `(layer, last-pos)` residual with the source's, sweep layers, report **flip-to-source
+  rate + source-logit shift**. On Qwen2.5-0.5B it gives a clean, monotone localization (0% early → 100% at L23; ≥50%
+  band L21–23) — France→Spain flips *Paris→Madrid*. Knobs: `--causal-template "…{}…"`, `--causal-entities`, `--causal-pairs`.
+- **`--jlens-causal-jspace`** — the J-space test (paper 5.1). At the causal layer, patch with only a subspace's slice of
+  the swap `Δ`: the J-space `P_JΔ` (from `{J_l}`) vs its complement vs a diff-subspace **oracle** (top-PCA of the actual
+  swaps) vs random; report flip + capture `‖PΔ‖/‖Δ‖`. Knobs: `--jlens-in`, `--causal-layer`, `--causal-jspace k1,k2,…`.
+
+## Eval-time denoising knobs (`--jlens-rank`, `--jlens-logit-rank`, `--jlens-shrink`)
+
+Applied to a loaded `{J_l}` before the read (no re-fit): `--jlens-shrink λ` blends toward the logit-lens;
+`--jlens-rank k` keeps the top-k SVD of `J−I`; `--jlens-logit-rank k` keeps the logit-relevant rank-k (top eigenvectors
+of `JᵀMJ`, `M` = sampled unembed Gram — the paper's `Wᵤ·J` J-space).
+
+## Status & honest findings (2026-07)
+
+The J-lens **instrument** is built, tested, and faithful (off the forward path). The J-space **phenomenon** does *not*
+cleanly reproduce at 0.5B–410m on CPU — consistent with it being a frontier-scale result. Specifically:
+
+- **Fit / lens read** (Qwen2.5-0.5B): `‖J_l−I‖_F` decays monotonically toward the output (right shape). The J-lens
+  resolves the final token *earlier* than the logit-lens at **λ≈0.25–0.5** on some contexts — **but the resolve-layer
+  metric is context-fragile** (full-rank 410m flips +2.1 later ↔ −1.1 earlier just by changing the sentence), so this is
+  not a reliable signal.
+- **Pythia ladder** (14m→410m): earlier-resolve is **non-monotonic in scale**; the largest rung regresses under a
+  fixed-probe fit (read-noise ∝ σ√d).
+- **Low-rank denoise** (`--jlens-rank`): removes the σ√d noise but also removes signal — rescues 410m, breaks Qwen.
+  **Logit-weighted** (`--jlens-logit-rank`, G′): worse (the sampled NeoX Gram is outlier-dominated).
+- **Causal (`--jlens-causal`)**: the tracer **works** — clean, monotone, faithful. This is the reusable win.
+- **J-space causal test (`--jlens-causal-jspace`)**: the fitted-`{J_l}` J-space **does not house** the swappable concept
+  at L22 — both definitions capture ≤half of the swap direction and **never suffice to flip** (0%), while the complement
+  ≈ full. Caveats: our J-space (top-k of `JᵀMJ`) ≠ the paper's sparse-pursuit over the `Wᵤ·J` dictionary; partial-swap
+  flips are confounded by downstream nonlinearity; 0.5B is below the expected scale.
+
+**To push further** (both larger efforts): implement the paper-faithful sparse-pursuit J-space, or add
+`predict_patched`/`residuals_at` to `neox` and run the causal tests up the Pythia ladder / on the big MoE archs.

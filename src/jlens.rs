@@ -12,7 +12,7 @@
 //! `E_g[(J g) g^T] = J` for `g ~ N(0, I)`, central-differenced. `run_eval` compares the J-lens recursion trace against
 //! the logit-lens one (resolve-layer + across-depth argmax stability) so the improvement is measured, not assumed.
 
-use ndarray::Array2;
+use ndarray::{s, Array1, Array2};
 
 use crate::model::Model;
 
@@ -259,6 +259,197 @@ pub fn shrink_toward_identity(m: &Array2<f32>, lambda: f32) -> Array2<f32> {
         out[[i, i]] += 1.0 - lambda;
     }
     out
+}
+
+// ── low-rank denoising of J ──────────────────────────────────────────────────────────────────────────────────────────
+// The paper reports the verbalizable J-space is only ~5-10% of activation variance ⇒ the useful part of `J_l - I` is
+// LOW RANK. The Hutchinson estimate is full-rank: signal in a few top singular directions + ~σ√d noise smeared across
+// all d. SVD-truncating `J_l - I` to rank k keeps the signal subspace and discards the noise tail — a free denoise of an
+// ALREADY-fit `J` (no extra probes). No LAPACK in fieldrun, so this is a dependency-free randomized SVD.
+
+/// Modified Gram–Schmidt: orthonormalize the columns of `y` (d×r) in place-ish, returning a d×r matrix with orthonormal
+/// columns (degenerate columns zeroed).
+fn mgs(y: &Array2<f32>) -> Array2<f32> {
+    let (d, r) = (y.nrows(), y.ncols());
+    // Keep only numerically-independent columns. The threshold is RELATIVE (residual vs the column's own norm) — an
+    // absolute cutoff misfires after subspace iteration inflates the scale, normalizing round-off into spurious unit
+    // vectors and breaking orthonormality. Dependent columns are dropped, not zeroed, so Q stays orthonormal.
+    let mut cols: Vec<Vec<f32>> = Vec::new();
+    for j in 0..r {
+        let mut col: Vec<f32> = (0..d).map(|row| y[[row, j]]).collect();
+        let n0 = col.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if n0 < 1e-30 {
+            continue;
+        }
+        for q in &cols {
+            let dot: f32 = col.iter().zip(q).map(|(a, b)| a * b).sum();
+            for (c, &qq) in col.iter_mut().zip(q) {
+                *c -= dot * qq;
+            }
+        }
+        let n1 = col.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if n1 < 1e-6 * n0 {
+            continue; // dependent on the columns already kept → drop it
+        }
+        for c in col.iter_mut() {
+            *c /= n1;
+        }
+        cols.push(col);
+    }
+    let mut q = Array2::<f32>::zeros((d, cols.len()));
+    for (jc, col) in cols.iter().enumerate() {
+        for (row, &v) in col.iter().enumerate() {
+            q[[row, jc]] = v;
+        }
+    }
+    q
+}
+
+/// Eigendecomposition of a small SYMMETRIC matrix by cyclic Jacobi rotations. Returns (eigenvalues descending,
+/// eigenvectors as columns in the same order). Used only on the tiny r×r `BBᵀ` in the randomized SVD.
+fn sym_eig_jacobi(a: &Array2<f32>) -> (Vec<f32>, Array2<f32>) {
+    let n = a.nrows();
+    let mut m = a.clone();
+    let mut v = Array2::<f32>::eye(n);
+    for _ in 0..100 {
+        let mut off = 0.0f32;
+        for p in 0..n {
+            for q in (p + 1)..n {
+                off += m[[p, q]] * m[[p, q]];
+            }
+        }
+        if off <= 1e-18 {
+            break;
+        }
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = m[[p, q]];
+                if apq.abs() < 1e-20 {
+                    continue;
+                }
+                let theta = (m[[q, q]] - m[[p, p]]) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for i in 0..n {
+                    let (mip, miq) = (m[[i, p]], m[[i, q]]);
+                    m[[i, p]] = c * mip - s * miq;
+                    m[[i, q]] = s * mip + c * miq;
+                }
+                for i in 0..n {
+                    let (mpi, mqi) = (m[[p, i]], m[[q, i]]);
+                    m[[p, i]] = c * mpi - s * mqi;
+                    m[[q, i]] = s * mpi + c * mqi;
+                }
+                for i in 0..n {
+                    let (vip, viq) = (v[[i, p]], v[[i, q]]);
+                    v[[i, p]] = c * vip - s * viq;
+                    v[[i, q]] = s * vip + c * viq;
+                }
+            }
+        }
+    }
+    let diag: Vec<f32> = (0..n).map(|i| m[[i, i]]).collect();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| diag[b].total_cmp(&diag[a]));
+    let evals = idx.iter().map(|&i| diag[i]).collect();
+    let mut evecs = Array2::<f32>::zeros((n, n));
+    for (col, &i) in idx.iter().enumerate() {
+        for row in 0..n {
+            evecs[[row, col]] = v[[row, i]];
+        }
+    }
+    (evals, evecs)
+}
+
+/// Best rank-`k` approximation of `a` (d×d) by randomized SVD: sketch the range with `k+oversample` random probes and
+/// `power` subspace iterations, orthonormalize (Φ = top-k left singular vectors), then project `A_k = Φ (Φᵀ A)`.
+/// `k == 0` or `k >= d` ⇒ no truncation (returns a clone).
+/// The top-`k` left-singular subspace of `a` (d×keff, orthonormal columns; keff = min(k, numerical rank)) by randomized
+/// range-finding. For a symmetric PSD `a` these are its top-k eigenvectors. Empty (d×0) if the sketch is rank-0.
+fn topk_subspace(a: &Array2<f32>, k: usize, rng: &mut Rng, power: usize) -> Array2<f32> {
+    let d = a.nrows();
+    let r = (k + 8).min(d); // oversampling for a stable range estimate
+    let mut omega = Array2::<f32>::zeros((d, r));
+    for x in omega.iter_mut() {
+        *x = rng.gauss();
+    }
+    let mut y = a.dot(&omega); // d×r range sketch
+    for _ in 0..power {
+        let aty = a.t().dot(&y); // d×r  (Aᵀ Y)
+        y = a.dot(&aty); //          A (Aᵀ Y) — sharpen toward the dominant subspace
+    }
+    let q = mgs(&y); // d×q' orthonormal (q' = numerical rank of the sketch, ≤ r)
+    let qn = q.ncols();
+    if qn == 0 {
+        return Array2::<f32>::zeros((d, 0));
+    }
+    let keff = k.min(qn); // if the sketch is lower-rank than k, return that lower rank
+    let b = q.t().dot(a); // q'×d
+    let s = b.dot(&b.t()); // q'×q' = B Bᵀ (symmetric PSD)
+    let (_ev, w) = sym_eig_jacobi(&s); // eigenvectors, descending
+    let wk = w.slice(s![.., 0..keff]).to_owned(); // q'×keff
+    q.dot(&wk) // d×keff — the top left singular vectors
+}
+
+fn truncate_rank(a: &Array2<f32>, k: usize, rng: &mut Rng, power: usize) -> Array2<f32> {
+    let d = a.nrows();
+    if k == 0 || k >= d {
+        return a.clone();
+    }
+    let phi = topk_subspace(a, k, rng, power); // d×keff top-k left singular vectors
+    if phi.ncols() == 0 {
+        return Array2::<f32>::zeros((d, a.ncols()));
+    }
+    phi.dot(&phi.t().dot(a)) // A_k = Φ Φᵀ A (rank keff)
+}
+
+/// Logit-weighted low-rank denoise (G′): keep the part of `J − I` that most affects the OUTPUT LOGITS, not the part with
+/// the largest raw magnitude. The read is `Wᵤ·norm(J·r)`, so the output space is weighted by the unembed Gram `M = WᵤᵀWᵤ`.
+/// We keep `L = J−I`'s action on the top-`k` INPUT directions whose L-image carries the most logit energy — the top-k
+/// eigenvectors `Φ` of `A = Lᵀ M L` — giving `L_k = L Φ Φᵀ`, then `J_k = I + L_k`. This matches the paper's J-space
+/// (defined by the `Wᵤ·J` directions), unlike a plain SVD of `J−I` which keeps the biggest *residual* reshaping.
+/// `m` is the (approximate) `d×d` unembed Gram. `k == 0` or `k >= d` ⇒ unchanged.
+pub fn rank_reduce_logit(j: &Array2<f32>, k: usize, m: &Array2<f32>, seed: u64) -> Array2<f32> {
+    let d = j.nrows();
+    if k == 0 || k >= d {
+        return j.clone();
+    }
+    let mut l = j.clone();
+    for i in 0..d {
+        l[[i, i]] -= 1.0; // L = J − I
+    }
+    let a = l.t().dot(&m.dot(&l)); // Lᵀ M L (d×d, symmetric PSD) — logit-energy metric on the input directions
+    let mut rng = Rng::new(seed);
+    let phi = topk_subspace(&a, k, &mut rng, 2); // top-k logit-relevant input directions
+    if phi.ncols() == 0 {
+        return j.clone();
+    }
+    let lk = l.dot(&phi).dot(&phi.t()); // L_k = (L Φ) Φᵀ — keep L on the relevant input subspace
+    let mut jk = lk;
+    for i in 0..d {
+        jk[[i, i]] += 1.0; // J_k = I + L_k
+    }
+    jk
+}
+
+/// Low-rank-denoise a fitted Jacobian: keep only the rank-`k` part of `J - I` (the paper's low-dim J-space), then add
+/// `I` back. `k == 0` or `k >= d` ⇒ unchanged. Seeded internally for reproducibility.
+pub fn rank_reduce(j: &Array2<f32>, k: usize, seed: u64) -> Array2<f32> {
+    let d = j.nrows();
+    if k == 0 || k >= d {
+        return j.clone();
+    }
+    let mut l = j.clone();
+    for i in 0..d {
+        l[[i, i]] -= 1.0; // L = J - I
+    }
+    let mut rng = Rng::new(seed);
+    let mut jk = truncate_rank(&l, k, &mut rng, 2);
+    for i in 0..d {
+        jk[[i, i]] += 1.0; // J' = I + L_k
+    }
+    jk
 }
 
 /// Frobenius distance of `J_l` from the identity — a cheap "how far from the logit-lens is this layer's map" readout.
@@ -665,6 +856,33 @@ mod cli {
         Agg { rl: rl / n, rj: rj / n, fl: fl / n, fj: fj / n, sl: sl / n, sj: sj / n, earlier, later, same }
     }
 
+    /// Approximate the unembed Gram `M = WᵤᵀWᵤ` (d×d) by sampling `s` random unembed rows and forming `Uₛᵀ Uₛ` (one
+    /// matmul). Unscaled — only its eigen-directions feed the logit-weighted truncation. `None` if the arch lacks
+    /// `unembed_row`/`logits`. The Gram is model-only (independent of the context), so `s` rows is plenty for the metric.
+    fn sample_unembed_gram(model: &dyn Model, ids: &[i64], s: usize) -> Option<Array2<f32>> {
+        let vocab = model.logits(ids)?.len();
+        let s = s.min(vocab);
+        let mut rng = Rng::new(7);
+        let (mut rows, mut d, mut n) = (Vec::<f32>::new(), 0usize, 0usize);
+        for _ in 0..s {
+            let v = (rng.next_u64() % vocab as u64) as usize;
+            if let Some(u) = model.unembed_row(v) {
+                if d == 0 {
+                    d = u.len();
+                }
+                if u.len() == d {
+                    rows.extend_from_slice(&u);
+                    n += 1;
+                }
+            }
+        }
+        if d == 0 || n == 0 {
+            return None;
+        }
+        let us = Array2::from_shape_vec((n, d), rows).ok()?;
+        Some(us.t().dot(&us)) // d×d
+    }
+
     /// `--recursion-explain --jlens-eval`: read the context through BOTH lenses and report where the J-lens resolves
     /// the final token earlier and/or reads more stably across depth than the plain logit-lens. Knobs: `--jlens-in`,
     /// `--jlens-shrink λ|λ1,λ2,…` (shrinkage toward the logit-lens; default `1.0` = raw `J`, sweep to find the best λ).
@@ -693,9 +911,40 @@ mod cli {
             .map(|s| s.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![1.0]);
+        // Low-rank denoise each J BEFORE shrinking (applied once, reused across the λ sweep). Two modes:
+        //   --jlens-logit-rank k : keep the k directions of J−I most relevant to the OUTPUT logits (weighted by the
+        //                          unembed Gram M = WᵤᵀWᵤ, sampled) — the paper's J-space (Wᵤ·J).  [G′, preferred]
+        //   --jlens-rank k       : keep the top-k of J−I in the raw metric (plain SVD denoise).
+        // 0 (default) = no truncation.
+        let logit_rank: usize = flag(args, "--jlens-logit-rank").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rank: usize = flag(args, "--jlens-rank").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let jmats: Vec<Array2<f32>> = if logit_rank > 0 {
+            match sample_unembed_gram(model, ids, 4096) {
+                Some(m) => {
+                    eprintln!("[jlens] logit-weighted low-rank: keeping rank {logit_rank} (Wᵤ-relevant) of each J−I");
+                    jmats.iter().map(|j| rank_reduce_logit(j, logit_rank, &m, 1)).collect()
+                }
+                None => {
+                    eprintln!("[jlens] --jlens-logit-rank: arch lacks unembed_row/logits — using full J");
+                    jmats
+                }
+            }
+        } else if rank > 0 {
+            eprintln!("[jlens] plain low-rank denoise: keeping rank {rank} of each J−I");
+            jmats.iter().map(|m| rank_reduce(m, rank, 1)).collect()
+        } else {
+            jmats
+        };
         let nl = trace_l.first().map(|r| r.n_layer).unwrap_or(0);
         let dec = |t: i64| tg.token_label(t);
-        println!("[jlens] eval · d={d} · {nl} layers · {} positions · J-lens vs logit-lens · shrink λ∈{lambdas:?}", trace_l.len());
+        let rank_s = if logit_rank > 0 {
+            format!(" · logit-rank {logit_rank}")
+        } else if rank > 0 {
+            format!(" · rank {rank}")
+        } else {
+            String::new()
+        };
+        println!("[jlens] eval · d={d} · {nl} layers · {} positions · J-lens vs logit-lens · shrink λ∈{lambdas:?}{rank_s}", trace_l.len());
 
         for &lam in &lambdas {
             let shrunk: Vec<Array2<f32>> = jmats.iter().map(|m| shrink_toward_identity(m, lam)).collect();
@@ -743,6 +992,229 @@ mod cli {
         }
     }
 
+    fn argmax(v: &[f32]) -> i64 {
+        v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as i64).unwrap_or(0)
+    }
+
+    struct CPrompt {
+        ent: String,
+        ids: Vec<i64>,
+        pred: i64,
+    }
+
+    /// Build aligned interchange pairs from a template + entity pool: prompts of equal token length whose base
+    /// predictions differ (so a swap has something to flip). Returns (prompts, (base_idx, source_idx) pairs, template).
+    fn causal_pairs<'a>(args: &'a [String], model: &dyn Model, tg: &TextGen) -> Option<(Vec<CPrompt>, Vec<(usize, usize)>, &'a str)> {
+        let template = flag(args, "--causal-template").unwrap_or("The capital of {} is");
+        let default_pool = "France,China,Japan,Spain,Italy,Germany,Russia,Egypt,India,Brazil,Canada,Mexico,Greece,Turkey,Norway,Poland,Chile,Peru,Cuba,Iran,Kenya,Portugal,Austria,Ireland";
+        let pool: Vec<&str> = flag(args, "--causal-entities").unwrap_or(default_pool).split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let max_pairs: usize = flag(args, "--causal-pairs").and_then(|s| s.parse().ok()).unwrap_or(24);
+        let mut ps: Vec<CPrompt> = Vec::new();
+        for ent in &pool {
+            let text = template.replacen("{}", ent, 1);
+            let ids = tg.encode(&text, false);
+            if ids.len() < 3 {
+                continue;
+            }
+            match model.logits(&ids) {
+                Some(lg) => ps.push(CPrompt { ent: ent.to_string(), ids, pred: argmax(&lg) }),
+                None => {
+                    eprintln!("[jlens] causal: arch has no logits hook");
+                    return None;
+                }
+            }
+        }
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        'outer: for i in 0..ps.len() {
+            for j in 0..ps.len() {
+                if i != j && ps[i].ids.len() == ps[j].ids.len() && ps[i].pred != ps[j].pred {
+                    pairs.push((i, j));
+                    if pairs.len() >= max_pairs {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if pairs.is_empty() {
+            eprintln!("[jlens] causal: no aligned pairs (same length, different predictions) from {} prompts", ps.len());
+            return None;
+        }
+        Some((ps, pairs, template))
+    }
+
+    /// `--recursion-explain --jlens-causal`: CAUSAL interchange tracing — the metric-independent test of the paper's
+    /// swap claim (5.3/5.4). For aligned prompt pairs (same length, differing only in a swapped concept), e.g.
+    /// "The capital of France is"→Paris vs "…China is"→Beijing, patch the base run's residual at (layer, last-pos) with
+    /// the SOURCE run's, and measure whether the output flips to the source's answer (France→Beijing). A hard behavioral
+    /// readout — top-1 flip rate + the source-token logit shift — swept over layers to localize where the swappable
+    /// concept lives. No lens, no resolve-layer. Uses `residuals_at` + `logits_patched` (rope family, for now).
+    pub fn run_causal(args: &[String], model: &dyn Model, tg: &Option<TextGen>, _stem: &str) {
+        let Some(tg) = tg.as_ref() else {
+            eprintln!("[jlens] --jlens-causal needs a tokenizer");
+            return;
+        };
+        let Some((ps, pairs, template)) = causal_pairs(args, model, tg) else { return };
+        let nl = model.dims().map(|(n, _)| n).unwrap_or(0);
+        if nl == 0 || model.residuals_at(&ps[0].ids, &[0]).is_none() {
+            eprintln!("[jlens] --jlens-causal needs residuals_at + dims (rope family, for now)");
+            return;
+        }
+        let dec = |t: i64| tg.token_label(t);
+        println!("[jlens] causal interchange · template {template:?} · {} aligned pairs · {nl} layers · patch last-position residual", pairs.len());
+        println!("  swap each base→source: does patching the source's layer-ℓ residual flip base→source's answer?");
+        // per-layer accumulators: flip count, summed source-target logit shift, normalized shift toward source.
+        let mut flip = vec![0u32; nl];
+        let mut shift = vec![0f32; nl];
+        let npairs = pairs.len();
+        for &(bi, si) in &pairs {
+            let (base, src) = (&ps[bi], &ps[si]);
+            let last = base.ids.len() - 1;
+            let base_lg = model.logits(&base.ids).unwrap();
+            let base_tgt = base_lg[src.pred as usize]; // base logit of the SOURCE's answer (what we try to raise)
+            // source residuals at the last position, all layers
+            let src_res = model.residuals_at(&src.ids, &[last]).unwrap(); // [pos][layer][d]
+            for l in 0..nl {
+                let donor = &src_res[0][l];
+                if let Some(lg) = model.logits_patched(&base.ids, l, &[last], std::slice::from_ref(donor)) {
+                    if argmax(&lg) == src.pred {
+                        flip[l] += 1;
+                    }
+                    shift[l] += lg[src.pred as usize] - base_tgt;
+                }
+            }
+        }
+        // report per-layer flip rate + mean logit shift, and the peak.
+        let (mut peak_l, mut peak_r) = (0usize, -1f32);
+        println!("  layer  flip→source   mean Δlogit(source)   bar");
+        for l in 0..nl {
+            let rate = flip[l] as f32 / npairs as f32;
+            if rate > peak_r {
+                peak_r = rate;
+                peak_l = l;
+            }
+            let bar = "█".repeat((rate * 30.0).round() as usize);
+            println!("  L{l:<3}   {:>4.0}%  ({:>2}/{npairs})   {:>+8.2}          {bar}", rate * 100.0, flip[l], shift[l] / npairs as f32);
+        }
+        // sample pairs for legibility
+        println!("  ── sample swaps (base→source ⇒ answers) ──");
+        for &(bi, si) in pairs.iter().take(6) {
+            println!("    {:<10} ({}) → {:<10} ({})", ps[bi].ent, dec(ps[bi].pred).trim(), ps[si].ent, dec(ps[si].pred).trim());
+        }
+        let band: Vec<usize> = (0..nl).filter(|&l| flip[l] as f32 / npairs as f32 >= 0.5).collect();
+        println!("  → peak flip-rate {:.0}% at L{peak_l}; ≥50%-flip band: {band:?}", peak_r * 100.0);
+        println!("  (FAITHFUL causal test — the patch is a real forward with a swapped residual; behavioral readout, no lens/resolve-layer.)");
+    }
+
+    /// `--recursion-explain --jlens-causal-jspace`: the J-SPACE causal test (paper 5.1). At the causal layer (where a
+    /// full-residual swap flips the answer, from `--jlens-causal`), patch the base with only a COMPONENT of the swap
+    /// `Δ = x_source − x_base`: the J-space projection `P_J Δ` (P_J = top-k logit-relevant subspace, eigenvectors of
+    /// `J_lᵀ M J_l`), its complement `(I−P_J)Δ`, or a random rank-k subspace (control). If the J-space part alone flips
+    /// the answer (≈ full) while the complement doesn't — and J-space ≫ random — the swappable concept lives in the
+    /// J-space. Behavioral readout: the noisy `{J_l}` is used only as a coarse SUBSPACE, so lens fragility doesn't bite.
+    /// Knobs: `--jlens-in`, `--causal-layer L` (default late), `--causal-jspace k1,k2,…` (rank sweep). rope family only.
+    pub fn run_causal_jspace(args: &[String], model: &dyn Model, tg: &Option<TextGen>, stem: &str) {
+        let Some(tg) = tg.as_ref() else {
+            eprintln!("[jlens] --jlens-causal-jspace needs a tokenizer");
+            return;
+        };
+        let Some((ps, pairs, _t)) = causal_pairs(args, model, tg) else { return };
+        let nl = model.dims().map(|(n, _)| n).unwrap_or(0);
+        if nl == 0 || model.residuals_at(&ps[0].ids, &[0]).is_none() {
+            eprintln!("[jlens] --jlens-causal-jspace needs residuals_at + dims (rope family, for now)");
+            return;
+        }
+        let inp = flag(args, "--jlens-in").map(|s| s.to_string()).unwrap_or_else(|| format!("{stem}.jlens"));
+        let (d, jmats) = match load(&inp) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[jlens] load {inp}: {e} — run --jlens-fit first (or pass --jlens-in)");
+                return;
+            }
+        };
+        let Some(m) = sample_unembed_gram(model, &ps[0].ids, 4096) else {
+            eprintln!("[jlens] --jlens-causal-jspace: arch lacks unembed_row for the Gram");
+            return;
+        };
+        let layer = flag(args, "--causal-layer").and_then(|s| s.parse::<usize>().ok()).unwrap_or(nl.saturating_sub(2)).min(nl - 1);
+        let ks: Vec<usize> = flag(args, "--causal-jspace")
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![8, 32, 128]);
+
+        // cache each prompt's residual at (layer, its last position) — reused across the k sweep
+        let resid: Vec<Array1<f32>> = ps
+            .iter()
+            .map(|p| {
+                let last = p.ids.len() - 1;
+                Array1::from(model.residuals_at(&p.ids, &[last]).unwrap()[0][layer].clone())
+            })
+            .collect();
+        let npairs = pairs.len() as f32;
+        let flip_of = |bi: usize, si: usize, donor: &Array1<f32>| -> bool {
+            let last = ps[bi].ids.len() - 1;
+            let dv = donor.to_vec();
+            model.logits_patched(&ps[bi].ids, layer, &[last], std::slice::from_ref(&dv)).map(|lg| argmax(&lg) == ps[si].pred).unwrap_or(false)
+        };
+        // full-residual swap = the B1 baseline at this layer
+        let full: u32 = pairs.iter().map(|&(bi, si)| flip_of(bi, si, &resid[si]) as u32).sum();
+        println!("[jlens] causal J-space test · L{layer} · {} pairs · d={d} · full-swap flip {:.0}%", pairs.len(), full as f32 / npairs * 100.0);
+        // candidate subspaces to house the swappable concept: the two J-space definitions, a diff-subspace ORACLE (top
+        // PCA of the actual swap directions Δ — where the concept lives BY CONSTRUCTION), and random. `cap` = the mean
+        // fraction of ‖Δ‖ the subspace captures; `flip` = patching base with only that subspace's slice of Δ.
+        let jl = &jmats[layer];
+        let a = jl.t().dot(&m.dot(jl)); // Jᵀ M J — logit-weighted (paper's Wᵤ·J) J-space
+        let mut lmi = jl.clone(); // J − I — plain J-space (downstream reshaping)
+        for i in 0..d {
+            lmi[[i, i]] -= 1.0;
+        }
+        let deltas: Vec<Array1<f32>> = pairs.iter().map(|&(bi, si)| &resid[si] - &resid[bi]).collect();
+        let mut dmat = Array2::<f32>::zeros((d, pairs.len())); // Δ matrix (d × npairs) for the oracle PCA
+        for (c, dl) in deltas.iter().enumerate() {
+            dmat.column_mut(c).assign(dl);
+        }
+        let dcov = dmat.dot(&dmat.t()); // d×d Δ-covariance; its top-k eigenvectors are the principal swap directions
+        let cap = |phi: &Array2<f32>| -> f32 {
+            deltas.iter().map(|dl| {
+                let p = phi.dot(&phi.t().dot(dl));
+                let (pn, dn) = (p.dot(&p).sqrt(), dl.dot(dl).sqrt());
+                if dn > 1e-9 { pn / dn } else { 0.0 }
+            }).sum::<f32>() / npairs
+        };
+        let flip_sub = |phi: &Array2<f32>| -> u32 {
+            pairs.iter().enumerate().map(|(pi, &(bi, si))| {
+                let pj = phi.dot(&phi.t().dot(&deltas[pi]));
+                flip_of(bi, si, &(&resid[bi] + &pj)) as u32
+            }).sum()
+        };
+        println!("  swap ONLY a subspace's slice of Δ=x_src−x_base.  flip = does it redirect base→source; cap = ‖P Δ‖/‖Δ‖.");
+        println!("  k     diff-ORACLE      J(WᵤᵀWᵤ)        J(plain J−I)    complement   random");
+        println!("         flip  cap       flip  cap       flip  cap       flip         flip");
+        for &k in &ks {
+            let mut rng = Rng::new(1);
+            let phi_w = topk_subspace(&a, k, &mut rng, 2); // logit-weighted J-space
+            let phi_p = topk_subspace(&lmi, k, &mut rng, 2); // plain J-space
+            let phi_o = topk_subspace(&dcov, k, &mut rng, 2); // ORACLE: top PCA of the swaps themselves
+            let mut rr = Array2::<f32>::zeros((d, k.min(d)));
+            for x in rr.iter_mut() {
+                *x = rng.gauss();
+            }
+            let rrand = mgs(&rr);
+            let (fw, fp, fo, frd) = (flip_sub(&phi_w), flip_sub(&phi_p), flip_sub(&phi_o), flip_sub(&rrand));
+            // complement of the logit-weighted J-space (swap everything EXCEPT P_w)
+            let cpl: u32 = pairs.iter().enumerate().map(|(pi, &(bi, si))| {
+                let pj = phi_w.dot(&phi_w.t().dot(&deltas[pi]));
+                flip_of(bi, si, &(&resid[si] - &pj)) as u32
+            }).sum();
+            let pct = |x: u32| x as f32 / npairs * 100.0;
+            println!(
+                "  {k:<4}  {:>4.0}% {:>5.2}     {:>4.0}% {:>5.2}     {:>4.0}% {:>5.2}     {:>4.0}%        {:>4.0}%",
+                pct(fo), cap(&phi_o), pct(fw), cap(&phi_w), pct(fp), cap(&phi_p), pct(cpl), pct(frd)
+            );
+        }
+        println!("  → diff-ORACLE flip high at small k ⇒ the swap IS low-dimensional. A J-space def is validated iff it");
+        println!("    matches the oracle (high flip + high cap). Low cap ⇒ that basis misses the concept.  (behavioral; no lens.)");
+    }
+
     /// Dispatch: returns true if it handled a `--jlens-*` subcommand.
     pub fn dispatch(args: &[String], model: &dyn Model, tg: &Option<TextGen>, stem: &str, ids: &[i64]) -> bool {
         if has_flag(args, "--jlens-fit") {
@@ -750,6 +1222,12 @@ mod cli {
             true
         } else if has_flag(args, "--jlens-eval") {
             run_eval(args, model, tg, stem, ids);
+            true
+        } else if has_flag(args, "--jlens-causal-jspace") {
+            run_causal_jspace(args, model, tg, stem);
+            true
+        } else if has_flag(args, "--jlens-causal") {
+            run_causal(args, model, tg, stem);
             true
         } else if let Some(out) = flag(args, "--tensors-export") {
             run_tensors_export(model, out);
@@ -827,6 +1305,85 @@ mod tests {
             assert_eq!(a, b);
         }
         let _ = std::fs::remove_file(ps);
+    }
+
+
+    #[test]
+    fn sym_eig_jacobi_recovers_known_spectrum() {
+        // A = Q diag(3,1) Qᵀ for a 45° Q ⇒ eigenvalues {3,1}, eigenvectors the rotated axes.
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let a = Array2::from_shape_vec((2, 2), vec![2.0, 1.0, 1.0, 2.0]).unwrap(); // eig {3,1}
+        let (ev, vec) = sym_eig_jacobi(&a);
+        assert!((ev[0] - 3.0).abs() < 1e-4 && (ev[1] - 1.0).abs() < 1e-4);
+        // leading eigenvector ~ (1,1)/√2 (up to sign)
+        assert!((vec[[0, 0]].abs() - c).abs() < 1e-3 && (vec[[1, 0]].abs() - c).abs() < 1e-3);
+    }
+
+    #[test]
+    fn truncate_recovers_a_low_rank_matrix() {
+        // A = rank-3 signal + small full-rank noise, d=24. Truncating to rank 3 should recover the signal well and beat
+        // keeping the noisy full matrix.
+        let (d, k) = (24usize, 3usize);
+        let mut rng = Rng::new(11);
+        let b = Array2::from_shape_fn((d, k), |_| rng.gauss());
+        let c = Array2::from_shape_fn((d, k), |_| rng.gauss());
+        let signal = b.dot(&c.t()); // exact rank 3
+        let noise = Array2::from_shape_fn((d, d), |_| 0.02 * rng.gauss());
+        let a = &signal + &noise;
+        let ak = truncate_rank(&a, k, &mut rng, 2);
+        let err_k: f32 = (&ak - &signal).iter().map(|v| v * v).sum();
+        let err_full: f32 = (&a - &signal).iter().map(|v| v * v).sum();
+        assert!(err_k < err_full, "rank-k truncation ({err_k}) must be closer to the signal than the noisy full matrix ({err_full})");
+        assert!(err_k < 0.6 * err_full, "truncation should remove a meaningful share of the noise energy");
+    }
+
+    #[test]
+    fn logit_weighted_keeps_relevant_over_big_irrelevant() {
+        // L has (a) a BIG map e3→e4 into a logit-IRRELEVANT output coord (M weight 0.001), and (b) a SMALL map e0→e0
+        // into a RELEVANT coord (M weight 1). Plain rank-1 keeps the big one (σ=10); logit-weighted rank-1 must keep the
+        // relevant one — because A = Lᵀ M L ranks e0 (0.5²·1) above e3 (10²·0.001).
+        let d = 6usize;
+        let m = Array2::from_shape_fn((d, d), |(i, j)| if i == j { if i < 3 { 1.0 } else { 0.001 } } else { 0.0 });
+        let mut l = Array2::<f32>::zeros((d, d));
+        l[[4, 3]] = 10.0; // big, irrelevant
+        l[[0, 0]] = 0.5; // small, relevant
+        let mut j = l.clone();
+        for i in 0..d {
+            j[[i, i]] += 1.0; // J = I + L
+        }
+        let jl = rank_reduce_logit(&j, 1, &m, 1);
+        assert!(jl[[0, 0]] > 1.3, "logit-weighted must KEEP the relevant e0→e0 (J[0,0]≈1.5), got {}", jl[[0, 0]]);
+        assert!(jl[[4, 3]].abs() < 0.5, "logit-weighted must DROP the big irrelevant e3→e4, got {}", jl[[4, 3]]);
+        let jp = rank_reduce(&j, 1, 1); // plain SVD keeps the biggest-magnitude direction
+        assert!(jp[[4, 3]] > 5.0, "plain rank keeps the big e3→e4, got {}", jp[[4, 3]]);
+        assert!(jp[[0, 0]] < 1.3, "plain rank drops the small e0→e0, got {}", jp[[0, 0]]);
+    }
+
+    #[test]
+    fn truncate_full_rank_is_a_noop() {
+        let mut rng = Rng::new(3);
+        let a = Array2::from_shape_fn((6, 6), |_| rng.gauss());
+        assert_eq!(truncate_rank(&a, 0, &mut rng, 2), a); // k=0
+        assert_eq!(truncate_rank(&a, 6, &mut rng, 2), a); // k>=d
+    }
+
+    #[test]
+    fn rank_reduce_preserves_identity_and_reduces_l() {
+        let d = 20usize;
+        // J = I exactly ⇒ L = 0 ⇒ rank-reduce is still I.
+        let jid = Array2::<f32>::eye(d);
+        let r = rank_reduce(&jid, 4, 1);
+        assert!((&r - &jid).iter().map(|v| v.abs()).fold(0.0, f32::max) < 1e-5);
+        // J = I + rank-2 ⇒ rank_reduce(k=2) should recover it (L is exactly rank 2).
+        let mut rng = Rng::new(9);
+        let u = Array2::from_shape_fn((d, 2), |_| rng.gauss());
+        let v = Array2::from_shape_fn((d, 2), |_| rng.gauss());
+        let mut j = u.dot(&v.t());
+        for i in 0..d {
+            j[[i, i]] += 1.0;
+        }
+        let jr = rank_reduce(&j, 2, 1);
+        assert!((&jr - &j).iter().map(|v| v * v).sum::<f32>() < 1e-3, "rank-2 J recovered by rank_reduce(k=2)");
     }
 
     #[test]
