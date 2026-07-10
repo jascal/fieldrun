@@ -1160,13 +1160,14 @@ impl rustyline::completion::Completer for SlashHelper {
             let frag = &upto[arg_start..];
             let subs: &[&str] = match cmd {
                 "/explain" => &["on", "off", "route", "circuits", "all", "logic", "recursion", "context", "tokens"],
+                "/trajectory" => &["causal"],
                 "/format" => &["on", "off"],
                 "/bucket" => &["on", "off", "experts", "k", "reset", "dump"],
                 _ => &[],
             };
             Ok((arg_start, subs.iter().filter(|s| s.starts_with(frag)).map(|s| pair(s)).collect()))
         } else {
-            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/export-logic", "/bucket", "/format", "/raw", "/help"];
+            const CMDS: &[&str] = &["/exit", "/quit", "/reset", "/clear", "/explain", "/trajectory", "/export-logic", "/bucket", "/format", "/raw", "/help"];
             Ok((0, CMDS.iter().filter(|c| c.starts_with(upto)).map(|c| pair(c)).collect()))
         }
     }
@@ -1311,6 +1312,37 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                     fmt = false;
                     eprintln!("[fieldrun] markdown rendering OFF (raw)");
                 }
+                // /trajectory [causal] <text> — the residual-trajectory explain (JLENS.md) for the model's NEXT-token
+                // decision given <text> in the current chat context: per residual write, the EXACT ‖write‖ + Δ→pred, the
+                // cumulative logit-lens vocab read (◄resolve), and — with `causal` — a MEASURED block-ablation flip.
+                // Lens-only is interactive (~a forward); `causal` adds 2·n_layer forwards (seconds). rope/neox archs.
+                "trajectory" | "traj" => {
+                    let mut toks: Vec<&str> = parts.collect();
+                    let do_causal = if toks.first() == Some(&"causal") {
+                        toks.remove(0);
+                        true
+                    } else {
+                        false
+                    };
+                    let prompt = toks.join(" ");
+                    if prompt.trim().is_empty() {
+                        eprintln!("[fieldrun] /trajectory [causal] <text> — residual-trajectory explain of the model's next-token \
+                                   decision after <text>: per write, exact ‖·‖ + Δ→pred, the cumulative logit-lens vocab read \
+                                   (◄resolve), and (with `causal`) a measured block-ablation flip. e.g. /trajectory The capital of France is");
+                    } else {
+                        let (p, add_special) = if chatml {
+                            (tg.chat_prompt(None, &history, &prompt), false)
+                        } else {
+                            (prompt.clone(), true)
+                        };
+                        let ids = tg.encode(&p, add_special);
+                        if do_causal {
+                            let nl = lm.dims().map(|(n, _)| n).unwrap_or(0);
+                            eprintln!("[fieldrun] /trajectory: running the trajectory + {} block ablations (a few seconds)…", 2 * nl);
+                        }
+                        crate::jlens::trajectory(lm.as_ref(), &tg, &ids, 3, do_causal, false);
+                    }
+                }
                 // /export-logic [file.dl] <prompt> — generate the WHOLE reply to <prompt> (greedy, to EOS / max_tokens) in the
                 // SAME chat context a real turn uses, and emit it as a semiring-Datalog decode TRACE: one runnable .dl per
                 // generated token (prefix.000.dl, prefix.001.dl, …). gen_ids IS the trajectory; we walk it exactly like the
@@ -1442,6 +1474,7 @@ pub fn chat(lm: Box<dyn Model>, tg: TextGen, max_tokens: usize, mut explain: Opt
                         ("/explain recursion", "long-range binds vs nested folds over the reply (rope family only)"),
                         ("/explain context <N|all>", "how many trailing context tokens to show (default 10)"),
                         ("/explain tokens <N|all>", "deep-explain only the first/last N reply tokens"),
+                        ("/trajectory [causal] <text>", "residual-trajectory of the next-token decision: per write, exact ‖·‖ + Δ→pred, cumulative logit-lens read (◄resolve); `causal` adds measured block-ablations (rope/neox)"),
                     ]);
                     group(&mut h, "datalog export", &[
                         ("/export-logic [file.dl] <prompt>", "generate the whole reply and emit one runnable .dl per token (semiring-Datalog decode trace); stitch with `fieldrun stitch`"),
