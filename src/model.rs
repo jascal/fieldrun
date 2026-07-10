@@ -309,6 +309,13 @@ pub trait Model: Sync {
         None
     }
 
+    /// Like `predict_patched` but returns the full next-token LOGIT vector (not just the argmax) — so a causal
+    /// interchange can be scored by the target token's logit SHIFT, a continuous signal, not only the top-1 flip.
+    /// Default None; arches that support patching implement it (and `predict_patched` can delegate to its argmax).
+    fn logits_patched(&self, _ids: &[i64], _layer: usize, _positions: &[usize], _donors: &[Vec<f32>]) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Explain the prediction (composition-side circuits + features). Default None; GPT-2 implements it.
     fn explain(&self, _ids: &[i64]) -> Option<crate::explain::Explanation> {
         None
