@@ -946,9 +946,13 @@ impl Model for Rope {
         self.gate = None;
     }
 
-    fn predict_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)], attn_layers: &[usize], mlp_layers: &[usize]) -> Option<i64> {
+    fn logits_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)], attn_layers: &[usize], mlp_layers: &[usize]) -> Option<Vec<f32>> {
         let xf = self.hidden_ab(ids, heads, neurons, attn_layers, mlp_layers);
-        let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
+        Some(self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec()))
+    }
+
+    fn predict_ablated_blocks(&self, ids: &[i64], heads: &[(usize, usize)], neurons: &[(usize, usize)], attn_layers: &[usize], mlp_layers: &[usize]) -> Option<i64> {
+        let logits = self.logits_ablated_blocks(ids, heads, neurons, attn_layers, mlp_layers)?;
         Some(logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
     }
 

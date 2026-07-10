@@ -1279,11 +1279,11 @@ mod cli {
             "[jlens] trajectory · predicts {} (logit {:.2}, margin {:+.2} vs {}) · {} writes · cum-lens=logit (empirical)",
             dec(pred), logits[pred as usize], logits[pred as usize] - rul, dec(ru), labels.len()
         );
-        println!("  block         write‖    Δ→pred   cum-lens top{topk}                     {}", if do_causal { "ablate→flip?" } else { "(causal off — /trajectory causal)" });
+        println!("  block         write‖    Δ→pred   cum-lens top{topk}                     {}", if do_causal { "ablate Δ→pred (flip)" } else { "(causal off — /trajectory causal)" });
         let mut cum = vec![0f32; d];
         let mut resolve: Option<usize> = None;
-        // (label, write_l2, dla, top-k ids, flip)
-        let mut rec: Vec<(String, f32, f32, Vec<i64>, Option<bool>)> = Vec::new();
+        // (label, write_l2, dla, top-k ids, causal: (Δlogit-of-pred-when-ablated, flips-top1))
+        let mut rec: Vec<(String, f32, f32, Vec<i64>, Option<(f32, bool)>)> = Vec::new();
         for (b, (lab, w)) in labels.iter().zip(&dvec).enumerate() {
             for (c, &wv) in w.iter().enumerate() {
                 cum[c] += wv;
@@ -1295,14 +1295,18 @@ mod cli {
             if top.first() == Some(&pred) && resolve.is_none() {
                 resolve = Some(b);
             }
-            let (caus, flip) = if do_causal {
+            let (caus, cinfo) = if do_causal {
                 match parse(lab) {
                     Some((l, is_attn)) => {
                         let (al, ml): (Vec<usize>, Vec<usize>) = if is_attn { (vec![l], vec![]) } else { (vec![], vec![l]) };
-                        match model.predict_ablated_blocks(ids, &[], &[], &al, &ml) {
-                            Some(t) => {
-                                let f = t != pred;
-                                (if f { format!("FLIP→{}", dec(t)) } else { "·".into() }, Some(f))
+                        match model.logits_ablated_blocks(ids, &[], &[], &al, &ml) {
+                            // Δlogit = predicted token's logit AFTER zeroing this block − before; negative ⇒ the block
+                            // was SUPPORTING the prediction (a measured, continuous causal weight, not just the flip).
+                            Some(abl) => {
+                                let dlog = abl[pred as usize] - logits[pred as usize];
+                                let f = argmax(&abl) != pred;
+                                let s = if f { format!("{dlog:>+6.2}  FLIP→{}", dec(argmax(&abl))) } else { format!("{dlog:>+6.2}") };
+                                (s, Some((dlog, f)))
                             }
                             None => ("—".into(), None),
                         }
@@ -1315,7 +1319,7 @@ mod cli {
             let toks = top.iter().map(|&t| dec(t)).collect::<Vec<_>>().join("  ");
             let rmark = if Some(b) == resolve { " ◄resolve" } else { "" };
             println!("  {:<12}  {:>6.2}   {:>+7.2}   {:<30}{:<9} {}", lab, wl2, dla, toks, rmark, caus);
-            rec.push((lab.clone(), wl2, dla, top, flip));
+            rec.push((lab.clone(), wl2, dla, top, cinfo));
         }
         // ---- summary ----
         let rb = resolve.map(|b| format!("{} (write {}/{})", rec[b].0, b + 1, rec.len())).unwrap_or_else(|| "never (last write only)".into());
@@ -1325,14 +1329,20 @@ mod cli {
         let writers: Vec<String> = order.iter().take(4).map(|&i| format!("{} {:+.2}", rec[i].0, rec[i].2)).collect();
         println!("  → top exact writers to {}: {}", dec(pred), writers.join(", "));
         if do_causal {
-            let flips: Vec<String> = rec.iter().filter(|r| r.4 == Some(true)).map(|r| r.0.clone()).collect();
-            println!("  → single-block ablations that FLIP the prediction: {}", if flips.is_empty() { "(none singly — the write is distributed)".into() } else { flips.join(", ") });
+            // most causally load-bearing = biggest DROP in the predicted logit when the block is zeroed (most negative Δ).
+            let mut cord: Vec<usize> = (0..rec.len()).filter(|&i| rec[i].4.is_some()).collect();
+            cord.sort_by(|&a, &b| rec[a].4.unwrap().0.total_cmp(&rec[b].4.unwrap().0));
+            let load: Vec<String> = cord.iter().take(4).map(|&i| format!("{} {:+.2}", rec[i].0, rec[i].4.unwrap().0)).collect();
+            println!("  → most causally load-bearing (Δlogit→pred when ablated): {}", load.join(", "));
+            let flips: Vec<String> = rec.iter().filter(|r| r.4.map(|(_, f)| f).unwrap_or(false)).map(|r| r.0.clone()).collect();
+            println!("  → single-block ablations that FLIP the top-1: {}", if flips.is_empty() { "(none singly — the write is distributed)".into() } else { flips.join(", ") });
         }
-        println!("  (‖·‖ + Δ→pred are EXACT block contributions; cum-lens is the logit-lens readout — empirical, VOCAB tokens not named concepts; ablate→flip is MEASURED.)");
+        println!("  (‖·‖ + Δ→pred are EXACT block contributions; cum-lens is the logit-lens readout — empirical, VOCAB tokens not named concepts; ablate Δlogit/flip is MEASURED.)");
         if json {
-            let blocks: Vec<serde_json::Value> = rec.iter().map(|(lab, wl2, dla, top, flip)| {
+            let blocks: Vec<serde_json::Value> = rec.iter().map(|(lab, wl2, dla, top, cinfo)| {
                 serde_json::json!({ "block": lab, "write_l2": wl2, "dla_pred": dla,
-                    "cum_lens_top": top.iter().map(|&t| dec(t)).collect::<Vec<_>>(), "ablate_flips": flip })
+                    "cum_lens_top": top.iter().map(|&t| dec(t)).collect::<Vec<_>>(),
+                    "ablate_dlogit": cinfo.map(|(d, _)| d), "ablate_flips": cinfo.map(|(_, f)| f) })
             }).collect();
             let out = serde_json::json!({
                 "predicted": dec(pred), "predicted_id": pred, "runner_up": dec(ru), "margin": logits[pred as usize] - rul,

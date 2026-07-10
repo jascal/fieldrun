@@ -454,6 +454,14 @@ pub trait Model: Sync {
         None
     }
 
+    /// Like `predict_ablated_blocks` but returns the full LOGIT vector (not just the argmax) — so a block ablation can be
+    /// scored by the CONTINUOUS logit shift of a token (`Δlogit = ablated[t] − base[t]`), not only the top-1 flip. The
+    /// trajectory explain uses it for a per-block `Δ→pred(ablate)` magnitude. Default None; rope/neox implement it (and
+    /// `predict_ablated_blocks` can delegate to its argmax).
+    fn logits_ablated_blocks(&self, _ids: &[i64], _heads: &[(usize, usize)], _neurons: &[(usize, usize)], _attn_layers: &[usize], _mlp_layers: &[usize]) -> Option<Vec<f32>> {
+        None
+    }
+
     /// (n_layer, n_head) — for the rescue-localization layer sweep (`--probe-ablate`): ablate the top circuit + a whole
     /// downstream layer's attention to find where the indirect rescue δ lives. Default None; rope implements it.
     fn dims(&self) -> Option<(usize, usize)> {
