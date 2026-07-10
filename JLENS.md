@@ -78,6 +78,9 @@ basis via the conjugation `diag(γ) J diag(1/γ)`. For **RMSNorm** archs (rope) 
 conjugation is **exact**; for **LayerNorm** archs (neox) it omits the mean-centering rank-1 term and the `ln_f` bias, so
 `gamma_exact=false` (a documented approximation). Unlike `--jlens-export` (a pure transcode), this reads the loaded
 model's weights — pass `--bundle`. Implemented for the **rope** and **neox** families (others report unsupported).
+**Quantized bundles**: `U` is dequantized via the forward's `rows_f32` path, so an int8/RowI8 embed/unembed exports the
+same `(vocab, d)` f32 as an f32 bundle (within int8 noise) — the deep (≥24L) models that show the correction win are
+all int8, so this is the usual case.
 
 Feed the two files to the sweep (`--U`/`--gamma` read the `U`/`gamma` arrays from the same `.npz`):
 `jlens_correction_sweep.py run.source.jsonl --jlens model.npz --U model.tensors.npz --gamma model.tensors.npz`.
