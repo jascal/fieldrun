@@ -132,7 +132,10 @@ named "concepts" or J-space "amplification" numbers — the readout is vocab tok
 it matches the actual next token), the **resolve write and its depth** (fraction of the stack; low = decided early /
 copy-like, high = decided late / computed), the top exact writer, and the margin. Reveals cross-position structure — e.g.
 a *repeated* pattern resolves earlier and more confidently the second time (induction), while computed answers resolve
-late. Lens-only (batch); knobs `--traj-from N`, `--traj-max-pos N`. Run the single-position mode for the per-block + causal dive.
+late. Lens-only (batch); knobs `--traj-from N` (default 1 — skips the first token) and `--traj-max-pos N` (default 32).
+CLI-only — the REPL `/trajectory` stays single-position for interactive causal work. Resolve depth is a *lens* read, so
+`never` (shown as 100%) is possible when the cumulative-lens argmax never matches the final logits. Run the
+single-position mode for the per-block + causal dive.
 
 Also in the `--chat` REPL: **`/trajectory [causal] <text>`** runs it on the model's next-token decision in the current
 chat context. Lens-only is interactive (~one forward); `causal` opts into the block ablations (a few seconds, so it is

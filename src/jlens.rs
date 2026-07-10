@@ -1303,7 +1303,10 @@ mod cli {
         println!("  pos  token           →pred          actual        resolve         depth  top-writer     margin");
         let (mut sum_depth, mut hits, mut n) = (0f32, 0usize, 0usize);
         for p in from..last {
-            let Some(s) = traj_summary(model, &ids[..=p]) else { continue };
+            let Some(s) = traj_summary(model, &ids[..=p]) else {
+                eprintln!("[jlens] --traj-multi: skipped position {p} (residual_normed_writes / logits hook returned None)");
+                continue;
+            };
             let cur = dec(ids[p]);
             let (actual, hit) = if p + 1 < seq {
                 let a = ids[p + 1];
