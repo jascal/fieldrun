@@ -353,6 +353,14 @@ pub trait Model: Sync {
         None
     }
 
+    /// Project an arbitrary residual-space vector `v` (d,) through the unembedding → logits over the vocab. This is the
+    /// logit-lens of any residual (or partial residual) — used by the trajectory explain to read the CUMULATIVE
+    /// block-write sum at each stage. Default None; the rope/neox families implement it. `⟨cumsum(d̃_b), U_v⟩` at the
+    /// last block equals the true logit, so the readout converges exactly to the model's prediction.
+    fn unembed_project(&self, _v: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Full next-token logit vector at the predicting position (the same vector `predict` argmaxes). For
     /// per-token loss / target-token-logit measurement (`ablate-eval`). Default None; arches wire it where they can.
     fn logits(&self, _ids: &[i64]) -> Option<Vec<f32>> {

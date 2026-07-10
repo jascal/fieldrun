@@ -1116,6 +1116,10 @@ impl Model for Rope {
         if na > 0.0 && nb > 0.0 { Some(dot / (na * nb)) } else { None }
     }
 
+    fn unembed_project(&self, v: &[f32]) -> Option<Vec<f32>> {
+        Some(self.b.rowdot_f32(self.unembed_name(), v)) // logit-lens of any residual vector
+    }
+
     fn unembed_row(&self, id: usize) -> Option<Vec<f32>> {
         let r = self.b.weight_row(self.unembed_name(), id);
         if r.is_empty() { None } else { Some(r) }

@@ -103,6 +103,29 @@ swapped residual; no lens, no resolve-layer).
   the swap `Δ`: the J-space `P_JΔ` (from `{J_l}`) vs its complement vs a diff-subspace **oracle** (top-PCA of the actual
   swaps) vs random; report flip + capture `‖PΔ‖/‖Δ‖`. Knobs: `--jlens-in`, `--causal-layer`, `--causal-jspace k1,k2,…`.
 
+## Trajectory explain (`--jlens-trajectory`)
+
+A **faithful** per-token residual-trajectory explain for the predicting position — the honest version of a "watch the
+concept evolve through the block" record. For each residual-stream write (embed, then each layer's attn / mlp) it prints:
+
+- **`write‖`** — the write magnitude `‖d̃_b‖` (the block's delta into logit-space), and **`Δ→pred`** — that block's
+  **exact** direct logit contribution to the predicted token. Both from `residual_normed_writes` (`Σ_b d̃_b` = the true
+  logit, exactly).
+- **`cum-lens top-k`** — the cumulative logit-lens read (the top-k **vocabulary tokens** the residual points at after
+  this block). Tagged `empirical`; it converges exactly to the model's prediction at the last write. `◄resolve` marks
+  the first block whose read locks to the final token.
+- **`ablate→flip?`** — a **measured** causal flag: does zeroing this whole block (`predict_ablated_blocks`) flip the
+  prediction, and to what.
+
+```bash
+fieldrun --bundle <model> --text "The capital of France is" --recursion-explain --jlens-trajectory --traj-topk 2
+# → resolves to " Paris" at L21.mlp; top exact writers L21.attn +4.24, L21.mlp +3.89; ablating L20.mlp/L21.attn flips it.
+```
+
+Knobs: `--traj-topk`, `--traj-causal 0` (skip the ~2·n_layer ablation forwards), `--traj-json`. **Deliberately not**
+named "concepts" or J-space "amplification" numbers — the readout is vocab tokens (concept dictionaries are the
+`sm-sae`/`polygram` stack), and every field is exact, measured, or tagged-empirical. rope/neox families.
+
 ## Eval-time denoising knobs (`--jlens-rank`, `--jlens-logit-rank`, `--jlens-shrink`)
 
 Applied to a loaded `{J_l}` before the read (no re-fit): `--jlens-shrink λ` blends toward the logit-lens;
