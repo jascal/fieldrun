@@ -778,45 +778,20 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
     }
 }
 
-/// `--source-dump <path>`: the forge-tax certificate seam. Per natural-text position emits the RAW per-block
-/// contribution vectors `d̃_b ∈ ℝ^d` (final-norm folded, in unembed space; `r_x = Σ_b d̃_b`) — NOT their projection onto
-/// the model's own `U`. The certificate (pic/spec/forge_tax_certificate.md) holds these fixed and frees the decoder
-/// frame `U'`, so faithfulness + single-source become an LP in `U'`; that needs the raw `d̃_b`, which `--pil-dump`
-/// (incidences under the model's own `U`) cannot supply. Emits the target token + top-K competitor ids per position;
-/// a recon self-check (`Σ_b ⟨d̃_b, U_v⟩` vs the model logit argmax) is printed to confirm exactness.
-pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
-    let path = match flag(args, "--source-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-dump needs a path"); return; } };
-    let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(24);
-    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(64);
-    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
-        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
-        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
-        in which a hypothesis must be tested against evidence before it can be accepted.";
-    let ids: Vec<i64> = if let Some(idspath) = flag(args, "--ids") {
-        let txt = std::fs::read_to_string(idspath).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
-        let arr = v.get("holdout_ids").and_then(|a| a.as_array()).or_else(|| v.as_array());
-        match arr { Some(a) => a.iter().filter_map(|x| x.as_i64()).collect(), None => { eprintln!("[fieldrun] --ids: no id array"); return; } }
-    } else {
-        match tg { Some(t) => t.encode(flag(args, "--text").unwrap_or(DEFAULT), false),
-                   None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
-    };
-    if ids.len() < 4 { eprintln!("[fieldrun] source-dump: too few ids ({})", ids.len()); return; }
-    let mut out = String::new();
+fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, nmax: usize, sid: Option<&str>, out: &mut String) -> (usize, usize) {
     let last = (ids.len() - 1).min(nmax + 1);
     let mut recon_ok = 0usize;
     let mut npos = 0usize;
-    eprintln!("[fieldrun] source-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
     for p in 1..last {
         let ctx = &ids[..=p];
-        let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return; } };
+        let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return (recon_ok, npos); } };
         let mut order: Vec<usize> = (0..logits.len()).collect();
         order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
         let target = ids[p + 1];
         let mut cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
         if !cand.contains(&target) { cand.pop(); cand.push(target); }
         let (labels, dvec) = match lm.residual_normed_writes(ctx) {
-            Some(x) => x, None => { eprintln!("[fieldrun] arch lacks residual_normed_writes (rope/neox)"); return; }
+            Some(x) => x, None => { eprintln!("[fieldrun] arch lacks residual_normed_writes (rope/neox)"); return (recon_ok, npos); }
         };
         let pred = order[0] as i64;
         let margin = logits[order[0]] - logits[order[1]];
@@ -846,10 +821,87 @@ pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
         dstr.push(']');
         let cands_str: Vec<String> = cand.iter().map(|c| c.to_string()).collect();
         let labels_str: Vec<String> = labels.iter().map(|l| format!("\"{l}\"")).collect();
-        out.push_str(&format!(
-            "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"dim\":{},\"cands\":[{}],\"blocks\":[{}],\"d\":{dstr}}}\n",
-            ids[p], dvec.first().map(|d| d.len()).unwrap_or(0), cands_str.join(","), labels_str.join(",")));
+        if let Some(sid) = sid {
+            out.push_str(&format!(
+                "{{\"sid\":{},\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"dim\":{},\"cands\":[{}],\"blocks\":[{}],\"d\":{dstr}}}\n",
+                serde_json::to_string(sid).unwrap(), ids[p], dvec.first().map(|d| d.len()).unwrap_or(0), cands_str.join(","), labels_str.join(",")));
+        } else {
+            out.push_str(&format!(
+                "{{\"pos\":{p},\"cur\":{},\"target\":{target},\"tgt_idx\":{tgt_idx},\"pred\":{pred},\"margin\":{margin:.4},\"dim\":{},\"cands\":[{}],\"blocks\":[{}],\"d\":{dstr}}}\n",
+                ids[p], dvec.first().map(|d| d.len()).unwrap_or(0), cands_str.join(","), labels_str.join(",")));
+        }
     }
+    (recon_ok, npos)
+}
+
+/// `--source-dump <path>`: the forge-tax certificate seam. Per natural-text position emits the RAW per-block
+/// contribution vectors `d̃_b ∈ ℝ^d` (final-norm folded, in unembed space; `r_x = Σ_b d̃_b`) — NOT their projection onto
+/// the model's own `U`. The certificate (pic/spec/forge_tax_certificate.md) holds these fixed and frees the decoder
+/// frame `U'`, so faithfulness + single-source become an LP in `U'`; that needs the raw `d̃_b`, which `--pil-dump`
+/// (incidences under the model's own `U`) cannot supply. Emits the target token + top-K competitor ids per position;
+/// a recon self-check (`Σ_b ⟨d̃_b, U_v⟩` vs the model logit argmax) is printed to confirm exactness.
+pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
+    let path = match flag(args, "--source-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-dump needs a path"); return; } };
+    let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(24);
+    let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(64);
+    let mut out = String::new();
+    if let Some(textspath) = flag(args, "--texts") {
+        let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } };
+        let txt = match std::fs::read_to_string(textspath) {
+            Ok(txt) => txt,
+            Err(e) => { eprintln!("[fieldrun] cannot read {textspath}: {e}"); return; }
+        };
+        let mut sentences = 0usize;
+        let mut total_positions = 0usize;
+        let mut recon_ok_total = 0usize;
+        let mut npos_total = 0usize;
+        for (line_idx, line) in txt.lines().enumerate() {
+            if line.trim().is_empty() { continue; }
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("[fieldrun] source-dump: skipping line {}: {e}", line_idx + 1); continue; }
+            };
+            let (sid, text) = match (v.get("sid").and_then(|x| x.as_str()), v.get("text").and_then(|x| x.as_str())) {
+                (Some(sid), Some(text)) => (sid, text),
+                _ => { eprintln!("[fieldrun] source-dump: skipping line {}: needs string sid and text", line_idx + 1); continue; }
+            };
+            let ids = tg.encode(text, false);
+            if ids.len() < 4 {
+                eprintln!("[fieldrun] source-dump: skipping sid={sid} too few ids ({})", ids.len());
+                continue;
+            }
+            sentences += 1;
+            total_positions += (ids.len() - 1).min(nmax + 1).saturating_sub(1);
+            let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, Some(sid), &mut out);
+            recon_ok_total += recon_ok;
+            npos_total += npos;
+        }
+        let recon = if npos_total > 0 { format!("{:.2}", recon_ok_total as f32 / npos_total as f32) } else { "n/a (no unembed_row)".into() };
+        eprintln!("[fieldrun] source-dump · {sentences} sentences · {total_positions} positions · one load → {path}");
+        match std::fs::write(path, &out) {
+            Ok(_) => eprintln!("[fieldrun] wrote {total_positions} records → {path}  (recon argmax {recon})"),
+            Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
+        }
+        return;
+    }
+
+    const DEFAULT: &str = "The history of science is the study of how knowledge of the natural world has developed over \
+        the centuries. Early civilisations recorded observations of the stars and the seasons, and from those records \
+        they built the first calendars. Much later, careful experiments replaced pure speculation, and a method emerged \
+        in which a hypothesis must be tested against evidence before it can be accepted.";
+    let ids: Vec<i64> = if let Some(idspath) = flag(args, "--ids") {
+        let txt = std::fs::read_to_string(idspath).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let arr = v.get("holdout_ids").and_then(|a| a.as_array()).or_else(|| v.as_array());
+        match arr { Some(a) => a.iter().filter_map(|x| x.as_i64()).collect(), None => { eprintln!("[fieldrun] --ids: no id array"); return; } }
+    } else {
+        match tg { Some(t) => t.encode(flag(args, "--text").unwrap_or(DEFAULT), false),
+                   None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
+    };
+    if ids.len() < 4 { eprintln!("[fieldrun] source-dump: too few ids ({})", ids.len()); return; }
+    let last = (ids.len() - 1).min(nmax + 1);
+    eprintln!("[fieldrun] source-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
+    let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, None, &mut out);
     let recon = if npos > 0 { format!("{:.2}", recon_ok as f32 / npos as f32) } else { "n/a (no unembed_row)".into() };
     match std::fs::write(path, &out) {
         Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon})", last.saturating_sub(1)),
