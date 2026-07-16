@@ -778,7 +778,8 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
     }
 }
 
-fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, nmax: usize, sid: Option<&str>, out: &mut String) -> (usize, usize) {
+/// Per-position residual dump used by `--source-dump` and the GPU faithfulness check (`--gpu-dump-check`).
+pub(crate) fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, nmax: usize, sid: Option<&str>, out: &mut String) -> (usize, usize) {
     let last = (ids.len() - 1).min(nmax + 1);
     let mut recon_ok = 0usize;
     let mut npos = 0usize;
