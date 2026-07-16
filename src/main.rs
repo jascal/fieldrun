@@ -544,6 +544,116 @@ fn main() {
             return;
         }
 
+        // --gpu-dump-check: GPU residual-write faithfulness vs CPU Rope on the same --texts sentences.
+        // Reports median/max per-block relative error, recon-argmax parity, and top-1 logit agreement.
+        #[cfg(all(feature = "gpu", feature = "api"))]
+        if has_flag(&args, "--gpu-dump-check") {
+            let b1 = Bundle::load(&stem).expect("load bundle");
+            if b1.arch != "rope" {
+                println!("[fieldrun] --gpu-dump-check: arch {} not supported (rope only)", b1.arch);
+                return;
+            }
+            let texts_path = match flag(&args, "--texts") {
+                Some(p) => p,
+                None => {
+                    eprintln!("[fieldrun] --gpu-dump-check needs --texts <path.jsonl>");
+                    return;
+                }
+            };
+            let kcand: usize = flag(&args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(24);
+            let nmax: usize = flag(&args, "--n").and_then(|s| s.parse().ok()).unwrap_or(64);
+            let eos = b1.eos.clone();
+            let gpu = match gpu_rope::GpuRopeModel::new(b1) {
+                Some(g) => g,
+                None => { eprintln!("[fieldrun] --gpu-dump-check: no GPU adapter"); return; }
+            };
+            let cpu = Rope::new(Bundle::load(&stem).expect("load"), 0.0, false);
+            let tg = match api::TextGen::load(&stem, eos) {
+                Some(t) => t,
+                None => { eprintln!("[fieldrun] --gpu-dump-check: no tokenizer next to {stem}"); return; }
+            };
+            let txt = match std::fs::read_to_string(texts_path) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("[fieldrun] cannot read {texts_path}: {e}"); return; }
+            };
+            let mut rel_errs: Vec<f32> = Vec::new();
+            let mut npos = 0usize;
+            let mut top1_ok = 0usize;
+            let mut recon_ok = 0usize;
+            let mut recon_n = 0usize;
+            let mut sentences = 0usize;
+            for (line_idx, line) in txt.lines().enumerate() {
+                if line.trim().is_empty() { continue; }
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("[fieldrun] gpu-dump-check: skip line {}: {e}", line_idx + 1); continue; }
+                };
+                let text = match v.get("text").and_then(|x| x.as_str()) {
+                    Some(t) => t,
+                    None => { eprintln!("[fieldrun] gpu-dump-check: skip line {}: needs text", line_idx + 1); continue; }
+                };
+                let ids = tg.encode(text, false);
+                if ids.len() < 4 { continue; }
+                sentences += 1;
+                let last = (ids.len() - 1).min(nmax + 1);
+                for p in 1..last {
+                    let ctx = &ids[..=p];
+                    let (Some(lg_g), Some(lg_c)) = (gpu.logits(ctx), cpu.logits(ctx)) else {
+                        eprintln!("[fieldrun] gpu-dump-check: missing logits"); return;
+                    };
+                    let argmax = |v: &[f32]| -> i64 {
+                        v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64
+                    };
+                    let pred_g = argmax(&lg_g);
+                    let pred_c = argmax(&lg_c);
+                    if pred_g == pred_c { top1_ok += 1; }
+                    npos += 1;
+                    let (Some((lab_g, d_g)), Some((lab_c, d_c))) =
+                        (gpu.residual_normed_writes(ctx), cpu.residual_normed_writes(ctx))
+                    else {
+                        eprintln!("[fieldrun] gpu-dump-check: missing residual_normed_writes"); return;
+                    };
+                    if lab_g != lab_c || d_g.len() != d_c.len() {
+                        eprintln!("[fieldrun] gpu-dump-check: block-label/shape mismatch at pos {p}");
+                        return;
+                    }
+                    for (dg, dc) in d_g.iter().zip(d_c.iter()) {
+                        let diff: f32 = dg.iter().zip(dc.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                        let norm: f32 = dc.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        rel_errs.push(if norm > 0.0 { diff / norm } else { 0.0 });
+                    }
+                    // recon-argmax: Σ_b ⟨d̃_b^gpu, U_v⟩ over the top-kcand set should match GPU top-1
+                    let mut order: Vec<usize> = (0..lg_g.len()).collect();
+                    order.sort_unstable_by(|&a, &b| lg_g[b].partial_cmp(&lg_g[a]).unwrap());
+                    let cand: Vec<i64> = order.iter().take(kcand).map(|&i| i as i64).collect();
+                    let urows: Vec<Vec<f32>> = cand.iter().filter_map(|&c| gpu.unembed_row(c as usize)).collect();
+                    if urows.len() == cand.len() {
+                        let mut best = (f32::NEG_INFINITY, -1i64);
+                        for (k, u) in urows.iter().enumerate() {
+                            let lv: f32 = d_g.iter().map(|d| d.iter().zip(u.iter()).map(|(dd, ud)| dd * ud).sum::<f32>()).sum();
+                            if lv > best.0 { best = (lv, cand[k]); }
+                        }
+                        if best.1 == pred_g { recon_ok += 1; }
+                        recon_n += 1;
+                    }
+                }
+            }
+            rel_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (med, max) = if rel_errs.is_empty() {
+                (0.0, 0.0)
+            } else {
+                (rel_errs[rel_errs.len() / 2], *rel_errs.last().unwrap())
+            };
+            let top1 = if npos > 0 { 100.0 * top1_ok as f64 / npos as f64 } else { 0.0 };
+            let recon = if recon_n > 0 { 100.0 * recon_ok as f64 / recon_n as f64 } else { 0.0 };
+            println!("[fieldrun] GPU-dump-check [{}] · {sentences} sentences · {npos} positions · {} block-errors",
+                     gpu.gpu.name, rel_errs.len());
+            println!("[fieldrun]   residual rel-err ||d_gpu−d_cpu||/||d_cpu||: median {med:.6} · max {max:.6}");
+            println!("[fieldrun]   recon-argmax parity (GPU self-check): {recon_ok}/{recon_n} = {recon:.1}%");
+            println!("[fieldrun]   top-1 logit agreement GPU==CPU: {top1_ok}/{npos} = {top1:.1}%");
+            return;
+        }
+
         // live spinner while the bundle loads (mmap + dequant; a multi-GB int8 model takes a few seconds), so it's
         // clearly working, not hung — then "loaded", then the mode (chat prompt / server line) appears.
         let bundle = {
@@ -583,10 +693,38 @@ fn main() {
         let eos = bundle.eos.clone(); // for the text API / --chat stop condition
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let kv_int8 = has_flag(&args, "--kv-int8");
+        // GPU residual dumps: only when arch=rope + explicit --device gpu + --source-dump (narrow blast radius).
+        // Other consumers under --device gpu keep the CPU Model (they call methods GpuRopeModel does not implement).
         let mut lm: Box<dyn Model> = match arch.as_str() {
             "gpt2" => Box::new(Gpt2::new(bundle, route, kv_int8)),
             "neox" => Box::new(Neox::new(bundle, route, kv_int8)),
-            "rope" => Box::new(Rope::new(bundle, route, kv_int8)),
+            "rope" => {
+                #[cfg(feature = "gpu")]
+                if dev.use_gpu && has_flag(&args, "--source-dump") {
+                    if route != 0.0 {
+                        eprintln!("[fieldrun] notice: --route-frac is inapplicable with --device gpu --source-dump (ignored)");
+                    }
+                    if kv_int8 {
+                        eprintln!("[fieldrun] notice: --kv-int8 is inapplicable with --device gpu --source-dump (ignored)");
+                    }
+                    match gpu_rope::GpuRopeModel::new(bundle) {
+                        Some(m) => {
+                            eprintln!("[fieldrun] GPU source-dump via GpuRope [{}]", m.gpu.name);
+                            Box::new(m) as Box<dyn Model>
+                        }
+                        None => {
+                            eprintln!("[fieldrun] GPU requested for --source-dump but no adapter; falling back to CPU Rope");
+                            Box::new(Rope::new(Bundle::load(&stem).expect("reload bundle"), route, kv_int8)) as Box<dyn Model>
+                        }
+                    }
+                } else {
+                    Box::new(Rope::new(bundle, route, kv_int8)) as Box<dyn Model>
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    Box::new(Rope::new(bundle, route, kv_int8)) as Box<dyn Model>
+                }
+            }
             "gemma" => Box::new(Gemma::new(bundle, route, kv_int8)),
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
             "gemma4" => Box::new(Gemma4::new(bundle, route, kv_int8)),

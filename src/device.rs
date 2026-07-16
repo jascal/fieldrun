@@ -52,11 +52,28 @@ pub fn select(pref: &str, model_bytes: u64, ram_bytes: u64) -> Choice {
     let cpu = |detail: String| Choice { use_gpu: false, detail };
     match pref {
         "cpu" => cpu(format!("CPU (requested) · {fit}{warn}")),
-        "gpu" | "auto" => {
+        // Explicit --device gpu only: opt-in/experimental (GPU residual dumps via --source-dump). "auto" stays CPU.
+        "gpu" => {
+            #[cfg(feature = "gpu")]
+            {
+                match gpu_probe() {
+                    Some(n) => Choice {
+                        use_gpu: true,
+                        detail: format!("GPU [{n}] · {fit}{warn} · GPU path active for --source-dump (rope)"),
+                    },
+                    None => cpu(format!("CPU · {fit}{warn} · GPU requested but no adapter found")),
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                cpu(format!("CPU · {fit}{warn} · GPU requested but not built with --features gpu"))
+            }
+        }
+        "auto" => {
             #[cfg(feature = "gpu")]
             {
                 let g = gpu_probe()
-                    .map(|n| format!(" · GPU [{n}] present (used only by --gpu-check; generation runs on CPU)"))
+                    .map(|n| format!(" · GPU [{n}] present (opt-in via --device gpu for --source-dump)"))
                     .unwrap_or_default();
                 cpu(format!("CPU · {fit}{warn}{g}"))
             }

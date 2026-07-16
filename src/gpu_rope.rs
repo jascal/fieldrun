@@ -13,6 +13,7 @@ use pollster::block_on;
 use wgpu::util::DeviceExt;
 
 use crate::bundle::Bundle;
+use crate::model::Model;
 
 // Shared-memory tiled GEMM (16×16): each A/B element is read from global memory once per tile and reused by all 16
 // threads in its row/col (~16× less traffic than the naive one-thread-per-output kernel). a:(m,k), w:(k,n), c:(m,n).
@@ -274,7 +275,8 @@ impl GpuRope {
         out
     }
 
-    pub fn predict(&self, ids: &[i64], b: &Bundle) -> i64 {
+    /// Full-vocab next-token logits at the last position. Same forward as `predict`; only the argmax is dropped.
+    pub fn logits(&self, ids: &[i64], b: &Bundle) -> Vec<f32> {
         let (seq, d, hd, h, nkv, ffn) = (ids.len(), self.d, self.hd, self.h, self.nkv, self.ffn);
         let qd = h * hd;
         let kvd = nkv * hd;
@@ -331,8 +333,144 @@ impl GpuRope {
         self.record(&mut enc, &mut ku, &mut kb, "rowdot", &[&xf, &self.embed, &logits],
                     [self.vocab as u32, du, ((seq - 1) * d) as u32, 0], (self.vocab.div_ceil(64) as u32, 1));
         self.queue.submit(Some(enc.finish()));
-        let lg = self.read(&logits, self.vocab);
+        self.read(&logits, self.vocab)
+    }
+
+    pub fn predict(&self, ids: &[i64], b: &Bundle) -> i64 {
+        let lg = self.logits(ids, b);
         lg.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as i64
+    }
+
+    /// Per-block residual writes at the last position, final-RMSNorm-folded — same semantics as
+    /// `Rope::residual_normed_writes` (block order `["embed","L0.attn","L0.mlp",…]`, `d̃_b = inv_rms · gain ⊙ write_b`).
+    /// One GPU submit: last-row o_proj / down_proj writes + pre-final-norm residual are copied into a collector in the
+    /// same encoder as the layer loop (no per-layer sync). Block 0 ("embed") is already host-side from the embed gather.
+    pub fn residual_normed_writes(&self, ids: &[i64], b: &Bundle) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        if ids.is_empty() { return None; }
+        let (seq, d, hd, h, nkv, ffn) = (ids.len(), self.d, self.hd, self.h, self.nkv, self.ffn);
+        let qd = h * hd;
+        let kvd = nkv * hd;
+        let x0 = b.rows_f32("embed", ids); // (seq, d) — also the raw embed write (block 0), host-side
+        let x = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: cast(x0.as_slice().unwrap()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        let (a, q, k, v) = (self.storage(seq * d), self.storage(seq * qd), self.storage(seq * kvd), self.storage(seq * kvd));
+        let (attn, proj, a2) = (self.storage(seq * qd), self.storage(seq * d), self.storage(seq * d));
+        let (gate, up, hbuf, down) = (self.storage(seq * ffn), self.storage(seq * ffn), self.storage(seq * ffn), self.storage(seq * d));
+        // collector: 2*n_layer last-row writes (attn, mlp per layer) + 1 slot for pre-final-norm xpre
+        let n_slots = 2 * self.n_layer + 1;
+        let collector = self.storage(n_slots * d);
+        let last_off = ((seq - 1) * d * 4) as u64;
+        let d_bytes = (d * 4) as u64;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let (mut ku, mut kb) = (Vec::new(), Vec::new());
+        let mm = |m: usize, n: usize| (m.div_ceil(16) as u32, n.div_ceil(16) as u32);
+        let g1 = |n: usize| (n.div_ceil(64) as u32, 1u32);
+        let epsb = self.eps.to_bits();
+        let (su, du) = (seq as u32, d as u32);
+        let mut slot = 0usize;
+        for l in 0..self.n_layer {
+            // Scope the compute-pass closure so it drops before the collector copies need `&mut enc`.
+            // After the layer finishes, `proj`/`down` still hold this layer's o_proj/down_proj last-row writes.
+            {
+                let p = format!("l{l}.");
+                let wf = |s: &str| match &self.w[&format!("{p}{s}")] { Wt::F32(b) => b, _ => panic!("gpu_rope: {s} expected f32") };
+                let bias = |s: &str| self.w.contains_key(&format!("{p}{s}.bias"));
+                let mut r = |name: &str, bufs: &[&wgpu::Buffer], dims: [u32; 4], groups: (u32, u32)|
+                    self.record(&mut enc, &mut ku, &mut kb, name, bufs, dims, groups);
+                let mw = |r: &mut dyn FnMut(&str, &[&wgpu::Buffer], [u32; 4], (u32, u32)),
+                              s: &str, a: &wgpu::Buffer, out: &wgpu::Buffer, dims: [u32; 4], groups: (u32, u32)| {
+                    match &self.w[&format!("{p}{s}")] {
+                        Wt::F32(wb) => r("matmul", &[a, wb, out], dims, groups),
+                        Wt::I8 { q, scale } => r("matmul_i8", &[a, q, scale, out], dims, groups),
+                    }
+                };
+                r("rmsnorm", &[&x, wf("in_ln"), &a], [su, du, epsb, 0], g1(seq));
+                mw(&mut r, "self_attn.q_proj", &a, &q, [su, du, qd as u32, 0], mm(seq, qd));
+                mw(&mut r, "self_attn.k_proj", &a, &k, [su, du, kvd as u32, 0], mm(seq, kvd));
+                mw(&mut r, "self_attn.v_proj", &a, &v, [su, du, kvd as u32, 0], mm(seq, kvd));
+                if bias("self_attn.q_proj") { r("addbias", &[&q, wf("self_attn.q_proj.bias")], [su, qd as u32, 0, 0], g1(seq * qd)); }
+                if bias("self_attn.k_proj") { r("addbias", &[&k, wf("self_attn.k_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
+                if bias("self_attn.v_proj") { r("addbias", &[&v, wf("self_attn.v_proj.bias")], [su, kvd as u32, 0, 0], g1(seq * kvd)); }
+                r("rope", &[&q, &self.inv], [su, h as u32, hd as u32, 0], ((seq * h).div_ceil(64) as u32, 1));
+                r("rope", &[&k, &self.inv], [su, nkv as u32, hd as u32, 0], ((seq * nkv).div_ceil(64) as u32, 1));
+                r("gqa", &[&q, &k, &v, &attn], [su, hd as u32, h as u32, nkv as u32], ((seq * h).div_ceil(64) as u32, 1));
+                mw(&mut r, "self_attn.o_proj", &attn, &proj, [su, qd as u32, du, 0], mm(seq, d));
+                r("add", &[&x, &proj], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
+                r("rmsnorm", &[&x, wf("post_ln"), &a2], [su, du, epsb, 0], g1(seq));
+                mw(&mut r, "mlp.gate_proj", &a2, &gate, [su, du, ffn as u32, 0], mm(seq, ffn));
+                mw(&mut r, "mlp.up_proj", &a2, &up, [su, du, ffn as u32, 0], mm(seq, ffn));
+                r("swiglu", &[&gate, &up, &hbuf], [(seq * ffn) as u32, 0, 0, 0], g1(seq * ffn));
+                mw(&mut r, "mlp.down_proj", &hbuf, &down, [su, ffn as u32, du, 0], mm(seq, d));
+                r("add", &[&x, &down], [(seq * d) as u32, 0, 0, 0], g1(seq * d));
+            }
+            // same encoder as the layer loop — no extra submit/sync; just more commands
+            enc.copy_buffer_to_buffer(&proj, last_off, &collector, (slot * d * 4) as u64, d_bytes);
+            slot += 1;
+            enc.copy_buffer_to_buffer(&down, last_off, &collector, (slot * d * 4) as u64, d_bytes);
+            slot += 1;
+        }
+        // exact pre-final-norm residual the GPU accumulated (do not reconstruct by summing host-side writes)
+        enc.copy_buffer_to_buffer(&x, last_off, &collector, (slot * d * 4) as u64, d_bytes);
+        self.queue.submit(Some(enc.finish()));
+        let raw = self.read(&collector, n_slots * d);
+
+        let mut labels: Vec<String> = vec!["embed".into()];
+        let mut writes: Vec<Vec<f32>> = vec![x0.row(seq - 1).to_vec()];
+        for l in 0..self.n_layer {
+            let aw = &raw[(2 * l) * d..(2 * l + 1) * d];
+            writes.push(aw.to_vec());
+            labels.push(format!("L{l}.attn"));
+            let mw = &raw[(2 * l + 1) * d..(2 * l + 2) * d];
+            writes.push(mw.to_vec());
+            labels.push(format!("L{l}.mlp"));
+        }
+        let xpre = &raw[(2 * self.n_layer) * d..(2 * self.n_layer + 1) * d];
+        let inv_rms = 1.0 / (xpre.iter().map(|v| v * v).sum::<f32>() / d as f32 + self.eps).sqrt();
+        let gain = b.arr1("norm");
+        let dvec: Vec<Vec<f32>> = writes
+            .iter()
+            .map(|w| w.iter().zip(gain.iter()).map(|(wd, gd)| inv_rms * wd * gd).collect())
+            .collect();
+        Some((labels, dvec))
+    }
+}
+
+/// `Model` wrapper around `GpuRope` for `--source-dump` under `--device gpu`. Owns the bundle (host embed gather +
+/// unembed rows) and the uploaded GPU state. Only the methods `dump_one` / `run_source_dump` call are implemented.
+pub struct GpuRopeModel {
+    pub gpu: GpuRope,
+    b: Bundle,
+}
+
+impl GpuRopeModel {
+    pub fn new(b: Bundle) -> Option<Self> {
+        let gpu = GpuRope::new(&b)?;
+        Some(Self { gpu, b })
+    }
+
+    fn unembed_name(&self) -> &'static str {
+        if self.b.config[7] != 0 { "embed" } else { "lm_head" }
+    }
+}
+
+impl Model for GpuRopeModel {
+    fn predict(&self, ids: &[i64]) -> i64 {
+        self.gpu.predict(ids, &self.b)
+    }
+
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        Some(self.gpu.logits(ids, &self.b))
+    }
+
+    fn residual_normed_writes(&self, ids: &[i64]) -> Option<(Vec<String>, Vec<Vec<f32>>)> {
+        self.gpu.residual_normed_writes(ids, &self.b)
+    }
+
+    fn unembed_row(&self, id: usize) -> Option<Vec<f32>> {
+        let r = self.b.weight_row(self.unembed_name(), id);
+        if r.is_empty() { None } else { Some(r) }
     }
 }
 
