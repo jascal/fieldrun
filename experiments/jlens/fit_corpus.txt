@@ -1,0 +1,300 @@
+Covers the recommendation contract, the schedule shape, the un-converged refusal UX, the two opt-outs, and the empirical reference points from bio-sae's runs.
+It rises strongly and **monotonically** with the token's self-information: Spearman **+0.83** vs the model-intrinsic baseline-logit rarity, **+0.67** vs corpus unigram frequency.
+Promotes and to first-class fields (schema v2 with v1 forward-compat shim) and emits a on degenerate partitions — both directly relevant to the queued proposal. above.
+Treat as a cheap *triage* signal, not a guarantee.
+Numbers below are the committed results.
+The actual v0 wiring uses Polygram's existing → round-trip and reads the basis back via .
+This is the tropical face of and of PIC's weighted-threshold-beyond-Horn (T3).
+Stitching gives you the first; it does not and cannot give you the second.
+All non-trivial work lands through OpenSpec changes in .
+The v1 forward is a single masked matmul ( ) — mathematically identical to summing per-expert sub-decodes because the partition is disjoint, with no Python loop over experts.
+Given the KB's candidate set for a context, classify the model's argmax : the choice within it is made elsewhere).
+Prototype the Phase-2 causal gate on the high-activation feature sets from the Phase-0 layers (highest leverage).
+A surrogate that matches the model only on RETRIEVED positions but diverges on COMPOSED ones quantifies the forge tax as a regression residual. regions** (zonotope vertices, Cor.
+L29 #906 tops *both* the raw-magnitude and the discriminative rankings, so it is a genuine content-signaling unit, not a massive-activation artifact — a concrete, ablatable handle.
+For the whole- goal: **learn the generalizing idioms FIRST (unsupervised), then backfill n-gram determinism LAST** — never the reverse.
+TurboQuant these are **unbiased estimators**, not exact identities: holds *in expectation*, variance .
+So the consistent late-MLP *pool* is real, but the per-token *support* roams within it. (hard, low-margin) corpus needs **7**.
+Here each rule carries **support** (train occurrences) + **determinism** (majority fraction); the carried T>0 distribution also gives a logit **margin** for free.
+Pinned by , which demands bit-equality (no ) against the fp32-built-then-cast path at Gemma-2 . raises at first forward.
+So: **Rust is the engine, Datalog is the certificate** — the two roles the earlier "use Soufflé to combine" framing conflated.
+This is the "recompile" half of larql's decompile→query→**recompile** loop, used here as the faithfulness oracle. coverage scorecard's single number.
+A run with runs *three* shards, *two* refine iterations each, with *two* compress↔regrow passes per refine iteration — twelve total project+fine-tune cycles.
+Detect drift via held-out loss, advance when it climbs.
+Resolution order: per-field kwarg > > registry default ( ).
+The previous hard-coded doesn't exist for layer 12 of (layer 12 publishes ).
+Two knobs in conjunction: and must *both* be non-zero to enable replay.
+Each idiom keeps its *structure* but emits a distribution, and its incidence value **measures circuit sharpness** (induction strength = the copy probability).
+This is the minimization arm of the PIC **certified-compression loop** ( verifies · analyzes · learns · **rosetta minimizes**).
+When an FSM action raised, the failure was swallowed into and returned a with , , exit code 0 — no diagnostic signal.
+Run **E-TQ4 (explain stability) early too** — it is a user-facing output and shares the codec.
+Closest to EWC's Fisher information; the most expensive option (one backward per buffer) but the most principled for catastrophic-forgetting prevention. history.
+We argue the composition is nonetheless legible in a *different* basis.
+The perturbation of that signed distance is the projection of onto the **unit** facet normal ; because the distortion is isotropic, its variance is **direction-independent** — call its RMS .
+Anchoring on each instance and growing with *that instance's own values* surfaces every local idiom.
+Four phases, risk-managed (Phase 1 is non-destructive).
+Rows = ablated anchor, cols = held-out eval set.
+Anchor citations the writer should fetch and cite: Circuits* (Anthropic, 2021).
+Omitting is byte-for-byte identical to passing .
+When two of the three bases individually exceed KL ≈ 20, the hybrid composition compounds those errors through the (untrained) bridges.
+The riscv measurement disproved that premise for model-free domains.
+This is decompiling the **model**, not the corpus. store distilled from the model reproduces GPT-2's *exact* next token **49% of the time** — with no neural network in the running artifact.
+Pragmatic use of fieldrun for refs during minimization is fine and expected; a fieldrun (or any binary) dependency leaking into the *runtime* product is not.
+Residual width , depth , MLP hidden width .
+Forcing it on Gemma-2 will raise from the Gemma-2 adapter stub pointing at the queued follow-up.
+Ships first: a lossless feature-labeled view, zero risk to current certificates. and resumes → the causal test.
+This document covers how to forge a Whisper-encoder native model from a polygram-compressed Whisper SAE.
+Manifest key : a path (relative to the package) to plain text — the source corpus or document set.
+Finding: frame regularization is decoupled from the decode; the bottleneck is source-side.
+See for the worked example. is the loop's downstream half.
+Three ctx fields ( , , ) and the hardcoded map are gone — the runtime and the parsed are now the source of truth for control flow.
+Swap the token facts and Soufflé recomputes the next token; it's bit-faithful to the model's argmax.
+Invert the certificate for the Two consequences, both load-bearing: 1. **Lower ⇔ larger .** The thing to maximize for quantizability is , *not* raw margin.
+Docs: gains a "Swapping the faithfulness target" section; documents the knob in the basis-loop knobs table.
+The layer-11 residual stream is already lm-head-shaped; PCA-ing it produces a basis that fits the unembed *output* distribution but not the pre-unembed transformer stack.
+For any original weight matrix **W**: the matrix-layout convention).
+The detected writers — with their detection scores — are recorded in the run report. composition bridges are out of scope (see ).
+MLP substrate; in GPT-2-small the early detokenizer **MLP0 alone** carries almost the entire MLP dependence (Gemma is the exception — its clean standalone MLP0 isn't needed by induction).
+Holdouts: a natural-text and a code token stream.
+Callers who want a typed bundle can pass . replace any hardcoded with .
+Always call it with — the inverse-form symmetry break documented in q-orca-lang's is a hard error ( ), but stay on the preparation form regardless. plus the analysis helper.
+Bundy's load-bearing insight — *probability is not truth-functional, but incidence is, so track incidence sets and recover probability by measure* — is the whole reason PIC exists.
+Consistent with, and slightly above, the held-out teacher-forced fraction. text; this measures greedy-vs-natural, not decompilation fidelity.
+A specific construction — the orthonormalised union of circuit *writer heads'* OV-output rowspace ("writer-output ") — was tested here and **RETRACTED**.
+Pure function; testable in isolation. "Suite 5: partition-aware basis slicing".
+These bound *capability*; we *measure usage*.
+Back-of-envelope ( ): So full- rotation roughly **quarters** the per-coordinate distortion versus per-head — a real argument for it, weighed against the RoPE-ordering complication (TQ-O5).
+The extra is **not** required for inspection.
+The a priori guesses live in the (uncommitted) ** ** module. is the family catalog; is a ready library of domain-general inference rules.
+The internal neighbour cap now scales as (was hardcoded 7).
+The validation experiment ran on bio-sae's pooled fixture ( ) at the [1000, 5000] progressive schedule.
+Established terms link to a **canonical source**; working terms with no canonical reference link to the page that defines them here.
+Two-stage API: is cheap (in-memory union-find, no torch); reads the source , applies the strategy in-memory, and writes a new atomically. is the convenience wrapper.
+README gains a "Which tool should I use?" pivot table separating (encoding expressiveness) from (feature coherence).
+Attention faithfulness preserved exactly when the basis spans the full residual AND the family's positional encoding is honored.
+A controlled probe of recursive *structure*: predicting a closing bracket's TYPE requires tracking the open-bracket stack.
+Every option here defaults to a value that recovers the v0.1 single-shard pipeline byte-identically; you only pay for what you turn on.
+The induction and IOI circuits **share upstream subject-detection** and diverge only at the task-specific output heads, so the dissociation is partial.
+A harsher, sequence-level check ( ): roll out generation from held-out seeds with both pylm and the model. greedy rollout first differs from the model's.
+Bio-specific scoring — downstream."*). polygram-compressed SAEs produced with .
+Total focused suite 38 passing; full suite 744 passing.
+When several L's are admitted, the runtime tries the **longest first** (a longer repeated context is a more specific, higher-confidence match).
+Each change has (why + scope), (checklist), and (delta requirements + scenarios).
+To swap in any SAE format the bundled loaders don't cover yet (custom serialization, multi-file checkpoints, in-memory tensors), hand-roll a from your loader of choice and pass it to directly.
+Greedy-by- is near-optimal here; exact ILP is trivial at this size (≈ #tensors).
+GQA expansion; RMSNorm gain-fold ( , no mean-subtraction); and reading the **unrotated** content-QK (R₀) so RoPE's positional modulation is a separate axis from the content binding.
+So all four laptop architecture families — GPT-2, Llama, Qwen, Gemma-2 — run as the same flat-weights-plus-numpy story, no torch at runtime. counterpart of ).
+Default encoding remains . defaults to and is ignored by every non-Rung5 dispatch. of the 2026-05-15 GPT-2 bug report (MPSRung1.gram() saturating on activation-uncorrelated features).
+The end-to-end run that the structural-fix work in was building toward.
+This workaround is correct but slightly indirect; an upstream Polygram addition is preferred.
+Mutually exclusive with (different lifecycle stages). dataclass, , , , .
+The audio-side analog of pre-tokenised .
+The top head's share stays low and flat (1–8%) throughout — the extra inputs are absorbed by *recruiting more heads*, not by loading the dominant one harder.
+The symbolic **induction idiom is confirmed in the model** — the located head 5.5 attends a mean **0.26** to the copy-source over the 76 induction tokens.
+Neither the project's extra (capped at , no Qwen3 import) nor an M4 Apple Silicon box (insufficient memory for the host) can run the real forge.
+Strict default-off. falls back to with an INFO-once log — learned assignment for HEA's per-feature θ tensor is out of scope for v1.
+Two models with different weights that extract to the *same* are the same algorithm — an algorithmic identity test, regardless of mechanism.
+Everything they coordinate — finding food, warning of danger, splitting a catch — has to travel as sound.
+Named the non-GPT-2 models carry the universal idioms + behavioral tags + causal flags.
+Is there a (possibly learned, overcomplete) basis in which has an -sparse *per-input* evaluation with ?
+The two mechanisms are reported separately everywhere.
+Non-English mirrors this — slightly more concentrated and looser, consistent with marginally lower fluency producing more fallback.
+The named set demonstrably does not contain the model's real functions, so the next tool must *synthesize* functions, not select them.
+The spec's §3 pseudocode references returning an object with and methods.
+Selection is plan-order; richer strategies tracked as .
+The protected set is they are not frozen for all time, only protected against the next compress.
+Any drift between the post-cap host logits and the post-cap forged logits is and falls out at fine-tune. mask).
+The acceptance gate for this demo is qualitative + numerical, not automated.
+No labels and unpredictable cadence → .** The three triggers all share one contract: the action writes a single boolean based on the configured trigger.
+HY-O7).** Two regimes, both keyed by the facet margin : bounded by the *omitted* residuals: (tighter from the calibration activation stats).
+Every kernel is tiny-instance-validatable ( ); full weights are the hardware ask. cross-repo dependence is on published artifacts, not local paths (workspace rule). opt-in, feature-gated backend.
+So conditional-compute remains an open lever — a static read-off doesn't deliver it, but the learned version is untested. ( .) The static read-off (mass-routing) isn't the only router.
+See . carries new first-class fields and .
+This *names* the forge tax — **computation, syntax-heavy**, the quantified upstream of the recursive-syntax result below.
+Construction now emits a when and , naming the empirical anchor and pointing at or a hand-picked value as the next step.
+Run the same four steps on each fixture's hard tier; the cases that *stress* the heuristic (low-headroom-but-helps, or high-headroom-but-doesn't) teach more than the confirmations.
+A buffer carries the d → f bridge ( ) at the conv-stem → first-block boundary; state-dict-resident but not a parameter, so the no-randomly-initialised-weights invariant applies cleanly. .
+Mirrors 's YAML config schema; adds , , , , , .
+The buffer keeps ≈205 sequences per past task, stratified.
+To write CSV files instead of stdout, point at a directory: For a 2-candidate decode the interpreter is instant; only pays off on big fact sets.
+Scope + counterexamples (why it is *not* "all binding"): it holds only where the model's answer IS the structurally-unique token.
+The headline at-scale invocation, run from the project root: is the default and the recommended setting.
+Configs round-trip through the FSM context as JSON-friendly dicts — calls on each non-None field, and the polygram-driven actions ( , ) reconstitute via before calling polygram.
+So the legible corner is reconstruction of #146 was complete-but-illegible; the sparse 32×d is legible-but-forge-tax-incomplete).
+The catalog's causal column is *generic-prose* ΔNLL — task-specific ops read low there (see each dossier's section B).
+If the basis is narrow but fine-tuning is on the table, mode gives a smaller, more interpretable model whose attention scores live in feature space.
+The natural test bed is a sae-forge Axis-4 sweep with filtered to rows (sae-forge's capability).
+Even Gemma-2-2b — the operator-catalog outlier that breaks nearly every other cross-model regularity — obeys tightly.
+The constant is retained as a back-compat alias at the value (8).
+Measured, as instructed — not silently fixed.
+The pre-flight advisory surfaces this signal: when the largest-K SAE in any encoding reports , the advisory appends a one-line note suggesting the next encoding rung (Rung5 → , etc.).
+Margin-widening is **not** unconditionally free; it has a kernel-proved ceiling.
+This is the known tiny-whole-model-forge artifact, **not** the entangled-core ceiling — so this substrate *cannot* isolate the capability plateau-vs-core (the doc's central prediction).
+Amateur, provisional, single-corpus where noted; every claim links to the page with the data.
+Few-shot prompt, single-digit answers (exact read), controlled nesting depth.
+The PIC thesis predicts **behavior ≡ algorithm** — a real circuit (detect + causal) should recur regardless of substrate.
+Any rule may carry (default 1) and the manifest (default 0.35).
+It is the experimental companion to the fieldrun PIC formalization ( ) and the paper *"What a Transformer Retrieves and What It Computes"* (J.
+Combined with the cross-architecture result, the ops are invariant across **both architecture and language** — what varies is the operands (and, across families, the sink). , .
+Do not merge a tier that diverges without explaining why. outlier-aware activation quant).
+Four verdicts: cells (≪ the 0.35 needed to matter).
+Numerically identical forward; the untying purely unblocks hybrid forging. vectors of the post-layer residual stream over a 32-prompt activation set.
+This document covers the v0.2 extension: a configurable same FSM.
+The cost-saving short-circuit path (Tier A's stored lookup, Tier B skipped) is instead the same decision; the honest objective is exact-on-recompute, calibrated-sound-on-short-circuit.
+Every tunable knob on a public polygram constructor is also reachable through a frozen dataclass under .
+The script takes so any of these DAGs (other corpora, supervised models) drops straight in. (re-run to regenerate the figure).
+Orthogonal ⇒ exactly invertible up to the scalar quantization; preserves because .
+So pylm itself runs with **no neural network and no ML dependency** — the goal's constraint, satisfied and auditable.
+That turns out to be enough: argmax is the same -witness rule the rest of this doc uses.
+So the forge tax has a *meaning-vs-syntax* signature: it is the cost of predicting readout: cheap rank- (+ top-32 verify) on syntactic positions, full readout on content.
+So: TurboQuant the **KV cache** (lossy-unbiased is fine there), keep the **weights and unembedding exact** via the residual path.
+The alongside the original was self-inconsistent (Linear bias must match the first weight axis).
+The reconciliation question: how is a token the argmax of *many* circuits yet "argmax of a sum that is the argmax of no summand." *Status:* the live frontier; not yet a theorem.
+Optional **sliding window** applies one window to *every* layer (no per-layer pattern, unlike Gemma).
+That is exactly what **Datalog evaluated under a provenance semiring** *is*.
+Canonical framing: Elhage et al., *A Mathematical Framework for Transformer Circuits* (2021). ( , ) name *both* an operator and a circuit.
+That is the "complex hybrid" this migration dissolves.
+The decision lives in the **low-energy tail**, not the high-energy bulk (the geometric face of ).
+Not trained SAEs; cheap CPU proxies for the cross-arch defaults experiment. at their orthogonal-random init, not trained).
+Quantum-flavoured analysis of the basis (interference, cancellation, tier separation) flows through Polygram, which is the canonical Q-Orca emitter.
+PIC is **descriptive** — it documents the calculus the analysis runs in and the proofs quantify over.
+Picks cluster representatives by **behavioural-ablation importance** (existing fields from ) instead of by the geometric proxies ( , ).
+Truncated last lines (mid-write crashes) are detected, dropped, and rewritten on the next invocation.
+So both halves are named, not bare indices.
+See for the corrected prediction in the spec deltas.
+By default, uses KL divergence between the host's and the forged model's next-token distributions as the loop-gating faithfulness signal (for LM hosts; per-frame cosine for hosts).
+Conjectural sections are marked; the measured floor (§2) stands on the existing probes. is a near-clone of ( , rope-only via ) plus the interior-point test from 's machinery.
+Without this, setting on the compressor would still result in MPS-equivalent per-block dictionaries during validation — defeating the un-dormanting work from PR #63.
+Every quantitative claim points to the exact it comes from (all tracked), so figures and tables can be regenerated.
+Both are calibrated for the profile in polygram 0.2.0+. sae-forge does not consume the profile name — it's a polygram-side compression knob, not a forge-side configuration.
+The open question: is the genuinely Chomskyan part — hierarchy, long-range dependency, recursion — in that basis, or in the **composition**?
+No group limiting, no shared expert, no dense layers — the leanest of the frontier-MoE recipes.
+The learner correctly finds nothing (no false positives — validated against threx).
+One block per architecture scaling ladder (one architecture, same data, six sizes).
+We split provable optimization of into two regimes: The two regimes meet the rest of the program at one wall.
+Implementation surface (a later PR, after this design is agreed): curated, retrieval), not just the cover ( covers the cover today). loop, deliberately.
+Accept the Gemma license at and run with a token that has read access.
+The header reports per-expert decision entropy — ≈0 marks a **lookup-exact (retrievable)** expert, >0 the **computed residue** (the forge tax).
+The symmetric Romance→spares-German test is a **null** (e17 anchor not load-bearing), so the family claim is only half-confirmed.
+If absent, the runtime loads a separately for Tier A. must equal and must be understood by the reader, else it refuses to load.
+This predict high-frequency function tokens, not to scaffold syntax across languages.
+Maintain a measure over proposition labels with uniform base .
+Arithmetic and complex predicates belong in actions.
+On a box without root, install them locally: is the token id ( per the file's header comment).
+The projection algebra in §4 is architecture-agnostic; v0.2 (the OpenSpec change) extended sae-forge to cover Llama-3 and Gemma-2 hosts via the registry.
+Two non-negotiable principles, both from the project's standing direction: On Qwen-0.5B, faithful cross-attribution over a *named* candidate set ( ) found: That residue is the target.
+Emits one JSONL row per capturing kept-feature count, downstream KL, perplexity, fine-tune loss, and elapsed seconds.
+Polygram's projection algebra doesn't define a projection for these; the forge copies them bit-for-bit from the host.
+The sweep is **resumable** (rerun the same command after a crash — completed rows are skipped) and **per-row failure-isolated** (one bad K records and the sweep continues).
+So the dense content code is a *growing fraction of an already-growing width* — it outpaces the MLP width (compute axis).
+Each expert is a **deterministic slice** of — the rows whose features the polygram clustering assigned to that expert.
+When True, the loader populates higher-rung amp-branch knobs ( , , , ) from decoder geometry via PCA-axis extension of the existing β strategy.
+A naive induction rule served on all its firings therefore emits **more confident-WRONG answers than correct ones** — net-harmful as a "trusted" tier on natural in-domain text.
+The change shipped as forge-magnitude diagnostics instead: (or ) populates and on every row, and prints a post-sweep advisory if is non-monotone in K.
+Absent: current row-norm slicing preserved byte-equivalently. (private; not in ).
+The claim is about where the decode logit's mass *comes from* and what is causally necessary for it — two different things, both measured.
+A copy-paste walkthrough: install Rust, build , convert a small model, and chat with it.
+Tropicalizing ( , ) turns sum-product into max-product (Viterbi) — the MAP decode.
+The forged model is initialized via projection — every linear map in the host transfers into the basis-width residual stream.
+New , native module (with a frozen-copied conv stem and a buffer at the d → f boundary), eval, family-aware dispatch.
+Default preserves byte-equivalence with pre-change behavior (every zeroed slot regrown).
+Embedded in ; asserts the doc matches the live emit so drift can't land.
+Applying the **Density-Minimization** result from ( + , kernel-checked) to fieldrun's measured DLA surface.
+The DSL is the knob that decides what we can discover: too narrow → can't reach obscure functions; too broad → enumeration blows up.
+For camera-ready, drop and add the venue's , , and .
+The surviving decoder rows (with original magnitudes preserved) become the new basis for the entire model.
+Single-unit Δloss alone is unreliable for small effects.
+The default surface stays byte-identical with v0.3.0 for every non-deprecated call site. now accepts an optional argument implementing the new protocol.
+This is a 0.x prototype — interfaces and the on-disk bundle format are not yet stable.
+Each lit position prints the **value stack read straight from the residual** (logit-lens trajectory).
+Existing positive-float values are unchanged; the default remains . (both default to ). adds a function parameter (notebook-driven, no argparse).
+The work above emits induction into the souffle (the minimization arm).
+Distortion bound: the TurboQuant of (kernel-checked, ).
+Any change to the blob layout, dtype encoding, or config vectors bumps .
+Step 1 — per tier (no training): confirm the hard tiers sit low for the host (high headroom) and the salient tiers near the ceiling.
+Semantic recall (antonym, capital, analogy) has no structural rule at all.
+Encoder-only is the natural unit because the polygram-side Whisper SAEs target encoder residuals.
+Threshold mode is byte-identical to 0.3.0; new modes are opt-in.
+Cost-free for targets that don't read this key (every bundled target ignores it except ). ( , ) emit a buffer alongside .
+Holds a list of blocks (each ≤ ) plus a sparse cross-block adjacency.
+Let be a trained autoregressive transformer. is a distribution over a vocabulary , .
+Workflow (same YAML config as ): Schedule shape: comma-separated protein counts per stage, monotone non-decreasing.
+The pre-refactor algorithm is to the pre-refactor output (modulo + tempfile paths) on the deterministic fixture, gated by against the frozen reference at .
+And within the six, instances where the model diverges from once-appearing (llama MP detect 80%, spatial 96%) are excluded from the certificate, not certified against.
+Fix: adapter-driven layout via a new method with per-family overrides; dispatches via a new registry helper. (PR #7).
+If ILP recovers those + certifies them + drops threx's holdout loss toward 0, the approach is proven; then scale to the stories ladder, where the unknown circuits live.
+Two classical objects pin it exactly: to ; the **dual subdivision** is the projection of the **upper faces** of .
+GQA), tied embeddings, four-norm Gemma-2 layout, soft-cap config passthrough, the no-randomly-initialised-weight invariant, and family-field validation.
+Single-encoding sweeps (above) commit to ONE basis encoding (e.g. the raw row-norm slice or a partition-aware slice with ).
+So they speak in **pulses**: short, terse strings called *calls*.
+Tropical geometry is the right tool for the which PIC develops.
+A user running single-shot at low data picks a noise-driven argmax; a user running at higher data picks a different noise-driven argmax.
+Store per vector: the scale (its norm), and -bit codes.
+ReLU nets ⟺ tropical rational maps (**Thm.
+Byte-identical behaviour preserved at the default — load-bearing differential regression ( ) passes unchanged.
+The materialized reports both, plus a one-line interpretation.
+Diagnoses magnitude-matching independently of the forge's .
+This is direct support for "same function block over more possible inputs": input-diversity is its own driver of the head count, on top of (and separable from) model size.
+The arm reproduces the pre-fix no-RoPE behaviour byte-identically (regression-diff knob).
+In the RoPE models, **no** upstream head's key-content removal collapses prev-token (max −0%): their rotation, untouched by the content patch, still aligns q−1.
+The bound on a dropped token's logit is a **rank-1 directional split**, not raw Cauchy–Schwarz: writing along the dominant elided direction (top singular vector of the dropped rows), , where and .
+The anchors are overwhelmingly **late-layer (L21–23) neurons**; the dominant expert (anchor L23 #2539 — the same circuit that was the per-query hub) routes 26 % of tokens.
+Every exported program has the same shape (see , ): sums each token's weights; takes the argmax.
+The cut is the model's grain — and both substrates are native Rust (a KB index and a sparse integer kernel), so the engine never leaves fieldrun's framework-free pure-Rust runtime.
+Whether the heavy tail is intrinsic to *all* rank- lenses or only the *frozen-SVD* one is the **decode-targeted trained-head** question — now run (R2, below), not assumed.
+Both shipped profiles ( , ) honour the flag.
+Synthetic loop runs and is tested; the fieldrun seam is a documented contract awaiting the emitter.
+At least one "expert" anchor is a genuine, isolated language circuit.
+Downstream consumers (an orca-lang workflow fine-tune node, an external trainer, a research notebook) take it from there.
+The partition still works as a polygram-Dictionary substrate cost reducer + analyst diagnostic tool.
+The change as merged is **diagnostics-only**: it adds the surface that explains WHY a sweep produced bad forge KL, without attempting to fix it automatically.
+The compression is reported alongside the distortion.
+One unbuildable document is **skipped with a warning** (the build proceeds on the rest); an unknown adapter *name* is a hard config error.
+So the substrate is genuinely capable. pythia.
+The proofs live in , the runtime in , the learner in .
+Single-shot frontiers (no field) bypass the check entirely — back-compat with v0.8.x. : the last stage shift?", doesn't require K-in-a-row stability.
+These are emitter changes (a branch + PR) and are what unlock full-vocab real models.
+Removal is scheduled for the next minor version after this lands.
+New runtime dependency: (powers helper, matching bit-for-bit without taking on sklearn itself).
+So even a *full* exact residual is just the native bulk + a cheap 2–3-trit pass.
+Defaults are for both — existing call sites are byte-identical. accepts a kwarg selecting which geometric regime the SAE belongs to.
+Composition dominates; the retrievable floor is small and corpus-dependent.
+So the PR-core lever is **not SmolLM-specific**; the readout-aligned decision geometry is the right first-class input on every architecture tested.
+Profile resolution order: **per-field kwarg > over the profile's default of 16; always wins over a config-supplied .
+For real models the build-time oracle is the ** binary**, not (which is faithful but slow, and its logic-export is rope-only).
+The *factory*, built **on** the minimization core and explicitly separate from it. deployment-only concerns.
+The short-circuit then **bypasses the router itself**, not just expert compute, for high-margin retrieved cases — a strictly bigger win, since routing is its own cost.
+The composition subspace is redefined from the aggregate per-layer reader-geometry to the orthonormalised union of the **OV-output row spaces of the circuit's writer heads** ( ).
+So a low headroom flags "the substrate likely already encodes this" — it does **not** prove a specialist is useless.
+Those files are written to be **Soufflé-compatible**, so you can verify a decode with an off-the-shelf Datalog engine instead of trusting .
+The shared gains a host-attribute-gated MoE branch ( ) that emits the router + per-expert SwiGLU keys.
+Quantizing tensor to bits perturbs its incidence by a bounded : where is tensor 's contribution magnitude (the per-block from the Step 0 probe, or the L2 sensitivity for the RMS variant).
+Optionally spans multiple labelled encodings (e.g.
+The decision tree: **labels available → .
+Validated in when the master toggle is on (require AND ); silently inert otherwise. from to .
+An interpreter that "approximates the core cheaply" is just choosing a point on that frontier (and paying the capability cliff) — the ceiling is the forge tax, restated.
+Emits a buffer alongside the projected weights so under-complete-basis cosine eval can project host states into basis space (same contract as ). .
+It **exits non-zero with no shippable package** if the scorecard misses or a benchmark .
+Orientation for agents working in this repo.
+The largest *committed* mixed run is the **0.5B "monster" corpus-decompose (15k tokens, 10 wiki languages + code + math)**.
+This is a *stronger* tier than the extracted cover ( ): authored deduction is -backed. expert can be *more correct* than any model).
+A top-K SAE (with an attention pre-mixer): encode the residual into sparse , keep the top-K, decode back.
+Populated even on row failure (computed pre-forge), so an analyst can distinguish "doomed input" from "bug in the forge." , , and .
+The tip of the hat is Bundy's; we have only added a thermometer.
+L-token suffix recurs earlier in the context; it copies the successor of the **most recent** earlier occurrence ( ).
+In this architecture the precision knob is concrete: the residual ( scale) stays below the margin's tolerance (the TT2 threshold).
+The **achievability** (random rotation, Beta concentration, Lloyd–Max optimality) and the **Shannon + Yao lower bound** are explicitly *meta* (not formalised).
+Everything above is **attribution** (where the decode logit's *mass* comes from).
+The knob is a Python-API extension (no CLI flag yet) — pass to swap the loop-gating scorer.
+Linear components match the host exactly when the basis spans the residual.
+End-to-end sweep of the density-minimization bucketing across **models × corpora × (experts, depth)**.
+Under-corrects on polygram-compressed bases (see ).
+Falsifying tests in pin the invariant that Rung4 gram with amp-on differs from amp-off by Frobenius > 1e-3 on the toy fixture (off-diagonal-only > 1e-3 too).
+RoPE rotates the patched key, so the relative match is preserved; only the key *content* changes.
+Separating classes and fitting them are not in conflict here.
+This thread **assembles, quantifies, causally tests, corpus-checks, and cross-model-replicates** such a catalog; it does not reproduce an existing one.
+This is the realized form of the kernel-proved bound (rule adjustments live in a low-rank subspace).
+The recommendation is purely upstream: compress audio SAEs with , then forge them with sae-forge as you would any other compressed SAE.
+The forge tax is the open lexicon on every tokenizer.
+Emits a with the projected model, faithfulness KL against the host on a held-out prompt set, parameter count, and a structured artifact tree under . variant.
+So the full build has **three first-class inputs**, not one: 1. **Corpus design** — what the expert should know: the content, its structure, its coverage of the domain.

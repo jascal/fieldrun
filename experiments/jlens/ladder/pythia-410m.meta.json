@@ -1,0 +1,39 @@
+{
+  "apply": "route a layer-l residual r through  J[l] @ r   (numpy: r @ J[l].T), then the model's final norm + unembed",
+  "arrays": {
+    "J": "[n_layer, d, d] averaged causal Jacobian  E_{t, t'>=t, prompt}[ d h_final,t' / d h_l,t ]",
+    "fitted": "[n_layer] int32: 1 if this layer was fit, 0 = identity (reads as the plain logit-lens)"
+  },
+  "capture_point": "h_l = the POST-block residual of layer l (after the attn+MLP residual add, PRE final-norm); h_final = the post-last-block residual (pre final-norm), so J[n_layer-1] = I",
+  "d": 1024,
+  "dtype": "float32",
+  "fitted_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "format": "fieldrun-jlens-v1",
+  "n_layer": 24,
+  "note": "EMPIRICAL readout: a first-order, context-averaged approximation of the downstream map. NOT faithfulness-gated; off the forward path.",
+  "source": "experiments/jlens/ladder/pythia-410m.jlens"
+}
