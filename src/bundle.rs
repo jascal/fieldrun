@@ -657,9 +657,12 @@ impl Bundle {
                 // generation gets all cores per forward; under the scoring loop's outer rayon it work-steals.
                 #[cfg(not(feature = "blas"))]
                 {
-                    let block = 512.min(n.max(1));
+                    // adaptive block: enough blocks to feed the pool (a 768-wide Linear at block=512 got only
+                    // 2-way parallelism), but never below 128 columns so per-block GEMMs stay cache-efficient.
+                    let threads = rayon::current_num_threads().max(1);
+                    let block = (n.div_ceil(threads * 2)).clamp(128, 512).min(n.max(1));
                     let nblocks = n.div_ceil(block);
-                    if nblocks <= 1 {
+                    if nblocks <= 1 || a.nrows() * n < 32_768 {
                         return a.dot(&w);
                     }
                     let mut blocks: Vec<(usize, Array2<f32>)> = (0..nblocks)
@@ -686,6 +689,39 @@ impl Bundle {
                 let scale = self.arr1o(&format!("{name}__scale"));
                 let (kk, nn) = (w8.k, w8.n);
                 let t = OUTLIER_T.min(kk); // keep the T largest-magnitude activation channels in f32
+                if a.nrows() > 1 {
+                    // encoder/prefill shape: rows are independent — parallelise over rows, keep the
+                    // per-row column loop sequential (col-granular tasks at k~768 are pure overhead).
+                    let rows: Vec<Vec<f32>> = (0..a.nrows())
+                        .into_par_iter()
+                        .map(|i| {
+                            let arow = a.row(i);
+                            let arow = arow.as_slice().unwrap();
+                            let absv: Vec<f32> = arow.iter().map(|v| v.abs()).collect();
+                            let mut idx: Vec<usize> = (0..kk).collect();
+                            if t < kk {
+                                idx.select_nth_unstable_by(t, |&x, &y| absv[y].partial_cmp(&absv[x]).unwrap());
+                            }
+                            let bulk_max = if t < kk { absv[idx[t]] } else { 0.0 };
+                            let sa = if bulk_max > 0.0 { bulk_max / 127.0 } else { 1.0 };
+                            let mut a8: Vec<i8> = arow.iter().map(|&v| ((v / sa).round() as i32).clamp(-127, 127) as i8).collect();
+                            let ov: Vec<(usize, f32)> = idx[0..t].iter().map(|&o| { a8[o] = 0; (o, arow[o]) }).collect();
+                            (0..nn)
+                                .map(|j| {
+                                    let base = j * kk;
+                                    let acc = i8dot(&a8, &w8.wt[base..base + kk]);
+                                    let corr: f32 = ov.iter().map(|&(ch, av)| av * w8.wt[base + ch] as f32).sum();
+                                    scale[j] * (sa * acc as f32 + corr)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let mut out = Array2::<f32>::zeros((a.nrows(), nn));
+                    for (i, r) in rows.into_iter().enumerate() {
+                        out.row_mut(i).assign(&ArrayView1::from(r.as_slice()));
+                    }
+                    return out;
+                }
                 let mut out = Array2::<f32>::zeros((a.nrows(), nn));
                 for i in 0..a.nrows() {
                     let arow = a.row(i);

@@ -5,6 +5,7 @@
 //! config: [n_layer, n_head, d, d_ff, vocab, max_pos, type_vocab]; config_f: [layer_norm_eps].
 
 use ndarray::{s, Array2};
+use rayon::prelude::*;
 
 use crate::bundle::Bundle;
 
@@ -87,17 +88,24 @@ impl Bert {
 
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
-            let q = self.lin(&x, &format!("{p}q"));
-            let k = self.lin(&x, &format!("{p}k"));
-            let v = self.lin(&x, &format!("{p}v"));
+            let ((q, k), v) = rayon::join(
+                || rayon::join(|| self.lin(&x, &format!("{p}q")), || self.lin(&x, &format!("{p}k"))),
+                || self.lin(&x, &format!("{p}v")),
+            );
+            let heads: Vec<Array2<f32>> = (0..self.n_head)
+                .into_par_iter()
+                .map(|h| {
+                    let qh = q.slice(s![.., h * hd..(h + 1) * hd]);
+                    let kh = k.slice(s![.., h * hd..(h + 1) * hd]);
+                    let vh = v.slice(s![.., h * hd..(h + 1) * hd]);
+                    let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt(); // bidirectional: no causal mask
+                    softmax_rows(&mut scores);
+                    scores.dot(&vh)
+                })
+                .collect();
             let mut attn_out = Array2::<f32>::zeros((seq, self.d));
-            for h in 0..self.n_head {
-                let qh = q.slice(s![.., h * hd..(h + 1) * hd]);
-                let kh = k.slice(s![.., h * hd..(h + 1) * hd]);
-                let vh = v.slice(s![.., h * hd..(h + 1) * hd]);
-                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt(); // bidirectional: no causal mask
-                softmax_rows(&mut scores);
-                attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&vh));
+            for (h, ho) in heads.iter().enumerate() {
+                attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(ho);
             }
             // post-LN residual blocks (BERT ordering): LN(x + sublayer(x))
             x = self.ln(&(&x + &self.lin(&attn_out, &format!("{p}ao"))), &format!("{p}ln1"));
