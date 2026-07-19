@@ -40,6 +40,10 @@ api = ["dep:tokenizers", "dep:rustyline"]
 # (newer) MSRV, which is fine because this is opt-in — the default build never compiles it, so it stays on 1.89.
 jit = ["dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-native"]
 
+[lib]
+name = "fieldrun"
+path = "src/lib.rs"
+
 [dependencies]
 libm = "0.2"   # exact-erf GELU for the BERT encoder (torch-matching, f64 internally)
 serde = { version = "1", features = ["derive"] }

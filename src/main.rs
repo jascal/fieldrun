@@ -23,6 +23,17 @@ mod deltanet;
 mod device;
 mod bert;
 mod dsv4;
+
+// Encoder-only archs have no next-token head; the Model impl lives here (not in bert.rs) so the library
+// target (src/lib.rs: bundle+ternary+bert only) stays free of the Model trait's heavy deps (jlens, headgate).
+impl model::Model for bert::Bert {
+    fn predict(&self, _ids: &[i64]) -> i64 {
+        panic!(
+            "[fieldrun] arch `bert` is encoder-only (no LM head): use --encode-dump <out.bin> to get per-token \
+             hidden states (13 snapshots, HF output_hidden_states convention)"
+        );
+    }
+}
 mod explain;
 mod jlens;
 #[cfg(feature = "gpu")]

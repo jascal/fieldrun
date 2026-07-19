@@ -7,7 +7,6 @@
 use ndarray::{s, Array2};
 
 use crate::bundle::Bundle;
-use crate::model::Model;
 
 pub struct Bert {
     b: Bundle,
@@ -108,14 +107,5 @@ impl Bert {
             snaps.push(x.iter().cloned().collect());
         }
         snaps
-    }
-}
-
-impl Model for Bert {
-    fn predict(&self, _ids: &[i64]) -> i64 {
-        panic!(
-            "[fieldrun] arch `bert` is encoder-only (no LM head): use --encode-dump <out.bin> to get per-token \
-             hidden states (13 snapshots, HF output_hidden_states convention)"
-        );
     }
 }
