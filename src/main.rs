@@ -21,7 +21,19 @@ mod composition;
 mod convert;
 mod deltanet;
 mod device;
+mod bert;
 mod dsv4;
+
+// Encoder-only archs have no next-token head; the Model impl lives here (not in bert.rs) so the library
+// target (src/lib.rs: bundle+ternary+bert only) stays free of the Model trait's heavy deps (jlens, headgate).
+impl model::Model for bert::Bert {
+    fn predict(&self, _ids: &[i64]) -> i64 {
+        panic!(
+            "[fieldrun] arch `bert` is encoder-only (no LM head): use --encode-dump <out.bin> to get per-token \
+             hidden states (13 snapshots, HF output_hidden_states convention)"
+        );
+    }
+}
 mod explain;
 mod jlens;
 #[cfg(feature = "gpu")]
@@ -149,7 +161,7 @@ fn main() {
         };
         let arch = flag(&args, "--arch").unwrap_or("rope");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
         if !ARCHS.contains(&arch) {
             eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
             std::process::exit(2);
@@ -733,8 +745,37 @@ fn main() {
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4)"),
+            "bert" => Box::new(bert::Bert::new(bundle)),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4, bert)"),
         };
+
+        // ── encode-dump: encoder-only per-token hidden states ───────────────────────────────────────────────
+        // Runs the full --ids sequence through an encoder arch and writes ALL hidden-state snapshots (HF
+        // `output_hidden_states` convention: embeddings output + each layer's output, n_layer+1 total, each the
+        // flat seq·d f32 LE states) to a file. This is the validation surface (scripts/bert_ref.py compares it
+        // against transformers) AND the substrate a downstream head (satzklar biaffine) consumes. bert only —
+        // decoder archs have --hidden-dump under --recursion-explain instead.
+        if let Some(out) = flag(&args, "--encode-dump") {
+            if arch != "bert" {
+                eprintln!("[fieldrun] --encode-dump is for encoder archs (bert); {arch:?} has --hidden-dump");
+                std::process::exit(2);
+            }
+            if ids.is_empty() {
+                eprintln!("[fieldrun] --encode-dump: no ids (pass --ids <holdout.json>)");
+                std::process::exit(2);
+            }
+            let b = bundle::Bundle::load(&stem).expect("reload bundle for --encode-dump");
+            let snaps = bert::Bert::new(b).hiddens(&ids);
+            let mut buf: Vec<u8> = Vec::new();
+            for sn in &snaps {
+                for v in sn {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            std::fs::write(out, &buf).unwrap();
+            eprintln!("[fieldrun] --encode-dump: {} snapshots x {} tokens (f32 LE) -> {out}", snaps.len(), ids.len());
+            return;
+        }
 
         // ── ablate-eval: causal-ablation specificity battery ────────────────────────────────────────────────
         // Manifest JSON: {ctx, max_pos?, evals:{name:path}, specs:{name:{neurons:[[L,i]..], heads:[[L,h]..]}}}.

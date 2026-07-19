@@ -399,6 +399,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
             ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
             ("mla", &["deepseek", "deepseek_v3", "kimi"]),
             ("minimax", &["minimax"]),
+            ("bert", &["bert"]),
             // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with a new attention class (shared-KV MQA + sink +
             // undo-RoPE + grouped o_proj, mHC residual, sqrtsoftplus MoE, and CSA/HCA compressors). Longest-prefix-wins
             // routes "deepseek_v4" here (11 chars) over `mla`'s "deepseek" (8). convert_dsv4 handles the sliding subset
@@ -439,7 +440,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax)"),
+        "bert" => convert_bert(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, bert)"),
     };
     // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
     let eos = eos_ids(&cfg);
@@ -456,6 +458,49 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
     }
     println!("[convert] {n} arrays -> {out_stem}.fieldrun.json/.bin (arch={arch}, dtype={dtype}, {shards} shard(s), eos={eos:?}, no torch)");
     Ok(())
+}
+
+/// Encoder-only BERT (deepset/gbert-base class): word/position/token-type embeddings + embeddings LayerNorm,
+/// per layer fused-nothing q/k/v/attn-out/fc/out Linears (all with biases) and two post-LN LayerNorms. No LM
+/// head is converted (the pooler and any MLM cls head are skipped — the product is hidden states).
+/// config: [n_layer, n_head, d, d_ff, vocab, max_pos, type_vocab]; config_f: [layer_norm_eps].
+fn convert_bert(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    let (nl, nh, d) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "num_attention_heads").unwrap(), geti(c, "hidden_size").unwrap());
+    let (ffn, vocab) = (geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
+    let (npos, ntype) = (geti(c, "max_position_embeddings").unwrap(), geti(c, "type_vocab_size").unwrap_or(2));
+    let eps = getf(c, "layer_norm_eps").unwrap_or(1e-12);
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "bert",
+        "config": [nl, nh, d, ffn, vocab, npos, ntype], "config_f": [eps] });
+    let mut w = BundleWriter::new(stem)?;
+    let pre = if m.has("bert.embeddings.word_embeddings.weight") { "bert." } else { "" }; // BertForMaskedLM vs BertModel
+    let sml = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    {
+        let (s, dt) = m.read(&format!("{pre}embeddings.word_embeddings.weight"));
+        w.put_embed("wte", &dt, &s, edt, dtype)?;
+    }
+    sml(&mut w, "wpe", &format!("{pre}embeddings.position_embeddings.weight"))?;
+    sml(&mut w, "wtt", &format!("{pre}embeddings.token_type_embeddings.weight"))?;
+    sml(&mut w, "emb_ln.weight", &format!("{pre}embeddings.LayerNorm.weight"))?;
+    sml(&mut w, "emb_ln.bias", &format!("{pre}embeddings.LayerNorm.bias"))?;
+    for l in 0..nl {
+        let p = format!("{pre}encoder.layer.{l}.");
+        for (fr, hf) in [("q", "attention.self.query"), ("k", "attention.self.key"), ("v", "attention.self.value"),
+                         ("ao", "attention.output.dense"), ("fc", "intermediate.dense"), ("out", "output.dense")] {
+            let (s, dt) = m.read(&format!("{p}{hf}.weight"));
+            w.put_lin(&format!("l{l}.{fr}.weight"), &dt, s[0], s[1], dtype)?;
+            sml(&mut w, &format!("l{l}.{fr}.bias"), &format!("{p}{hf}.bias"))?;
+        }
+        sml(&mut w, &format!("l{l}.ln1.weight"), &format!("{p}attention.output.LayerNorm.weight"))?;
+        sml(&mut w, &format!("l{l}.ln1.bias"), &format!("{p}attention.output.LayerNorm.bias"))?;
+        sml(&mut w, &format!("l{l}.ln2.weight"), &format!("{p}output.LayerNorm.weight"))?;
+        sml(&mut w, &format!("l{l}.ln2.bias"), &format!("{p}output.LayerNorm.bias"))?;
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
 }
 
 fn convert_gpt2(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {

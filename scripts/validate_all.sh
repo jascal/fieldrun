@@ -53,6 +53,19 @@ for spec in qwen3:rope gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 gemma4keqv:g
 done
 echo
 
+# Encoder arch (bert): per-token hidden-state parity vs transformers BertModel over all snapshots (HF
+# output_hidden_states convention) — the f32 gate is max|diff| < 1e-4 (no next-token head to top-1 compare).
+echo "encoder arch (bert) hidden-state parity:"
+if $PY scripts/bert_ref.py build >/dev/null 2>&1; then
+  $BIN convert --model /tmp/berttiny --arch bert --dtype f32 -o /tmp/bert_f32 --force >/dev/null 2>&1
+  $BIN --bundle /tmp/bert_f32 --ids /tmp/bert_holdout.json --encode-dump /tmp/bert_rust.bin >/dev/null 2>&1
+  r=$($PY scripts/bert_ref.py compare /tmp/bert_rust.bin 2>/dev/null | tail -1)
+  printf "%-12s %-14s %s\n" bert BertModel "${r:-ERR}"
+else
+  printf "%-12s BUILD FAILED\n" bert
+fi
+echo
+
 # Real-model round-trips from the HF cache (the convert + run path on actual weights), where present.
 GPT2=$(find ~/.cache/huggingface/hub/models--gpt2/snapshots -name config.json -exec dirname {} \; 2>/dev/null | head -1)
 if [ -n "${GPT2:-}" ] && [ -f ../lm-sae/pylm/holdout_gpt2.json ]; then

@@ -465,6 +465,53 @@ pub fn dist_from_identity(m: &Array2<f32>) -> f32 {
     s.sqrt()
 }
 
+// ── sparse-pursuit J-space (the paper's overcomplete sparse-nonneg code) ─────────────────────────────────────────────
+// The paper defines the J-space as the set of points expressible as a SPARSE NONNEGATIVE combination of the J-lens
+// vectors — an OVERCOMPLETE dictionary (n_vocab ≫ d, one atom per token: the residual-space direction Wᵤ·J_l reads out
+// as that token). This is a sparse-coding object (like an SAE), NOT a linear subspace — which is why the top-k-subspace
+// test (`--jlens-causal-jspace`) came back negative: a variance subspace can't isolate a specific concept atom, a sparse
+// code can. `nn_pursuit` is the solver (nonnegative OMP); the dictionary is built from a fitted `{J_l}` + the unembed.
+
+/// Nonnegative Orthogonal Matching Pursuit: decompose `target` (d,) as a `k`-sparse NONNEGATIVE combination of the
+/// columns of `dict` (d × m, overcomplete). Each step adds the atom most positively correlated with the residual, then
+/// re-solves the nonneg least-squares over the active set by projected gradient. Returns the active `(atom, coeff>0)`.
+pub fn nn_pursuit(dict: &Array2<f32>, target: &[f32], k: usize, refine_iters: usize) -> Vec<(usize, f32)> {
+    let (d, m) = (dict.nrows(), dict.ncols());
+    let t = Array1::from(target.to_vec());
+    let mut resid = t.clone();
+    let mut support: Vec<usize> = Vec::new();
+    let mut coeffs: Array1<f32> = Array1::zeros(0);
+    for _ in 0..k.min(d) {
+        let corr = dict.t().dot(&resid); // Dᵀ r  (m,)
+        let mut best = (1e-9f32, usize::MAX); // only POSITIVE correlations (nonneg code)
+        for j in 0..m {
+            if corr[j] > best.0 && !support.contains(&j) {
+                best = (corr[j], j);
+            }
+        }
+        if best.1 == usize::MAX {
+            break; // no atom improves the fit
+        }
+        support.push(best.1);
+        let mut ds = Array2::<f32>::zeros((d, support.len())); // active atoms
+        for (c, &j) in support.iter().enumerate() {
+            ds.column_mut(c).assign(&dict.column(j));
+        }
+        // nonneg least squares over the active set: min ½‖D_S a − t‖², a ≥ 0, by projected gradient.
+        let gram = ds.t().dot(&ds);
+        let step = 1.0 / gram.diag().iter().sum::<f32>().max(1e-6); // 1/trace ≤ 1/λ_max ⇒ stable
+        let dst = ds.t().dot(&t);
+        let mut a = Array1::<f32>::zeros(support.len());
+        for _ in 0..refine_iters.max(1) {
+            let grad = gram.dot(&a) - &dst;
+            a = (&a - &(step * &grad)).mapv(|v| v.max(0.0));
+        }
+        resid = &t - &ds.dot(&a);
+        coeffs = a;
+    }
+    support.iter().zip(coeffs.iter()).filter(|(_, &c)| c > 1e-6).map(|(&j, &c)| (j, c)).collect()
+}
+
 // ── .npz export: put {J_l} on the numpy channel pil consumes (fieldrun_io.py) without adding a zip/numpy dep ──────────
 // A `.npz` is just a ZIP (STORED, no compression — what `np.savez` emits) of `.npy` members. We hand-roll both so the
 // only dependency stays `serde`; the round-trip is verified against real numpy. See `run_export`.
@@ -1453,6 +1500,94 @@ mod cli {
         }
     }
 
+    /// `--recursion-explain --jspace-decompose`: the go/no-go for the paper's sparse-pursuit J-space. Builds the
+    /// overcomplete dictionary `D_l = ((Wᵤ⊙γ)·J_l)ᵀ` (column t = the residual direction that reads out as token t,
+    /// unit-normalized) from a fitted `{J_l}`, decomposes the layer-l residual at the predicting position with
+    /// `nn_pursuit` (k-sparse nonneg), and prints the active token-atoms + reconstruction error next to the plain
+    /// logit-lens. The question it answers cheaply, on CPU, before renting a GPU: are the codes interpretable tokens
+    /// (⇒ scale should sharpen them) or noise (⇒ the fragile fit dominates; a bigger model won't help)? Knobs:
+    /// `--jlens-in`, `--jspace-layer a,b,c`, `--jspace-k`. rope/neox.
+    pub fn run_jspace_decompose(args: &[String], model: &dyn Model, tg: &Option<TextGen>, stem: &str, ids: &[i64]) {
+        let Some(tg) = tg.as_ref() else {
+            eprintln!("[jlens] --jspace-decompose needs a tokenizer");
+            return;
+        };
+        if ids.len() < 2 {
+            eprintln!("[jlens] --jspace-decompose needs a context (--text/--ids)");
+            return;
+        }
+        let inp = flag(args, "--jlens-in").map(|s| s.to_string()).unwrap_or_else(|| format!("{stem}.jlens"));
+        let (d, jmats) = match load(&inp) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[jlens] load {inp}: {e} — run --jlens-fit first");
+                return;
+            }
+        };
+        let Some(uex) = model.export_unembed() else {
+            eprintln!("[jlens] --jspace-decompose: arch lacks export_unembed (rope/neox)");
+            return;
+        };
+        let mut wprime = uex.u; // (vocab, d); fold the final-norm gain γ per dim: W'[t,i] = U[t,i]·γ[i]
+        let gamma = uex.gamma;
+        for mut row in wprime.rows_mut() {
+            for (i, v) in row.iter_mut().enumerate() {
+                *v *= gamma[i];
+            }
+        }
+        let vocab = wprime.nrows();
+        let nl = jmats.len();
+        let k: usize = flag(args, "--jspace-k").and_then(|s| s.parse().ok()).unwrap_or(12);
+        let layers: Vec<usize> = flag(args, "--jspace-layer")
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<_>>())
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![nl / 2, 2 * nl / 3, nl.saturating_sub(3)]);
+        let last = ids.len() - 1;
+        let Some(resids) = model.residuals_at(ids, &[last]) else {
+            eprintln!("[jlens] --jspace-decompose: arch lacks residuals_at (rope/neox)");
+            return;
+        };
+        let dec = |t: i64| tg.token_label(t).replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+        println!("[jlens] J-space sparse decomposition (go/no-go) · predicting after {} · vocab {vocab} · k={k}", dec(ids[last]));
+        for &l in &layers {
+            if l + 1 > nl {
+                continue;
+            }
+            let h = &resids[0][l];
+            eprint!("\r[jlens]   L{l}: building the {d}×{vocab} dictionary…   ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let uj = wprime.dot(&jmats[l]); // (vocab, d)
+            let mut dmat = Array2::<f32>::zeros((d, vocab)); // atoms as columns (residual space), unit-normalized
+            for t in 0..vocab {
+                let n = uj.row(t).iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+                let s = 1.0 / n;
+                for i in 0..d {
+                    dmat[[i, t]] = uj[[t, i]] * s;
+                }
+            }
+            let code = nn_pursuit(&dmat, h, k, 300);
+            // reconstruction error ‖h − Da‖/‖h‖
+            let mut recon = vec![0f32; d];
+            for &(t, c) in &code {
+                for i in 0..d {
+                    recon[i] += c * dmat[[i, t]];
+                }
+            }
+            let hn = h.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+            let herr = h.iter().zip(&recon).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt() / hn;
+            let mut cs = code.clone();
+            cs.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let atoms: Vec<String> = cs.iter().take(10).map(|(t, c)| format!("{}·{c:.2}", dec(*t as i64))).collect();
+            let ll = model.unembed_project(h).unwrap();
+            let lltop = crate::explain::top_promoted(&ll, 1.0, 5);
+            eprint!("\r                                                          \r");
+            println!("  L{l:<2} recon {herr:.2} · {} atoms", code.len());
+            println!("     J-space: {}", atoms.join("  "));
+            println!("     logit-lens: {}", lltop.iter().map(|&t| dec(t)).collect::<Vec<_>>().join("  "));
+        }
+        println!("  (GO if the atoms are interpretable tokens tied to the context; NO-GO if noise — then the fragile fit dominates, not scale.)");
+    }
+
     /// Dispatch: returns true if it handled a `--jlens-*` subcommand.
     pub fn dispatch(args: &[String], model: &dyn Model, tg: &Option<TextGen>, stem: &str, ids: &[i64]) -> bool {
         if has_flag(args, "--jlens-fit") {
@@ -1460,6 +1595,9 @@ mod cli {
             true
         } else if has_flag(args, "--jlens-eval") {
             run_eval(args, model, tg, stem, ids);
+            true
+        } else if has_flag(args, "--jspace-decompose") {
+            run_jspace_decompose(args, model, tg, stem, ids);
             true
         } else if has_flag(args, "--jlens-trajectory") {
             run_trajectory(args, model, tg, ids);
@@ -1625,6 +1763,34 @@ mod tests {
         }
         let jr = rank_reduce(&j, 2, 1);
         assert!((&jr - &j).iter().map(|v| v * v).sum::<f32>() < 1e-3, "rank-2 J recovered by rank_reduce(k=2)");
+    }
+
+    #[test]
+    fn nn_pursuit_recovers_a_sparse_nonneg_code() {
+        // overcomplete random dict (d=24, m=100), unit-norm atoms; a known 3-sparse NONNEGATIVE code; recover it.
+        let (d, m) = (24usize, 100usize);
+        let mut rng = Rng::new(5);
+        let mut dict = Array2::from_shape_fn((d, m), |_| rng.gauss());
+        for c in 0..m {
+            let n = dict.column(c).dot(&dict.column(c)).sqrt().max(1e-9);
+            dict.column_mut(c).mapv_inplace(|v| v / n);
+        }
+        let (sup, coef) = ([7usize, 42, 88], [1.5f32, 0.8, 2.1]);
+        let mut target = Array1::<f32>::zeros(d);
+        for (&s, &c) in sup.iter().zip(coef.iter()) {
+            target = &target + &(&dict.column(s) * c);
+        }
+        let code = nn_pursuit(&dict, &target.to_vec(), 3, 500);
+        let mut got: Vec<usize> = code.iter().map(|(j, _)| *j).collect();
+        got.sort();
+        assert_eq!(got, vec![7, 42, 88], "recovered the true 3-atom support");
+        for (j, c) in &code {
+            let idx = sup.iter().position(|&s| s == *j).unwrap();
+            assert!((c - coef[idx]).abs() < 0.1, "coeff for atom {j}: got {c}, want {}", coef[idx]);
+        }
+        // a target with no positive-correlation structure still returns ≤k atoms (no panic, all coeffs ≥ 0)
+        let noise = nn_pursuit(&dict, &vec![0.01f32; d], 3, 100);
+        assert!(noise.len() <= 3 && noise.iter().all(|(_, c)| *c >= 0.0));
     }
 
     #[test]
