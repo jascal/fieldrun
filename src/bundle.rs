@@ -1370,7 +1370,7 @@ mod tests {
             state ^= state << 17;
             (state >> 56) as i8 // full i8 range incl. -128
         };
-        for &len in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 100, 255, 896, 4864] {
+        for &len in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 100, 128, 255, 896, 4864] {
             let a: Vec<i8> = (0..len).map(|_| next()).collect();
             let w: Vec<i8> = (0..len).map(|_| next()).collect();
             assert_eq!(i8dot(&a, &w), scalar(&a, &w), "len {len}");

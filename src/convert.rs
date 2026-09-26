@@ -381,21 +381,46 @@ fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
     }
 }
 
+/// Select the supported text backbone from a checkpoint's model type.
+/// MiMo's separate MTP tensors are omitted from ordinary `rope` bundles.
+pub fn infer_arch(c: &serde_json::Value) -> Option<&'static str> {
+    match c.get("model_type")?.as_str()? {
+        "mimo" => Some("rope"),
+        "qwen3_5" | "qwen3_5_text" => Some("qwen35"),
+        "qwen3_5_moe" | "qwen3_5_moe_text" => Some("qwen35moe"),
+        _ => None,
+    }
+}
+
+fn check_mimo_config(c: &serde_json::Value) -> std::io::Result<()> {
+    if c["use_sliding_window"].as_bool().unwrap_or(false) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+            "MiMo sliding-window attention is enabled, but the rope kernel only supports full attention"));
+    }
+    if c["use_mrope"].as_bool().unwrap_or(false) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+            "MiMo multimodal RoPE is enabled, but the rope kernel only supports text RoPE"));
+    }
+    Ok(())
+}
+
 pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
+    // The text API loads the bundled tokenizer with the same Rust crate. Check it before
+    // spending time converting a large MiMo or Qwen3.5 checkpoint.
     #[cfg(feature = "api")]
-    if matches!(cfg["model_type"].as_str(), Some("qwen3_5" | "qwen3_5_text")) {
+    if matches!(cfg["model_type"].as_str(), Some("mimo" | "qwen3_5" | "qwen3_5_text")) {
         let tok_path = format!("{model_dir}/tokenizer.json");
         if std::path::Path::new(&tok_path).exists() {
             let tok = tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    format!("qwen35 tokenizer.json cannot be loaded by the text API: {e}")))?;
+                    format!("tokenizer.json cannot be loaded by the text API: {e}")))?;
             let encoded = tok.encode("MiMo", true)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    format!("qwen35 tokenizer.json cannot encode text: {e}")))?;
+                    format!("tokenizer.json cannot encode text: {e}")))?;
             if encoded.get_ids().is_empty() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    "qwen35 tokenizer.json encoded nonempty text to no tokens"));
+                    "tokenizer.json encoded nonempty text to no tokens"));
             }
         }
     }
@@ -409,7 +434,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         let table: &[(&str, &[&str])] = &[
             ("gpt2", &["gpt2"]),
             ("neox", &["gpt_neox"]),
-            ("rope", &["llama", "qwen2", "mistral", "phi"]),
+            ("rope", &["llama", "qwen2", "mistral", "phi", "mimo"]),
             ("gemma", &["gemma", "gemma2"]),
             ("gemma3", &["gemma3"]),
             ("gemma4", &["gemma4"]),
@@ -643,9 +668,23 @@ fn convert_rope(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
     let hd = geti(c, "head_dim").unwrap_or(d / nh);
     let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
     let (theta, eps) = rope_theta_eps(c);
+    let is_mimo = infer_arch(c) == Some("rope");
+    if is_mimo {
+        // MiMo-7B checkpoints ship these flags even though sliding attention is disabled.
+        // The rope kernel is full-context; accepting an enabled window would silently break parity.
+        check_mimo_config(c)?;
+        let mtp_count = m.idx.keys().filter(|k| k.starts_with("model.mtp_layers.")).count();
+        eprintln!("[convert] MiMo: standard next-token backbone; omitting {mtp_count} MTP tensors");
+    }
+    assert!(nh > 0 && nkv > 0 && nh % nkv == 0 && hd > 0 && hd % 2 == 0,
+        "rope: expected even head_dim and query heads divisible by KV heads");
     let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
-    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "rope",
+    let mut manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "rope",
         "config": [nl, nh, nkv, hd, d, ffn, vocab, tie as usize], "config_f": [theta, eps] });
+    if is_mimo {
+        manifest["source_model_type"] = serde_json::json!("mimo");
+        manifest["mtp_layers_omitted"] = serde_json::json!(true);
+    }
     let mut w = BundleWriter::new(stem)?;
     write_layers(&mut w, c, m, dtype, edt, nl, tie, &[("in_ln", "input_layernorm"), ("post_ln", "post_attention_layernorm")], false)?;
     let n = w.arrays.len();
@@ -1503,6 +1542,18 @@ mod tests {
         assert_eq!(geti(&c, "a"), Some(7));
         assert_eq!(geti(&c, "missing"), None);
         assert_eq!(getf(&c, "b"), Some(1.5));
+    }
+
+    #[test]
+    fn mimo_uses_rope_backbone() {
+        assert_eq!(infer_arch(&json!({"model_type": "mimo"})), Some("rope"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5"})), Some("qwen35"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_text"})), Some("qwen35"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe"})), Some("qwen35moe"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe_text"})), Some("qwen35moe"));
+        assert!(check_mimo_config(&json!({"use_sliding_window": false, "use_mrope": false})).is_ok());
+        assert!(check_mimo_config(&json!({"use_sliding_window": true})).is_err());
+        assert!(check_mimo_config(&json!({"use_mrope": true})).is_err());
     }
 
     #[test]

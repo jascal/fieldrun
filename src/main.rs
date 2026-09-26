@@ -162,9 +162,11 @@ fn main() {
         let requested_arch = flag(&args, "--arch");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
         const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
-        if requested_arch.is_some_and(|a| !ARCHS.contains(&a)) {
-            eprintln!("[fieldrun] convert: unknown --arch {:?} (have: {})", requested_arch.unwrap(), ARCHS.join(", "));
-            std::process::exit(2);
+        if let Some(arch) = requested_arch {
+            if !ARCHS.contains(&arch) {
+                eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
+                std::process::exit(2);
+            }
         }
         if !["int4", "q4a", "int8", "f16", "f32"].contains(&dtype) {
             eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, q4a, int8, f16, f32)");
@@ -220,11 +222,7 @@ fn main() {
         };
         let detected_arch = std::fs::read_to_string(format!("{model_dir}/config.json"))
             .ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|c| match c["model_type"].as_str()? {
-                "qwen3_5" | "qwen3_5_text" => Some("qwen35"),
-                "qwen3_5_moe" | "qwen3_5_moe_text" => Some("qwen35moe"),
-                _ => None,
-            });
+            .and_then(|c| convert::infer_arch(&c));
         let arch = requested_arch.or(detected_arch).unwrap_or("rope");
         if requested_arch.is_none() && detected_arch.is_some() {
             eprintln!("[fieldrun] convert: detected --arch {arch} from config.json");
