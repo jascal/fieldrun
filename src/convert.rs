@@ -373,18 +373,21 @@ fn getf(c: &serde_json::Value, k: &str) -> Option<f64> {
 }
 
 fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
-    match c.get("eos_token_id") {
+    match c.get("eos_token_id").filter(|v| !v.is_null())
+        .or_else(|| c.get("text_config").and_then(|t| t.get("eos_token_id"))) {
         Some(serde_json::Value::Number(n)) => n.as_i64().map(|x| vec![x]).unwrap_or_default(),
         Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_i64()).collect(),
         _ => vec![],
     }
 }
 
-/// MiMo's standard next-token path uses the Qwen2 backbone. Its MTP tensors are a separate
-/// speculative head and are deliberately omitted from ordinary `rope` bundles.
+/// Select the supported text backbone from a checkpoint's model type.
+/// MiMo's separate MTP tensors are omitted from ordinary `rope` bundles.
 pub fn infer_arch(c: &serde_json::Value) -> Option<&'static str> {
     match c.get("model_type")?.as_str()? {
         "mimo" => Some("rope"),
+        "qwen3_5" | "qwen3_5_text" => Some("qwen35"),
+        "qwen3_5_moe" | "qwen3_5_moe_text" => Some("qwen35moe"),
         _ => None,
     }
 }
@@ -403,21 +406,21 @@ fn check_mimo_config(c: &serde_json::Value) -> std::io::Result<()> {
 
 pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_stem: &str) -> std::io::Result<()> {
     let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{model_dir}/config.json"))?)?;
-    // The text API loads the bundled tokenizer with the same Rust crate. Check MiMo's
-    // Qwen2Tokenizer JSON before spending time converting its multi-GB weights.
+    // The text API loads the bundled tokenizer with the same Rust crate. Check it before
+    // spending time converting a large MiMo or Qwen3.5 checkpoint.
     #[cfg(feature = "api")]
-    if cfg["model_type"] == "mimo" {
+    if matches!(cfg["model_type"].as_str(), Some("mimo" | "qwen3_5" | "qwen3_5_text")) {
         let tok_path = format!("{model_dir}/tokenizer.json");
         if std::path::Path::new(&tok_path).exists() {
             let tok = tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    format!("MiMo tokenizer.json cannot be loaded by the text API: {e}")))?;
+                    format!("tokenizer.json cannot be loaded by the text API: {e}")))?;
             let encoded = tok.encode("MiMo", true)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    format!("MiMo tokenizer.json cannot encode text: {e}")))?;
+                    format!("tokenizer.json cannot encode text: {e}")))?;
             if encoded.get_ids().is_empty() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                    "MiMo tokenizer.json encoded nonempty text to no tokens"));
+                    "tokenizer.json encoded nonempty text to no tokens"));
             }
         }
     }
@@ -436,6 +439,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
             ("gemma3", &["gemma3"]),
             ("gemma4", &["gemma4"]),
             ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
+            ("qwen35", &["qwen3_5", "qwen3_5_text"]),
+            ("qwen35moe", &["qwen3_5_moe", "qwen3_5_moe_text"]),
             ("mla", &["deepseek", "deepseek_v3", "kimi"]),
             ("minimax", &["minimax"]),
             ("bert", &["bert"]),
@@ -475,7 +480,8 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "gemma3" => convert_gemma3(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "qwen3moe" => convert_qwen3moe(&cfg, &m, dtype, embed_dtype, out_stem)?,
-        "qwen35moe" => convert_qwen35moe(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "qwen35" => convert_qwen35(&cfg, &m, dtype, embed_dtype, out_stem, true)?,
+        "qwen35moe" => convert_qwen35(&cfg, &m, dtype, embed_dtype, out_stem, false)?,
         "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
@@ -990,23 +996,31 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
     Ok(n)
 }
 
-/// Qwen3.6 (`qwen3_5_moe`) — hybrid: 3-of-4 layers are Gated DeltaNet *linear* attention, the rest full GQA
-/// attention; every layer has a SparseMoeBlock (softmax top-k routed experts + a sigmoid-gated shared expert).
-/// The text config is NESTED under `text_config` (the family is VL/omni-capable). Experts ship as PACKED 3D
+/// Qwen3.5 dense text or Qwen3.5 MoE — hybrid: 3-of-4 layers are Gated DeltaNet *linear* attention,
+/// the rest full GQA. Dense uses SwiGLU per layer; MoE uses routed and shared experts.
+/// The text config may be nested under `text_config` (the family is VL/omni-capable). Experts ship as PACKED 3D
 /// tensors (`experts.gate_up_proj` [E, 2·moe_inter, d], `experts.down_proj` [E, d, moe_inter]); we unpack them
 /// into the per-expert `l{l}.experts.{e}.{gate,up,down}` layout so the runtime reuses the qwen3moe MoE path.
 /// config_i: [nl, nh, nkv, hd, d, vocab, tied, n_exp, topk, moe_inter, shared_inter, norm_topk,
 ///            num_v_heads, num_k_heads, head_k_dim, head_v_dim, conv_k, <nl layer_types: 0=full 1=linear>]
-fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+fn convert_qwen35(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str, dense: bool) -> std::io::Result<usize> {
     let tc = c.get("text_config").unwrap_or(c); // text dims are nested in the composite config
+    let invalid = |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("qwen35: {message}"));
+    if tc["rope_parameters"]["rope_type"].as_str().is_some_and(|kind| kind != "default") {
+        return Err(invalid("only default RoPE is supported"));
+    }
+    if tc["mlp_only_layers"].as_array().is_some_and(|layers| !layers.is_empty()) {
+        return Err(invalid("mlp_only_layers is not supported"));
+    }
     let nh = geti(tc, "num_attention_heads").unwrap();
     let nkv = geti(tc, "num_key_value_heads").unwrap_or(nh);
     let d = geti(tc, "hidden_size").unwrap();
+    if nh == 0 { return Err(invalid("num_attention_heads must be positive")); }
     let hd = geti(tc, "head_dim").unwrap_or(d / nh);
     let (nl, vocab) = (geti(tc, "num_hidden_layers").unwrap(), geti(tc, "vocab_size").unwrap());
     let (theta, eps) = rope_theta_eps(tc);
     let tie = tc.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
-    let n_exp = geti(tc, "num_experts").unwrap_or(0);
+    let n_exp = if dense { 0 } else { geti(tc, "num_experts").unwrap() };
     let topk = geti(tc, "num_experts_per_tok").unwrap_or(0);
     let moe_inter = geti(tc, "moe_intermediate_size").unwrap_or(0);
     let shared_inter = geti(tc, "shared_expert_intermediate_size").unwrap_or(0);
@@ -1015,17 +1029,30 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
     let (hkd, hvd) = (geti(tc, "linear_key_head_dim").unwrap(), geti(tc, "linear_value_head_dim").unwrap());
     let conv_k = geti(tc, "linear_conv_kernel_dim").unwrap_or(4);
     // partial RoPE: only the first `rotary_dim` of each head_dim is rotated (full attention only)
-    let prf = tc.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let prf = tc.get("partial_rotary_factor").and_then(|v| v.as_f64())
+        .or_else(|| tc["rope_parameters"]["partial_rotary_factor"].as_f64()).unwrap_or(1.0);
     let rotary_dim = (hd as f64 * prf) as usize;
     let ltypes: Vec<String> = tc.get("layer_types").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    if nkv == 0 || nh % nkv != 0 || nkh == 0 || nvh == 0 || nvh % nkh != 0
+        || hkd == 0 || hvd == 0 || conv_k == 0
+        || rotary_dim == 0 || rotary_dim > hd || rotary_dim % 2 != 0 {
+        return Err(invalid("invalid attention head or partial RoPE dimensions"));
+    }
+    if ltypes.len() != nl || ltypes.iter().any(|s| s != "linear_attention" && s != "full_attention") {
+        return Err(invalid("layer_types must name every linear_attention/full_attention layer"));
+    }
+    if !dense && (n_exp == 0 || topk == 0 || topk > n_exp) {
+        return Err(invalid("invalid MoE expert count or top-k"));
+    }
     let is_linear = |l: usize| ltypes.get(l).map(|s| s == "linear_attention").unwrap_or(false);
 
     let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, vocab, tie as usize, n_exp, topk, moe_inter,
                                       shared_inter, norm_topk as usize, nvh, nkh, hkd, hvd, conv_k];
     for l in 0..nl { config.push(if is_linear(l) { 1 } else { 0 }); } // layer_types at config[17..17+nl]
     config.push(rotary_dim); // config[17+nl] = rotary_dim (partial RoPE width)
-    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen35moe",
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1,
+        "arch": if dense { "qwen35" } else { "qwen35moe" },
         "config": config, "config_f": [theta, eps] });
 
     let mut w = BundleWriter::new(stem)?;
@@ -1037,15 +1064,14 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
         let (s, dt) = m.read(hf);
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
-    let (es, ed) = m.read("model.embed_tokens.weight");
-    w.put_embed("embed", &ed, &es, edt, dtype)?;
-    norm(&mut w, "norm", "model.norm.weight")?;
+    let model_prefix = if m.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
+    w.put_embed_streamed(m, "embed", &format!("{model_prefix}.embed_tokens.weight"), edt, dtype)?;
+    norm(&mut w, "norm", &format!("{model_prefix}.norm.weight"))?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight");
-        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
+        w.put_embed_streamed(m, "lm_head", "lm_head.weight", edt, dtype)?;
     }
     for l in 0..nl {
-        let p = format!("model.layers.{l}.");
+        let p = format!("{model_prefix}.layers.{l}.");
         norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
         norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
         if is_linear(l) {
@@ -1067,6 +1093,12 @@ fn convert_qwen35moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, s
             for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
                 lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
             }
+        }
+        if dense {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                lin(&mut w, &format!("l{l}.mlp.{proj}"), &format!("{p}mlp.{proj}.weight"))?;
+            }
+            continue;
         }
         // MoE (every layer): router + experts (handle BOTH on-disk layouts) + sigmoid-gated shared expert
         lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?;
@@ -1499,6 +1531,8 @@ mod tests {
     fn eos_ids_int_array_none() {
         assert_eq!(eos_ids(&json!({"eos_token_id": 5})), vec![5]);
         assert_eq!(eos_ids(&json!({"eos_token_id": [1, 2, 3]})), vec![1, 2, 3]);
+        assert_eq!(eos_ids(&json!({"text_config": {"eos_token_id": 248044}})), vec![248044]);
+        assert_eq!(eos_ids(&json!({"eos_token_id": null, "text_config": {"eos_token_id": 248044}})), vec![248044]);
         assert_eq!(eos_ids(&json!({})), Vec::<i64>::new());
     }
 
@@ -1513,7 +1547,10 @@ mod tests {
     #[test]
     fn mimo_uses_rope_backbone() {
         assert_eq!(infer_arch(&json!({"model_type": "mimo"})), Some("rope"));
-        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe"})), None);
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5"})), Some("qwen35"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_text"})), Some("qwen35"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe"})), Some("qwen35moe"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe_text"})), Some("qwen35moe"));
         assert!(check_mimo_config(&json!({"use_sliding_window": false, "use_mrope": false})).is_ok());
         assert!(check_mimo_config(&json!({"use_sliding_window": true})).is_err());
         assert!(check_mimo_config(&json!({"use_mrope": true})).is_err());

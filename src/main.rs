@@ -154,14 +154,14 @@ fn main() {
                     "[fieldrun] convert: --model is required.\n  \
                      fieldrun convert --model <local-dir | hf-repo-id> --arch <arch> [--dtype int8|f16|f32] [-o <stem>]\n  \
                      e.g.  fieldrun convert --model Qwen/Qwen2.5-1.5B-Instruct --arch rope --dtype f16\n  \
-                     archs: gpt2 | rope | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax   (see `fieldrun --help`)"
+                     archs: gpt2 | rope | qwen35 | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax   (see `fieldrun --help`)"
                 );
                 std::process::exit(2);
             }
         };
         let requested_arch = flag(&args, "--arch");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
         if let Some(arch) = requested_arch {
             if !ARCHS.contains(&arch) {
                 eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
@@ -750,12 +750,12 @@ fn main() {
             "gemma3" => Box::new(Gemma3::new(bundle, route, kv_int8)),
             "gemma4" => Box::new(Gemma4::new(bundle, route, kv_int8)),
             "qwen3moe" => Box::new(Qwen3Moe::new(bundle, route, kv_int8)),
-            "qwen35moe" => Box::new(qwen35moe::Qwen35Moe::new(bundle, route, kv_int8)),
+            "qwen35" | "qwen35moe" => Box::new(qwen35moe::Qwen35Moe::new(bundle, route, kv_int8)),
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
             "bert" => Box::new(bert::Bert::new(bundle)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, dsv4, bert)"),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, bert)"),
         };
 
         // ── encode-dump: encoder-only per-token hidden states ───────────────────────────────────────────────
@@ -3910,7 +3910,8 @@ fn main() {
             let naive: Vec<i64> = (0..n).map(|_| { let t = lm.predict(&ctx2); ctx2.push(t); t }).collect();
             let naive_s = t1.elapsed().as_secs_f64();
             println!("[fieldrun] generate {n} tokens from a {}-token prompt · {arch}", prompt.len());
-            println!("[fieldrun]   KV-cache: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
+            let path = if matches!(arch.as_str(), "qwen35" | "qwen35moe") { "stream  " } else { "KV-cache" };
+            println!("[fieldrun]   {path}: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
             println!("[fieldrun]   naive   : {naive_s:.2}s  ({:.1} tok/s)", n as f64 / naive_s);
             println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
             return;
@@ -4068,7 +4069,7 @@ USAGE\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
-  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
+  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | qwen35 (Qwen3.5 dense text) | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
   --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
