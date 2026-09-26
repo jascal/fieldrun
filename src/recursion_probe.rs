@@ -779,11 +779,17 @@ pub fn run_pil_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<c
 }
 
 /// Per-position residual dump used by `--source-dump` and the GPU faithfulness check (`--gpu-dump-check`).
-pub(crate) fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, nmax: usize, sid: Option<&str>, out: &mut String) -> (usize, usize) {
-    let last = (ids.len() - 1).min(nmax + 1);
+pub(crate) fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, nmax: usize, tail: Option<usize>, sid: Option<&str>, out: &mut String) -> (usize, usize) {
+    // default: the first `nmax` scored positions. `--tail N`: only the last N scored positions (a position is scored
+    // when it has a successor, so the final scored position is `len-2`) — e.g. a decision prompt with one placeholder
+    // token appended dumps exactly its decision position with `--tail 1`.
+    let (first, last) = match tail {
+        Some(n) => ((ids.len() - 1).saturating_sub(n).max(1), ids.len() - 1),
+        None => (1, (ids.len() - 1).min(nmax + 1)),
+    };
     let mut recon_ok = 0usize;
     let mut npos = 0usize;
-    for p in 1..last {
+    for p in first..last {
         let ctx = &ids[..=p];
         let logits = match lm.logits(ctx) { Some(l) => l, None => { eprintln!("[fieldrun] no logits (arch)"); return (recon_ok, npos); } };
         let mut order: Vec<usize> = (0..logits.len()).collect();
@@ -841,13 +847,17 @@ pub(crate) fn dump_one(lm: &dyn crate::model::Model, ids: &[i64], kcand: usize, 
 /// frame `U'`, so faithfulness + single-source become an LP in `U'`; that needs the raw `d̃_b`, which `--pil-dump`
 /// (incidences under the model's own `U`) cannot supply. Emits the target token + top-K competitor ids per position;
 /// a recon self-check (`Σ_b ⟨d̃_b, U_v⟩` vs the model logit argmax) is printed to confirm exactness.
+/// `--texts` rows are `{"sid", "text"}` or `{"sid", "ids": [..]}` (exact token ids, e.g. a chat-templated decision
+/// prompt). `--tail N` dumps only the last N scored positions instead of the first `--n` (append one placeholder
+/// token to a decision prompt and `--tail 1` dumps exactly its decision position).
 pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Option<crate::api::TextGen>, stem: &str) {
     let path = match flag(args, "--source-dump") { Some(p) => p, None => { eprintln!("[fieldrun] --source-dump needs a path"); return; } };
     let kcand: usize = flag(args, "--kcand").and_then(|s| s.parse().ok()).unwrap_or(24);
     let nmax: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(64);
+    let tail: Option<usize> = flag(args, "--tail").and_then(|s| s.parse().ok());
+    let n_scored = |len: usize| match tail { Some(n) => n.min(len - 2), None => (len - 1).min(nmax + 1).saturating_sub(1) };
     let mut out = String::new();
     if let Some(textspath) = flag(args, "--texts") {
-        let tg = match tg { Some(t) => t, None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } };
         let txt = match std::fs::read_to_string(textspath) {
             Ok(txt) => txt,
             Err(e) => { eprintln!("[fieldrun] cannot read {textspath}: {e}"); return; }
@@ -862,18 +872,28 @@ pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
                 Ok(v) => v,
                 Err(e) => { eprintln!("[fieldrun] source-dump: skipping line {}: {e}", line_idx + 1); continue; }
             };
-            let (sid, text) = match (v.get("sid").and_then(|x| x.as_str()), v.get("text").and_then(|x| x.as_str())) {
-                (Some(sid), Some(text)) => (sid, text),
-                _ => { eprintln!("[fieldrun] source-dump: skipping line {}: needs string sid and text", line_idx + 1); continue; }
+            // a row carries either `text` (tokenized here) or exact token `ids` (e.g. a chat-templated decision prompt
+            // whose special tokens and suffix boundary must be reproduced exactly).
+            let sid = match v.get("sid").and_then(|x| x.as_str()) {
+                Some(sid) => sid,
+                None => { eprintln!("[fieldrun] source-dump: skipping line {}: needs a string sid", line_idx + 1); continue; }
             };
-            let ids = tg.encode(text, false);
+            let ids: Vec<i64> = if let Some(arr) = v.get("ids").and_then(|x| x.as_array()) {
+                arr.iter().filter_map(|x| x.as_i64()).collect()
+            } else if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
+                match tg { Some(t) => t.encode(text, false),
+                           None => { eprintln!("[fieldrun] source-dump: sid={sid} has text but no tokenizer next to {stem}"); continue; } }
+            } else {
+                eprintln!("[fieldrun] source-dump: skipping line {}: needs text or ids", line_idx + 1);
+                continue;
+            };
             if ids.len() < 4 {
                 eprintln!("[fieldrun] source-dump: skipping sid={sid} too few ids ({})", ids.len());
                 continue;
             }
             sentences += 1;
-            total_positions += (ids.len() - 1).min(nmax + 1).saturating_sub(1);
-            let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, Some(sid), &mut out);
+            total_positions += n_scored(ids.len());
+            let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, tail, Some(sid), &mut out);
             recon_ok_total += recon_ok;
             npos_total += npos;
         }
@@ -900,12 +920,11 @@ pub fn run_source_dump(args: &[String], lm: &dyn crate::model::Model, tg: &Optio
                    None => { eprintln!("[fieldrun] --source-dump needs a tokenizer next to {stem} (or --ids)"); return; } }
     };
     if ids.len() < 4 { eprintln!("[fieldrun] source-dump: too few ids ({})", ids.len()); return; }
-    let last = (ids.len() - 1).min(nmax + 1);
-    eprintln!("[fieldrun] source-dump · {} positions · top-{kcand} cands → {path}", last.saturating_sub(1));
-    let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, None, &mut out);
+    eprintln!("[fieldrun] source-dump · {} positions · top-{kcand} cands → {path}", n_scored(ids.len()));
+    let (recon_ok, npos) = dump_one(lm, &ids, kcand, nmax, tail, None, &mut out);
     let recon = if npos > 0 { format!("{:.2}", recon_ok as f32 / npos as f32) } else { "n/a (no unembed_row)".into() };
     match std::fs::write(path, &out) {
-        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon})", last.saturating_sub(1)),
+        Ok(_) => eprintln!("[fieldrun] wrote {} records → {path}  (recon argmax {recon})", n_scored(ids.len())),
         Err(e) => eprintln!("[fieldrun] cannot write {path}: {e}"),
     }
 }
