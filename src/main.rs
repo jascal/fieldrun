@@ -159,12 +159,14 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let arch = flag(&args, "--arch").unwrap_or("rope");
+        let requested_arch = flag(&args, "--arch");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
         const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
-        if !ARCHS.contains(&arch) {
-            eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
-            std::process::exit(2);
+        if let Some(arch) = requested_arch {
+            if !ARCHS.contains(&arch) {
+                eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
+                std::process::exit(2);
+            }
         }
         if !["int4", "q4a", "int8", "f16", "f32"].contains(&dtype) {
             eprintln!("[fieldrun] convert: unknown --dtype {dtype:?} (have: int4, q4a, int8, f16, f32)");
@@ -218,6 +220,13 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        let detected_arch = std::fs::read_to_string(format!("{model_dir}/config.json"))
+            .ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|c| convert::infer_arch(&c));
+        let arch = requested_arch.or(detected_arch).unwrap_or("rope");
+        if requested_arch.is_none() && detected_arch.is_some() {
+            eprintln!("[fieldrun] convert: detected --arch {arch} from config.json");
+        }
         // `--dtype-map <alloc.json>`: per-tensor dtype overrides for CERTIFIED mixed precision
         // (CERTIFIED_QUANT_PROPOSAL.md). JSON `{"dtype_map": {"l0.mlp.gate_proj":"int4", ...}}`; absent
         // tensors keep the global --dtype. Produced by experiments/certified_quant/step1_allocate.py.

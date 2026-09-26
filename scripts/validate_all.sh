@@ -32,6 +32,18 @@ for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma
 done
 echo
 
+# MiMo-7B: Qwen2 backbone at head_dim 128 / 4:1 GQA / theta 640000, with an
+# extra MTP tensor that standard next-token conversion must omit.
+if $PY scripts/mimo_ref.py build >/dev/null 2>&1; then
+  $BIN convert --model /tmp/fieldrun_mimo_tiny --dtype f32 -o /tmp/fieldrun_mimo_f32 --force >/dev/null 2>&1 || exit 1
+  $BIN --bundle /tmp/fieldrun_mimo_f32 --ids /tmp/fieldrun_mimo_holdout.json --ctx 16 --n-eval 60 --dump /tmp/fieldrun_mimo_f32.txt >/dev/null 2>&1 || exit 1
+  $PY scripts/mimo_ref.py compare /tmp/fieldrun_mimo_f32.txt || exit 1
+else
+  echo "MiMo tiny reference build failed"
+  exit 1
+fi
+echo
+
 # Generate + explain gate: incremental KV-cache decode must be BYTE-IDENTICAL to the naive full-recompute path (the f32
 # correctness gate for generation — naive is itself top-1-validated vs torch above, so KV==naive ⇒ KV==torch), for both
 # the f32 and int8-KV caches. `prefix`/`prefix-q` gate prefix-KV reuse (the chat/serve cross-turn cache) on the f32 and
