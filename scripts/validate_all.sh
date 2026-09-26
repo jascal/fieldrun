@@ -32,6 +32,18 @@ for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma
 done
 echo
 
+# Qwen3.5 dense text (MiMo-V2.6-Distill-Qwen-9B): the 3:1 DeltaNet/full hybrid,
+# dense SwiGLU, composite model.language_model.* names, and partial RoPE.
+if $PY scripts/qwen35_dense_ref.py build >/dev/null 2>&1; then
+  $BIN convert --model /tmp/fieldrun_qwen35_dense_tiny --dtype f32 -o /tmp/fieldrun_qwen35_dense_f32 --force >/dev/null 2>&1 || exit 1
+  $BIN --bundle /tmp/fieldrun_qwen35_dense_f32 --ids /tmp/fieldrun_qwen35_dense_ids.json --ctx 16 --n-eval 60 --dump /tmp/fieldrun_qwen35_dense_f32.txt >/dev/null 2>&1 || exit 1
+  $PY scripts/qwen35_dense_ref.py compare /tmp/fieldrun_qwen35_dense_f32.txt || exit 1
+else
+  echo "Qwen3.5 dense reference build failed"
+  exit 1
+fi
+echo
+
 # Generate + explain gate: incremental KV-cache decode must be BYTE-IDENTICAL to the naive full-recompute path (the f32
 # correctness gate for generation — naive is itself top-1-validated vs torch above, so KV==naive ⇒ KV==torch), for both
 # the f32 and int8-KV caches. `prefix`/`prefix-q` gate prefix-KV reuse (the chat/serve cross-turn cache) on the f32 and

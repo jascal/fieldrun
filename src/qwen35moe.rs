@@ -1,12 +1,12 @@
-//! Qwen3.6 (`qwen3_5_moe`) — hybrid Gated-DeltaNet / full-attention MoE. Layout: the `3×(GatedDeltaNet→MoE)
-//! → 1×(GatedAttention→MoE)` pattern (per `layer_types`); 3 of every 4 layers are Gated DeltaNet *linear*
+//! Qwen3.5 hybrid Gated-DeltaNet / full-attention, with dense SwiGLU or MoE FFNs. Layout: the `3×linear
+//! → 1×full` pattern (per `layer_types`); 3 of every 4 layers are Gated DeltaNet *linear*
 //! attention (`crate::deltanet`, golden-tested vs transformers in #112–#114), the 4th is full GQA attention.
 //!
 //! Architecture quirks this port implements (each verified against `Qwen3_5MoeForCausalLM`):
 //!   • full attention is GATED: `q_proj → [query | gate]` per head; `attn_out ·= sigmoid(gate)` before o_proj
 //!   • PARTIAL RoPE: only the first `rotary_dim = head_dim·partial_rotary_factor` of each head is rotated
-//!   • MoE every layer: softmax top-k, ALWAYS-renormalized weights (independent of norm_topk_prob) + a
-//!     sigmoid-gated shared expert
+//!   • MoE variant: softmax top-k, ALWAYS-renormalized weights (independent of norm_topk_prob) + a
+//!     sigmoid-gated shared expert; dense variant: ordinary SwiGLU
 //!   • RMSNorm is GEMMA-style `·(1+weight)` (the gating bug that took the longest); the linear path's output
 //!     gate is the separate `Qwen3_5MoeRMSNormGated` = plain `·weight` (see `deltanet::rmsnorm_gated`)
 //!
@@ -14,6 +14,8 @@
 //! op matches to 9.7e-9 (`full_attn_golden.py`), and end-to-end logits argmax = 100% (max diff 1.27e-3),
 //! per-layer residual ≤ 7e-3 — so the MoE renorm, gated attention, shared expert, and partial RoPE are
 //! confirmed correct, not just asserted. Harness: make_tiny → convert → `--hidden-dump`/`--logits-dump` → compare.
+//! Dense Qwen3.5 text (MiMo-V2.6-Distill-Qwen-9B's backbone) is gated 60/60 top-1 against torch by
+//! `scripts/qwen35_dense_ref.py`; generation uses the trait's full-context path until hybrid state caching lands.
 
 use std::collections::HashMap;
 
@@ -65,7 +67,10 @@ fn softmax_rows(a: &mut Array2<f32>) {
 }
 
 impl Qwen35Moe {
-    pub fn new(b: Bundle, _route: f32, _kv_int8: bool) -> Qwen35Moe {
+    pub fn new(b: Bundle, _route: f32, kv_int8: bool) -> Qwen35Moe {
+        if kv_int8 {
+            eprintln!("[fieldrun] qwen35: --kv-int8 needs hybrid state caching; using full-context generation");
+        }
         // config_i: [nl,nh,nkv,hd,d,vocab,tied,n_exp,topk,moe_inter,shared_inter,norm_topk,
         //            nvh,nkh,hkd,hvd,conv_k, <nl layer_types: 0=full 1=linear>]
         let c = &b.config;
@@ -289,6 +294,20 @@ impl Qwen35Moe {
         out
     }
 
+    fn ffn(&self, l: usize, x: &Array2<f32>) -> Array2<f32> {
+        if self.n_exp != 0 {
+            return self.moe_branch(l, x);
+        }
+        let p = format!("l{l}.mlp.");
+        let gate = self.b.mm(x, &format!("{p}gate_proj"));
+        let up = self.b.mm(x, &format!("{p}up_proj"));
+        let mut hidden = gate;
+        for (v, u) in hidden.iter_mut().zip(up.iter()) {
+            *v = silu(*v) * u;
+        }
+        self.b.mm(&hidden, &format!("{p}down_proj"))
+    }
+
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
         let mut x = self.b.rows_f32("embed", ids);
         for l in 0..self.n_layer {
@@ -297,7 +316,7 @@ impl Qwen35Moe {
             let attn = if self.linear[l] { self.linear_attn(l, &a) } else { self.full_attn(l, &a) };
             x = &x + &attn;
             let a2 = self.norm(&x, &format!("{p}post_ln"));
-            x = &x + &self.moe_branch(l, &a2);
+            x = &x + &self.ffn(l, &a2);
         }
         self.norm(&x, "norm")
     }
@@ -315,7 +334,7 @@ impl Qwen35Moe {
             let attn = if self.linear[l] { self.linear_attn(l, &a) } else { self.full_attn(l, &a) };
             x = &x + &attn;
             let a2 = self.norm(&x, &format!("{p}post_ln"));
-            x = &x + &self.moe_branch(l, &a2);
+            x = &x + &self.ffn(l, &a2);
             if l + 1 < self.n_layer {
                 snaps.push(x.iter().cloned().collect()); // input to L{l+1}
             }
