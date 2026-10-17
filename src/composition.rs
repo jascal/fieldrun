@@ -102,6 +102,47 @@ impl Gpt2 {
         layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"))
     }
 
+    fn mlp_act_last(&self, ids: &[i64], layer: usize) -> Option<Vec<f32>> {
+        if layer >= self.n_layer || ids.is_empty() {
+            return None;
+        }
+        // Same arithmetic as `hidden`, same order, stopping at `layer` — no later layer feeds back into this one.
+        // GPT-2's FFN is GELU (c_fc), not SwiGLU, so the "post-activation" vector here is post-GELU.
+        let seq = ids.len();
+        let hd = self.d / self.n_head;
+        let mut x = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &(0..seq as i64).collect::<Vec<_>>());
+        for l in 0..=layer {
+            let p = format!("h{l}.");
+            let a = layernorm(&x, self.b.arr1(&format!("{p}ln_1.weight")), self.b.arr1(&format!("{p}ln_1.bias")));
+            let qkv = self.b.mm(&a, &format!("{p}attn.c_attn.weight")) + &self.b.arr1(&format!("{p}attn.c_attn.bias"));
+            let mut attn_out = Array2::<f32>::zeros((seq, self.d));
+            for h in 0..self.n_head {
+                let q = qkv.slice(s![.., h * hd..(h + 1) * hd]);
+                let k = qkv.slice(s![.., self.d + h * hd..self.d + (h + 1) * hd]);
+                let v = qkv.slice(s![.., 2 * self.d + h * hd..2 * self.d + (h + 1) * hd]);
+                let mut scores = q.dot(&k.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e10; // causal mask
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&v));
+            }
+            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight"))
+                + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
+            let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
+            let mut h_mlp = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
+            gelu(&mut h_mlp);
+            if l == layer {
+                return Some(h_mlp.row(seq - 1).to_vec());
+            }
+            x = &x + &(self.down(&h_mlp, &format!("{p}mlp.c_proj.weight"))
+                + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+        }
+        None
+    }
+
     /// Explain the prediction: the live attention-head circuits + top MLP features at the predicting position.
     fn explanation(&self, ids: &[i64]) -> crate::explain::Explanation {
         use crate::explain::*;

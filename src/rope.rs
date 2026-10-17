@@ -499,6 +499,22 @@ impl Rope {
         (att_last, head_act, mlp_h, x.row(last).to_vec(), xf.row(last).to_vec())
     }
 
+    /// KV-cached twin of [`Model::mlp_act_last`]: prefill `ids` through `forward_block_capture`, which already
+    /// captures the same per-layer `mlp_h` vector the explain path uses. Exists so the cached and naive readouts
+    /// can be asserted bit-identical — the same bar every other cache in this repo is held to.
+    pub(crate) fn mlp_act_last_kv(&self, ids: &[i64], layer: usize) -> Option<Vec<f32>> {
+        if layer >= self.n_layer || ids.is_empty() {
+            return None;
+        }
+        let total = ids.len();
+        let kvdim = self.nkv * self.hd;
+        let mut kc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
+        let mut vc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
+        let emb = self.b.rows_f32("embed", ids);
+        let (_att_last, _head_act, mlp_h, _x, _xf) = self.forward_block_capture(&emb, 0, &mut kc, &mut vc);
+        mlp_h.get(layer).cloned()
+    }
+
     /// Build the Explanation for the LAST token of `ids` from already-captured per-layer rows (shared by the cached
     /// stream and a byte-identity check). `att_last`/`head_act`/`mlp_h` are the last-position captures, `x_last`/`xf_last`
     /// the residual either side of the final norm.
@@ -743,6 +759,59 @@ impl Model for Rope {
 
     fn explain_stream(&self, ids: &[i64], decomp_k: usize, start: usize, f: &mut dyn FnMut(usize, crate::explain::Explanation)) {
         self.explanation_stream(ids, decomp_k, start, f); // KV-cached growing-prefix explain — byte-identical, O(seq)
+    }
+
+    fn mlp_act_last(&self, ids: &[i64], layer: usize) -> Option<Vec<f32>> {
+        if layer >= self.n_layer || ids.is_empty() {
+            return None;
+        }
+        // Same arithmetic as `hidden`, in the same order, stopping at `layer` — later layers cannot
+        // influence this one, so the early exit is exact rather than an approximation.
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids);
+        for l in 0..=layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            if l == layer {
+                return Some(hidden.row(seq - 1).to_vec());
+            }
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        None
     }
 
     fn final_residual(&self, ids: &[i64]) -> Option<Vec<f32>> {
@@ -1249,5 +1318,174 @@ impl Model for Rope {
             self.forward_block(&emb, cur, kc, vc)
         };
         crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, ctx| self.head_argmax_gated(xb, ctx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::Bundle;
+    use crate::model::Model;
+
+    /// Deterministic pseudo-random weights — no RNG dependency, so a failure is always reproducible.
+    fn v(seed: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (((seed * 37 + i * 17) % 41) as f32) / 20.0 - 1.0).collect()
+    }
+
+    /// A 3-layer rope-family bundle with no QK-norm (so `qk_norm` is off). Returns the bundle stem.
+    fn tiny_rope(tag: &str) -> String {
+        let (nl, hh, nkv, hd, d, ff, vocab) = (3usize, 4usize, 2usize, 4usize, 16usize, 12usize, 20usize);
+        let dir = std::env::temp_dir().join(format!("fr_blindmax_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut bin: Vec<u8> = Vec::new();
+        let mut specs: Vec<serde_json::Value> = Vec::new();
+        let mut add = |name: String, shape: Vec<usize>, data: Vec<f32>| {
+            let offset = bin.len();
+            for x in &data {
+                bin.extend_from_slice(&x.to_le_bytes());
+            }
+            specs.push(serde_json::json!({ "name": name, "dtype": "f32", "shape": shape,
+                "offset": offset, "bytes": bin.len() - offset }));
+        };
+        add("embed".into(), vec![vocab, d], v(1, vocab * d));
+        add("norm".into(), vec![d], v(2, d));
+        add("lm_head".into(), vec![vocab, d], v(3, vocab * d));
+        for l in 0..nl {
+            let p = format!("l{l}.");
+            add(format!("{p}in_ln"), vec![d], v(10 + l, d));
+            add(format!("{p}post_ln"), vec![d], v(20 + l, d));
+            // Linear weights are stored (in, out) — `mm(a: (seq,in), w: (in,out))`.
+            add(format!("{p}self_attn.q_proj"), vec![d, hh * hd], v(30 + l, d * hh * hd));
+            add(format!("{p}self_attn.k_proj"), vec![d, nkv * hd], v(40 + l, d * nkv * hd));
+            add(format!("{p}self_attn.v_proj"), vec![d, nkv * hd], v(50 + l, d * nkv * hd));
+            add(format!("{p}self_attn.o_proj"), vec![hh * hd, d], v(60 + l, hh * hd * d));
+            add(format!("{p}mlp.gate_proj"), vec![d, ff], v(70 + l, d * ff));
+            add(format!("{p}mlp.up_proj"), vec![d, ff], v(80 + l, d * ff));
+            add(format!("{p}mlp.down_proj"), vec![ff, d], v(90 + l, ff * d));
+        }
+        let manifest = serde_json::json!({
+            "format": crate::bundle::FORMAT, "version": crate::bundle::VERSION, "arch": "rope",
+            // [n_layer, H, nkv, hd, d, ffn, vocab, tied=0]; config_f = [rope_theta, eps]
+            "config": [nl as i64, hh as i64, nkv as i64, hd as i64, d as i64, ff as i64, vocab as i64, 0],
+            "config_f": [10000.0, 1e-5], "arrays": specs,
+        });
+        std::fs::write(format!("{stem}.fieldrun.bin"), &bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        stem
+    }
+
+    /// Every layer's last-position post-activation row, with NO early exit — i.e. what a forward that
+    /// always runs to the end produces. `mlp_act_last` stops at `layer` as an optimisation; this is the
+    /// reference that optimisation must not perturb.
+    fn full_mlp_h(m: &Rope, ids: &[i64]) -> Vec<Vec<f32>> {
+        let seq = ids.len();
+        let (h, nkv, hd) = (m.h, m.nkv, m.hd);
+        let rep = h / nkv;
+        let mut x = m.b.rows_f32("embed", ids);
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        for l in 0..m.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, m.b.arr1(&format!("{p}in_ln")), m.eps);
+            let mut q = m.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = m.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = m.proj(&a, &format!("{p}self_attn.v_proj"));
+            m.rope(&mut q, h, 0);
+            m.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &m.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let a2 = rmsnorm(&x, m.b.arr1(&format!("{p}post_ln")), m.eps);
+            let gate = m.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = m.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            out.push(hidden.row(seq - 1).to_vec());
+            x = &x + &m.down(&hidden, &format!("{p}mlp.down_proj"));
+        }
+        out
+    }
+
+    const IDS: [i64; 7] = [1, 5, 3, 9, 2, 7, 4];
+
+    /// (a) The early exit at `layer` is EXACT: stopping there must not perturb the value, so every layer's
+    /// readout must match the same layer taken from a forward that ran to the end. Bit-for-bit.
+    #[test]
+    fn mlp_act_last_early_exit_is_exact() {
+        let stem = tiny_rope("early");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let full = full_mlp_h(&m, &IDS);
+        for l in 0..m.n_layer {
+            let got = m.mlp_act_last(&IDS, l).unwrap();
+            assert_eq!(got.len(), full[l].len(), "layer {l}: wrong width");
+            for i in 0..got.len() {
+                assert_eq!(
+                    got[i].to_bits(),
+                    full[l][i].to_bits(),
+                    "layer {l} neuron {i}: early exit diverged — {:e} vs {:e}",
+                    got[i],
+                    full[l][i]
+                );
+            }
+        }
+    }
+
+    /// (b) The KV-cached readout must be BYTE-identical to the naive one — the same bar every other cache
+    /// in this repo is held to. A token equality check would not catch a small per-layer drift here.
+    #[test]
+    fn mlp_act_last_cached_matches_naive_bitwise() {
+        let stem = tiny_rope("cached");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        for l in 0..m.n_layer {
+            let naive = m.mlp_act_last(&IDS, l).unwrap();
+            let cached = m.mlp_act_last_kv(&IDS, l).unwrap();
+            assert_eq!(naive.len(), cached.len(), "layer {l}: width mismatch");
+            for i in 0..naive.len() {
+                assert_eq!(
+                    naive[i].to_bits(),
+                    cached[i].to_bits(),
+                    "layer {l} neuron {i}: KV-cached readout diverged — {:e} vs {:e}",
+                    naive[i],
+                    cached[i]
+                );
+            }
+        }
+    }
+
+    /// Guards the edges the blind-max harness will hit: no layer, a negative layer, and an empty sequence.
+    #[test]
+    fn mlp_act_last_rejects_bad_inputs() {
+        let stem = tiny_rope("edges");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        assert!(m.mlp_act_last(&IDS, m.n_layer).is_none(), "out-of-range layer must be None");
+        assert!(m.mlp_act_last(&IDS, 999).is_none(), "far out-of-range layer must be None");
+        assert!(m.mlp_act_last(&[], 0).is_none(), "empty sequence must be None");
+    }
+
+    /// A single-token sequence still returns that token's activations (length 1, no mask needed) —
+    /// blind-max evaluates short probes, so a 1-token case must not silently return None.
+    #[test]
+    fn mlp_act_last_single_token() {
+        let stem = tiny_rope("one");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let got = m.mlp_act_last(&[3], 1).unwrap();
+        assert_eq!(got.len(), 12); // ffn width
+        let full = full_mlp_h(&m, &[3]);
+        assert_eq!(got[0].to_bits(), full[1][0].to_bits());
     }
 }
