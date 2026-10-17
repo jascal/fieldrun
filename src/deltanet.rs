@@ -37,7 +37,6 @@ fn stable_softplus(z: f32) -> f32 {
 
 /// Single-head Gated DeltaNet over a `t`-token sequence. Flat row-major slices:
 /// `q,k` are `t·d_k`, `v` is `t·d_v`, `g_log` and `beta` are `t`. Returns `t·d_v` outputs.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment; tested standalone for now
 pub fn gated_deltanet(
     q: &[f32],
     k: &[f32],
@@ -48,10 +47,30 @@ pub fn gated_deltanet(
     dk: usize,
     dv: usize,
 ) -> Vec<f32> {
+    gated_deltanet_state(q, k, v, g_log, beta, t, dk, dv, &mut vec![0f32; dk * dv])
+}
+
+/// [`gated_deltanet`] with CALLER-OWNED state — the decode kernel. `s` is `dk·dv` row-major
+/// (`s[d·dv + e]`), read in and written out, so one token per call carries the recurrence forward.
+/// Starting from a zeroed `s` and feeding the whole sequence in one call is the same arithmetic in the
+/// same order, so a decode split is bit-identical to the full-sequence form (the `t=1` step applies the
+/// identical `α`-decay → `v̂` → `Δ` → write → read sequence per token).
+pub fn gated_deltanet_state(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g_log: &[f32],
+    beta: &[f32],
+    t: usize,
+    dk: usize,
+    dv: usize,
+    s: &mut [f32],
+) -> Vec<f32> {
     debug_assert_eq!(q.len(), t * dk);
     debug_assert_eq!(v.len(), t * dv);
+    debug_assert_eq!(s.len(), dk * dv);
     let scale = 1.0 / (dk as f32).sqrt();
-    let mut s = vec![0f32; dk * dv]; // S[d*dv + e]: k-dim d → v-dim e
+    let s = &mut *s; // S[d*dv + e]: k-dim d → v-dim e
     let mut out = vec![0f32; t * dv];
     let (mut qn, mut kn) = (vec![0f32; dk], vec![0f32; dk]);
     let mut vnew = vec![0f32; dv];
@@ -101,7 +120,6 @@ pub fn gated_deltanet(
 /// prelude). `x` is row-major `t·conv_dim`; `weight` is `conv_dim·k` (per-channel kernel), `bias` is
 /// `conv_dim`. Causal: out[t,c] depends on x[t-(k-1)..t, c] (left-pad zeros). Matches `nn.Conv1d(groups=
 /// conv_dim, padding=k-1)[:, :, :t]` then SiLU — verified against torch (test `conv_matches_torch_golden`).
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, conv_dim: usize,
                           k: usize) -> Vec<f32> {
     debug_assert_eq!(x.len(), t * conv_dim);
@@ -121,13 +139,61 @@ pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, con
     out
 }
 
+/// [`causal_conv1d_silu`] with a rolling window of the previous `k-1` input rows, for incremental decode.
+///
+/// `hist` holds the most recent `(k-1)·conv_dim` input values (row-major, oldest first) and is updated
+/// in place to the last `k-1` rows of `x` afterwards. The conv is causal with left zero-padding, so an
+/// output row depends only on `x[t-(k-1)..t]` — prepending the retained history reproduces the
+/// full-sequence window exactly, in the same accumulation order, hence bit-identical. A short first call
+/// (`t < k-1`, e.g. a 3-token prompt at `k=4`) zero-pads the remainder of the window, matching the
+/// full-sequence left-pad.
+pub fn causal_conv1d_silu_hist(
+    x: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    t: usize,
+    conv_dim: usize,
+    k: usize,
+    hist: &mut Vec<f32>,
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), t * conv_dim);
+    let keep_rows = k - 1;
+    let keep = keep_rows * conv_dim; // retained history, in VALUES
+    if t >= keep_rows {
+        // every output window lies entirely inside `x` — no history needed
+        let out = causal_conv1d_silu(x, weight, bias, t, conv_dim, k);
+        hist.clear();
+        hist.extend_from_slice(&x[x.len() - keep..]);
+        return out;
+    }
+    // prepend the retained window (zero-filled on the first call), then drop the rows we re-computed
+    let mut buf = vec![0f32; (keep_rows + t) * conv_dim];
+    let have = (hist.len() / conv_dim).min(keep_rows) * conv_dim;
+    buf[keep - have..keep].copy_from_slice(&hist[hist.len() - have..]);
+    buf[keep..].copy_from_slice(x);
+    let out = causal_conv1d_silu(&buf, weight, bias, keep_rows + t, conv_dim, k);
+    hist.clear();
+    hist.extend_from_slice(&buf[buf.len() - keep..]);
+    out[keep..].to_vec()
+}
+
 /// Multi-head GQA Gated DeltaNet: runs `gated_deltanet` per value-head, each paired with its grouped key-
 /// head (transformers `repeat_interleave(num_v/num_k)`). `q,k` are `t·(n_k_heads·hk)`, `v` is
 /// `t·(n_v_heads·hv)`, `g,beta` are `t·n_v_heads` (per value-head). Returns `t·(n_v_heads·hv)`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], t: usize,
                           n_k_heads: usize, n_v_heads: usize, hk: usize, hv: usize) -> Vec<f32> {
+    let mut s: Vec<Vec<f32>> = (0..n_v_heads).map(|_| vec![0f32; hk * hv]).collect();
+    gated_deltanet_mha_state(q, k, v, g, beta, t, n_k_heads, n_v_heads, hk, hv, &mut s)
+}
+
+/// [`gated_deltanet_mha`] with per-value-head CALLER-OWNED state `s` (one `hk·hv` matrix per value head,
+/// advanced in place). Each value head is an independent recurrence over the same inputs, so splitting
+/// the sequence across calls changes nothing but where the loop boundary sits — bit-identical output.
+pub fn gated_deltanet_mha_state(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], t: usize,
+                                n_k_heads: usize, n_v_heads: usize, hk: usize, hv: usize,
+                                s: &mut [Vec<f32>]) -> Vec<f32> {
     let r = n_v_heads / n_k_heads; // value-heads per key-head (repeat_interleave factor)
+    debug_assert_eq!(s.len(), n_v_heads);
     let mut out = vec![0f32; t * n_v_heads * hv];
     let (mut qh, mut kh) = (vec![0f32; t * hk], vec![0f32; t * hk]);
     let (mut vh, mut gh, mut bh) = (vec![0f32; t * hv], vec![0f32; t], vec![0f32; t]);
@@ -142,7 +208,7 @@ pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f3
             gh[ti] = g[ti * n_v_heads + vhead];
             bh[ti] = beta[ti * n_v_heads + vhead];
         }
-        let oh = gated_deltanet(&qh, &kh, &vh, &gh, &bh, t, hk, hv);
+        let oh = gated_deltanet_state(&qh, &kh, &vh, &gh, &bh, t, hk, hv, &mut s[vhead]);
         for ti in 0..t {
             let ob = ti * n_v_heads * hv + vhead * hv;
             out[ob..ob + hv].copy_from_slice(&oh[ti * hv..ti * hv + hv]);
@@ -154,7 +220,6 @@ pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f3
 /// Gated RMSNorm — Qwen3.6's linear-layer output gate (`Qwen3_5MoeRMSNormGated`). Per row of size `d`
 /// (a value-head's `head_v_dim`): `out = weight · (x · rsqrt(mean(x²)+eps)) · silu(gate)`. Note the order
 /// — RMS-normalize FIRST, then apply the SiLU gate. `weight` is `d`; `x`/`gate` are row-major `rows·d`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: usize,
                      eps: f32) -> Vec<f32> {
     let mut out = vec![0f32; rows * d];
@@ -173,7 +238,6 @@ pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: us
 /// The DeltaNet decay gate: `g = −exp(a_log)·softplus(a + dt_bias)`, per value-head — produces the
 /// `g_log` the kernel consumes (`α = exp(g)`). `a` is `t·n_v_heads` (the dt projection); `a_log`,
 /// `dt_bias` are `n_v_heads` per-head params. softplus is the numerically-stable `ln(1+eᶻ)`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn delta_gate(a: &[f32], a_log: &[f32], dt_bias: &[f32], t: usize, n_v_heads: usize) -> Vec<f32> {
     let mut g = vec![0f32; t * n_v_heads];
     for i in 0..t {
@@ -392,5 +456,118 @@ mod tests {
             }
         }
         assert!(e < 1e-6, "delta gate diverges from golden: maxerr {e:e}");
+    }
+
+    // --- incremental-decode equivalence -------------------------------------------------
+    // The hybrid KV cache is only allowed to exist if feeding a sequence one token at a time through
+    // the stateful kernels gives BYTE-IDENTICAL results to one full-sequence call. These pin that at
+    // the kernel level, before the arch wires them together.
+
+    /// Feeding `t` tokens one at a time through `gated_deltanet_state` must reproduce the single
+    /// full-sequence call exactly — not to a tolerance, but bit-for-bit (`to_bits`).
+    #[test]
+    fn state_split_is_bit_identical() {
+        let (t, dk, dv) = (7, 6, 4);
+        let (q, k, v, g, beta) = inputs(t, dk, dv);
+        let full = gated_deltanet(&q, &k, &v, &g, &beta, t, dk, dv);
+        let mut s = vec![0f32; dk * dv];
+        let mut split = Vec::with_capacity(t * dv);
+        for i in 0..t {
+            split.extend_from_slice(&gated_deltanet_state(
+                &q[i * dk..(i + 1) * dk],
+                &k[i * dk..(i + 1) * dk],
+                &v[i * dv..(i + 1) * dv],
+                &g[i..i + 1],
+                &beta[i..i + 1],
+                1,
+                dk,
+                dv,
+                &mut s,
+            ));
+        }
+        assert_eq!(full.len(), split.len());
+        for i in 0..full.len() {
+            assert_eq!(
+                full[i].to_bits(),
+                split[i].to_bits(),
+                "token-split DeltaNet diverged at {i}: {:e} vs {:e}",
+                full[i],
+                split[i]
+            );
+        }
+    }
+
+    /// Same, through the multi-head GQA wrapper with one state matrix per value head.
+    #[test]
+    fn mha_state_split_is_bit_identical() {
+        let (t, nk, nv, hk, hv) = (5, 2, 4, 3, 2);
+        let f = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let q: Vec<f32> = (0..t).flat_map(|i| (0..nk * hk).map(move |j| f(i * 7 + j * 5, 13))).collect();
+        let k: Vec<f32> = (0..t).flat_map(|i| (0..nk * hk).map(move |j| f(i * 3 + j * 11, 13))).collect();
+        let v: Vec<f32> = (0..t).flat_map(|i| (0..nv * hv).map(move |j| f(i * 5 + j * 7, 13))).collect();
+        let g: Vec<f32> = (0..t)
+            .flat_map(|i| (0..nv).map(move |vh| -((((i * 2 + vh) % 5) + 1) as f32) / 10.0))
+            .collect();
+        let beta: Vec<f32> = (0..t)
+            .flat_map(|i| (0..nv).map(move |vh| ((((i * 4 + vh) % 7) + 1) as f32) / 8.0))
+            .collect();
+        let full = gated_deltanet_mha(&q, &k, &v, &g, &beta, t, nk, nv, hk, hv);
+        let mut s: Vec<Vec<f32>> = (0..nv).map(|_| vec![0f32; hk * hv]).collect();
+        let mut split = Vec::new();
+        for i in 0..t {
+            split.extend_from_slice(&gated_deltanet_mha_state(
+                &q[i * nk * hk..(i + 1) * nk * hk],
+                &k[i * nk * hk..(i + 1) * nk * hk],
+                &v[i * nv * hv..(i + 1) * nv * hv],
+                &g[i * nv..(i + 1) * nv],
+                &beta[i * nv..(i + 1) * nv],
+                1,
+                nk,
+                nv,
+                hk,
+                hv,
+                &mut s,
+            ));
+        }
+        assert_eq!(full.len(), split.len());
+        for i in 0..full.len() {
+            assert_eq!(full[i].to_bits(), split[i].to_bits(), "MHA split diverged at {i}");
+        }
+    }
+
+    /// The conv rolling window must reproduce the full-sequence conv bit-for-bit, INCLUDING a first
+    /// call shorter than the kernel (t < k-1), where the full-sequence form zero-pads on the left.
+    #[test]
+    fn conv_hist_split_is_bit_identical() {
+        let (cd, k) = (3, 4);
+        let f = |a: usize, m: usize| (a % m) as f32 / m as f32 - 0.5;
+        let w: Vec<f32> = (0..cd).flat_map(|c| (0..k).map(move |j| f(c * 2 + j * 7, 11))).collect();
+        let b: Vec<f32> = (0..cd).map(|c| f(c * 5, 7)).collect();
+        // two cases: a short first block (2 < k-1, forces the zero-padded window) then more singles
+        for first in [1usize, 2, 3, 4] {
+            let total = first + 5;
+            let x: Vec<f32> =
+                (0..total).flat_map(|ti| (0..cd).map(move |c| f(c * 3 + ti * 5, 13))).collect();
+            let full = causal_conv1d_silu(&x, &w, &b, total, cd, k);
+            let mut hist: Vec<f32> = Vec::new();
+            let mut split = Vec::new();
+            // prefill block of `first` rows, then one row at a time
+            split.extend_from_slice(&causal_conv1d_silu_hist(
+                &x[..first * cd], &w, &b, first, cd, k, &mut hist,
+            ));
+            for i in first..total {
+                split.extend_from_slice(&causal_conv1d_silu_hist(
+                    &x[i * cd..(i + 1) * cd], &w, &b, 1, cd, k, &mut hist,
+                ));
+            }
+            assert_eq!(full.len(), split.len(), "first={first}");
+            for i in 0..full.len() {
+                assert_eq!(
+                    full[i].to_bits(),
+                    split[i].to_bits(),
+                    "conv rolling-window split diverged at {i} (first={first})"
+                );
+            }
+        }
     }
 }

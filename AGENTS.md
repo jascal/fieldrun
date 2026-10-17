@@ -53,6 +53,17 @@ diverges without explaining why.
   window** (`use_sliding_window`: ONE window on every layer — no per-layer pattern, unlike Gemma 3). No new attention
   kernel — reuses the MoE-FFN + expert-offload. KV-cache `generate` (+ int8-KV) and `explain` wired; on a MoE layer the
   explain feature is the dominant expert's promoted neuron.
+- `src/qwen35moe.rs` + `src/deltanet.rs` — Qwen3.5 / Qwen3.6 (`model_type: qwen3_5` dense, `qwen3_5_moe` MoE; this single
+  arch also covers the 27B Qwen3.6/3.8 dense releases, which are shape-identical): a **hybrid** stack — 3 of every 4 layers
+  are Gated DeltaNet *linear* attention (`deltanet.rs`, pinned ~1e-7 vs `torch_recurrent_gated_delta_rule`), the 4th is gated
+  full GQA attention with partial RoPE. `qwen35` (dense SwiGLU) and `qwen35moe` (softmax top-k, always-renormalized, plus a
+  sigmoid-gated shared expert; packed `experts.gate_up_proj`/`down_proj` unpacked at convert) share the kernel.
+  **Decode is incremental via `HybridState`** — the DeltaNet recurrence (per-value-head `S` + the conv1d rolling window) is
+  carried alongside the full-attention K/V cache, 6.0x on Qwen3.5-0.8B and byte-identical to the naive path. `--kv-int8`
+  quantises the full-attention K/V only (the recurrent state stays f32 — no natural per-token scale). Because that state is
+  *recurrent*, not row-indexed, cross-turn prefix reuse resumes only when the new prompt extends the cached one exactly;
+  otherwise it falls back to a cold prefill (correct, just not faster). `validate_all.sh`'s "HYBRID decode gate" asserts the
+  resume counter advanced, since token equality alone is satisfiable by a cold prefill — see that gate's header.
 - `src/mla.rs` — DeepSeek-V3/R1 / Kimi-K2: MLA (q/kv low-rank latents + latent RMSNorms, a no-RoPE ‖ shared-RoPE key
   split, v_head_dim ≠ qk_head_dim) + DeepSeek MoE (group-limited sigmoid routing with bias-corrected *choice* and
   sigmoid *weight*, an always-on shared expert, first-k-dense layers). **YaRN** rope scaling (every real
