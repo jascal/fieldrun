@@ -20,6 +20,13 @@ pub struct PrefixKv {
     pub vc_q: Vec<Vec<i8>>,
     pub ks_q: Vec<Vec<f32>>,
     pub vs_q: Vec<Vec<f32>>,
+    /// HYBRID recurrence state for the Gated-DeltaNet layers (Qwen3.5): per layer, `lin_s[l]` is that layer's
+    /// per-value-head state matrices and `lin_hist[l]` its conv1d rolling window, both captured after exactly
+    /// `ids.len()` tokens. Empty for every non-hybrid kernel. A recurrent state can't be re-indexed per row the
+    /// way K/V can, so a hybrid kernel reuses it only when the new prompt extends the cached one exactly
+    /// (the dominant multi-turn case) and falls back to a cold prefill otherwise — see `qwen35moe`.
+    pub lin_s: Vec<Vec<Vec<f32>>>,
+    pub lin_hist: Vec<Vec<f32>>,
 }
 
 impl PrefixKv {
@@ -31,6 +38,8 @@ impl PrefixKv {
         self.vc_q.clear();
         self.ks_q.clear();
         self.vs_q.clear();
+        self.lin_s.clear();
+        self.lin_hist.clear();
     }
 
     /// Longest common prefix length between the cached ids and `prompt`, capped at `prompt.len()-1` so there is always

@@ -3910,8 +3910,7 @@ fn main() {
             let naive: Vec<i64> = (0..n).map(|_| { let t = lm.predict(&ctx2); ctx2.push(t); t }).collect();
             let naive_s = t1.elapsed().as_secs_f64();
             println!("[fieldrun] generate {n} tokens from a {}-token prompt · {arch}", prompt.len());
-            let path = if matches!(arch.as_str(), "qwen35" | "qwen35moe") { "stream  " } else { "KV-cache" };
-            println!("[fieldrun]   {path}: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
+            println!("[fieldrun]   KV-cache: {kv_s:.2}s  ({:.1} tok/s)", n as f64 / kv_s);
             println!("[fieldrun]   naive   : {naive_s:.2}s  ({:.1} tok/s)", n as f64 / naive_s);
             println!("[fieldrun]   speedup : {:.1}x  ·  tokens identical: {}", naive_s / kv_s, kv == naive);
             return;
@@ -3938,6 +3937,22 @@ fn main() {
                      prompt.len(), ext.len(), ext.len() - reuse_l);
             println!("[fieldrun]   reuse==fresh: {}  ·  reuse==naive: {}  ·  identical: {}",
                      reuse == fresh, reuse == naive, reuse == fresh && reuse == naive);
+            // APPEND arm: `ext` above TRUNCATES the warm context (reuse point lands mid-cache), which a
+            // row-indexed KV cache can reuse but a RECURRENT state cannot — resuming there would need a
+            // snapshot at that exact position. Appending instead puts the reuse point at the end of the
+            // cached context, which is also what a real chat turn does (new prompt = old context + new
+            // message). Prints the resume count for hybrid kernels so a byte-identical-but-never-resumed
+            // run can't read as a green gate.
+            let mut ext2 = warm.ids.clone();
+            ext2.push(*ids.first().unwrap_or(&0));
+            let reuse_at = ext2.len() - 1;
+            let r0 = crate::qwen35moe::QWEN35_RESUMES.load(std::sync::atomic::Ordering::Relaxed);
+            let reuse2 = lm.generate_stream_prefix(&ext2, n, &[], &mut |_| true, &mut warm);
+            let fresh2 = lm.generate_stream_prefix(&ext2, n, &[], &mut |_| true, &mut PrefixKv::default());
+            let naive2 = lm.generate_stream(&ext2, n, &[], &mut |_| true);
+            let resumed = crate::qwen35moe::QWEN35_RESUMES.load(std::sync::atomic::Ordering::Relaxed) - r0;
+            println!("[fieldrun]   append  · ext {} (reuse point {reuse_at} = cache len {})  reuse==fresh: {}  ·  reuse==naive: {}  ·  resumed: {}",
+                     ext2.len(), reuse_at, reuse2 == fresh2, reuse2 == naive2, resumed);
             return;
         }
         let t0 = std::time::Instant::now();

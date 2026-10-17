@@ -44,6 +44,70 @@ else
 fi
 echo
 
+# Qwen3.5 MoE top-1 gate (experiments/qwen3next): 8 experts + a sigmoid-gated shared expert, the packed
+# experts.gate_up_proj/down_proj on-disk layout, and the same 3:1 DeltaNet/full hybrid — vs transformers
+# Qwen3_5MoeForCausalLM. This is the arch's first row in the automated sweep (it was previously only ever
+# checked by hand and recorded in experiments/qwen3next/qwen35moe_parity.RESULTS.txt).
+if $PY experiments/qwen3next/make_tiny_qwen3next.py --seq 16 --out /tmp/fieldrun_qwen35moe_tiny >/dev/null 2>&1; then
+  $BIN convert --model /tmp/fieldrun_qwen35moe_tiny --arch qwen35moe --dtype f32 -o /tmp/fieldrun_qwen35moe_f32 --force >/dev/null 2>&1 || exit 1
+  $BIN --bundle /tmp/fieldrun_qwen35moe_f32 --recursion-explain --logits-dump /tmp/fieldrun_qwen35moe_logits.bin --ids /tmp/fieldrun_qwen35moe_tiny/ref_ids.json >/dev/null 2>&1
+  $PY - <<'EOF' || exit 1
+import sys
+import numpy as np
+ref = np.load('/tmp/fieldrun_qwen35moe_tiny/ref.npz')
+got = np.fromfile('/tmp/fieldrun_qwen35moe_logits.bin', dtype=np.float32).reshape(ref['logits'].shape)
+agree = (got.argmax(-1) == ref['logits'].argmax(-1)).mean()
+print(f"Qwen3.5 MoE: {agree*100:.0f}% argmax agreement vs transformers (max|diff| {np.abs(got-ref['logits']).max():.2e})")
+sys.exit(0 if agree == 1.0 else 1)
+EOF
+else
+  echo "Qwen3.5 MoE reference build failed"
+  exit 1
+fi
+echo
+
+# --- Qwen3.5 HYBRID decode gate -------------------------------------------------------------
+# Qwen3.5 interleaves Gated DeltaNet — a RECURRENT state, not a per-position row — with gated full
+# attention. So `identical: true` is NOT sufficient evidence here: a cold prefill matches the naive path
+# too, and the earlier "reuse==fresh" arm (which TRUNCATES the warm context, landing the reuse point
+# mid-cache) can never resume a recurrent state and would pass without ever exercising the cache.
+#
+# The `append` arm instead appends to the warm context, putting the reuse point exactly at the end of the
+# cached ids — the shape a real chat turn takes, and the only one a recurrent state can resume from. It
+# also reports a RESUME COUNT, and the gate requires that count >= 1: that is what distinguishes a real
+# hybrid cache from a silent fallback to full recompute. int8-KV stays a reported, unasserted column (lossy
+# by design, like every other arch).
+printf "%-12s %-11s %-8s %-8s %-13s %-9s %s\n" arch "KV==naive" "int8-KV" prefix "prefix-append" resumed verdict
+printf '%.0s-' {1..74}; echo
+hybrid_fail=0
+hybrid_gate() { # $1=label $2=bundle-stem $3=ids
+  local lbl=$1 b=$2 ids=$3 verdict
+  if [ ! -f "$b.fieldrun.json" ]; then printf "%-12s (no f32 bundle — built above?)\n" "$lbl"; return; fi
+  local idn kv8 gp trunc app resumed
+  idn=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  kv8=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 --kv-int8 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
+  gp=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --gen-prefix 16 2>/dev/null)
+  trunc=$(echo "$gp" | grep -oE 'identical: (true|false)' | head -1 | grep -oE '(true|false)')
+  app=$(echo "$gp"   | grep -oE 'reuse==fresh: (true|false)'  | tail -1 | grep -oE '(true|false)')
+  resumed=$(echo "$gp" | grep -oE 'resumed: [0-9]+' | tail -1 | grep -oE '[0-9]+')
+  resumed=${resumed:-0}
+  if [ "${idn:-}" = "true" ] && [ "${trunc:-}" = "true" ] && [ "${app:-}" = "true" ] && [ "${resumed:-0}" -ge 1 ]; then
+    verdict="ok"
+  elif [ "${resumed:-0}" -lt 1 ]; then
+    # token equality held but the cache never engaged — the failure mode this gate exists to catch
+    verdict="VACUOUS"
+    hybrid_fail=1
+  else
+    verdict="FAIL"
+    hybrid_fail=1
+  fi
+  printf "%-12s %-11s %-8s %-8s %-13s %-9s %s\n" "$lbl" "${idn:-ERR}" "${kv8:-ERR}" "${trunc:-ERR}" "${app:-ERR}" "$resumed" "$verdict"
+}
+hybrid_gate qwen35   /tmp/fieldrun_qwen35_dense_f32 /tmp/fieldrun_qwen35_dense_ids.json
+hybrid_gate qwen35moe /tmp/fieldrun_qwen35moe_f32   /tmp/fieldrun_qwen35moe_tiny/ref_ids.json
+[ "$hybrid_fail" -eq 0 ] || { echo "Qwen3.5 hybrid decode gate FAILED (see verdict above)"; exit 1; }
+echo
+
 # MiMo-7B: Qwen2 backbone at head_dim 128 / 4:1 GQA / theta 640000, with an
 # extra MTP tensor that standard next-token conversion must omit.
 if $PY scripts/mimo_ref.py build >/dev/null 2>&1; then
