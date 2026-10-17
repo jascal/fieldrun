@@ -2527,10 +2527,11 @@ fn main() {
         }
 
         // --probe-mlp-act <layer> [neuron]: raw post-activation of a layer's FFN neurons at the last token
-        // — the substrate the blind-max harness searches over. With no `neuron`, prints the top-K by |act|;
-        // with one, prints that single scalar (exact f32 bits), which is what a blind-max candidate scores.
-        // Deliberately reads the ACTIVATION, not the unembedding projection, so units whose meaning is on
-        // their negative pole are visible here and not in `explain`'s positive-only `promotes`.
+        // — the substrate the blind-max harness searches over. `layer` then an optional `neuron`, given
+        // either positionally (`--probe-mlp-act 26 6203`) or as `--neuron N`. With no neuron, prints the top-K
+        // by |act|; with one, prints that single scalar (exact f32 bits), which is what a blind-max candidate
+        // scores. Deliberately reads the ACTIVATION, not the unembedding projection, so units whose meaning is
+        // on their negative pole are visible here and not in `explain`'s positive-only `promotes`.
         if let Some(lstr) = flag(&args, "--probe-mlp-act") {
             let layer: usize = match lstr.parse() {
                 Ok(v) => v,
@@ -2541,7 +2542,17 @@ fn main() {
                 Some(a) => a,
                 None => { eprintln!("[fieldrun] --probe-mlp-act: arch {arch} doesn't expose mlp_act_last (or layer {layer} out of range)"); return; }
             };
-            match flag(&args, "--neuron").and_then(|s| s.parse::<usize>().ok()) {
+            // The neuron may be given either positionally (`--probe-mlp-act 26 6203`, the natural
+            // form) or as `--neuron N` (which the rest of the probe flags use). Positional wins only
+            // when `--neuron` is absent.
+            let neuron: Option<usize> = flag(&args, "--neuron")
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| {
+                    args.iter().position(|a| a == "--probe-mlp-act")
+                        .and_then(|i| args.get(i + 2))
+                        .and_then(|s| s.parse::<usize>().ok())
+                });
+            match neuron {
                 Some(n) => match acts.get(n) {
                     Some(&a) => println!("mlp_act layer={layer} neuron={n} act={a:e} bits={:08x} width={}", a.to_bits(), acts.len()),
                     None => eprintln!("[fieldrun] --probe-mlp-act: neuron {n} out of range (width {})", acts.len()),
