@@ -348,6 +348,20 @@ pub trait Model: Sync {
         }
     }
 
+    /// The post-SwiGLU activations of EVERY neuron in `layer`, at the LAST token of `ids` — the vector
+    /// `explain` computes and then narrows to its top-N before reporting. Length is the layer's MLP
+    /// intermediate width, so neuron `n` is `out[n]`.
+    ///
+    /// This is the substrate for blind-max activation probing: it reads what a unit actually *does*
+    /// rather than what an unembedding projection claims it promotes, so it also covers units whose
+    /// meaning lives on their NEGATIVE pole — which a positive-only `promotes` readout cannot show.
+    ///
+    /// Default None — arches without a post-SwiGLU dense FFN, or whose FFN shape differs, don't provide
+    /// it. Implementations MAY stop after `layer`: no later layer can feed back into it.
+    fn mlp_act_last(&self, _ids: &[i64], _layer: usize) -> Option<Vec<f32>> {
+        None
+    }
+
     /// The final post-norm residual `r(x)` at the predicting position — the exact vector the unembedding dots against
     /// (`logits = U·r`). Exposed for the power-diagram geometry probe (`--probe-facet`): the token cells in r-space are
     /// the Laguerre power diagram of the unembedding rows. Default None; arches implement it where wired.
