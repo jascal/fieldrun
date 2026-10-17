@@ -37,7 +37,6 @@ fn stable_softplus(z: f32) -> f32 {
 
 /// Single-head Gated DeltaNet over a `t`-token sequence. Flat row-major slices:
 /// `q,k` are `t·d_k`, `v` is `t·d_v`, `g_log` and `beta` are `t`. Returns `t·d_v` outputs.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment; tested standalone for now
 pub fn gated_deltanet(
     q: &[f32],
     k: &[f32],
@@ -56,7 +55,6 @@ pub fn gated_deltanet(
 /// Starting from a zeroed `s` and feeding the whole sequence in one call is the same arithmetic in the
 /// same order, so a decode split is bit-identical to the full-sequence form (the `t=1` step applies the
 /// identical `α`-decay → `v̂` → `Δ` → write → read sequence per token).
-#[allow(dead_code)]
 pub fn gated_deltanet_state(
     q: &[f32],
     k: &[f32],
@@ -122,7 +120,6 @@ pub fn gated_deltanet_state(
 /// prelude). `x` is row-major `t·conv_dim`; `weight` is `conv_dim·k` (per-channel kernel), `bias` is
 /// `conv_dim`. Causal: out[t,c] depends on x[t-(k-1)..t, c] (left-pad zeros). Matches `nn.Conv1d(groups=
 /// conv_dim, padding=k-1)[:, :, :t]` then SiLU — verified against torch (test `conv_matches_torch_golden`).
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, conv_dim: usize,
                           k: usize) -> Vec<f32> {
     debug_assert_eq!(x.len(), t * conv_dim);
@@ -150,7 +147,6 @@ pub fn causal_conv1d_silu(x: &[f32], weight: &[f32], bias: &[f32], t: usize, con
 /// full-sequence window exactly, in the same accumulation order, hence bit-identical. A short first call
 /// (`t < k-1`, e.g. a 3-token prompt at `k=4`) zero-pads the remainder of the window, matching the
 /// full-sequence left-pad.
-#[allow(dead_code)]
 pub fn causal_conv1d_silu_hist(
     x: &[f32],
     weight: &[f32],
@@ -184,7 +180,6 @@ pub fn causal_conv1d_silu_hist(
 /// Multi-head GQA Gated DeltaNet: runs `gated_deltanet` per value-head, each paired with its grouped key-
 /// head (transformers `repeat_interleave(num_v/num_k)`). `q,k` are `t·(n_k_heads·hk)`, `v` is
 /// `t·(n_v_heads·hv)`, `g,beta` are `t·n_v_heads` (per value-head). Returns `t·(n_v_heads·hv)`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], t: usize,
                           n_k_heads: usize, n_v_heads: usize, hk: usize, hv: usize) -> Vec<f32> {
     let mut s: Vec<Vec<f32>> = (0..n_v_heads).map(|_| vec![0f32; hk * hv]).collect();
@@ -194,7 +189,6 @@ pub fn gated_deltanet_mha(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f3
 /// [`gated_deltanet_mha`] with per-value-head CALLER-OWNED state `s` (one `hk·hv` matrix per value head,
 /// advanced in place). Each value head is an independent recurrence over the same inputs, so splitting
 /// the sequence across calls changes nothing but where the loop boundary sits — bit-identical output.
-#[allow(dead_code)]
 pub fn gated_deltanet_mha_state(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], t: usize,
                                 n_k_heads: usize, n_v_heads: usize, hk: usize, hv: usize,
                                 s: &mut [Vec<f32>]) -> Vec<f32> {
@@ -226,7 +220,6 @@ pub fn gated_deltanet_mha_state(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta
 /// Gated RMSNorm — Qwen3.6's linear-layer output gate (`Qwen3_5MoeRMSNormGated`). Per row of size `d`
 /// (a value-head's `head_v_dim`): `out = weight · (x · rsqrt(mean(x²)+eps)) · silu(gate)`. Note the order
 /// — RMS-normalize FIRST, then apply the SiLU gate. `weight` is `d`; `x`/`gate` are row-major `rows·d`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: usize,
                      eps: f32) -> Vec<f32> {
     let mut out = vec![0f32; rows * d];
@@ -245,7 +238,6 @@ pub fn rmsnorm_gated(x: &[f32], weight: &[f32], gate: &[f32], rows: usize, d: us
 /// The DeltaNet decay gate: `g = −exp(a_log)·softplus(a + dt_bias)`, per value-head — produces the
 /// `g_log` the kernel consumes (`α = exp(g)`). `a` is `t·n_v_heads` (the dt projection); `a_log`,
 /// `dt_bias` are `n_v_heads` per-head params. softplus is the numerically-stable `ln(1+eᶻ)`.
-#[allow(dead_code)] // wired into the qwen3_5_moe arch in a follow-up increment
 pub fn delta_gate(a: &[f32], a_log: &[f32], dt_bias: &[f32], t: usize, n_v_heads: usize) -> Vec<f32> {
     let mut g = vec![0f32; t * n_v_heads];
     for i in 0..t {

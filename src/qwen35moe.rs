@@ -41,7 +41,18 @@ use crate::model::{Model, PrefixKv};
 /// Counts how many times a hybrid decode actually RESUMED from a persisted DeltaNet state, versus falling
 /// back to a cold prefill. Token equality alone can't tell those apart (a cold prefill is correct too), so
 /// the `--gen-prefix` gate prints this to prove the prefix path engaged instead of silently not running.
+///
+/// A **validation-gate diagnostic only** — deliberately a process-wide counter, read as a delta around a
+/// single call. It is not a serving metric: under concurrent requests the global total is uninformative,
+/// so don't build reuse-rate telemetry on it. If the chat/serve path ever needs per-request accounting,
+/// thread a counter through `PrefixKv` instead.
 pub static QWEN35_RESUMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts turns that had a NON-EMPTY prefix cache but still cold-prefilled, because the new prompt diverged
+/// from the cached one before its end (a recurrent state can only resume at the exact cached length). This is
+/// the reuse-rate signal the exact-extension rule costs you — a large number here means turns are re-prefilling
+/// more than the caller expects. Empty-cache first turns are not counted; those are normal.
+pub static QWEN35_PREFIX_FALLBACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub struct Qwen35Moe {
     b: Bundle,
@@ -687,6 +698,9 @@ impl Model for Qwen35Moe {
         let resumable = l > 0 && l == cache.ids.len() && cache.lin_s.len() == self.n_layer && !self.kv_int8;
         if resumable {
             QWEN35_RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if !cache.ids.is_empty() {
+            // had a cache, couldn't use it — surface it rather than let a cold prefill look like a hit
+            QWEN35_PREFIX_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let mut st = HybridState::new(self, total);
         if resumable {
@@ -714,7 +728,9 @@ impl Model for Qwen35Moe {
                 let mut ids: Vec<i64> = Vec::with_capacity(pos);
                 ids.extend_from_slice(prompt);
                 ids.extend_from_slice(&out);
-                ids.truncate(pos);
+                ids.truncate(pos); // NOT a bug: see above — the recurrent state sits at `pos`, so the saved
+                                    // id count must too, even though `out` is one token longer. A row-indexed
+                                    // KV cache could ignore this mismatch; a recurrent one cannot.
                 cache.ids = ids;
                 cache.kc = kc;
                 cache.vc = vc;

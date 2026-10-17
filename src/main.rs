@@ -3947,12 +3947,14 @@ fn main() {
             ext2.push(*ids.first().unwrap_or(&0));
             let reuse_at = ext2.len() - 1;
             let r0 = crate::qwen35moe::QWEN35_RESUMES.load(std::sync::atomic::Ordering::Relaxed);
+            let f0 = crate::qwen35moe::QWEN35_PREFIX_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
             let reuse2 = lm.generate_stream_prefix(&ext2, n, &[], &mut |_| true, &mut warm);
             let fresh2 = lm.generate_stream_prefix(&ext2, n, &[], &mut |_| true, &mut PrefixKv::default());
             let naive2 = lm.generate_stream(&ext2, n, &[], &mut |_| true);
             let resumed = crate::qwen35moe::QWEN35_RESUMES.load(std::sync::atomic::Ordering::Relaxed) - r0;
-            println!("[fieldrun]   append  · ext {} (reuse point {reuse_at} = cache len {})  reuse==fresh: {}  ·  reuse==naive: {}  ·  resumed: {}",
-                     ext2.len(), reuse_at, reuse2 == fresh2, reuse2 == naive2, resumed);
+            let fellback = crate::qwen35moe::QWEN35_PREFIX_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed) - f0;
+            println!("[fieldrun]   append  · ext {} (reuse point {reuse_at} = cache len {reuse_at})  reuse==fresh: {}  ·  reuse==naive: {}  ·  resumed: {}  ·  cold-fallbacks: {}",
+                     ext2.len(), reuse2 == fresh2, reuse2 == naive2, resumed, fellback);
             return;
         }
         let t0 = std::time::Instant::now();
