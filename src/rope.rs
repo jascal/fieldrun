@@ -514,7 +514,67 @@ impl Rope {
         let (_att_last, _head_act, mlp_h, _x, _xf) = self.forward_block_capture(&emb, 0, &mut kc, &mut vc);
         mlp_h.get(layer).cloned()
     }
+}
 
+// close `impl Rope`
+
+/// A persistent K/V cache for incremental blind-max scoring: the prefix is prefilled ONCE, then candidate
+/// tokens are scored one at a time at successive positions. Scoring is O(prefix) per candidate instead of a
+/// full re-forward, which is what makes a hill-climb over even a few hundred candidates affordable.
+///
+/// Every score WRITES the cache row at `cur`, so trying C candidates at one position is C single-row steps
+/// against the same slots — the prefix rows are never disturbed. Call [`ScoreCache::commit`] to accept the
+/// winning token and step to the next position; it re-scores the winner rather than assuming the cache
+/// still holds it, so a caller can't corrupt the cache by scoring out of order.
+pub struct ScoreCache {
+    kc: Vec<Array2<f32>>,
+    vc: Vec<Array2<f32>>,
+    cur: usize,
+}
+
+impl Rope {
+    /// Prefill `prefix` into a cache sized for `total` positions; returns None if the prefix is empty or
+    /// longer than `total`.
+    pub fn score_cache(&self, prefix: &[i64], total: usize) -> Option<ScoreCache> {
+        if prefix.is_empty() || prefix.len() >= total {
+            return None;
+        }
+        let kvdim = self.nkv * self.hd;
+        let mut kc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
+        let mut vc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
+        let emb = self.b.rows_f32("embed", prefix);
+        self.forward_block_capture(&emb, 0, &mut kc, &mut vc);
+        Some(ScoreCache { kc, vc, cur: prefix.len() })
+    }
+
+    /// Write `token` at `cur` and return the activation of `(layer, neuron)` at that new position. Does
+    /// NOT advance — call [`ScoreCache::commit`] for that, so several candidates can be compared at one
+    /// position. Uses the same `forward_block_capture` path as the cached explain stream, so the value is
+    /// bit-identical to `mlp_act_last(prefix ++ [token], layer)[neuron]`.
+    pub fn score_step(&self, c: &mut ScoreCache, token: i64, layer: usize, neuron: usize) -> Option<f32> {
+        if layer >= self.n_layer {
+            return None;
+        }
+        let emb = self.b.rows_f32("embed", &[token]);
+        let (_a, _h, mlp_h, _x, _xf) = self.forward_block_capture(&emb, c.cur, &mut c.kc, &mut c.vc);
+        mlp_h.get(layer)?.get(neuron).copied()
+    }
+
+    /// Accept `token` at the current position (re-scoring it so the cache slot definitely holds the
+    /// winner) and advance to the next position.
+    pub fn score_commit(&self, c: &mut ScoreCache, token: i64, layer: usize, neuron: usize) -> Option<f32> {
+        let a = self.score_step(c, token, layer, neuron);
+        c.cur += 1;
+        a
+    }
+
+    /// The position the next `score_step` will write at.
+    pub fn score_pos(&self, c: &ScoreCache) -> usize {
+        c.cur
+    }
+}
+
+impl Rope {
     /// Build the Explanation for the LAST token of `ids` from already-captured per-layer rows (shared by the cached
     /// stream and a byte-identity check). `att_last`/`head_act`/`mlp_h` are the last-position captures, `x_last`/`xf_last`
     /// the residual either side of the final norm.
@@ -743,6 +803,87 @@ impl Rope {
 }
 
 impl Model for Rope {
+
+    /// The unit's top-`k` proposed tokens, ranked by `polarity` × (its down-projection · final-norm gain)
+    /// dotted into the unembed — the SAME readout `explain` displays as `promotes`, signed so the negative
+    /// pole is reachable. Deliberately derived from the unit's OUTPUT projection, not from its activations
+    /// on any corpus: this is the unit's opinion about itself, which is what the test then tries to falsify.
+    fn blind_proposals(&self, layer: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
+        if layer >= self.n_layer {
+            return None;
+        }
+        let gain = self.b.arr1("norm").to_vec();
+        let mut w = self.b.weight_row(&format!("l{layer}.mlp.down_proj"), neuron);
+        w.iter_mut().zip(gain.iter()).for_each(|(v, g)| *v *= g);
+        let proj = self.b.rowdot_f32(self.unembed_name(), &w);
+        let mut idx: Vec<usize> = (0..proj.len()).collect();
+        idx.sort_by(|&a, &b| {
+            (polarity * proj[b]).partial_cmp(&(polarity * proj[a])).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(idx.into_iter().take(k).map(|i| i as i64).collect())
+    }
+
+    /// Greedy hill-climb: at each step try every candidate at the current position, keep the best by
+    /// `polarity × activation`, commit it, repeat. Returns the winning sequence (prefix included).
+    fn blind_climb(
+        &self,
+        layer: usize,
+        neuron: usize,
+        prefix: &[i64],
+        cands: &[i64],
+        steps: usize,
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        if cands.is_empty() || layer >= self.n_layer {
+            return None;
+        }
+        let total = prefix.len() + steps + 1;
+        let mut c = self.score_cache(prefix, total)?;
+        let mut ids = prefix.to_vec();
+        let mut best = f32::NEG_INFINITY;
+        for _ in 0..steps {
+            let mut pick = cands[0];
+            let mut pick_obj = f32::NEG_INFINITY;
+            for &t in cands {
+                if let Some(a) = self.score_step(&mut c, t, layer, neuron) {
+                    let o = polarity * a;
+                    if o > pick_obj {
+                        pick_obj = o;
+                        pick = t;
+                    }
+                }
+            }
+            self.score_commit(&mut c, pick, layer, neuron);
+            ids.push(pick);
+            best = pick_obj;
+        }
+        Some(crate::model::BlindArm { ids, obj: best })
+    }
+
+    /// Oracle arm: the best-activating context in a corpus, scored by the NAIVE path (not the search cache),
+    /// so the baseline is computed independently of the thing it is a baseline for.
+    fn blind_corpus_best(
+        &self,
+        layer: usize,
+        neuron: usize,
+        windows: &[Vec<i64>],
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        let mut best: Option<crate::model::BlindArm> = None;
+        for w in windows {
+            if w.is_empty() {
+                continue;
+            }
+            if let Some(v) = self.mlp_act_last(w, layer).and_then(|a| a.get(neuron).copied()) {
+                let o = polarity * v;
+                if best.as_ref().map_or(true, |b| o > b.obj) {
+                    best = Some(crate::model::BlindArm { ids: w.clone(), obj: o });
+                }
+            }
+        }
+        best
+    }
+
     fn predict(&self, ids: &[i64]) -> i64 {
         let xf = self.hidden(ids); // unembed only the predicting position
         let logits = self.b.rowdot_f32(self.unembed_name(), &xf.row(ids.len() - 1).to_vec());
@@ -1325,7 +1466,7 @@ impl Model for Rope {
 mod tests {
     use super::*;
     use crate::bundle::Bundle;
-    use crate::model::Model;
+    use crate::model::{Model, BlindArm, POLE_NEG, POLE_POS};
 
     /// Deterministic pseudo-random weights — no RNG dependency, so a failure is always reproducible.
     fn v(seed: usize, n: usize) -> Vec<f32> {
@@ -1475,6 +1616,124 @@ mod tests {
         assert!(m.mlp_act_last(&IDS, m.n_layer).is_none(), "out-of-range layer must be None");
         assert!(m.mlp_act_last(&IDS, 999).is_none(), "far out-of-range layer must be None");
         assert!(m.mlp_act_last(&[], 0).is_none(), "empty sequence must be None");
+    }
+
+    /// The cached scoring step must equal the NAIVE forward bit-for-bit. This is the property the whole
+    /// blind-max search rests on: it scores candidates through `ScoreCache` and compares them to a
+    /// corpus scored through `mlp_act_last`, and a per-token drift between the two paths would silently
+    /// corrupt every ratio the harness reports.
+    #[test]
+    fn score_step_is_bit_identical_to_naive() {
+        let stem = tiny_rope("step");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let total = IDS.len() + 8;
+        for l in 0..m.n_layer {
+            // score each token appended to the prefix, one cached step per token
+            let mut c = m.score_cache(&IDS, total).unwrap();
+            for (i, &tok) in [7i64, 2, 11, 0].iter().enumerate() {
+                let got = m.score_step(&mut c, tok, l, (i * 3) % 12).unwrap();
+                let mut want_ids = IDS.to_vec();
+                want_ids.push(tok);
+                let want = m.mlp_act_last(&want_ids, l).unwrap()[(i * 3) % 12];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "layer {l} tok {tok}: cached step {got:e} != naive {want:e}"
+                );
+            }
+        }
+    }
+
+    /// Committing must leave the cache holding the ACCEPTED token at the previous position — the next
+    /// step reads the prefix through those rows, so a wrong row here would poison everything after it.
+    #[test]
+    fn score_commit_advances_and_persists_winner() {
+        let stem = tiny_rope("commit");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let l = 1;
+        let mut c = m.score_cache(&IDS, IDS.len() + 8).unwrap();
+        assert_eq!(m.score_pos(&c), IDS.len());
+        // try a few candidates, commit a MIDDLE one, then score a fresh appended token
+        let cands = [4i64, 9, 1];
+        let mut scores = Vec::new();
+        for &t in &cands {
+            scores.push(m.score_step(&mut c, t, l, 2).unwrap());
+        }
+        let best = (0..cands.len()).max_by(|&a, &b| scores[a].partial_cmp(&scores[b]).unwrap()).unwrap();
+        m.score_commit(&mut c, cands[best], l, 2);
+        assert_eq!(m.score_pos(&c), IDS.len() + 1);
+        let next_tok = 6i64;
+        let got = m.score_step(&mut c, next_tok, l, 2).unwrap();
+        let mut want_ids = IDS.to_vec();
+        want_ids.push(cands[best]);
+        want_ids.push(next_tok);
+        let want = m.mlp_act_last(&want_ids, l).unwrap()[2];
+        assert_eq!(got.to_bits(), want.to_bits(), "after commit: {got:e} != {want:e}");
+    }
+
+    /// An empty or over-long prefix can't back a cache — return None rather than allocating a bogus one.
+    #[test]
+    fn score_cache_rejects_bad_prefix() {
+        let stem = tiny_rope("badprefix");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        assert!(m.score_cache(&[], 32).is_none(), "empty prefix must be None");
+        assert!(m.score_cache(&IDS, IDS.len()).is_none(), "prefix >= total must be None");
+    }
+
+    /// The hill-climb reports an objective it obtained through the search cache; that number must equal the
+    /// NAIVE forward over the sequence it claims to have found. If it didn't, every ratio the blind-max
+    /// report shows is measured against a fiction.
+    #[test]
+    fn blind_climb_objective_matches_naive_recompute() {
+        let stem = tiny_rope("climb");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let (l, n) = (1usize, 4usize);
+        for pol in [POLE_POS, POLE_NEG] {
+            let cands = m.blind_proposals(l, n, 8, pol).unwrap();
+            assert!(!cands.is_empty(), "proposals must be non-empty");
+            let arm = m.blind_climb(l, n, &IDS, &cands, 3, pol).unwrap();
+            let act = m.mlp_act_last(&arm.ids, l).unwrap()[n];
+            assert_eq!(
+                (pol * act).to_bits(),
+                arm.obj.to_bits(),
+                "pole {pol}: climb reported {:e} but naive recompute gives {:e}",
+                arm.obj,
+                pol * act
+            );
+            // the climb must actually be greedily improving, not just returning something
+            if pol == POLE_POS {
+                assert!(arm.obj > m.mlp_act_last(&IDS, l).unwrap()[n], "climb must beat the bare prefix");
+            }
+        }
+    }
+
+    /// The corpus arm must be scored by the NAIVE path and must return the genuine maximum over the windows.
+    #[test]
+    fn blind_corpus_best_returns_true_maximum() {
+        let stem = tiny_rope("corpus");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let (l, n) = (0usize, 2usize);
+        let wins: Vec<Vec<i64>> = vec![IDS.to_vec(), vec![9], vec![2, 2, 2], vec![7, 7, 7, 7, 7]];
+        let arm = m.blind_corpus_best(l, n, &wins, POLE_POS).unwrap();
+        let brute: Vec<f32> = wins.iter().map(|w| m.mlp_act_last(w, l).unwrap()[n]).collect();
+        let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(arm.obj.to_bits(), want.to_bits(), "corpus arm must be the true max");
+    }
+
+    /// Polarity must flip which end of the range is sought: the negative-pole search must not return the
+    /// same winner as the positive-pole search when the two differ.
+    #[test]
+    fn blind_climb_polarity_selects_opposite_extremes() {
+        let stem = tiny_rope("pol");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let (l, n) = (2usize, 9usize);
+        let pos = m.blind_climb(l, n, &IDS, &m.blind_proposals(l, n, 10, POLE_POS).unwrap(), 2, POLE_POS).unwrap();
+        let neg = m.blind_climb(l, n, &IDS, &m.blind_proposals(l, n, 10, POLE_NEG).unwrap(), 2, POLE_NEG).unwrap();
+        // neg must be the negation of the smallest (most negative) achievable activation it found
+        let act = m.mlp_act_last(&neg.ids, l).unwrap()[n];
+        assert_eq!((-act).to_bits(), neg.obj.to_bits(), "negative-pole arm objective must be -act");
+        // and the two arms should generally disagree on which token wins
+        assert_ne!(pos.obj, neg.obj, "poles should not coincide for a real unit");
     }
 
     /// A single-token sequence still returns that token's activations (length 1, no mask needed) —

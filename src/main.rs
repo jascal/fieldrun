@@ -2526,6 +2526,79 @@ fn main() {
             return;
         }
 
+        // --blind-max <layer> <neuron>: does the unit's OWN README (its down-projection · final-norm · unembed,
+        // i.e. what `explain` prints as `promotes`) actually point at what fires it? Hill-climbs text from
+        // that proposal set, scores it by RAW ACTIVATION, and compares against the best corpus example.
+        //
+        // This is Cammarata's blind-maximum idea, MINUS the LLM. His adversary reads a written explanation and
+        // writes a sentence; here the proposal distribution is the unit's own projected vocabulary and the
+        // search is a greedy token loop. That is a much weaker adversary — so `ratio < 1` is a BOUND on what
+        // this search can reach, NOT a refutation of the unit's explanation. Read it that way.
+        if let Some(spec) = flag(&args, "--blind-max") {
+            let mut it = spec.split(',');
+            let layer: usize = match it.next().and_then(|s| s.trim().parse().ok()) {
+                Some(v) => v,
+                None => { eprintln!("[fieldrun] --blind-max: layer must be an integer"); return; }
+            };
+            let neuron: usize = match it.next().and_then(|s| s.trim().parse().ok())
+                .or_else(|| flag(&args, "--neuron").and_then(|s| s.parse().ok()))
+            {
+                Some(v) => v,
+                None => { eprintln!("[fieldrun] --blind-max: neuron must be an integer (e.g. --blind-max 26,6203)"); return; }
+            };
+            let steps: usize = flag(&args, "--blind-steps").and_then(|s| s.parse().ok()).unwrap_or(8);
+            let k: usize = flag(&args, "--blind-cands").and_then(|s| s.parse().ok()).unwrap_or(24);
+            let pole = if flag(&args, "--blind-pole").map_or("pos", |s| s) .starts_with("neg") { model::POLE_NEG } else { model::POLE_POS };
+            if lm.blind_proposals(layer, neuron, 1, model::POLE_POS).is_none() {
+                eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family only)");
+                return;
+            }
+            let seed: Vec<i64> = ids.iter().copied().take(2).collect();
+            if seed.is_empty() {
+                eprintln!("[fieldrun] --blind-max: needs at least 2 tokens (a seed context)");
+                return;
+            }
+            let cands = lm.blind_proposals(layer, neuron, k, pole).unwrap_or_default();
+            if cands.is_empty() {
+                eprintln!("[fieldrun] --blind-max: no proposals for L{layer}/N{neuron} (bad layer?)");
+                return;
+            }
+            eprintln!("[fieldrun] --blind-max: L{layer}/N{neuron} · pole {} · {k} proposals × {steps} steps…",
+                      if pole == model::POLE_NEG { "NEG" } else { "POS" });
+            let t0 = std::time::Instant::now();
+            let blind = lm.blind_climb(layer, neuron, &seed, &cands, steps, pole);
+            println!("[fieldrun] blind-max L{layer}/N{neuron} pole={} proposals={} steps={} ({:.1}s)",
+                     if pole == model::POLE_NEG { "neg" } else { "pos" }, k, steps, t0.elapsed().as_secs_f64());
+            if let Some(a) = &blind {
+                println!("  blind arm : obj {:e}", a.obj);
+                println!("    ids      : {:?}", a.ids);
+            }
+            // oracle arm over the same corpus the model was loaded with, scored by the NAIVE path
+            let wins: Vec<Vec<i64>> = ids.windows(16).map(|w| w.to_vec()).collect();
+            let oracle = lm.blind_corpus_best(layer, neuron, &wins, pole);
+            if let Some(o) = &oracle {
+                println!("  oracle arm: obj {:e}   (best of {} corpus windows)", o.obj, wins.len());
+                println!("    ids      : {:?}", o.ids);
+                if let Some(a) = blind {
+                    // Only meaningful when BOTH arms actually reached the pole. Objectives are signed
+                    // activations; if either is <= 0 the search never reached the pole at all, and dividing
+                    // (let alone a negative by a positive) would print a confident-looking nonsense ratio.
+                    if a.obj > 0.0 && o.obj > 0.0 {
+                        println!("  RATIO blind/oracle = {:.4}", a.obj / o.obj);
+                        println!("    (a greedy token climb is a WEAK adversary vs Cammarata's LLM — ratio < 1 bounds this");
+                        println!("     search, it does not refute the unit's explanation)");
+                    } else {
+                        println!("  RATIO n/a — a blind arm obj {:e}, oracle obj {:e}", a.obj, o.obj);
+                        println!("    (not both positive: neither arm reached this pole. The unit is likely near-dead");
+                        println!("     on this context — probe one with a real |act| via --probe-mlp-act.)");
+                    }
+                }
+            } else {
+                println!("  oracle arm: none (corpus too short for any full window)");
+            }
+            return;
+        }
+
         // --probe-mlp-act <layer> [neuron]: raw post-activation of a layer's FFN neurons at the last token
         // — the substrate the blind-max harness searches over. `layer` then an optional `neuron`, given
         // either positionally (`--probe-mlp-act 26 6203`) or as `--neuron N`. With no neuron, prints the top-K

@@ -264,6 +264,18 @@ pub fn build_rec_lens_at(
         .collect()
 }
 
+/// Result of one blind-max arm: the best sequence found for a target unit, and the polarity-signed
+/// objective it reached.
+#[derive(Clone, Debug)]
+pub struct BlindArm {
+    pub ids: Vec<i64>,
+    pub obj: f32,
+}
+
+/// Blind-max polarity: `+1` maximises a unit's positive pole, `-1` its negative one.
+pub const POLE_POS: f32 = 1.0;
+pub const POLE_NEG: f32 = -1.0;
+
 pub trait Model: Sync {
     /// Top-1 next-token id for a context.
     fn predict(&self, ids: &[i64]) -> i64;
@@ -348,7 +360,46 @@ pub trait Model: Sync {
         }
     }
 
-    /// The post-SwiGLU activations of EVERY neuron in `layer`, at the LAST token of `ids` — the vector
+/// Blind-max probing. `polarity` `+1` maximises a unit's POSITIVE pole, `-1` its NEGATIVE one — a unit whose
+    /// job is suppression never peaks on the positive side, and a positive-only readout cannot see it.
+    ///
+    /// The three steps compose into a falsification test of a unit's own self-description: propose from what
+    /// it SAYS it does (`blind_proposals`, its output projection — the same readout `explain` prints as
+    /// `promotes`), search for what actually maximises it (`blind_climb`), and compare against brute force
+    /// over a corpus (`blind_corpus_best`). A ratio near or above 1 means the description points at the
+    /// mechanism.
+    ///
+    /// IMPORTANT — this greedy token climb is a WEAK adversary next to Cammarata's blind maximum, where an
+    /// LLM reads a written explanation and writes a sentence that fires the unit. A ratio BELOW 1 bounds what
+    /// this search could reach; it does NOT refute the explanation. Report it as a bound, never as a verdict.
+    ///
+    /// Default None — only arches with a cached scorer implement these.
+    fn blind_proposals(&self, _layer: usize, _neuron: usize, _k: usize, _polarity: f32) -> Option<Vec<i64>> {
+        None
+    }
+    fn blind_climb(
+        &self,
+        _layer: usize,
+        _neuron: usize,
+        _prefix: &[i64],
+        _cands: &[i64],
+        _steps: usize,
+        _polarity: f32,
+    ) -> Option<BlindArm> {
+        None
+    }
+    /// Scored by the NAIVE path (not the search cache), so the baseline stays independent of what it baselines.
+    fn blind_corpus_best(
+        &self,
+        _layer: usize,
+        _neuron: usize,
+        _windows: &[Vec<i64>],
+        _polarity: f32,
+    ) -> Option<BlindArm> {
+        None
+    }
+
+/// The post-SwiGLU activations of EVERY neuron in `layer`, at the LAST token of `ids` — the vector
     /// `explain` computes and then narrows to its top-N before reporting. Length is the layer's MLP
     /// intermediate width, so neuron `n` is `out[n]`.
     ///
