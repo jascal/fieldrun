@@ -72,14 +72,26 @@ math_tex = (
 )
 
 
-def english_text(src: Tokenizer, n: int) -> str:
+def english_text(src: Tokenizer, n: int, holdout: str = HOLDOUT) -> str:
     """Recover the holdout's English as TEXT, so any tokenizer can be retokenized from it.
 
     Guards the one assumption this whole path rests on: that decode -> encode is lossless for this data.
     If it ever stops being exact, the recovered text is no longer the holdout and every English corpus
     derived from it would be quietly a different corpus.
     """
-    ids = json.load(open(HOLDOUT))["holdout_ids"][:n]
+    if not os.path.exists(holdout):
+        # The holdout lives in the sibling lm-sae checkout, so this is a genuinely easy thing to be missing
+        # (fresh clone, wrong cwd, that tree not fetched). A bare FileNotFoundError says "no such file"
+        # and nothing about which file or why; this says both, and names the flag that overrides it.
+        raise SystemExit(
+            f"English holdout not found: {holdout}\n"
+            f"It lives in the sibling lm-sae checkout (run from the fieldrun repo root), or pass "
+            f"--holdout <path>. Without it there is no English slice to retokenize."
+        )
+    try:
+        ids = json.load(open(holdout))["holdout_ids"][:n]
+    except (json.JSONDecodeError, KeyError) as e:
+        raise SystemExit(f"{holdout} is not a holdout file ({{\"holdout_ids\": [...]}}): {e}")
     text = src.decode(ids)
     back = src.encode(text).ids
     if back != ids:
@@ -116,6 +128,8 @@ def main() -> None:
     ap.add_argument("--src-tok", default=DEFAULT_SRC_TOK, help="tokenizer that produced the English holdout ids")
     ap.add_argument("--out", default="sweeps/corpora", help="output directory")
     ap.add_argument("--model", default="Qwen2.5", help="model tag recorded in each json")
+    ap.add_argument("--holdout", default=HOLDOUT,
+                    help="English holdout json (default: the sibling lm-sae checkout)")
     ap.add_argument("--english", type=int, default=1200,
                     help="how much of the English holdout to use (default 1200, which reproduces the "
                          "committed corpora byte-for-byte). The holdout holds ~30k; raise it for a wider pool.")
@@ -130,7 +144,7 @@ def main() -> None:
 
     samples = {"german": german * 3, "spanish": spanish * 3, "code": code * 4, "math": math_tex * 4}
     ids = {name: tok.encode(text).ids for name, text in samples.items()}
-    ids["english"] = tok.encode(english_text(src, args.english)).ids
+    ids["english"] = tok.encode(english_text(src, args.english, args.holdout)).ids
 
     # pooled combos: a small multilingual pool, and a wider all-domain pool.
     ids["pooled_small"] = ids["english"][:500] + ids["german"] + ids["code"]
@@ -143,7 +157,7 @@ def main() -> None:
         # Deliberately built from the FULL holdout, not from `--english`: its size must not depend on the
         # flag, or the same invocation writes a different `pooled_wide` depending on unrelated arguments and
         # the committed file stops being reproducible from the documented default.
-        wide = {"english": tok.encode(english_text(src, WIDE_ENGLISH)).ids}
+        wide = {"english": tok.encode(english_text(src, WIDE_ENGLISH, args.holdout)).ids}
         wide.update({k: ids[k] for k in ("german", "spanish", "code", "math")})
         ids["pooled_wide"] = interleave(wide)
 
