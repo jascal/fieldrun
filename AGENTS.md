@@ -99,7 +99,13 @@ diverges without explaining why.
   `Model::blind_support` is what the CLI gates on, and it must stay **coherent with** the arms: an arch that
   implements `blind_proposals` but inherits the `NoScorer` default makes the harness refuse to run on a model
   it supports (this happened, and the message named the rope family as unsupported). Two decline reasons,
-  not one: `NoScorer` (nobody implemented it) vs `RoutedLayers` (works, but these layers are per-token routed).
+  not one: `NoScorer` (nobody implemented it) vs `RoutedLayers` (the DENSE unit is declined, but a routed
+  one is addressable as `--blind-max L,E,N`). A routed unit is scored by **`w_router · act`** — not `act`,
+  since the router is a real gate, and not `· down[n]`, which is a per-neuron constant that cancels in the
+  ratio and is signed, so including it can invert the objective. Only positions whose top-k CONTAINS that
+  expert have a value; the rest are skipped, which is what makes a MoE unit's reachable set routing-dependent.
+  Its self-description is `experts.{e}.down` row `n` — read through `expert_f32`, because expert weights are
+  PAGED and `weight_row` cannot see them.
 - `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
   and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
   Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and

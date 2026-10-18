@@ -2545,9 +2545,13 @@ fn main() {
             return;
         }
 
-        // --blind-max <layer> <neuron>: does the unit's OWN README (its down-projection · final-norm · unembed,
-        // i.e. what `explain` prints as `promotes`) actually point at what fires it? Hill-climbs text from
-        // that proposal set, scores it by RAW ACTIVATION, and compares against the best corpus example.
+        // --blind-max <layer>,<neuron>            — a DENSE unit (rope family, qwen3_5 dense)
+        // --blind-max <layer>,<expert>,<neuron>   — a ROUTED unit (qwen3_5_moe): expert `expert`'s neuron
+        //   `neuron`, scored by `w_router · act` and only over positions the router actually selects.
+        //
+        // Either way the question is: does the unit's OWN README (its down-projection · final-norm ·
+        // unembed, i.e. what `explain` prints as `promotes`) actually point at what fires it? Hill-climbs
+        // text from that proposal set and compares against the best corpus example.
         //
         // This is Cammarata's blind-maximum idea, MINUS the LLM. His adversary reads a written explanation and
         // writes a sentence; here the proposal distribution is the unit's own projected vocabulary and the
@@ -2559,47 +2563,74 @@ fn main() {
                 Some(v) => v,
                 None => { eprintln!("[fieldrun] --blind-max: layer must be an integer"); return; }
             };
-            let neuron: usize = match it.next().and_then(|s| s.trim().parse().ok())
+            // `L,N` is a dense unit; `L,E,N` names a routed one (expert E, neuron N).
+            let second: usize = match it
+                .next()
+                .and_then(|s| s.trim().parse().ok())
                 .or_else(|| flag(&args, "--neuron").and_then(|s| s.parse().ok()))
             {
                 Some(v) => v,
-                None => { eprintln!("[fieldrun] --blind-max: neuron must be an integer (e.g. --blind-max 26,6203)"); return; }
+                None => {
+                    eprintln!("[fieldrun] --blind-max: expected <layer>,<neuron> (dense) or <layer>,<expert>,<neuron> (routed)");
+                    return;
+                }
             };
+            let (expert, neuron) = match it.next().and_then(|s| s.trim().parse().ok()) {
+                Some(e) => (Some(e), second),
+                // 2-component form, or an explicit --neuron with the expert taken from --expert
+                None => (flag(&args, "--expert").and_then(|s| s.parse().ok()), second),
+            };
+
             let steps: usize = flag(&args, "--blind-steps").and_then(|s| s.parse().ok()).unwrap_or(8);
             let k: usize = flag(&args, "--blind-cands").and_then(|s| s.parse().ok()).unwrap_or(24);
             let pole = if flag(&args, "--blind-pole").map_or("pos", |s| s) .starts_with("neg") { model::POLE_NEG } else { model::POLE_POS };
-            match lm.blind_support() {
-                model::BlindSupport::Supported => {}
-                model::BlindSupport::RoutedLayers => {
-                    eprintln!("[fieldrun] --blind-max: this bundle's FFN layers are MoE, and blind-max declines on");
-                    eprintln!("                   routed layers: the router picks which experts run PER TOKEN, so");
-                    eprintln!("                   \"neuron n\" has no fixed meaning across positions. This is a deliberate");
-                    eprintln!("                   decline, not a missing feature. The DENSE release of this arch (qwen3_5)");
-                    eprintln!("                   is fully supported — load that bundle, or use --probe-mlp-act /");
-                    eprintln!("                   --explain to read routed layers.");
+            let routed = expert.is_some();
+            match (lm.blind_support(), routed) {
+                (model::BlindSupport::NoScorer, _) => {
+                    eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family + Qwen3.5)");
                     return;
                 }
-                model::BlindSupport::NoScorer => {
-                    eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family + Qwen3.5 dense)");
+                // A routed unit was named but these layers are dense: the 3-component form needs a MoE bundle.
+                (_, true) if lm.blind_support() == model::BlindSupport::Supported => {
+                    eprintln!("[fieldrun] --blind-max: this bundle's FFN layers are DENSE, so there is no expert to name.");
+                    eprintln!("                   Use --blind-max {layer},{neuron} (drop the expert).");
                     return;
                 }
+                // No expert named on a routed bundle: the old answer, now pointing at the form that works.
+                (model::BlindSupport::RoutedLayers, false) => {
+                    eprintln!("[fieldrun] --blind-max: this bundle's FFN layers are MoE, and there is no fixed");
+                    eprintln!("                   \"neuron n\" — the router picks which experts run PER TOKEN. A ROUTED unit");
+                    eprintln!("                   is addressable as --blind-max {layer},<expert>,<neuron>, scored by");
+                    eprintln!("                   w_router·act over only the positions that select that expert. The DENSE");
+                    eprintln!("                   release (qwen3_5) takes --blind-max {layer},{neuron} instead.");
+                    return;
+                }
+                _ => {}
             }
             let seed: Vec<i64> = ids.iter().copied().take(2).collect();
             if seed.is_empty() {
                 eprintln!("[fieldrun] --blind-max: needs at least 2 tokens (a seed context)");
                 return;
             }
-            let cands = lm.blind_proposals(layer, neuron, k, pole).unwrap_or_default();
+            let e = expert.unwrap_or(0);
+            let unit = if routed { format!("L{layer}/E{e}/N{neuron}") } else { format!("L{layer}/N{neuron}") };
+            let cands = if routed { lm.blind_moe_proposals(layer, e, neuron, k, pole) } else { lm.blind_proposals(layer, neuron, k, pole) }
+                .unwrap_or_default();
             if cands.is_empty() {
-                eprintln!("[fieldrun] --blind-max: no proposals for L{layer}/N{neuron} (bad layer?)");
+                eprintln!("[fieldrun] --blind-max: no proposals for {unit} (bad layer/expert?)");
                 return;
             }
-            eprintln!("[fieldrun] --blind-max: L{layer}/N{neuron} · pole {} · {k} proposals × {steps} steps…",
+            eprintln!("[fieldrun] --blind-max: {unit} · pole {} · {k} proposals × {steps} steps…",
                       if pole == model::POLE_NEG { "NEG" } else { "POS" });
             let t0 = std::time::Instant::now();
-            let blind = lm.blind_climb(layer, neuron, &seed, &cands, steps, pole);
-            println!("[fieldrun] blind-max L{layer}/N{neuron} pole={} proposals={} steps={} ({:.1}s)",
-                     if pole == model::POLE_NEG { "neg" } else { "pos" }, k, steps, t0.elapsed().as_secs_f64());
+            let blind = if routed {
+                lm.blind_moe_climb(layer, e, neuron, &seed, &cands, steps, pole)
+            } else {
+                lm.blind_climb(layer, neuron, &seed, &cands, steps, pole)
+            };
+            println!("[fieldrun] blind-max {unit} pole={} proposals={} steps={} ({:.1}s){}",
+                     if pole == model::POLE_NEG { "neg" } else { "pos" }, k, steps, t0.elapsed().as_secs_f64(),
+                     if routed { "  [routed unit: objective w_router·act]" } else { "" });
             if let Some(a) = &blind {
                 println!("  blind arm : obj {:e}", a.obj);
                 println!("    ids      : {:?}", a.ids);
@@ -2617,7 +2648,11 @@ fn main() {
                     ids.clone()
                 }
             };
-            let oracle = lm.blind_corpus_best(layer, neuron, &stream, pole);
+            let oracle = if routed {
+                lm.blind_moe_corpus_best(layer, e, neuron, &stream, pole)
+            } else {
+                lm.blind_corpus_best(layer, neuron, &stream, pole)
+            };
             if let Some(o) = &oracle {
                 println!("  oracle arm: obj {:e}   (best over {} corpus tokens)", o.obj, stream.len());
                 if let Some(p) = o.pos {
