@@ -2557,9 +2557,21 @@ fn main() {
             let steps: usize = flag(&args, "--blind-steps").and_then(|s| s.parse().ok()).unwrap_or(8);
             let k: usize = flag(&args, "--blind-cands").and_then(|s| s.parse().ok()).unwrap_or(24);
             let pole = if flag(&args, "--blind-pole").map_or("pos", |s| s) .starts_with("neg") { model::POLE_NEG } else { model::POLE_POS };
-            if lm.blind_proposals(layer, neuron, 1, model::POLE_POS).is_none() {
-                eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family only)");
-                return;
+            match lm.blind_support() {
+                model::BlindSupport::Supported => {}
+                model::BlindSupport::RoutedLayers => {
+                    eprintln!("[fieldrun] --blind-max: this bundle's FFN layers are MoE, and blind-max declines on");
+                    eprintln!("                   routed layers: the router picks which experts run PER TOKEN, so");
+                    eprintln!("                   \"neuron n\" has no fixed meaning across positions. This is a deliberate");
+                    eprintln!("                   decline, not a missing feature. The DENSE release of this arch (qwen3_5)");
+                    eprintln!("                   is fully supported — load that bundle, or use --probe-mlp-act /");
+                    eprintln!("                   --explain to read routed layers.");
+                    return;
+                }
+                model::BlindSupport::NoScorer => {
+                    eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family + Qwen3.5 dense)");
+                    return;
+                }
             }
             let seed: Vec<i64> = ids.iter().copied().take(2).collect();
             if seed.is_empty() {
@@ -2616,7 +2628,7 @@ fn main() {
                     }
                 }
             } else {
-                println!("  oracle arm: none (corpus shorter than 2 tokens, or the arch has no cached scorer)");
+                println!("  oracle arm: none (corpus shorter than 2 tokens, unit out of range for this layer, or the arch has no cached scorer)");
             }
             return;
         }

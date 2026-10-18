@@ -93,8 +93,13 @@ diverges without explaining why.
   ~0.9 s/token and would cost ~3 h), and each position still sees its true causal history. The block
   values are bit-identical to a naive per-position forward, asserted in tests.
   The oracle is a **weak, corpus-relative adversary**: `ratio < 1` bounds the search, it does NOT refute the
-  explanation, and the CLI says so inline. MoE layers return `None` at every entry point — a routed expert has no fixed
-  "neuron n", and guessing would be worse than declining.
+  explanation, and the CLI says so inline — including the search config that produced the number, because the
+  ratio is a property of the search and the corpus, not of the unit. MoE layers return `None` at every entry
+  point — a routed expert has no fixed "neuron n", and guessing would be worse than declining.
+  `Model::blind_support` is what the CLI gates on, and it must stay **coherent with** the arms: an arch that
+  implements `blind_proposals` but inherits the `NoScorer` default makes the harness refuse to run on a model
+  it supports (this happened, and the message named the rope family as unsupported). Two decline reasons,
+  not one: `NoScorer` (nobody implemented it) vs `RoutedLayers` (works, but these layers are per-token routed).
 - `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
   and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
   Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and

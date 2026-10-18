@@ -829,6 +829,13 @@ impl Model for Rope {
     /// dotted into the unembed — the SAME readout `explain` displays as `promotes`, signed so the negative
     /// pole is reachable. Deliberately derived from the unit's OUTPUT projection, not from its activations
     /// on any corpus: this is the unit's opinion about itself, which is what the test then tries to falsify.
+    fn blind_support(&self) -> crate::model::BlindSupport {
+        // rope layers are dense, so the harness always applies. This override exists because the CLI
+        // gates on `blind_support`, and inheriting the `NoScorer` default here made the harness refuse
+        // rope entirely — with a message that named the rope family as unsupported.
+        crate::model::BlindSupport::Supported
+    }
+
     fn blind_proposals(&self, layer: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
         if layer >= self.n_layer {
             return None;
@@ -1520,7 +1527,19 @@ impl Model for Rope {
 mod tests {
     use super::*;
     use crate::bundle::Bundle;
-    use crate::model::{Model, POLE_NEG, POLE_POS};
+    use crate::model::{BlindSupport, Model, POLE_NEG, POLE_POS};
+
+    /// rope implements the blind-max arms, so it must also say so. The CLI gates on `blind_support`,
+    /// and an arch that implements the arms but inherits the `NoScorer` default silently refuses to
+    /// run — a self-inflicted version of exactly the false "unsupported" message this API replaced.
+    #[test]
+    fn rope_reports_supported() {
+        let stem = tiny_rope("support");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        assert_eq!(m.blind_support(), BlindSupport::Supported);
+        // coherence: if the arms answer, support must not be NoScorer
+        assert!(m.blind_proposals(0, 2, 4, POLE_POS).is_some(), "proposals should be available");
+    }
 
     /// Deterministic pseudo-random weights — no RNG dependency, so a failure is always reproducible.
     fn v(seed: usize, n: usize) -> Vec<f32> {
