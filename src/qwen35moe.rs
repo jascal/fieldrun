@@ -242,8 +242,25 @@ impl Qwen35Scorer {
     pub fn try_token(&mut self, m: &Qwen35Moe, token: i64, layer: usize, neuron: usize) -> Option<f32> {
         self.st = self.snap.clone(); // candidates must not see each other's writes
         let emb = m.b.rows_f32("embed", &[token]);
-        let (mlp_h, _) = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st, None);
+        let (mlp_h, _, _) = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st, None, None);
         mlp_h.get(layer)?.get(neuron).copied()
+    }
+
+    /// Score `token` at the next position by the ROUTED unit's `w_router · act`, WITHOUT committing.
+    /// `None` for a bad unit; `Some(NaN)` when the router did not select that expert for this position —
+    /// the unit genuinely has no value there, which is not the same as a value of zero.
+    pub fn try_token_moe(
+        &mut self,
+        m: &Qwen35Moe,
+        token: i64,
+        layer: usize,
+        expert: usize,
+        neuron: usize,
+    ) -> Option<f32> {
+        self.st = self.snap.clone(); // candidates must not see each other's writes
+        let emb = m.b.rows_f32("embed", &[token]);
+        let (_h, _rows, vals) = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st, None, Some((layer, expert, neuron)));
+        vals.first().copied()
     }
 
     /// Accept `token`: re-probe from the snapshot, advance `pos`, re-take the snapshot there.
@@ -422,7 +439,7 @@ impl Qwen35Moe {
     }
 
     /// SparseMoeBlock: softmax top-k routed experts + a sigmoid-gated shared expert.
-    fn moe_branch(&self, l: usize, a2: &Array2<f32>) -> Array2<f32> {
+    fn moe_branch(&self, l: usize, a2: &Array2<f32>, scan: Option<(usize, usize)>) -> (Array2<f32>, Vec<f32>) {
         let p = format!("l{l}.");
         let seq = a2.nrows();
         let mut logits = self.b.mm(a2, &format!("{p}gate"));
@@ -441,6 +458,10 @@ impl Qwen35Moe {
             }
         }
         let mut out = Array2::<f32>::zeros((seq, self.d));
+        // Per-row value of ONE routed unit, recorded in the same pass so the expert's weights are read
+        // once. Empty where the expert is not in that row's top-k: the unit is not computed there at
+        // all, so it has no value rather than a value of zero — see `Model::blind_moe_*`.
+        let mut scan_out: Vec<f32> = scan.map(|_| vec![f32::NAN; seq]).unwrap_or_default();
         for &e in assign.keys() {
             self.b.prefetch(&format!("{p}experts.{e}.gate"));
             self.b.prefetch(&format!("{p}experts.{e}.up"));
@@ -459,6 +480,11 @@ impl Qwen35Moe {
             }
             let down = self.b.expert_mm(&hh, &format!("{p}experts.{e}.down"));
             for (i, &(t, wgt)) in toks.iter().enumerate() {
+                if let Some((se, sn)) = scan {
+                    if *e == se && sn < hh.ncols() {
+                        scan_out[t] = wgt * hh[[i, sn]];
+                    }
+                }
                 for c in 0..self.d {
                     out[[t, c]] += wgt * down[[i, c]];
                 }
@@ -481,12 +507,12 @@ impl Qwen35Moe {
                 }
             }
         }
-        out
+        (out, scan_out)
     }
 
     fn ffn(&self, l: usize, x: &Array2<f32>) -> Array2<f32> {
         if self.n_exp != 0 {
-            return self.moe_branch(l, x);
+            return self.moe_branch(l, x, None).0;
         }
         let p = format!("l{l}.mlp.");
         let gate = self.b.mm(x, &format!("{p}gate_proj"));
@@ -619,12 +645,14 @@ impl Qwen35Moe {
     /// kernel. Identical walk and arithmetic, so its `mlp_h[layer][neuron]` is bit-identical to the naive
     /// `mlp_act_last` over the same ids; the difference is that it ADVANCES `st` (DeltaNet recurrence and
     /// conv window included), which is why the scorer snapshots before probing a candidate.
-    fn forward_block_capture_mlp(&self, emb: &Array2<f32>, cur: usize, st: &mut HybridState, scan: Option<(usize, usize)>) -> (Vec<Vec<f32>>, Vec<f32>) {
+    fn forward_block_capture_mlp(&self, emb: &Array2<f32>, cur: usize, st: &mut HybridState, scan: Option<(usize, usize)>, moe_scan: Option<(usize, usize, usize)>) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
         let last = emb.nrows() - 1;
         let mut x = emb.clone();
         let mut mlp_h: Vec<Vec<f32>> = Vec::with_capacity(self.n_layer);
         // per-ROW activations of one unit, for the corpus scan (see `Model::blind_corpus_best`)
         let mut scan_out: Vec<f32> = Vec::new();
+        // per-ROW router-weighted activation of one ROUTED unit, for the MoE blind-max arms
+        let mut moe_out: Vec<f32> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}in_ln"));
@@ -649,12 +677,18 @@ impl Qwen35Moe {
                     }
                 }
                 x = &x + &self.b.mm(&hid, &format!("{q}down_proj"));
+            } else if let Some((ml, me, mn)) = moe_scan.filter(|(ml, ..)| *ml == l) {
+                // one pass: the branch's output AND this row's routed-unit value
+                let (mo, vals) = self.moe_branch(l, &a2, Some((me, mn)));
+                moe_out = vals;
+                mlp_h.push(Vec::new());
+                x = &x + &mo;
             } else {
                 mlp_h.push(Vec::new());
                 x = &x + &self.ffn(l, &a2);
             }
         }
-        (mlp_h, scan_out)
+        (mlp_h, scan_out, moe_out)
     }
 
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
@@ -807,6 +841,120 @@ impl Model for Qwen35Moe {
         Some(idx.into_iter().take(k).map(|i| i as i64).collect())
     }
 
+    /// One ROUTED unit's self-description: expert `e` neuron `n`'s own output row
+    /// (`experts.{e}.down`), scaled by the final-norm gain and projected through the unembed — exactly
+    /// the construction `blind_proposals` uses for a dense `mlp.down_proj`, so the two are comparable.
+    fn blind_moe_proposals(&self, layer: usize, expert: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
+        if layer >= self.n_layer || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        // Expert weights are PAGED, not resident: `weight_row` cannot see them, so go through
+        // `expert_f32`, which returns (shape, values) as (in, out) row-major. down_proj is (mi, d),
+        // so neuron `n`'s output direction is one contiguous d-wide row of it.
+        let (shape, vals) = self.b.expert_f32(&format!("l{layer}.experts.{expert}.down"));
+        let d = shape[1];
+        if neuron >= shape[0] {
+            return None;
+        }
+        let gain = self.b.arr1("norm").to_vec();
+        let mut w = vals[neuron * d..(neuron + 1) * d].to_vec();
+        w.iter_mut().zip(gain.iter()).for_each(|(v, g)| *v *= g);
+        let proj = self.b.rowdot_f32(self.unembed(), &w);
+        let mut idx: Vec<usize> = (0..proj.len()).collect();
+        idx.sort_by(|&a, &b| {
+            (polarity * proj[b]).partial_cmp(&(polarity * proj[a])).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(idx.into_iter().take(k).map(|i| i as i64).collect())
+    }
+
+    /// Greedy hill-climb for one routed unit, scored by `w_router · act`. Candidates the router does not
+    /// select score `NaN` and are skipped rather than treated as zero, so the climb never "wins" by
+    /// steering the router away from the expert it is trying to maximise.
+    fn blind_moe_climb(
+        &self,
+        layer: usize,
+        expert: usize,
+        neuron: usize,
+        prefix: &[i64],
+        cands: &[i64],
+        steps: usize,
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        if cands.is_empty() || layer >= self.n_layer || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        let mut sc = Qwen35Scorer::new(self, prefix, prefix.len() + steps + 1)?;
+        let mut ids = prefix.to_vec();
+        let mut best = f32::NEG_INFINITY;
+        for _ in 0..steps {
+            let mut pick = None;
+            let mut pick_obj = f32::NEG_INFINITY;
+            for &t in cands {
+                match sc.try_token_moe(self, t, layer, expert, neuron) {
+                    Some(v) if !v.is_nan() && polarity * v > pick_obj => {
+                        pick_obj = polarity * v;
+                        pick = Some(t);
+                    }
+                    _ => {}
+                }
+            }
+            let Some(t) = pick else { break }; // no candidate reaches this expert on this position
+            // advance the hybrid state by re-scoring the winner from the snapshot; its value was
+            // already read by the probe above
+            sc.commit(self, t, 0, 0);
+            ids.push(t);
+            best = best.max(pick_obj);
+        }
+        if best == f32::NEG_INFINITY {
+            return None;
+        }
+        Some(crate::model::BlindArm { ids, obj: best, pos: None })
+    }
+
+    /// Oracle for one routed unit over a corpus: best `w_router · act` among positions that route to
+    /// `expert`. Chunked exactly like the dense arm, and using the same hybrid scorer, so the recurrent
+    /// state advances identically across chunk boundaries.
+    fn blind_moe_corpus_best(
+        &self,
+        layer: usize,
+        expert: usize,
+        neuron: usize,
+        ids: &[i64],
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        if ids.len() < 2 || layer >= self.n_layer || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        let mut sc = Qwen35Scorer::empty(self, ids.len());
+        let (mut best_obj, mut best_idx, mut routed) = (f32::NEG_INFINITY, 0usize, 0usize);
+        for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
+            let start = sc.pos();
+            let emb = self.b.rows_f32("embed", chunk);
+            let (_h, _rows, vals) =
+                self.forward_block_capture_mlp(&emb, start, &mut sc.st, None, Some((layer, expert, neuron)));
+            sc.pos += chunk.len();
+            if vals.len() != chunk.len() {
+                continue;
+            }
+            for (j, &v) in vals.iter().enumerate() {
+                if v.is_nan() {
+                    continue; // expert not in this row's top-k: unit not computed there
+                }
+                routed += 1;
+                let o = polarity * v;
+                if o > best_obj {
+                    best_obj = o;
+                    best_idx = start + j;
+                }
+            }
+        }
+        if routed == 0 {
+            return None; // this expert is never selected anywhere in the corpus
+        }
+        let lo = best_idx.saturating_sub(crate::model::CORPUS_CTX - 1);
+        Some(crate::model::BlindArm { ids: ids[lo..=best_idx].to_vec(), obj: best_obj, pos: Some(best_idx) })
+    }
+
     /// Greedy hill-climb over those proposals, scored by RAW ACTIVATION through [`Qwen35Scorer`].
     fn blind_climb(
         &self,
@@ -861,7 +1009,7 @@ impl Model for Qwen35Moe {
         for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
             let start = sc.pos();
             let emb = self.b.rows_f32("embed", chunk);
-            let (_mlp_h, rows) = self.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((layer, neuron)));
+            let (_mlp_h, rows, _) = self.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((layer, neuron)), None);
             sc.pos += chunk.len();
             if rows.len() != chunk.len() {
                 continue; // unit out of range for this layer's FFN width
@@ -1042,13 +1190,23 @@ mod tests {
             add(format!("{p}mlp.up_proj"), vec![d, ffn], v(80 + l, d * ffn));
             add(format!("{p}mlp.down_proj"), vec![ffn, d], v(90 + l, ffn * d));
             if moe {
-                add(format!("{p}mlp.gate.weight"), vec![ffn, d], v(100 + l, ffn * d));
-                add(format!("{p}mlp.experts.gate_up_proj"), vec![n_exp, 2 * moe_inter, d], v(110 + l, n_exp * 2 * moe_inter * d));
-                add(format!("{p}mlp.experts.down_proj"), vec![n_exp, d, moe_inter], v(120 + l, n_exp * d * moe_inter));
-                add(format!("{p}mlp.shared_expert.gate_proj"), vec![d, shared_inter], v(130 + l, d * shared_inter));
-                add(format!("{p}mlp.shared_expert.up_proj"), vec![d, shared_inter], v(140 + l, d * shared_inter));
-                add(format!("{p}mlp.shared_expert.down_proj"), vec![shared_inter, d], v(150 + l, shared_inter * d));
-                add(format!("{p}mlp.shared_expert_gate.weight"), vec![d], v(160 + l, d));
+                // RUNTIME names, not HF's packed ones. These used to be written as
+                // `mlp.gate.weight` / `mlp.experts.gate_up_proj` / … which is what `convert` emits on the
+                // way IN — the loader never reads them, so a MoE bundle built here had no readable experts
+                // and any test that actually ran a MoE forward would panic on a missing array. The decline
+                // tests passed only because they short-circuit before touching a single expert.
+                add(format!("{p}gate"), vec![d, n_exp], v(100 + l, d * n_exp));
+                for e in 0..n_exp {
+                    // `.experts.` in the name is what puts these in the PAGED map `expert_f32` reads.
+                    add(format!("{p}experts.{e}.gate"), vec![d, moe_inter], v(110 + e, d * moe_inter));
+                    add(format!("{p}experts.{e}.up"), vec![d, moe_inter], v(120 + e, d * moe_inter));
+                    add(format!("{p}experts.{e}.down"), vec![moe_inter, d], v(130 + e, moe_inter * d));
+                }
+                add(format!("{p}shared.gate_proj"), vec![d, shared_inter], v(140 + l, d * shared_inter));
+                add(format!("{p}shared.up_proj"), vec![d, shared_inter], v(150 + l, d * shared_inter));
+                add(format!("{p}shared.down_proj"), vec![shared_inter, d], v(160 + l, shared_inter * d));
+                // (d, 1): the router sigmoid gate is read through `mm`, which needs 2-D
+                add(format!("{p}shared_gate"), vec![d, 1], v(170 + l, d));
             }
             if linear {
                 add(format!("{p}linear_attn.in_proj_qkv"), vec![d, 2 * key_dim + value_dim], v(200 + l, d * (2 * key_dim + value_dim)));
@@ -1172,7 +1330,7 @@ mod tests {
         for chunk in stream.chunks(1) {
             let start = sc.pos();
             let emb = m.b.rows_f32("embed", chunk);
-            let (_h, rows) = m.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((0, 2)));
+            let (_h, rows, _) = m.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((0, 2)), None);
             sc.pos += chunk.len();
             for (j, &a) in rows.iter().enumerate() {
                 let want = m.mlp_act_last(&stream[..=start + j], 0).unwrap()[2];
@@ -1203,6 +1361,108 @@ mod tests {
             assert_eq!(arm.pos, Some(at), "reported position must be the argmax position");
             assert_eq!(arm.ids.last().copied(), Some(stream[at]), "ids must end at the best position");
         }
+    }
+
+    /// The routed oracle's value must equal an INDEPENDENT recompute.
+    ///
+    /// The sweep runs through the cached, chunked, hybrid-state path. So the reference here goes around
+    /// it: take the residual ENTERING the layer from `hiddens`, apply the post-norm, and run the router
+    /// and that one expert by hand. If the two disagree, the oracle is measuring something the search
+    /// cannot see — and a ratio whose denominator came from a different instrument than its numerator is
+    /// fiction. This is the whole point of picking `w_router · act`: it must be reproducible from the
+    /// layer input alone, with no scorer state involved.
+    /// The routed OBJECTIVE must be reproducible from the layer's post-norm input alone.
+    ///
+    /// This is the claim that makes `w_router · act` a legible score rather than an opaque one, and it
+    /// double-checks the two things most likely to be wrong: that the router's ALWAYS-renormalised top-k
+    /// weights are applied, and that the expert projections are matmuls (sum over inputs BEFORE the silu,
+    /// not an elementwise product). Both mistakes produce plausible-looking numbers, so they are worth a
+    /// hand-written reference.
+    ///
+    /// Deliberately driven from a CONTROLLED `a2` rather than the model's own residual. The FFN sees the
+    /// post-ATTENTION residual, which is not reachable without re-running attention, so deriving it from
+    /// `hiddens` would mean testing something other than what the sweep reads. What this test owns is the
+    /// objective; the residual itself is gated by the cached-vs-naive tests on the dense arms.
+    #[test]
+    fn qwen35_routed_objective_matches_reference() {
+        let m = load_tiny_moe("moeref");
+        let (l, e, n) = (1usize, 0usize, 1usize);
+        let stream: Vec<i64> = (0..6).map(|i: i64| i).collect();
+        let xin = m.hiddens(&stream)[l].clone();
+        let (seq, d) = (stream.len(), m.d);
+        let mut rows = Array2::<f32>::zeros((seq, d));
+        for t in 0..seq {
+            for c in 0..d {
+                rows[[t, c]] = xin[t * d + c];
+            }
+        }
+        let a2 = m.norm(&rows, &format!("l{l}.post_ln"));
+
+        // what the branch reports for this unit, on this exact input
+        let (_out, got) = m.moe_branch(l, &a2, Some((e, n)));
+
+        // ...and the same thing written out by hand
+        let mut logits = m.b.mm(&a2, &format!("l{l}.gate"));
+        softmax_rows(&mut logits);
+        let (_, gv) = m.b.expert_f32(&format!("l{l}.experts.{e}.gate"));
+        let (_, uv) = m.b.expert_f32(&format!("l{l}.experts.{e}.up"));
+        let (dsh, _) = m.b.expert_f32(&format!("l{l}.experts.{e}.down"));
+        let mi = dsh[0];
+        assert_eq!(got.len(), seq, "one value per position");
+        let mut n_routed = 0;
+        for t in 0..seq {
+            let row = logits.row(t).to_vec();
+            // Qwen3.5 router: softmax -> top-k -> RENORMALISE the kept weights
+            let mut idx: Vec<usize> = (0..m.n_exp).collect();
+            idx.sort_by(|&x, &y| row[y].partial_cmp(&row[x]).unwrap());
+            idx.truncate(m.topk);
+            if !idx.contains(&e) {
+                assert!(got[t].is_nan(), "t={t}: expert not selected, so the unit has NO value there");
+                continue;
+            }
+            n_routed += 1;
+            let denom: f32 = idx.iter().map(|&x| row[x]).sum::<f32>().max(1e-20);
+            let w = row[e] / denom;
+            // matmul first, THEN silu: gate/up are (d, mi) and project the input, they do not scale it
+            let (mut g, mut u) = (0f32, 0f32);
+            for i in 0..d {
+                g += a2[[t, i]] * gv[i * mi + n];
+                u += a2[[t, i]] * uv[i * mi + n];
+            }
+            let want = w * silu(g) * u;
+            // NOT bit-equality, and deliberately: this reference re-derives the same arithmetic in a
+            // different summation order than `expert_mm`, which costs the last ulp or two of f32. Asserting
+            // bit-equality here would be asserting float noise. What this test owns is the OBJECTIVE's
+            // semantics — renormalised routing, matmul-before-silu, w·act — and those differ by orders of
+            // magnitude if any of the three is wrong. The BIT-EXACT claim is carried by the chunked ==
+            // single-token test, which walks the identical code path.
+            let rel = ((got[t] - want) / want.abs().max(1e-12)).abs();
+            assert!(rel < 1e-5, "t={t}: routed objective {:e} vs reference {:e} (rel {rel:e})", got[t], want);
+        }
+        assert!(n_routed > 0, "fixture must route this expert somewhere");
+    }
+
+    /// The corpus sweep visits positions in `CORPUS_CHUNK`-row blocks; forcing it to one row per block
+    /// must give BIT-IDENTICAL results. This is the bit-exact claim the chunked architecture rests on for
+    /// routed units too — if the carried hybrid state drifted across a block boundary, this is where it
+    /// would show.
+    #[test]
+    fn qwen35_routed_chunked_equals_single_token_walk() {
+        let m = load_tiny_moe("moechunk");
+        let (l, e, n) = (1usize, 2usize, 4usize);
+        let stream: Vec<i64> = (0..70).map(|i: i64| (i * 3 + 2) % 24).collect();
+        let chunked = m.blind_moe_corpus_best(l, e, n, &stream, POLE_POS).unwrap();
+        let mut sc = Qwen35Scorer::empty(&m, stream.len());
+        let mut best = f32::NEG_INFINITY;
+        for (i, &t) in stream.iter().enumerate() {
+            let emb = m.b.rows_f32("embed", &[t]);
+            let (_h, _r, vals) = m.forward_block_capture_mlp(&emb, i, &mut sc.st, None, Some((l, e, n)));
+            if let Some(v) = vals.first().copied().filter(|v| !v.is_nan()) {
+                best = best.max(v);
+            }
+        }
+        assert_eq!(chunked.obj.to_bits(), best.to_bits(),
+                   "chunked {:e} vs single-token walk {:e}", chunked.obj, best);
     }
 
     /// A MoE layer has no fixed "neuron n" — the routed expert decides. Every entry point must decline

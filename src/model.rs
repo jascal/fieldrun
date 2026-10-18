@@ -458,6 +458,63 @@ pub trait Model: Sync {
         None
     }
 
+    /// Propose tokens from what ONE ROUTED unit says it does — expert `e`, neuron `n` — i.e. its own
+    /// output projection (its `experts.{e}.down` row, the same role `mlp.down_proj` plays in a dense
+    /// layer). `None` on dense layers: use `blind_proposals`, which needs no expert.
+    ///
+    /// The objective these feed is `w_router · act`, NOT `act` and NOT `w_router · down[n] · act`:
+    ///
+    /// * not `act` — in a MoE the router is a real gate, and a neuron the router nearly closed did
+    ///   almost nothing. Scoring the bare activation would rank units by how loudly they fire rather
+    ///   than by how much they contributed.
+    /// * not `· down[n]` — that factor is CONSTANT for a given neuron, so it cancels in
+    ///   `blind/oracle` and only changes the units. Worse, `down[n]` is signed, so including it can
+    ///   flip the sign of the objective and make "maximise this unit" mean "maximise what it damps".
+    ///
+    /// `w_router · act` also keeps the ratio comparable with the dense arm, which scores activations.
+    /// Default None; arches with a cached scorer implement it.
+    fn blind_moe_proposals(
+        &self,
+        _layer: usize,
+        _expert: usize,
+        _neuron: usize,
+        _k: usize,
+        _polarity: f32,
+    ) -> Option<Vec<i64>> {
+        None
+    }
+
+    /// Greedy hill-climb for one routed unit, scored by `w_router · act`.
+    fn blind_moe_climb(
+        &self,
+        _layer: usize,
+        _expert: usize,
+        _neuron: usize,
+        _prefix: &[i64],
+        _cands: &[i64],
+        _steps: usize,
+        _polarity: f32,
+    ) -> Option<BlindArm> {
+        None
+    }
+
+    /// Oracle for one routed unit: the best `w_router · act` over a real corpus.
+    ///
+    /// Only positions whose top-k actually CONTAINS `expert` have a value — the unit is not computed
+    /// elsewhere, so those positions are excluded rather than scored as zero. That makes the unit's
+    /// reachable set routing-dependent, which is the property that makes a MoE unit different from a
+    /// dense one and worth stating in the output rather than hiding.
+    fn blind_moe_corpus_best(
+        &self,
+        _layer: usize,
+        _expert: usize,
+        _neuron: usize,
+        _ids: &[i64],
+        _polarity: f32,
+    ) -> Option<BlindArm> {
+        None
+    }
+
     /// Whether the blind-max harness can run at all, and if not, which of the two reasons applies.
     ///
     /// Separate from `blind_proposals` returning `None` on purpose: that also returns `None` for a
