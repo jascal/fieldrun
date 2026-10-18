@@ -105,7 +105,10 @@ diverges without explaining why.
   ratio and is signed, so including it can invert the objective. Only positions whose top-k CONTAINS that
   expert have a value; the rest are skipped, which is what makes a MoE unit's reachable set routing-dependent.
   Its self-description is `experts.{e}.down` row `n` — read through `expert_f32`, because expert weights are
-  PAGED and `weight_row` cannot see them.
+  PAGED and `weight_row` cannot see them. The two forms are the same flag: `--blind-max 7,42` names a dense
+  unit (layer 7, neuron 42), `--blind-max 7,3,42` names expert 3's neuron 42 on layer 7 — so a MoE bundle
+  accepts only the three-component form and a dense bundle only the two, and each says so rather than
+  guessing.
 - `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
   and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
   Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and
