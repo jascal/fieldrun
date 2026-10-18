@@ -230,11 +230,19 @@ impl Qwen35Scorer {
         Some(Qwen35Scorer { snap: st.clone(), st, pos })
     }
 
+    /// An empty scorer at position 0 — no seed context, for the corpus scan, which places every token.
+    /// `snap` is a clone of an empty state and is only meaningful after a `commit`; the scan path never
+    /// reads it (it has no candidates to isolate).
+    pub fn empty(m: &Qwen35Moe, total: usize) -> Qwen35Scorer {
+        let st = HybridState::new(m, total);
+        Qwen35Scorer { snap: st.clone(), st, pos: 0 }
+    }
+
     /// Score `token` at `pos` WITHOUT committing it. None for a bad layer or an out-of-range unit.
     pub fn try_token(&mut self, m: &Qwen35Moe, token: i64, layer: usize, neuron: usize) -> Option<f32> {
         self.st = self.snap.clone(); // candidates must not see each other's writes
         let emb = m.b.rows_f32("embed", &[token]);
-        let mlp_h = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st);
+        let (mlp_h, _) = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st, None);
         mlp_h.get(layer)?.get(neuron).copied()
     }
 
@@ -611,10 +619,12 @@ impl Qwen35Moe {
     /// kernel. Identical walk and arithmetic, so its `mlp_h[layer][neuron]` is bit-identical to the naive
     /// `mlp_act_last` over the same ids; the difference is that it ADVANCES `st` (DeltaNet recurrence and
     /// conv window included), which is why the scorer snapshots before probing a candidate.
-    fn forward_block_capture_mlp(&self, emb: &Array2<f32>, cur: usize, st: &mut HybridState) -> Vec<Vec<f32>> {
+    fn forward_block_capture_mlp(&self, emb: &Array2<f32>, cur: usize, st: &mut HybridState, scan: Option<(usize, usize)>) -> (Vec<Vec<f32>>, Vec<f32>) {
         let last = emb.nrows() - 1;
         let mut x = emb.clone();
         let mut mlp_h: Vec<Vec<f32>> = Vec::with_capacity(self.n_layer);
+        // per-ROW activations of one unit, for the corpus scan (see `Model::blind_corpus_best`)
+        let mut scan_out: Vec<f32> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}in_ln"));
@@ -632,13 +642,19 @@ impl Qwen35Moe {
                     *hv = silu(*hv) * uv;
                 }
                 mlp_h.push(hid.row(last).to_vec());
+                if let Some((sl, sn)) = scan {
+                    // `column` panics out of range, and a bad --neuron must not take the process down
+                    if l == sl && sn < hid.ncols() {
+                        scan_out = hid.column(sn).to_vec();
+                    }
+                }
                 x = &x + &self.b.mm(&hid, &format!("{q}down_proj"));
             } else {
                 mlp_h.push(Vec::new());
                 x = &x + &self.ffn(l, &a2);
             }
         }
-        mlp_h
+        (mlp_h, scan_out)
     }
 
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
@@ -812,7 +828,7 @@ impl Model for Qwen35Moe {
             ids.push(pick);
             best = pick_obj;
         }
-        Some(crate::model::BlindArm { ids, obj: best })
+        Some(crate::model::BlindArm { ids, obj: best, pos: None })
     }
 
     /// Oracle arm — scored by the NAIVE path so the baseline stays independent of the search cache.
@@ -820,22 +836,43 @@ impl Model for Qwen35Moe {
         &self,
         layer: usize,
         neuron: usize,
-        windows: &[Vec<i64>],
+        ids: &[i64],
         polarity: f32,
     ) -> Option<crate::model::BlindArm> {
-        let mut best: Option<crate::model::BlindArm> = None;
-        for w in windows {
-            if w.is_empty() {
-                continue;
+        if ids.len() < 2 || layer >= self.n_layer || self.n_exp != 0 {
+            return None;
+        }
+        // Chunked, not one token at a time: at batch 1 every step re-reads the whole (dense) weight set,
+        // which measured ~0.9 s/token on a 1.5B and made a real corpus infeasible. `CORPUS_CHUNK` rows per
+        // block amortises one weight read over 32 positions while the hybrid state carries forward, so
+        // each position still sees its true causal history. Every position is scored exactly once.
+        let mut sc = Qwen35Scorer::empty(self, ids.len());
+        let (mut best_obj, mut best_idx) = (f32::NEG_INFINITY, 0usize);
+        for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
+            let start = sc.pos();
+            let emb = self.b.rows_f32("embed", chunk);
+            let (_mlp_h, rows) = self.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((layer, neuron)));
+            sc.pos += chunk.len();
+            if rows.len() != chunk.len() {
+                continue; // unit out of range for this layer's FFN width
             }
-            if let Some(v) = self.mlp_act_last(w, layer).and_then(|a| a.get(neuron).copied()) {
-                let o = polarity * v;
-                if best.as_ref().map_or(true, |b| o > b.obj) {
-                    best = Some(crate::model::BlindArm { ids: w.clone(), obj: o });
+            for (j, &a) in rows.iter().enumerate() {
+                let o = polarity * a;
+                if o > best_obj {
+                    best_obj = o;
+                    best_idx = start + j;
                 }
             }
         }
-        best
+        if best_obj == f32::NEG_INFINITY {
+            return None;
+        }
+        let lo = best_idx.saturating_sub(crate::model::CORPUS_CTX - 1);
+        Some(crate::model::BlindArm {
+            ids: ids[lo..=best_idx].to_vec(),
+            obj: best_obj,
+            pos: Some(best_idx),
+        })
     }
 
     fn predict(&self, ids: &[i64]) -> i64 {
@@ -1110,6 +1147,54 @@ mod tests {
         }
     }
 
+    /// A chunked scan must equal a single-token walk of the same stream. The corpus scan feeds `CORPUS_CHUNK`
+    /// rows per forward so one weight read is amortised over 32 positions; that is only sound if a block
+    /// and a sequence of single steps produce the same numbers. This is that claim, bit for bit — and it
+    /// also pins the DeltaNet recurrence + conv window across chunk boundaries, which is the part of the
+    /// hybrid state most likely to drift when rows are fed in bulk.
+    #[test]
+    fn qwen35_chunked_scan_matches_single_token_walk() {
+        let m = load_tiny("chunk");
+        let stream: Vec<i64> = vec![3, 9, 4, 6, 8, 1, 7, 5, 2, 11, 0, 6];
+        let total = stream.len();
+        // chunked, but forced to one row per block so the two paths differ only in block shape
+        let mut sc = Qwen35Scorer::empty(&m, total);
+        for chunk in stream.chunks(1) {
+            let start = sc.pos();
+            let emb = m.b.rows_f32("embed", chunk);
+            let (_h, rows) = m.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((0, 2)));
+            sc.pos += chunk.len();
+            for (j, &a) in rows.iter().enumerate() {
+                let want = m.mlp_act_last(&stream[..=start + j], 0).unwrap()[2];
+                assert_eq!(a.to_bits(), want.to_bits(), "block at {} row {} : {a:e} != naive {want:e}", start, j);
+            }
+        }
+        // and the real chunked arm agrees with a naive per-position max
+        let arm: BlindArm = m.blind_corpus_best(0, 2, &stream, POLE_POS).unwrap();
+        let brute: Vec<f32> = (0..stream.len()).map(|i| m.mlp_act_last(&stream[..=i], 0).unwrap()[2]).collect();
+        let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(arm.obj.to_bits(), want.to_bits(), "chunked arm {:e} != naive {:e}", arm.obj, want);
+    }
+
+    /// The corpus arm must equal the brute-force max over every position of a naive `mlp_act_last`,
+    /// bit for bit — and must report the argmax position, not just its value.
+    #[test]
+    fn qwen35_corpus_best_matches_naive_per_position_max() {
+        let m = load_tiny("corpus");
+        let (l, n) = (0usize, 4usize);
+        let stream: Vec<i64> = vec![1, 5, 3, 9, 2, 8, 6, 4, 0, 7];
+        for pol in [POLE_POS, POLE_NEG] {
+            let arm: BlindArm = m.blind_corpus_best(l, n, &stream, pol).unwrap();
+            let brute: Vec<f32> = (0..stream.len()).map(|i| pol * m.mlp_act_last(&stream[..=i], l).unwrap()[n]).collect();
+            let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(arm.obj.to_bits(), want.to_bits(),
+                       "pole {pol}: streamed {:e} vs naive {:e}", arm.obj, want);
+            let at = brute.iter().position(|&x| x == want).expect("max must occur");
+            assert_eq!(arm.pos, Some(at), "reported position must be the argmax position");
+            assert_eq!(arm.ids.last().copied(), Some(stream[at]), "ids must end at the best position");
+        }
+    }
+
     /// A MoE layer has no fixed "neuron n" — the routed expert decides. Every entry point must decline
     /// rather than silently reporting something.
     #[test]
@@ -1118,5 +1203,6 @@ mod tests {
         assert!(m.mlp_act_last(&[1, 2, 3], 0).is_none(), "MoE mlp_act_last must be None");
         assert!(m.blind_proposals(0, 1, 8, POLE_POS).is_none(), "MoE blind_proposals must be None");
         assert!(m.blind_climb(0, 1, &[1, 2], &[5, 6], 2, POLE_POS).is_none(), "MoE climb must be None");
+        assert!(m.blind_corpus_best(0, 1, &[1, 2, 3, 4], POLE_POS).is_none(), "MoE corpus arm must be None");
     }
 }

@@ -443,7 +443,7 @@ impl Rope {
     /// `explanation()` exactly (== `down()` in the default non-routed case). Returns
     /// (att_last[layer][head][klen], head_act[layer][h*hd], mlp_h[layer][inter], x_last[d], xf_last[d]).
     #[allow(clippy::type_complexity)]
-    fn forward_block_capture(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> (Vec<Vec<Vec<f32>>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+    fn forward_block_capture(&self, emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>], scan: Option<(usize, usize)>) -> (Vec<Vec<Vec<f32>>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let (h, nkv, hd) = (self.h, self.nkv, self.hd);
         let rep = h / nkv;
         let m = emb.nrows();
@@ -451,6 +451,10 @@ impl Rope {
         let last = m - 1;
         let mut x = emb.clone();
         let (mut att_last, mut head_act, mut mlp_h) = (Vec::with_capacity(self.n_layer), Vec::with_capacity(self.n_layer), Vec::with_capacity(self.n_layer));
+        // per-ROW activations of one unit, for the corpus scan: the FFN already computes every row of
+        // `hidden`, so keeping one column costs O(m) and turns a batched block into m scored positions.
+        // Single-row scoring cannot do this — see `Model::blind_corpus_best`.
+        let mut scan_out: Vec<f32> = Vec::new();
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
@@ -493,10 +497,16 @@ impl Rope {
                 *hv = silu(*hv) * uv;
             }
             mlp_h.push(hidden.row(last).to_vec());
+            if let Some((sl, sn)) = scan {
+                // `column` panics out of range, and a bad --neuron must not take the process down
+                if l == sl && sn < hidden.ncols() {
+                    scan_out = hidden.column(sn).to_vec();
+                }
+            }
             x = &x + &self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
         }
         let xf = rmsnorm(&x, self.b.arr1("norm"), self.eps);
-        (att_last, head_act, mlp_h, x.row(last).to_vec(), xf.row(last).to_vec())
+        (att_last, head_act, mlp_h, x.row(last).to_vec(), xf.row(last).to_vec(), scan_out)
     }
 
     /// KV-cached twin of [`Model::mlp_act_last`]: prefill `ids` through `forward_block_capture`, which already
@@ -511,7 +521,7 @@ impl Rope {
         let mut kc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
         let mut vc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
         let emb = self.b.rows_f32("embed", ids);
-        let (_att_last, _head_act, mlp_h, _x, _xf) = self.forward_block_capture(&emb, 0, &mut kc, &mut vc);
+        let (_att_last, _head_act, mlp_h, _x, _xf, _) = self.forward_block_capture(&emb, 0, &mut kc, &mut vc, None);
         mlp_h.get(layer).cloned()
     }
 }
@@ -543,8 +553,19 @@ impl Rope {
         let mut kc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
         let mut vc = vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer];
         let emb = self.b.rows_f32("embed", prefix);
-        self.forward_block_capture(&emb, 0, &mut kc, &mut vc);
+        let (_a, _h, _mlp_h, _x, _xf, _) = self.forward_block_capture(&emb, 0, &mut kc, &mut vc, None);
         Some(ScoreCache { kc, vc, cur: prefix.len() })
+    }
+
+    /// An EMPTY cache — nothing prefilled, `cur = 0`. For the corpus scan, which places every token
+    /// itself and needs no seed context.
+    fn scan_cache(&self, total: usize) -> ScoreCache {
+        let kvdim = self.nkv * self.hd;
+        ScoreCache {
+            kc: vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer],
+            vc: vec![Array2::<f32>::zeros((total, kvdim)); self.n_layer],
+            cur: 0,
+        }
     }
 
     /// Write `token` at `cur` and return the activation of `(layer, neuron)` at that new position. Does
@@ -556,7 +577,7 @@ impl Rope {
             return None;
         }
         let emb = self.b.rows_f32("embed", &[token]);
-        let (_a, _h, mlp_h, _x, _xf) = self.forward_block_capture(&emb, c.cur, &mut c.kc, &mut c.vc);
+        let (_a, _h, mlp_h, _x, _xf, _) = self.forward_block_capture(&emb, c.cur, &mut c.kc, &mut c.vc, None);
         mlp_h.get(layer)?.get(neuron).copied()
     }
 
@@ -611,13 +632,13 @@ impl Rope {
         // prefill ids[..start] (cur=0, m=start) so the cache is warm, then decode one token at a time.
         if start > 1 {
             let emb = self.b.rows_f32("embed", &ids[..start - 1]);
-            let _ = self.forward_block_capture(&emb, 0, &mut kc, &mut vc); // warm the cache for ids[..start-1]
+            let _ = self.forward_block_capture(&emb, 0, &mut kc, &mut vc, None); // warm the cache for ids[..start-1]
         }
         // each step appends token ids[pos-1] (cur = pos-1) → the cache now covers ids[..pos]; explain that last position.
         let lo = start.max(1);
         for pos in lo..=seq {
             let emb = self.b.rows_f32("embed", &ids[pos - 1..pos]); // the single new token
-            let (att_last, head_act, mlp_h, x_last, xf_last) = self.forward_block_capture(&emb, pos - 1, &mut kc, &mut vc);
+            let (att_last, head_act, mlp_h, x_last, xf_last, _) = self.forward_block_capture(&emb, pos - 1, &mut kc, &mut vc, None);
             let ex = self.assemble_from_capture(&ids[..pos], &att_last, &head_act, &mlp_h, &x_last, &xf_last, decomp_k);
             f(pos, ex);
         }
@@ -857,31 +878,64 @@ impl Model for Rope {
             ids.push(pick);
             best = pick_obj;
         }
-        Some(crate::model::BlindArm { ids, obj: best })
+        Some(crate::model::BlindArm { ids, obj: best, pos: None })
     }
 
-    /// Oracle arm: the best-activating context in a corpus, scored by the NAIVE path (not the search cache),
-    /// so the baseline is computed independently of the thing it is a baseline for.
+    /// Oracle arm: the best-activating position over a real corpus, as ONE causal sweep.
+    ///
+    /// Chunked, not single-token, and that is the whole design. Two obvious alternatives are both wrong:
+    ///
+    /// * **Overlapping windows** — N independent forwards, each re-computing the ~32 rows it shares with
+    ///   its neighbours. Measured 0.43 s per 32-row window, so a 11.8k-token corpus costs ~84 min, and every
+    ///   position is scored with an artificial, freshly-restarted context.
+    /// * **One token at a time** — true causal history, but at batch 1 every step re-reads all 6 GB of
+    ///   weights, so cost is bandwidth-bound: measured 0.9 s/token, i.e. ~3 h for the same corpus. Worse
+    ///   than the windows it replaced.
+    ///
+    /// A chunk of `CORPUS_CHUNK` rows against a carried cache gets both: one weight read amortised over 32
+    /// positions (the windowed throughput) AND each position's true causal history (the streaming
+    /// correctness). Every position in the stream is scored exactly once.
+    ///
+    /// Uses the same cache the search uses, not the naive path — see `Model::blind_corpus_best` for why
+    /// that costs nothing in fidelity (the values are bit-identical to the naive forward, asserted in tests).
     fn blind_corpus_best(
         &self,
         layer: usize,
         neuron: usize,
-        windows: &[Vec<i64>],
+        ids: &[i64],
         polarity: f32,
     ) -> Option<crate::model::BlindArm> {
-        let mut best: Option<crate::model::BlindArm> = None;
-        for w in windows {
-            if w.is_empty() {
-                continue;
+        if ids.len() < 2 || layer >= self.n_layer {
+            return None;
+        }
+        let mut c = self.scan_cache(ids.len());
+        let (mut best_obj, mut best_idx) = (f32::NEG_INFINITY, 0usize);
+        for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
+            let emb = self.b.rows_f32("embed", chunk);
+            let start = c.cur;
+            let (_a, _h, _mlp_h, _x, _xf, rows) =
+                self.forward_block_capture(&emb, start, &mut c.kc, &mut c.vc, Some((layer, neuron)));
+            c.cur += chunk.len();
+            if rows.len() != chunk.len() {
+                continue; // unit out of range for this layer's FFN width
             }
-            if let Some(v) = self.mlp_act_last(w, layer).and_then(|a| a.get(neuron).copied()) {
-                let o = polarity * v;
-                if best.as_ref().map_or(true, |b| o > b.obj) {
-                    best = Some(crate::model::BlindArm { ids: w.clone(), obj: o });
+            for (j, &a) in rows.iter().enumerate() {
+                let o = polarity * a;
+                if o > best_obj {
+                    best_obj = o;
+                    best_idx = start + j;
                 }
             }
         }
-        best
+        if best_obj == f32::NEG_INFINITY {
+            return None;
+        }
+        let lo = best_idx.saturating_sub(crate::model::CORPUS_CTX - 1);
+        Some(crate::model::BlindArm {
+            ids: ids[lo..=best_idx].to_vec(),
+            obj: best_obj,
+            pos: Some(best_idx),
+        })
     }
 
     fn predict(&self, ids: &[i64]) -> i64 {
@@ -1466,7 +1520,7 @@ impl Model for Rope {
 mod tests {
     use super::*;
     use crate::bundle::Bundle;
-    use crate::model::{Model, BlindArm, POLE_NEG, POLE_POS};
+    use crate::model::{Model, POLE_NEG, POLE_POS};
 
     /// Deterministic pseudo-random weights — no RNG dependency, so a failure is always reproducible.
     fn v(seed: usize, n: usize) -> Vec<f32> {
@@ -1707,17 +1761,70 @@ mod tests {
         }
     }
 
-    /// The corpus arm must be scored by the NAIVE path and must return the genuine maximum over the windows.
+    /// The corpus arm walks the stream with the cache; its answer must equal the brute-force max over EVERY
+    /// position of a naive `mlp_act_last(&stream[..=i])`. Streaming may be cheaper than brute force — it
+    /// must never be a DIFFERENT number, or the oracle is measuring something the search can't see and
+    /// the ratio is fiction. Compared bit-for-bit, per this repo's one rule.
+    /// deliberately longer than `CORPUS_CHUNK`, so chunk boundaries — where a carried cache could drift from
+/// a full recompute — are actually crossed.
     #[test]
-    fn blind_corpus_best_returns_true_maximum() {
+    fn blind_corpus_best_matches_naive_per_position_max() {
         let stem = tiny_rope("corpus");
         let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
         let (l, n) = (0usize, 2usize);
-        let wins: Vec<Vec<i64>> = vec![IDS.to_vec(), vec![9], vec![2, 2, 2], vec![7, 7, 7, 7, 7]];
-        let arm = m.blind_corpus_best(l, n, &wins, POLE_POS).unwrap();
-        let brute: Vec<f32> = wins.iter().map(|w| m.mlp_act_last(w, l).unwrap()[n]).collect();
-        let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        assert_eq!(arm.obj.to_bits(), want.to_bits(), "corpus arm must be the true max");
+        let stream: Vec<i64> = (0..75).map(|i: i64| (i * 7 + 3) % 20).collect();
+        for pol in [POLE_POS, POLE_NEG] {
+            let arm = m.blind_corpus_best(l, n, &stream, pol).unwrap();
+            let brute: Vec<f32> =
+                (0..stream.len()).map(|i| pol * m.mlp_act_last(&stream[..=i], l).unwrap()[n]).collect();
+            let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(arm.obj.to_bits(), want.to_bits(), "pole {pol}: streamed {:e} vs naive {:e}", arm.obj, want);
+            // the reported index must be where that max actually is
+            let at = brute.iter().position(|&x| x == want).expect("max must occur");
+            assert_eq!(arm.pos, Some(at), "reported position must be the argmax position");
+            // and the reported ids must be the stream ending there, tail-bounded
+            assert_eq!(arm.ids.last().copied(), Some(stream[at]), "ids must end at the best position");
+            assert_eq!(arm.ids, stream[at.saturating_sub(crate::model::CORPUS_CTX - 1)..=at], "ids must be the bounded tail");
+        }
+    }
+
+    /// The oracle must cover EVERY position — including position 0, which a longer prefill would silently
+    /// skip (a block forward only captures its last row). If the argmax were position 0 and the scan
+    /// started after the prefill, this arm would report a smaller number than brute force: the one
+    /// failure mode that makes the ratio look better than it is.
+    #[test]
+    fn blind_corpus_best_scores_position_zero() {
+        let stem = tiny_rope("pos0");
+        let m = Rope::new(Bundle::load(&stem).unwrap(), 0.0, false);
+        let (l, n) = (1usize, 7usize);
+        let at = |st: &[i64]| -> Vec<f32> {
+            (0..st.len()).map(|i| m.mlp_act_last(&st[..=i], l).unwrap()[n]).collect()
+        };
+        // Search for a stream whose global argmax really is position 0. Deterministic, exhaustive over
+        // 2- and 3-token streams: the point is to build the case where skipping position 0 is DETECTABLE,
+        // and hand-picking a "clever" stream is how that silently stops being true.
+        let mut found: Option<Vec<i64>> = None;
+        'search: for len in [2usize, 3] {
+            for a in 0..20i64 {
+                for b in 0..20i64 {
+                    for c in 0..(if len == 3 { 20 } else { 0 }) {
+                        let st = if len == 2 { vec![a, b] } else { vec![a, b, c] };
+                        let v = at(&st);
+                        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        if v[0] == mx && v[1..].iter().all(|&x| x < mx) {
+                            found = Some(st);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        let stream = found.expect("tiny model must have a stream peaking at position 0");
+        let arm = m.blind_corpus_best(l, n, &stream, POLE_POS).unwrap();
+        let want = at(&stream).into_iter().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(arm.pos, Some(0), "the fixture's argmax is position 0, so that is what must be reported");
+        assert_eq!(arm.obj.to_bits(), want.to_bits(), "streamed {:e} vs naive {:e}", arm.obj, want);
+        assert_eq!(arm.ids, vec![stream[0]], "tail of a position-0 best is just that token");
     }
 
     /// Polarity must flip which end of the range is sought: the negative-pole search must not return the

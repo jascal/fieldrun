@@ -107,6 +107,14 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// Read a tokenized corpus/eval file: `{"ids":[…]}`, `{"holdout_ids":[…]}`, or a bare `[…ints…]`.
+/// Same three shapes the rest of the CLI accepts, so `sweeps/corpora/*.json` work as-is.
+fn load_token_file(path: &str) -> Option<Vec<i64>> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let arr = v["holdout_ids"].as_array().or_else(|| v["ids"].as_array()).or_else(|| v.as_array());
+    Some(arr?.iter().filter_map(|x| x.as_i64()).collect())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2573,12 +2581,26 @@ fn main() {
                 println!("  blind arm : obj {:e}", a.obj);
                 println!("    ids      : {:?}", a.ids);
             }
-            // oracle arm over the same corpus the model was loaded with, scored by the NAIVE path
-            let wins: Vec<Vec<i64>> = ids.windows(16).map(|w| w.to_vec()).collect();
-            let oracle = lm.blind_corpus_best(layer, neuron, &wins, pole);
+            // oracle arm: ONE causal sweep over a real token stream, in CORPUS_CHUNK-row blocks against a carried
+            // cache (see Model::blind_corpus_best — a block amortises one weight read over many positions
+            // while still giving each one its true causal history).
+            let stream: Vec<i64> = match flag(&args, "--blind-corpus").and_then(load_token_file) {
+                Some(c) => {
+                    eprintln!("[fieldrun] --blind-max: oracle over {} corpus tokens (chunked causal sweep)…", c.len());
+                    c
+                }
+                None => {
+                    eprintln!("[fieldrun] --blind-max: no --blind-corpus; oracle over the model's own input ({} tokens) — WEAK baseline", ids.len());
+                    ids.clone()
+                }
+            };
+            let oracle = lm.blind_corpus_best(layer, neuron, &stream, pole);
             if let Some(o) = &oracle {
-                println!("  oracle arm: obj {:e}   (best of {} corpus windows)", o.obj, wins.len());
-                println!("    ids      : {:?}", o.ids);
+                println!("  oracle arm: obj {:e}   (best over {} corpus tokens)", o.obj, stream.len());
+                if let Some(p) = o.pos {
+                    println!("    at       : corpus position {p} of {}", stream.len());
+                }
+                println!("    ids      : {:?}   (last {} tokens ending there)", o.ids, o.ids.len());
                 if let Some(a) = blind {
                     // Only meaningful when BOTH arms actually reached the pole. Objectives are signed
                     // activations; if either is <= 0 the search never reached the pole at all, and dividing
@@ -2594,7 +2616,7 @@ fn main() {
                     }
                 }
             } else {
-                println!("  oracle arm: none (corpus too short for any full window)");
+                println!("  oracle arm: none (corpus shorter than 2 tokens, or the arch has no cached scorer)");
             }
             return;
         }
