@@ -95,6 +95,16 @@ diverges without explaining why.
   The oracle is a **weak, corpus-relative adversary**: `ratio < 1` bounds the search, it does NOT refute the
   explanation, and the CLI says so inline. MoE layers return `None` at every entry point — a routed expert has no fixed
   "neuron n", and guessing would be worse than declining.
+- `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
+  and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
+  Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and
+  Qwen3-MoE share Qwen2.5's vocabulary and reuse `sweeps/corpora/*.json` as-is; Qwen3.5 uses
+  `sweeps/corpora/qwen35/*.json`. The default invocation reproduces the committed corpora byte-for-byte
+  (verified), so the flag is additive. The English slice is stored as IDs; the script recovers the TEXT with
+  the source tokenizer and asserts the `decode`→`encode` round-trip is exact before using it — if that ever
+  stops holding, the "English" corpus would quietly be a different corpus. A token id at or past the vocab
+  is rejected at generation time. `pooled_big.json` is a legacy ad-hoc artifact (committed in 71cd5a8 with no
+  generator); the script emits `pooled_wide.json` under a new name rather than silently replacing it.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
 - `src/mdfmt.rs` — dependency-free Markdown→ANSI for the chat REPL (headings/lists/bold/italic/code + LaTeX
   transliteration: `\theta`→θ, `\frac{a}{b}`→(a)/(b), `x^2`→x², math delimiters stripped). Line-buffered so it
