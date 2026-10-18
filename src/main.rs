@@ -115,6 +115,17 @@ fn load_token_file(path: &str) -> Option<Vec<i64>> {
     Some(arr?.iter().filter_map(|x| x.as_i64()).collect())
 }
 
+/// How strong the adversary was. Printed next to every ratio, because the ratio is a property of the
+/// SEARCH and the CORPUS, not of the unit: `0.2532` from 1 step over 2.8k tokens and `0.2835` from 6
+/// steps over 11.8k are different claims that would otherwise read as the same number.
+fn search_desc(cands: usize, steps: usize) -> String {
+    format!(
+        "greedy search: {cands} proposal{} × {steps} step{}",
+        if cands == 1 { "" } else { "s" },
+        if steps == 1 { "" } else { "s" }
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2606,9 +2617,10 @@ fn main() {
                     // activations; if either is <= 0 the search never reached the pole at all, and dividing
                     // (let alone a negative by a positive) would print a confident-looking nonsense ratio.
                     if a.obj > 0.0 && o.obj > 0.0 {
-                        println!("  RATIO blind/oracle = {:.4}", a.obj / o.obj);
-                        println!("    (a greedy token climb is a WEAK adversary vs Cammarata's LLM — ratio < 1 bounds this");
-                        println!("     search, it does not refute the unit's explanation)");
+                        println!("  RATIO blind/oracle = {:.4}   ({})", a.obj / o.obj, search_desc(k, steps));
+                        println!("    (a greedy token climb is a WEAK adversary vs Cammarata's LLM. ratio < 1 bounds THAT");
+                        println!("     SEARCH over {} corpus tokens — it does not refute the unit's explanation. Rerun with", stream.len());
+                        println!("     different --blind-steps/--blind-cands and the ratio moves; it is not a property of the unit.)");
                     } else {
                         println!("  RATIO n/a — a blind arm obj {:e}, oracle obj {:e}", a.obj, o.obj);
                         println!("    (not both positive: neither arm reached this pole. The unit is likely near-dead");
@@ -4406,5 +4418,17 @@ mod tests {
         assert_eq!(resolve_bundle("Qwen/Qwen2.5-0.5B-Instruct"), bstem);
         assert_eq!(resolve_bundle("does-not-exist"), "does-not-exist"); // passthrough
         std::env::remove_var("FIELDRUN_BUNDLES");
+    }
+
+    /// The ratio is a property of the SEARCH and the CORPUS, not of the unit — so the number printed
+    /// beside it has to say which search produced it. Two configs that differ only in `--blind-steps`
+    /// must not print the same self-description, which is what makes the caveat falsifiable rather than
+    /// boilerplate. This is the guard against the caveat quietly regressing to a bare ratio.
+    #[test]
+    fn search_desc_names_the_config_that_produced_the_ratio() {
+        assert_eq!(search_desc(4, 1), "greedy search: 4 proposals × 1 step");
+        assert_eq!(search_desc(16, 6), "greedy search: 16 proposals × 6 steps");
+        assert_eq!(search_desc(1, 1), "greedy search: 1 proposal × 1 step", "singulars must not read '1 proposals'");
+        assert_ne!(search_desc(4, 1), search_desc(16, 6), "different strengths must be distinguishable");
     }
 }
