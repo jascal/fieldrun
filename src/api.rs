@@ -37,6 +37,13 @@ struct PredictReq {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MlpProbeReq {
+    ids: Vec<i64>,
+    probe: crate::model::MlpProbe,
+}
+
+#[derive(Deserialize)]
 struct TopkReq {
     ids: Vec<i64>,
     #[serde(default = "default_k")]
@@ -583,6 +590,13 @@ fn handle(url: &str, body: &str, lm: &dyn Model, arch: &str, tg: Option<&TextGen
     let route = url.split('?').next().unwrap_or(url);
     match route {
         "/health" => "{\"ok\":true}".to_string(),
+        "/probe/mlp" => match serde_json::from_str::<MlpProbeReq>(body) {
+            Ok(r) => match lm.probe_mlp(&r.ids, &r.probe) {
+                Some(result) => serde_json::to_string(&result).unwrap(),
+                None => err("MLP probe unsupported or invalid ids/layers/units/patches/readouts"),
+            },
+            _ => err("expected {\"ids\":[...],\"probe\":{\"layers\":[...],\"units\":[[layer,neuron]],\"patches\":[],\"readouts\":[]}}"),
+        },
         "/predict" => match serde_json::from_str::<PredictReq>(body) {
             Ok(r) if !r.ids.is_empty() => format!("{{\"next\":{}}}", lm.predict(&r.ids)),
             _ => err("bad body; expected {\"ids\":[...]}"),

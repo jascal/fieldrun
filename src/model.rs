@@ -276,7 +276,56 @@ pub struct BlindArm {
 pub const POLE_POS: f32 = 1.0;
 pub const POLE_NEG: f32 = -1.0;
 
+/// Build-time native MLP observation. Products are recorded BEFORE any patch at
+/// that layer; later layers see patched values. Positions are zero-based.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlpPatch {
+    pub layer: usize,
+    pub position: usize,
+    pub neuron: usize,
+    pub value: f32,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlpProbe {
+    #[serde(default)]
+    pub layers: Vec<usize>,
+    /// Explicit (layer, neuron) coordinates, in addition to full `layers`.
+    #[serde(default)]
+    pub units: Vec<(usize, usize)>,
+    #[serde(default)]
+    pub patches: Vec<MlpPatch>,
+    /// Vocabulary indices whose final logits should be returned.
+    #[serde(default)]
+    pub readouts: Vec<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MlpObservation {
+    pub layer: usize,
+    pub position: usize,
+    pub neuron: usize,
+    pub gate: f32,
+    pub value: f32,
+    pub product: f32,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MlpProbeResult {
+    pub next: i64,
+    pub next_logit: f32,
+    pub observations: Vec<MlpObservation>,
+    pub logits: Vec<(usize, f32)>,
+}
+
 pub trait Model: Sync {
+    /// Observes last-position gate/value/product and optionally patches native
+    /// products before down-projection. None means unsupported or invalid input.
+    fn probe_mlp(&self, _ids: &[i64], _probe: &MlpProbe) -> Option<MlpProbeResult> {
+        None
+    }
     /// Top-1 next-token id for a context.
     fn predict(&self, ids: &[i64]) -> i64;
 
