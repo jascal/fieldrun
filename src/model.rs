@@ -282,6 +282,23 @@ pub struct BlindArm {
 pub const POLE_POS: f32 = 1.0;
 pub const POLE_NEG: f32 = -1.0;
 
+/// Why the blind-max harness is or isn't available, so the CLI can say WHICH problem it is.
+///
+/// This exists because one `Option::None` was conflating two situations with different fixes: an arch
+/// nobody has implemented a scorer for, versus an arch that works fine but whose layers are routed.
+/// Telling a user on Qwen3.5-MoE that "this arch has no cached scorer" is simply false — the dense
+/// release of that same arch is fully supported. A decline the user cannot diagnose is close to a bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlindSupport {
+    /// Scorer available; the entry points will answer for the given unit.
+    Supported,
+    /// This arch has no cached scorer implemented (default for arches that don't override).
+    NoScorer,
+    /// The scorer exists, but these FFN layers are routed: a token's router picks which experts run, so
+    /// "neuron n" has no fixed meaning across positions. Declined on purpose — see the docs on `mlp_act_last`.
+    RoutedLayers,
+}
+
 /// Tokens of context the corpus arm reports around its best position. Bounded on purpose: see `BlindArm`.
 pub const CORPUS_CTX: usize = 32;
 
@@ -390,6 +407,15 @@ pub trait Model: Sync {
     /// Default None — only arches with a cached scorer implement these.
     fn blind_proposals(&self, _layer: usize, _neuron: usize, _k: usize, _polarity: f32) -> Option<Vec<i64>> {
         None
+    }
+
+    /// Whether the blind-max harness can run at all, and if not, which of the two reasons applies.
+    ///
+    /// Separate from `blind_proposals` returning `None` on purpose: that also returns `None` for a
+    /// perfectly good model when the caller asked about a bad layer. Only this method distinguishes
+    /// "this arch can't" from "these layers are routed".
+    fn blind_support(&self) -> BlindSupport {
+        BlindSupport::NoScorer
     }
     fn blind_climb(
         &self,

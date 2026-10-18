@@ -782,6 +782,16 @@ impl Model for Qwen35Moe {
     /// The unit's own projected vocabulary — the SAME readout `explain` prints as `promotes` (down-projection
     /// · final-norm gain · unembed), signed so the NEGATIVE pole is reachable. Qwen3.5's full-attention
     /// layers sit every 4th layer; the FFN below them is dense SwiGLU, so the unit is a real fixed unit here.
+    fn blind_support(&self) -> crate::model::BlindSupport {
+        // The scorer is implemented here for both releases; only the MoE one declines, and for a
+        // different reason than "unsupported arch". Saying so is the whole point of this method.
+        if self.n_exp != 0 {
+            crate::model::BlindSupport::RoutedLayers
+        } else {
+            crate::model::BlindSupport::Supported
+        }
+    }
+
     fn blind_proposals(&self, layer: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
         if layer >= self.n_layer || self.n_exp != 0 {
             return None;
@@ -994,7 +1004,7 @@ impl Model for Qwen35Moe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BlindArm, Model, POLE_NEG, POLE_POS};
+    use crate::model::{BlindArm, BlindSupport, Model, POLE_NEG, POLE_POS};
 
     fn v(seed: usize, n: usize) -> Vec<f32> {
         (0..n).map(|i| (((seed * 41 + i * 23) % 43) as f32) / 20.0 - 1.0).collect()
@@ -1204,5 +1214,19 @@ mod tests {
         assert!(m.blind_proposals(0, 1, 8, POLE_POS).is_none(), "MoE blind_proposals must be None");
         assert!(m.blind_climb(0, 1, &[1, 2], &[5, 6], 2, POLE_POS).is_none(), "MoE climb must be None");
         assert!(m.blind_corpus_best(0, 1, &[1, 2, 3, 4], POLE_POS).is_none(), "MoE corpus arm must be None");
+        // ...and it must say WHY. Reporting "no cached scorer" here would be false: the scorer is
+        // implemented for this arch, and the dense release runs it. A user who cannot tell those apart
+        // concludes the arch is unsupported and stops.
+        assert_eq!(m.blind_support(), BlindSupport::RoutedLayers, "MoE must report RoutedLayers, not NoScorer");
+    }
+
+    /// The dense release of the SAME arch must report Supported. If this ever reports anything else the
+    /// user is told a supported model is not supported — the exact false claim this method exists to stop.
+    #[test]
+    fn qwen35_dense_reports_supported() {
+        let m = load_tiny("support");
+        assert_eq!(m.blind_support(), BlindSupport::Supported, "dense qwen3_5 must report Supported");
+        assert_ne!(m.blind_support(), load_tiny_moe("support_moe").blind_support(),
+                   "dense and MoE releases of one arch must not report the same support");
     }
 }
