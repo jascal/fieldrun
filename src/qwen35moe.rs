@@ -100,6 +100,7 @@ fn softmax_rows(a: &mut Array2<f32>) {
 /// prefix can be copied by row-slice and a decode step is byte-identical to the naive recompute. `Q8` is
 /// the `--kv-int8` cache (per-kv-head absmax scale, ~4× smaller, lossy by design). One variant per model,
 /// fixed for its lifetime.
+#[derive(Clone)]
 enum Kv {
     F32 { kc: Vec<Array2<f32>>, vc: Vec<Array2<f32>> },
     Q8 { kc: Vec<Vec<i8>>, vc: Vec<Vec<i8>>, ks: Vec<Vec<f32>>, vs: Vec<Vec<f32>>, kvdim: usize },
@@ -112,6 +113,7 @@ enum Kv {
 /// Deliberately kept separate from the naive `full_attn`/`linear_attn` pair above: those stay the untouched
 /// top-1-vs-torch reference, so `generate` (cached) vs `predict` (naive) is a real comparison rather than
 /// the cache checking itself.
+#[derive(Clone)]
 struct HybridState {
     kv: Kv,
     /// per layer, LINEAR layers only: `nvh` state matrices of `hkd·hvd`
@@ -203,6 +205,57 @@ impl Kv {
                 }
             }
         }
+    }
+}
+
+/// Blind-max scorer for the hybrid stack.
+///
+/// The rope scorer can overwrite a single K/V cache row per candidate. That trick does NOT transfer: the
+/// DeltaNet layers carry an ACCUMULATOR (per-value-head `S` plus the conv window), so probing a candidate
+/// mutates state the next candidate needs to start from. Each hill-climb step therefore takes ONE snapshot
+/// of the whole hybrid state, and every candidate is evaluated by restoring that snapshot, advancing a single
+/// row, and reading the target unit. Restoring is what makes candidates independent; snapshotting once per
+/// STEP (not per candidate) is what keeps it affordable — the recurrent state is ~19 MB on a 0.8B.
+pub struct Qwen35Scorer {
+    st: HybridState,   // working state, mutated by each probe
+    snap: HybridState, // restore point at `pos`, refreshed only by `commit`
+    pos: usize,
+}
+
+impl Qwen35Scorer {
+    /// Prefill `prefix`, then score candidates at the next position.
+    pub fn new(m: &Qwen35Moe, prefix: &[i64], total: usize) -> Option<Qwen35Scorer> {
+        let st = m.blind_score_state(prefix, total)?;
+        let pos = prefix.len();
+        Some(Qwen35Scorer { snap: st.clone(), st, pos })
+    }
+
+    /// An empty scorer at position 0 — no seed context, for the corpus scan, which places every token.
+    /// `snap` is a clone of an empty state and is only meaningful after a `commit`; the scan path never
+    /// reads it (it has no candidates to isolate).
+    pub fn empty(m: &Qwen35Moe, total: usize) -> Qwen35Scorer {
+        let st = HybridState::new(m, total);
+        Qwen35Scorer { snap: st.clone(), st, pos: 0 }
+    }
+
+    /// Score `token` at `pos` WITHOUT committing it. None for a bad layer or an out-of-range unit.
+    pub fn try_token(&mut self, m: &Qwen35Moe, token: i64, layer: usize, neuron: usize) -> Option<f32> {
+        self.st = self.snap.clone(); // candidates must not see each other's writes
+        let emb = m.b.rows_f32("embed", &[token]);
+        let (mlp_h, _) = m.forward_block_capture_mlp(&emb, self.pos, &mut self.st, None);
+        mlp_h.get(layer)?.get(neuron).copied()
+    }
+
+    /// Accept `token`: re-probe from the snapshot, advance `pos`, re-take the snapshot there.
+    pub fn commit(&mut self, m: &Qwen35Moe, token: i64, layer: usize, neuron: usize) -> Option<f32> {
+        let a = self.try_token(m, token, layer, neuron);
+        self.pos += 1;
+        self.snap = self.st.clone();
+        a
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
     }
 }
 
@@ -551,6 +604,59 @@ impl Qwen35Moe {
         self.norm(&x, "norm")
     }
 
+    /// Pre-fill `prefix` into a hybrid state that a [`Qwen35Scorer`] can probe from.
+    pub(crate) fn blind_score_state(&self, prefix: &[i64], total: usize) -> Option<HybridState> {
+        if prefix.is_empty() || prefix.len() >= total {
+            return None;
+        }
+        let mut st = HybridState::new(self, total);
+        let emb = self.b.rows_f32("embed", prefix);
+        self.forward_block(&emb, 0, &mut st);
+        Some(st)
+    }
+
+    /// `forward_block` with the last-row post-FFN activations captured per layer — the blind-max scoring
+    /// kernel. Identical walk and arithmetic, so its `mlp_h[layer][neuron]` is bit-identical to the naive
+    /// `mlp_act_last` over the same ids; the difference is that it ADVANCES `st` (DeltaNet recurrence and
+    /// conv window included), which is why the scorer snapshots before probing a candidate.
+    fn forward_block_capture_mlp(&self, emb: &Array2<f32>, cur: usize, st: &mut HybridState, scan: Option<(usize, usize)>) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let last = emb.nrows() - 1;
+        let mut x = emb.clone();
+        let mut mlp_h: Vec<Vec<f32>> = Vec::with_capacity(self.n_layer);
+        // per-ROW activations of one unit, for the corpus scan (see `Model::blind_corpus_best`)
+        let mut scan_out: Vec<f32> = Vec::new();
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let attn = if self.linear[l] { self.linear_attn_cached(l, &a, st) } else { self.full_attn_cached(l, &a, cur, st) };
+            x = &x + &attn;
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            // dense FFN only — a MoE layer's activation depends on which experts the router picks, so there
+            // is no single "neuron n" to report here (see `mlp_act_last`)
+            if self.n_exp == 0 {
+                let q = format!("l{l}.mlp.");
+                let gate = self.b.mm(&a2, &format!("{q}gate_proj"));
+                let up = self.b.mm(&a2, &format!("{q}up_proj"));
+                let mut hid = gate;
+                for (hv, uv) in hid.iter_mut().zip(up.iter()) {
+                    *hv = silu(*hv) * uv;
+                }
+                mlp_h.push(hid.row(last).to_vec());
+                if let Some((sl, sn)) = scan {
+                    // `column` panics out of range, and a bad --neuron must not take the process down
+                    if l == sl && sn < hid.ncols() {
+                        scan_out = hid.column(sn).to_vec();
+                    }
+                }
+                x = &x + &self.b.mm(&hid, &format!("{q}down_proj"));
+            } else {
+                mlp_h.push(Vec::new());
+                x = &x + &self.ffn(l, &a2);
+            }
+        }
+        (mlp_h, scan_out)
+    }
+
     fn head_argmax(&self, xfn: &Array2<f32>) -> i64 {
         let last = xfn.row(xfn.nrows() - 1).to_vec();
         self.b
@@ -640,6 +746,135 @@ impl Qwen35Moe {
 }
 
 impl Model for Qwen35Moe {
+    /// Naive post-FFN activations for every neuron of `layer` at the last token of `ids`. Same walk as
+    /// `hidden`, same order, exiting early at `layer` (exact — no later layer feeds back into an earlier one).
+    ///
+    /// DENSE-ONLY by construction: on a MoE model a layer's FFN is `moe_branch`, so "neuron n" depends on
+    /// which experts the router picks for the token being scored — there is no fixed unit to report. Returns
+    /// None there rather than inventing one.
+    fn mlp_act_last(&self, ids: &[i64], layer: usize) -> Option<Vec<f32>> {
+        if layer >= self.n_layer || ids.is_empty() || self.n_exp != 0 {
+            return None;
+        }
+        let last = ids.len() - 1;
+        let mut x = self.b.rows_f32("embed", ids);
+        for l in 0..=layer {
+            let p = format!("l{l}.");
+            let a = self.norm(&x, &format!("{p}in_ln"));
+            let attn = if self.linear[l] { self.linear_attn(l, &a) } else { self.full_attn(l, &a) };
+            x = &x + &attn;
+            let a2 = self.norm(&x, &format!("{p}post_ln"));
+            let q = format!("l{l}.mlp.");
+            let gate = self.b.mm(&a2, &format!("{q}gate_proj"));
+            let up = self.b.mm(&a2, &format!("{q}up_proj"));
+            let mut hid = gate;
+            for (hv, uv) in hid.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            if l == layer {
+                return Some(hid.row(last).to_vec());
+            }
+            x = &x + &self.b.mm(&hid, &format!("{q}down_proj"));
+        }
+        None
+    }
+
+    /// The unit's own projected vocabulary — the SAME readout `explain` prints as `promotes` (down-projection
+    /// · final-norm gain · unembed), signed so the NEGATIVE pole is reachable. Qwen3.5's full-attention
+    /// layers sit every 4th layer; the FFN below them is dense SwiGLU, so the unit is a real fixed unit here.
+    fn blind_proposals(&self, layer: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
+        if layer >= self.n_layer || self.n_exp != 0 {
+            return None;
+        }
+        let gain = self.b.arr1("norm").to_vec();
+        let mut w = self.b.weight_row(&format!("l{layer}.mlp.down_proj"), neuron);
+        w.iter_mut().zip(gain.iter()).for_each(|(v, g)| *v *= g);
+        let proj = self.b.rowdot_f32(self.unembed(), &w);
+        let mut idx: Vec<usize> = (0..proj.len()).collect();
+        idx.sort_by(|&a, &b| {
+            (polarity * proj[b]).partial_cmp(&(polarity * proj[a])).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(idx.into_iter().take(k).map(|i| i as i64).collect())
+    }
+
+    /// Greedy hill-climb over those proposals, scored by RAW ACTIVATION through [`Qwen35Scorer`].
+    fn blind_climb(
+        &self,
+        layer: usize,
+        neuron: usize,
+        prefix: &[i64],
+        cands: &[i64],
+        steps: usize,
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        if cands.is_empty() || layer >= self.n_layer || self.n_exp != 0 {
+            return None;
+        }
+        let mut sc = Qwen35Scorer::new(self, prefix, prefix.len() + steps + 1)?;
+        let mut ids = prefix.to_vec();
+        let mut best = f32::NEG_INFINITY;
+        for _ in 0..steps {
+            let (mut pick, mut pick_obj) = (cands[0], f32::NEG_INFINITY);
+            for &t in cands {
+                if let Some(a) = sc.try_token(self, t, layer, neuron) {
+                    let o = polarity * a;
+                    if o > pick_obj {
+                        pick_obj = o;
+                        pick = t;
+                    }
+                }
+            }
+            sc.commit(self, pick, layer, neuron);
+            ids.push(pick);
+            best = pick_obj;
+        }
+        Some(crate::model::BlindArm { ids, obj: best, pos: None })
+    }
+
+    /// Oracle arm — scored by the NAIVE path so the baseline stays independent of the search cache.
+    fn blind_corpus_best(
+        &self,
+        layer: usize,
+        neuron: usize,
+        ids: &[i64],
+        polarity: f32,
+    ) -> Option<crate::model::BlindArm> {
+        if ids.len() < 2 || layer >= self.n_layer || self.n_exp != 0 {
+            return None;
+        }
+        // Chunked, not one token at a time: at batch 1 every step re-reads the whole (dense) weight set,
+        // which measured ~0.9 s/token on a 1.5B and made a real corpus infeasible. `CORPUS_CHUNK` rows per
+        // block amortises one weight read over 32 positions while the hybrid state carries forward, so
+        // each position still sees its true causal history. Every position is scored exactly once.
+        let mut sc = Qwen35Scorer::empty(self, ids.len());
+        let (mut best_obj, mut best_idx) = (f32::NEG_INFINITY, 0usize);
+        for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
+            let start = sc.pos();
+            let emb = self.b.rows_f32("embed", chunk);
+            let (_mlp_h, rows) = self.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((layer, neuron)));
+            sc.pos += chunk.len();
+            if rows.len() != chunk.len() {
+                continue; // unit out of range for this layer's FFN width
+            }
+            for (j, &a) in rows.iter().enumerate() {
+                let o = polarity * a;
+                if o > best_obj {
+                    best_obj = o;
+                    best_idx = start + j;
+                }
+            }
+        }
+        if best_obj == f32::NEG_INFINITY {
+            return None;
+        }
+        let lo = best_idx.saturating_sub(crate::model::CORPUS_CTX - 1);
+        Some(crate::model::BlindArm {
+            ids: ids[lo..=best_idx].to_vec(),
+            obj: best_obj,
+            pos: Some(best_idx),
+        })
+    }
+
     fn predict(&self, ids: &[i64]) -> i64 {
         self.logits(ids).map(|lg| lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as i64)
             .unwrap_or(0)
@@ -753,5 +988,221 @@ impl Model for Qwen35Moe {
             cache.lin_hist.clear();
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BlindArm, Model, POLE_NEG, POLE_POS};
+
+    fn v(seed: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (((seed * 41 + i * 23) % 43) as f32) / 20.0 - 1.0).collect()
+    }
+
+    /// A 4-layer hybrid qwen35 bundle: layer_types = [linear, linear, linear, full], dense SwiGLU FFN.
+    /// `moe = true` swaps in the packed expert layout so the MoE decline path has real weights to decline on.
+    fn build_tiny(tag: &str, moe: bool) -> Qwen35Moe {
+        let (nl, nh, nkv, hd, d, vocab, ffn) = (4usize, 4, 2, 8, 32, 24, 16);
+        let (nvh, nkh, hkd, hvd, conv_k) = (4usize, 2, 8, 8, 4);
+        let n_exp = if moe { 4usize } else { 0 };
+        let (moe_inter, shared_inter) = (32usize, 32usize);
+        let dir = std::env::temp_dir().join(format!("fr_bm35_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut bin: Vec<u8> = Vec::new();
+        let mut specs: Vec<serde_json::Value> = Vec::new();
+        let mut add = |name: String, shape: Vec<usize>, data: Vec<f32>| {
+            let offset = bin.len();
+            for x in &data { bin.extend_from_slice(&x.to_le_bytes()); }
+            specs.push(serde_json::json!({ "name": name, "dtype": "f32", "shape": shape,
+                "offset": offset, "bytes": bin.len() - offset }));
+        };
+        add("embed".into(), vec![vocab, d], v(1, vocab * d));
+        add("norm".into(), vec![d], v(2, d));
+        add("lm_head".into(), vec![vocab, d], v(3, vocab * d));
+        let key_dim = nkh * hkd;
+        let value_dim = nvh * hvd;
+        for l in 0..nl {
+            let linear = l != nl - 1;
+            let p = format!("l{l}.");
+            add(format!("{p}in_ln"), vec![d], v(10 + l, d));
+            add(format!("{p}post_ln"), vec![d], v(20 + l, d));
+            add(format!("{p}mlp.gate_proj"), vec![d, ffn], v(70 + l, d * ffn));
+            add(format!("{p}mlp.up_proj"), vec![d, ffn], v(80 + l, d * ffn));
+            add(format!("{p}mlp.down_proj"), vec![ffn, d], v(90 + l, ffn * d));
+            if moe {
+                add(format!("{p}mlp.gate.weight"), vec![ffn, d], v(100 + l, ffn * d));
+                add(format!("{p}mlp.experts.gate_up_proj"), vec![n_exp, 2 * moe_inter, d], v(110 + l, n_exp * 2 * moe_inter * d));
+                add(format!("{p}mlp.experts.down_proj"), vec![n_exp, d, moe_inter], v(120 + l, n_exp * d * moe_inter));
+                add(format!("{p}mlp.shared_expert.gate_proj"), vec![d, shared_inter], v(130 + l, d * shared_inter));
+                add(format!("{p}mlp.shared_expert.up_proj"), vec![d, shared_inter], v(140 + l, d * shared_inter));
+                add(format!("{p}mlp.shared_expert.down_proj"), vec![shared_inter, d], v(150 + l, shared_inter * d));
+                add(format!("{p}mlp.shared_expert_gate.weight"), vec![d], v(160 + l, d));
+            }
+            if linear {
+                add(format!("{p}linear_attn.in_proj_qkv"), vec![d, 2 * key_dim + value_dim], v(200 + l, d * (2 * key_dim + value_dim)));
+                add(format!("{p}linear_attn.in_proj_z"), vec![d, value_dim], v(210 + l, d * value_dim));
+                add(format!("{p}linear_attn.in_proj_b"), vec![d, nvh], v(220 + l, d * nvh));
+                add(format!("{p}linear_attn.in_proj_a"), vec![d, nvh], v(230 + l, d * nvh));
+                add(format!("{p}linear_attn.conv1d"), vec![2 * key_dim + value_dim, conv_k], v(240 + l, (2 * key_dim + value_dim) * conv_k));
+                add(format!("{p}linear_attn.A_log"), vec![nvh], v(250 + l, nvh));
+                add(format!("{p}linear_attn.dt_bias"), vec![nvh], v(260 + l, nvh));
+                add(format!("{p}linear_attn.norm"), vec![hvd], v(270 + l, hvd));
+                add(format!("{p}linear_attn.out_proj"), vec![value_dim, d], v(280 + l, value_dim * d));
+            } else {
+                add(format!("{p}self_attn.q_proj"), vec![d, 2 * nh * hd], v(300 + l, d * 2 * nh * hd));
+                add(format!("{p}self_attn.k_proj"), vec![d, nkv * hd], v(310 + l, d * nkv * hd));
+                add(format!("{p}self_attn.v_proj"), vec![d, nkv * hd], v(320 + l, d * nkv * hd));
+                add(format!("{p}self_attn.o_proj"), vec![nh * hd, d], v(330 + l, nh * hd * d));
+                add(format!("{p}q_norm"), vec![hd], v(340 + l, hd));
+                add(format!("{p}k_norm"), vec![hd], v(350 + l, hd));
+            }
+        }
+        let mut cfg: Vec<i64> = vec![nl as i64, nh as i64, nkv as i64, hd as i64, d as i64, vocab as i64,
+                                    0, n_exp as i64, 2, moe_inter as i64, shared_inter as i64, 0,
+                                    nvh as i64, nkh as i64, hkd as i64, hvd as i64, conv_k as i64];
+        for l in 0..nl { cfg.push(if l != nl - 1 { 1 } else { 0 }); }
+        let manifest = serde_json::json!({ "format": crate::bundle::FORMAT, "version": crate::bundle::VERSION,
+            "arch": "qwen35", "config": cfg, "config_f": [10000.0, 1e-5, 0.25], "arrays": specs });
+        std::fs::write(format!("{stem}.fieldrun.bin"), &bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        Qwen35Moe::new(Bundle::load(&stem).unwrap(), 0.0, false)
+    }
+
+    /// Each test gets its OWN on-disk bundle: `cargo test` runs these concurrently, and sharing a path
+    /// would let one test load another's half-written file.
+    fn load_tiny(tag: &str) -> Qwen35Moe { build_tiny(tag, false) }
+    fn load_tiny_moe(tag: &str) -> Qwen35Moe { build_tiny(tag, true) }
+    /// FFN width, fixed by `build_tiny` (matches the `mlp.gate_proj` second dim).
+    fn m_ffn(_m: &Qwen35Moe) -> usize { 16 }
+
+    /// The whole port rests on this: a single cached scorer step over the HYBRID state must equal the naive
+    /// `mlp_act_last` over the same ids, bit for bit. If the snapshot/restore path drifted from the naive walk
+    /// by even one ULP, every blind-max ratio on this arch would be measured against a fiction.
+    #[test]
+    fn qwen35_scorer_step_matches_naive_bitwise() {
+        let m = load_tiny("step");
+        let ids: Vec<i64> = vec![1, 9, 4, 7, 2, 5];
+        let total = ids.len() + 6;
+        for layer in [0usize, 1, 3] { // a linear layer, a linear layer, the full-attention layer
+            let mut sc = Qwen35Scorer::new(&m, &ids, total).unwrap();
+            assert_eq!(sc.pos(), ids.len());
+            for (i, &tok) in [7i64, 3, 11].iter().enumerate() {
+                let n = (i * 5) % m_ffn(&m);
+                let got = sc.try_token(&m, tok, layer, n).unwrap();
+                let mut want_ids = ids.clone();
+                want_ids.push(tok);
+                let want = m.mlp_act_last(&want_ids, layer).unwrap()[n];
+                assert_eq!(
+                    got.to_bits(), want.to_bits(),
+                    "layer {layer} tok {tok}: scorer {:e} != naive {:e}", got, want
+                );
+            }
+        }
+    }
+
+    /// Candidates must be INDEPENDENT: probing token B after token A must give the same value as probing B
+    /// on a fresh scorer. Without the restore, the DeltaNet accumulator would carry A's write into B.
+    #[test]
+    fn qwen35_candidates_are_independent() {
+        let m = load_tiny("indep");
+        let ids: Vec<i64> = vec![2, 6, 1, 8];
+        let total = ids.len() + 4;
+        let mut sc = Qwen35Scorer::new(&m, &ids, total).unwrap();
+        let b_first = sc.try_token(&m, 5, 0, 3).unwrap();
+        let _ = sc.try_token(&m, 13, 0, 3).unwrap(); // must not perturb the next probe
+        let _ = sc.try_token(&m, 1, 0, 3).unwrap();
+        let b_again = sc.try_token(&m, 5, 0, 3).unwrap();
+        assert_eq!(b_first.to_bits(), b_again.to_bits(), "a prior probe leaked into the next candidate");
+    }
+
+    /// After commit, the state must have advanced exactly one position and the next probe must match a naive
+    /// recompute over prefix ++ [committed, next].
+    #[test]
+    fn qwen35_commit_advances_state() {
+        let m = load_tiny("commit");
+        let ids: Vec<i64> = vec![3, 9, 4];
+        let total = ids.len() + 4;
+        let mut sc = Qwen35Scorer::new(&m, &ids, total).unwrap();
+        sc.commit(&m, 6, 0, 2);
+        assert_eq!(sc.pos(), ids.len() + 1);
+        let got = sc.try_token(&m, 8, 0, 2).unwrap();
+        let want = m.mlp_act_last(&[3, 9, 4, 6, 8], 0).unwrap()[2];
+        assert_eq!(got.to_bits(), want.to_bits(), "post-commit probe {got:e} != naive {want:e}");
+    }
+
+    /// The climb's reported objective must equal a NAIVE recompute of the sequence it claims to have found.
+    #[test]
+    fn qwen35_climb_objective_matches_naive() {
+        let m = load_tiny("climb");
+        let ids: Vec<i64> = vec![1, 5, 3];
+        for pol in [POLE_POS, POLE_NEG] {
+            let cands = m.blind_proposals(0, 4, 8, pol).unwrap();
+            assert!(!cands.is_empty());
+            let arm: BlindArm = m.blind_climb(0, 4, &ids, &cands, 3, pol).unwrap();
+            let act = m.mlp_act_last(&arm.ids, 0).unwrap()[4];
+            assert_eq!((pol * act).to_bits(), arm.obj.to_bits(),
+                       "pole {pol}: reported {:e} but naive gives {:e}", arm.obj, pol * act);
+        }
+    }
+
+    /// A chunked scan must equal a single-token walk of the same stream. The corpus scan feeds `CORPUS_CHUNK`
+    /// rows per forward so one weight read is amortised over 32 positions; that is only sound if a block
+    /// and a sequence of single steps produce the same numbers. This is that claim, bit for bit — and it
+    /// also pins the DeltaNet recurrence + conv window across chunk boundaries, which is the part of the
+    /// hybrid state most likely to drift when rows are fed in bulk.
+    #[test]
+    fn qwen35_chunked_scan_matches_single_token_walk() {
+        let m = load_tiny("chunk");
+        let stream: Vec<i64> = vec![3, 9, 4, 6, 8, 1, 7, 5, 2, 11, 0, 6];
+        let total = stream.len();
+        // chunked, but forced to one row per block so the two paths differ only in block shape
+        let mut sc = Qwen35Scorer::empty(&m, total);
+        for chunk in stream.chunks(1) {
+            let start = sc.pos();
+            let emb = m.b.rows_f32("embed", chunk);
+            let (_h, rows) = m.forward_block_capture_mlp(&emb, start, &mut sc.st, Some((0, 2)));
+            sc.pos += chunk.len();
+            for (j, &a) in rows.iter().enumerate() {
+                let want = m.mlp_act_last(&stream[..=start + j], 0).unwrap()[2];
+                assert_eq!(a.to_bits(), want.to_bits(), "block at {} row {} : {a:e} != naive {want:e}", start, j);
+            }
+        }
+        // and the real chunked arm agrees with a naive per-position max
+        let arm: BlindArm = m.blind_corpus_best(0, 2, &stream, POLE_POS).unwrap();
+        let brute: Vec<f32> = (0..stream.len()).map(|i| m.mlp_act_last(&stream[..=i], 0).unwrap()[2]).collect();
+        let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(arm.obj.to_bits(), want.to_bits(), "chunked arm {:e} != naive {:e}", arm.obj, want);
+    }
+
+    /// The corpus arm must equal the brute-force max over every position of a naive `mlp_act_last`,
+    /// bit for bit — and must report the argmax position, not just its value.
+    #[test]
+    fn qwen35_corpus_best_matches_naive_per_position_max() {
+        let m = load_tiny("corpus");
+        let (l, n) = (0usize, 4usize);
+        let stream: Vec<i64> = vec![1, 5, 3, 9, 2, 8, 6, 4, 0, 7];
+        for pol in [POLE_POS, POLE_NEG] {
+            let arm: BlindArm = m.blind_corpus_best(l, n, &stream, pol).unwrap();
+            let brute: Vec<f32> = (0..stream.len()).map(|i| pol * m.mlp_act_last(&stream[..=i], l).unwrap()[n]).collect();
+            let want = brute.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(arm.obj.to_bits(), want.to_bits(),
+                       "pole {pol}: streamed {:e} vs naive {:e}", arm.obj, want);
+            let at = brute.iter().position(|&x| x == want).expect("max must occur");
+            assert_eq!(arm.pos, Some(at), "reported position must be the argmax position");
+            assert_eq!(arm.ids.last().copied(), Some(stream[at]), "ids must end at the best position");
+        }
+    }
+
+    /// A MoE layer has no fixed "neuron n" — the routed expert decides. Every entry point must decline
+    /// rather than silently reporting something.
+    #[test]
+    fn qwen35_moe_layers_decline() {
+        let m = load_tiny_moe("moe");
+        assert!(m.mlp_act_last(&[1, 2, 3], 0).is_none(), "MoE mlp_act_last must be None");
+        assert!(m.blind_proposals(0, 1, 8, POLE_POS).is_none(), "MoE blind_proposals must be None");
+        assert!(m.blind_climb(0, 1, &[1, 2], &[5, 6], 2, POLE_POS).is_none(), "MoE climb must be None");
+        assert!(m.blind_corpus_best(0, 1, &[1, 2, 3, 4], POLE_POS).is_none(), "MoE corpus arm must be None");
     }
 }

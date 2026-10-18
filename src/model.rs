@@ -264,6 +264,32 @@ pub fn build_rec_lens_at(
         .collect()
 }
 
+/// Result of one blind-max arm: the best sequence found for a target unit, and the polarity-signed
+/// objective it reached.
+///
+/// `ids` is the *found sequence* for the search arm, but only a bounded TAIL for the corpus arm — a
+/// corpus best can sit 200k tokens in, and cloning/printing the whole prefix would be quadratic work
+/// for a line no one can read. `pos` carries the absolute corpus index for that case.
+#[derive(Clone, Debug)]
+pub struct BlindArm {
+    pub ids: Vec<i64>,
+    pub obj: f32,
+    /// Absolute index into the corpus stream, when this arm came from `blind_corpus_best`.
+    pub pos: Option<usize>,
+}
+
+/// Blind-max polarity: `+1` maximises a unit's positive pole, `-1` its negative one.
+pub const POLE_POS: f32 = 1.0;
+pub const POLE_NEG: f32 = -1.0;
+
+/// Tokens of context the corpus arm reports around its best position. Bounded on purpose: see `BlindArm`.
+pub const CORPUS_CTX: usize = 32;
+
+/// Rows per forward in the corpus scan. One weight read is amortised over this many positions, so this
+/// is the knob that makes a real corpus affordable; it does not affect WHAT is scored (every position is
+/// still scored exactly once, with true causal history).
+pub const CORPUS_CHUNK: usize = 32;
+
 pub trait Model: Sync {
     /// Top-1 next-token id for a context.
     fn predict(&self, ids: &[i64]) -> i64;
@@ -348,7 +374,62 @@ pub trait Model: Sync {
         }
     }
 
-    /// The post-SwiGLU activations of EVERY neuron in `layer`, at the LAST token of `ids` — the vector
+/// Blind-max probing. `polarity` `+1` maximises a unit's POSITIVE pole, `-1` its NEGATIVE one — a unit whose
+    /// job is suppression never peaks on the positive side, and a positive-only readout cannot see it.
+    ///
+    /// The three steps compose into a falsification test of a unit's own self-description: propose from what
+    /// it SAYS it does (`blind_proposals`, its output projection — the same readout `explain` prints as
+    /// `promotes`), search for what actually maximises it (`blind_climb`), and compare against brute force
+    /// over a corpus (`blind_corpus_best`). A ratio near or above 1 means the description points at the
+    /// mechanism.
+    ///
+    /// IMPORTANT — this greedy token climb is a WEAK adversary next to Cammarata's blind maximum, where an
+    /// LLM reads a written explanation and writes a sentence that fires the unit. A ratio BELOW 1 bounds what
+    /// this search could reach; it does NOT refute the explanation. Report it as a bound, never as a verdict.
+    ///
+    /// Default None — only arches with a cached scorer implement these.
+    fn blind_proposals(&self, _layer: usize, _neuron: usize, _k: usize, _polarity: f32) -> Option<Vec<i64>> {
+        None
+    }
+    fn blind_climb(
+        &self,
+        _layer: usize,
+        _neuron: usize,
+        _prefix: &[i64],
+        _cands: &[i64],
+        _steps: usize,
+        _polarity: f32,
+    ) -> Option<BlindArm> {
+        None
+    }
+    /// The best-activating position over a real token stream, as ONE causal sweep in `CORPUS_CHUNK`-row blocks.
+    ///
+    /// Chunked, not windowed and not single-token: windows re-compute their overlapping rows (measured 0.43 s
+    /// per 32-row window, ~84 min for an 11.8k-token corpus) and restart context, while single-token steps are
+    /// bandwidth-bound at batch 1 (measured 0.9 s/token, ~3 h for the same). A block against a carried cache
+    /// gets the windowed throughput AND true causal history, scoring every position exactly once.
+    ///
+    /// Note what this arm is NO LONGER: it does not use the naive path, so it is no longer independent
+    /// of the search cache. It does not need to be. The block values are asserted BIT-IDENTICAL to a naive
+    /// per-position `mlp_act_last` (see the rope/qwen35 corpus tests), so streaming yields the same numbers
+    /// brute force would — the sweep is cheap, not weaker. What it cannot be is stronger than brute
+    /// force, which is the direction that matters: it never over-reports.
+    ///
+    /// The baseline is corpus-RELATIVE by construction: the ratio measures against whatever this returns,
+    /// so a weak corpus understates the bar. Never "the unit's true maximum". Whether a longer corpus
+    /// raises it is an empirical question, not a given — on Qwen2.5-1.5B L26/N6203 a 92x longer corpus
+    /// (128 -> 11799 tokens) returned the SAME max at the same position 127, so "more corpus" bought
+    /// nothing for that unit. Treat any such effect as unit-specific until measured.
+    ///
+    /// `BlindArm::ids` is the `CORPUS_CTX`-token tail ending at the best position, with `pos` holding the
+    /// absolute index.
+    ///
+    /// Default None; arches with a cached scorer implement it.
+    fn blind_corpus_best(&self, _layer: usize, _neuron: usize, _ids: &[i64], _polarity: f32) -> Option<BlindArm> {
+        None
+    }
+
+/// The post-SwiGLU activations of EVERY neuron in `layer`, at the LAST token of `ids` — the vector
     /// `explain` computes and then narrows to its top-N before reporting. Length is the layer's MLP
     /// intermediate width, so neuron `n` is `out[n]`.
     ///
