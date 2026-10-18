@@ -83,6 +83,33 @@ diverges without explaining why.
   (independently pageable). lm_head (non-tied unembed) stored raw (vocab, d) low-precision — read row-wise by
   rowdot_f32, NOT transposed like the other Linears.
 - `src/model.rs` — the `Model` trait (predict / generate / explain), arch-agnostic.
+- blind-max (the "Neural Networks Are Already Clean" probe, Cammarata) — `Model::{blind_proposals, blind_climb,
+  blind_corpus_best}` + `--blind-max L,N [--blind-pole pos|neg --blind-steps N --blind-cands K --blind-corpus F]`.
+  Question: does a unit's own self-description (its output projection, what `explain` prints as `promotes`) point at
+  what actually fires it? The `blind` arm greedily hill-climbs tokens against the raw activation; the `oracle` arm is
+  the best position over a real corpus (`--blind-corpus sweeps/corpora/*.json`), swept ONCE as a causal
+  pass in 32-row blocks against a carried cache — a block amortises one weight read over 32 positions
+  (overlapping windows cost ~84 min on an 11.8k-token corpus; one-token-at-a-time is bandwidth-bound at
+  ~0.9 s/token and would cost ~3 h), and each position still sees its true causal history. The block
+  values are bit-identical to a naive per-position forward, asserted in tests.
+  The oracle is a **weak, corpus-relative adversary**: `ratio < 1` bounds the search, it does NOT refute the
+  explanation, and the CLI says so inline — including the search config that produced the number, because the
+  ratio is a property of the search and the corpus, not of the unit. MoE layers return `None` at every entry
+  point — a routed expert has no fixed "neuron n", and guessing would be worse than declining.
+  `Model::blind_support` is what the CLI gates on, and it must stay **coherent with** the arms: an arch that
+  implements `blind_proposals` but inherits the `NoScorer` default makes the harness refuse to run on a model
+  it supports (this happened, and the message named the rope family as unsupported). Two decline reasons,
+  not one: `NoScorer` (nobody implemented it) vs `RoutedLayers` (works, but these layers are per-token routed).
+- `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
+  and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
+  Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and
+  Qwen3-MoE share Qwen2.5's vocabulary and reuse `sweeps/corpora/*.json` as-is; Qwen3.5 uses
+  `sweeps/corpora/qwen35/*.json`. The default invocation reproduces the committed corpora byte-for-byte
+  (verified), so the flag is additive. The English slice is stored as IDs; the script recovers the TEXT with
+  the source tokenizer and asserts the `decode`→`encode` round-trip is exact before using it — if that ever
+  stops holding, the "English" corpus would quietly be a different corpus. A token id at or past the vocab
+  is rejected at generation time. `pooled_big.json` is a legacy ad-hoc artifact (committed in 71cd5a8 with no
+  generator); the script emits `pooled_wide.json` under a new name rather than silently replacing it.
 - `src/explain.rs` — head-circuit classification + feature naming + render.
 - `src/mdfmt.rs` — dependency-free Markdown→ANSI for the chat REPL (headings/lists/bold/italic/code + LaTeX
   transliteration: `\theta`→θ, `\frac{a}{b}`→(a)/(b), `x^2`→x², math delimiters stripped). Line-buffered so it

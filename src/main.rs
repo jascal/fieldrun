@@ -107,6 +107,25 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// Read a tokenized corpus/eval file: `{"ids":[…]}`, `{"holdout_ids":[…]}`, or a bare `[…ints…]`.
+/// Same three shapes the rest of the CLI accepts, so `sweeps/corpora/*.json` work as-is.
+fn load_token_file(path: &str) -> Option<Vec<i64>> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let arr = v["holdout_ids"].as_array().or_else(|| v["ids"].as_array()).or_else(|| v.as_array());
+    Some(arr?.iter().filter_map(|x| x.as_i64()).collect())
+}
+
+/// How strong the adversary was. Printed next to every ratio, because the ratio is a property of the
+/// SEARCH and the CORPUS, not of the unit: `0.2532` from 1 step over 2.8k tokens and `0.2835` from 6
+/// steps over 11.8k are different claims that would otherwise read as the same number.
+fn search_desc(cands: usize, steps: usize) -> String {
+    format!(
+        "greedy search: {cands} proposal{} × {steps} step{}",
+        if cands == 1 { "" } else { "s" },
+        if steps == 1 { "" } else { "s" }
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2549,9 +2568,21 @@ fn main() {
             let steps: usize = flag(&args, "--blind-steps").and_then(|s| s.parse().ok()).unwrap_or(8);
             let k: usize = flag(&args, "--blind-cands").and_then(|s| s.parse().ok()).unwrap_or(24);
             let pole = if flag(&args, "--blind-pole").map_or("pos", |s| s) .starts_with("neg") { model::POLE_NEG } else { model::POLE_POS };
-            if lm.blind_proposals(layer, neuron, 1, model::POLE_POS).is_none() {
-                eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family only)");
-                return;
+            match lm.blind_support() {
+                model::BlindSupport::Supported => {}
+                model::BlindSupport::RoutedLayers => {
+                    eprintln!("[fieldrun] --blind-max: this bundle's FFN layers are MoE, and blind-max declines on");
+                    eprintln!("                   routed layers: the router picks which experts run PER TOKEN, so");
+                    eprintln!("                   \"neuron n\" has no fixed meaning across positions. This is a deliberate");
+                    eprintln!("                   decline, not a missing feature. The DENSE release of this arch (qwen3_5)");
+                    eprintln!("                   is fully supported — load that bundle, or use --probe-mlp-act /");
+                    eprintln!("                   --explain to read routed layers.");
+                    return;
+                }
+                model::BlindSupport::NoScorer => {
+                    eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family + Qwen3.5 dense)");
+                    return;
+                }
             }
             let seed: Vec<i64> = ids.iter().copied().take(2).collect();
             if seed.is_empty() {
@@ -2573,20 +2604,35 @@ fn main() {
                 println!("  blind arm : obj {:e}", a.obj);
                 println!("    ids      : {:?}", a.ids);
             }
-            // oracle arm over the same corpus the model was loaded with, scored by the NAIVE path
-            let wins: Vec<Vec<i64>> = ids.windows(16).map(|w| w.to_vec()).collect();
-            let oracle = lm.blind_corpus_best(layer, neuron, &wins, pole);
+            // oracle arm: ONE causal sweep over a real token stream, in CORPUS_CHUNK-row blocks against a carried
+            // cache (see Model::blind_corpus_best — a block amortises one weight read over many positions
+            // while still giving each one its true causal history).
+            let stream: Vec<i64> = match flag(&args, "--blind-corpus").and_then(load_token_file) {
+                Some(c) => {
+                    eprintln!("[fieldrun] --blind-max: oracle over {} corpus tokens (chunked causal sweep)…", c.len());
+                    c
+                }
+                None => {
+                    eprintln!("[fieldrun] --blind-max: no --blind-corpus; oracle over the model's own input ({} tokens) — WEAK baseline", ids.len());
+                    ids.clone()
+                }
+            };
+            let oracle = lm.blind_corpus_best(layer, neuron, &stream, pole);
             if let Some(o) = &oracle {
-                println!("  oracle arm: obj {:e}   (best of {} corpus windows)", o.obj, wins.len());
-                println!("    ids      : {:?}", o.ids);
+                println!("  oracle arm: obj {:e}   (best over {} corpus tokens)", o.obj, stream.len());
+                if let Some(p) = o.pos {
+                    println!("    at       : corpus position {p} of {}", stream.len());
+                }
+                println!("    ids      : {:?}   (last {} tokens ending there)", o.ids, o.ids.len());
                 if let Some(a) = blind {
                     // Only meaningful when BOTH arms actually reached the pole. Objectives are signed
                     // activations; if either is <= 0 the search never reached the pole at all, and dividing
                     // (let alone a negative by a positive) would print a confident-looking nonsense ratio.
                     if a.obj > 0.0 && o.obj > 0.0 {
-                        println!("  RATIO blind/oracle = {:.4}", a.obj / o.obj);
-                        println!("    (a greedy token climb is a WEAK adversary vs Cammarata's LLM — ratio < 1 bounds this");
-                        println!("     search, it does not refute the unit's explanation)");
+                        println!("  RATIO blind/oracle = {:.4}   ({})", a.obj / o.obj, search_desc(k, steps));
+                        println!("    (a greedy token climb is a WEAK adversary vs Cammarata's LLM. ratio < 1 bounds THAT");
+                        println!("     SEARCH over {} corpus tokens — it does not refute the unit's explanation. Rerun with", stream.len());
+                        println!("     different --blind-steps/--blind-cands and the ratio moves; it is not a property of the unit.)");
                     } else {
                         println!("  RATIO n/a — a blind arm obj {:e}, oracle obj {:e}", a.obj, o.obj);
                         println!("    (not both positive: neither arm reached this pole. The unit is likely near-dead");
@@ -2594,7 +2640,7 @@ fn main() {
                     }
                 }
             } else {
-                println!("  oracle arm: none (corpus too short for any full window)");
+                println!("  oracle arm: none (corpus shorter than 2 tokens, unit out of range for this layer, or the arch has no cached scorer)");
             }
             return;
         }
@@ -4384,5 +4430,17 @@ mod tests {
         assert_eq!(resolve_bundle("Qwen/Qwen2.5-0.5B-Instruct"), bstem);
         assert_eq!(resolve_bundle("does-not-exist"), "does-not-exist"); // passthrough
         std::env::remove_var("FIELDRUN_BUNDLES");
+    }
+
+    /// The ratio is a property of the SEARCH and the CORPUS, not of the unit — so the number printed
+    /// beside it has to say which search produced it. Two configs that differ only in `--blind-steps`
+    /// must not print the same self-description, which is what makes the caveat falsifiable rather than
+    /// boilerplate. This is the guard against the caveat quietly regressing to a bare ratio.
+    #[test]
+    fn search_desc_names_the_config_that_produced_the_ratio() {
+        assert_eq!(search_desc(4, 1), "greedy search: 4 proposals × 1 step");
+        assert_eq!(search_desc(16, 6), "greedy search: 16 proposals × 6 steps");
+        assert_eq!(search_desc(1, 1), "greedy search: 1 proposal × 1 step", "singulars must not read '1 proposals'");
+        assert_ne!(search_desc(4, 1), search_desc(16, 6), "different strengths must be distinguishable");
     }
 }
