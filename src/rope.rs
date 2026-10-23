@@ -164,6 +164,92 @@ impl Rope {
         rmsnorm(&x, self.b.arr1("norm"), self.eps)
     }
 
+    /// Instrumented twin of `hidden`; normal inference is unchanged.
+    fn observed_mlp(&self, ids: &[i64], probe: &crate::model::MlpProbe)
+        -> Option<crate::model::MlpProbeResult> {
+        use crate::model::{MlpObservation, MlpProbeResult};
+        let width = self.b.config[5] as usize;
+        let vocab = self.b.config[6] as usize;
+        if ids.is_empty() || ids.iter().any(|&i| i < 0 || i as usize >= vocab)
+            || probe.layers.iter().any(|&l| l >= self.n_layer)
+            || probe.units.iter().any(|&(l, n)| l >= self.n_layer || n >= width)
+            || probe.readouts.iter().any(|&i| i >= vocab)
+            || probe.patches.iter().any(|p| p.layer >= self.n_layer || p.position >= ids.len()
+                || p.neuron >= width || !p.value.is_finite()) {
+            return None;
+        }
+        let mut patched = std::collections::HashSet::new();
+        if probe.patches.iter().any(|p| !patched.insert((p.layer, p.position, p.neuron))) {
+            return None; // multiple writes must not silently depend on request ordering
+        }
+        let mut observations = Vec::new();
+        let seq = ids.len();
+        let (h, nkv, hd) = (self.h, self.nkv, self.hd);
+        let rep = h / nkv;
+        let mut x = self.b.rows_f32("embed", ids); // dtype-agnostic lookup (embed stays f16 under int8)
+
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let a = rmsnorm(&x, self.b.arr1(&format!("{p}in_ln")), self.eps);
+            let mut q = self.proj(&a, &format!("{p}self_attn.q_proj"));
+            let mut k = self.proj(&a, &format!("{p}self_attn.k_proj"));
+            let v = self.proj(&a, &format!("{p}self_attn.v_proj"));
+            if self.qk_norm {
+                self.head_norm(&mut q, &format!("{p}self_attn.q_norm"), h);
+                self.head_norm(&mut k, &format!("{p}self_attn.k_norm"), nkv);
+            }
+            self.rope(&mut q, h, 0);
+            self.rope(&mut k, nkv, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep; // GQA: this query head reads kv head head/rep
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t()) / (hd as f32).sqrt();
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[[i, j]] = -1e30;
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            x = &x + &self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+
+            let a2 = rmsnorm(&x, self.b.arr1(&format!("{p}post_ln")), self.eps);
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate.clone();
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) {
+                *hv = silu(*hv) * uv;
+            }
+            for n in 0..width {
+                if probe.layers.contains(&l) || probe.units.contains(&(l, n)) {
+                    observations.push(MlpObservation {
+                        layer: l, position: seq - 1, neuron: n,
+                        gate: gate[[seq - 1, n]], value: up[[seq - 1, n]],
+                        product: hidden[[seq - 1, n]],
+                    });
+                }
+            }
+            for patch in probe.patches.iter().filter(|p| p.layer == l) {
+                hidden[[patch.position, patch.neuron]] = patch.value;
+            }
+            x = &x + &self.down(&hidden, &format!("{p}mlp.down_proj"));
+        }
+
+        let xf = rmsnorm(&x, self.b.arr1("norm"), self.eps);
+        let all = self.b.rowdot_f32(self.unembed_name(), &xf.row(seq - 1).to_vec());
+        if all.iter().any(|v| !v.is_finite()) || observations.iter().any(|o|
+            !o.gate.is_finite() || !o.value.is_finite() || !o.product.is_finite()) {
+            return None;
+        }
+        let next = all.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?.0 as i64;
+        let logits = probe.readouts.iter().map(|&i| (i, all[i])).collect();
+        Some(MlpProbeResult { next, next_logit: all[next as usize], observations, logits })
+    }
+
     /// Copy of `hidden` with the K/V cache round-tripped through a quantizer per (position, kv-head) — the
     /// `--probe-kv-quant` fidelity sweep. `turbo_bits=None` → the int8 per-head max-scale scheme (== `forward_block_q`'s
     /// runtime cache); `Some(b)` → TurboQuant (SRHT rotation + Lloyd–Max levels, `Codec::roundtrip` per head-vector).
@@ -824,6 +910,11 @@ impl Rope {
 }
 
 impl Model for Rope {
+    fn probe_mlp(&self, ids: &[i64], probe: &crate::model::MlpProbe)
+        -> Option<crate::model::MlpProbeResult> {
+        self.observed_mlp(ids, probe)
+    }
+
 
     /// The unit's top-`k` proposed tokens, ranked by `polarity` × (its down-projection · final-norm gain)
     /// dotted into the unembed — the SAME readout `explain` displays as `promotes`, signed so the negative
@@ -1636,6 +1727,74 @@ mod tests {
     }
 
     const IDS: [i64; 7] = [1, 5, 3, 9, 2, 7, 4];
+
+    #[test]
+    fn native_probe_matches_forward_and_identity_patch() {
+        use crate::model::{MlpPatch, MlpProbe};
+        let m = Rope::new(Bundle::load(&tiny_rope("native_identity")).unwrap(), 0.0, false);
+        let mut p = MlpProbe { layers: vec![0, 1, 2], readouts: (0..20).collect(), ..Default::default() };
+        let base = m.probe_mlp(&IDS, &p).unwrap();
+        assert_eq!(base.next, m.predict(&IDS));
+        let logits = m.logits(&IDS).unwrap();
+        assert!(base.logits.iter().all(|&(i, x)| x.to_bits() == logits[i].to_bits()));
+        for o in &base.observations {
+            assert_eq!(o.product.to_bits(), (silu(o.gate) * o.value).to_bits());
+            assert_eq!(o.product.to_bits(), m.mlp_act_last(&IDS, o.layer).unwrap()[o.neuron].to_bits());
+        }
+        p.patches = base.observations.iter().map(|o| MlpPatch {
+            layer: o.layer, position: o.position, neuron: o.neuron, value: o.product,
+        }).collect();
+        let identity = m.probe_mlp(&IDS, &p).unwrap();
+        assert_eq!(identity.logits, base.logits);
+        assert_eq!(identity.next, base.next);
+    }
+
+    #[test]
+    fn native_probe_patch_is_position_specific_and_propagates() {
+        use crate::model::{MlpPatch, MlpProbe};
+        let m = Rope::new(Bundle::load(&tiny_rope("native_patch")).unwrap(), 0.0, false);
+        let mut p = MlpProbe { layers: vec![0, 1], readouts: (0..20).collect(), ..Default::default() };
+        let base = m.probe_mlp(&IDS, &p).unwrap();
+        p.patches.push(MlpPatch { layer: 0, position: IDS.len()-1, neuron: 3, value: 7.0 });
+        let patched = m.probe_mlp(&IDS, &p).unwrap();
+        // Observations at the intervened layer describe the unpatched local computation.
+        assert_eq!(patched.observations[3].product, base.observations[3].product);
+        assert_ne!(patched.logits, base.logits);
+        assert!(patched.observations.iter().zip(&base.observations)
+            .any(|(a,b)| a.layer == 1 && a.product != b.product));
+        p.patches[0].position = 0;
+        assert_ne!(m.probe_mlp(&IDS, &p).unwrap().logits, patched.logits);
+        // A later request starts clean: no persistent state is mutated.
+        p.patches.clear();
+        assert_eq!(m.probe_mlp(&IDS, &p).unwrap().logits, base.logits);
+        // Existing whole-column ablation independently checks a patch at every position.
+        p.patches = (0..IDS.len()).map(|position| MlpPatch {layer: 0, position, neuron: 3, value: 0.0}).collect();
+        let zero = m.probe_mlp(&IDS, &p).unwrap();
+        let want = m.logits_ablated(&IDS, &[], &[(0,3)]).unwrap();
+        assert!(zero.logits.iter().all(|&(i,x)| x.to_bits() == want[i].to_bits()));
+    }
+
+    #[test]
+    fn native_probe_rejects_invalid_coordinates_and_ambiguous_patches() {
+        use crate::model::{MlpPatch, MlpProbe};
+        let m = Rope::new(Bundle::load(&tiny_rope("native_invalid")).unwrap(), 0.0, false);
+        let p = MlpProbe::default();
+        assert!(m.probe_mlp(&[], &p).is_none());
+        assert!(m.probe_mlp(&[-1], &p).is_none());
+        assert!(m.probe_mlp(&[20], &p).is_none());
+        for p in [MlpProbe {layers: vec![3], ..Default::default()},
+                  MlpProbe {units: vec![(1,12)], ..Default::default()},
+                  MlpProbe {readouts: vec![20], ..Default::default()}] {
+            assert!(m.probe_mlp(&IDS, &p).is_none());
+        }
+        let patch = MlpPatch {layer: 0, position: 0, neuron: 0, value: 0.0};
+        let p = MlpProbe {patches: vec![patch.clone(), patch], ..Default::default()};
+        assert!(m.probe_mlp(&IDS, &p).is_none());
+        let p = MlpProbe {patches: vec![MlpPatch {layer: 0, position: 7, neuron: 0, value: 0.0}], ..Default::default()};
+        assert!(m.probe_mlp(&IDS, &p).is_none());
+        let p = MlpProbe {patches: vec![MlpPatch {layer: 0, position: 0, neuron: 0, value: f32::NAN}], ..Default::default()};
+        assert!(m.probe_mlp(&IDS, &p).is_none());
+    }
 
     /// (a) The early exit at `layer` is EXACT: stopping there must not perturb the value, so every layer's
     /// readout must match the same layer taken from a forward that ran to the end. Bit-for-bit.
