@@ -89,6 +89,12 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   details — a wrong rope de-interleave agrees only ~11/60, a missing YaRN ramp ~32/60; its int8 dip is that same
   sharpness amplifying near-tie flips, not a kernel gap.
 
+**KV precision.** `--kv-int8` quantizes cached keys and values separately from bundle weights. In the 16-token
+generation sweep, Gemma-4 MoE and the sharp MLA YaRN fixture produced sequences different from naive f32;
+their f32 KV sequences matched exactly. Quantized prefix reuse matched a fresh quantized prefill on every tested
+architecture. These are different checks: cache reuse can be correct while quantization changes a greedy token.
+Use f32 KV when token identity matters; the tiny fixtures do not establish a safe context-length threshold for int8 KV.
+
 **Quality (precision sweep, `scripts/bench.sh`).** Aggregating 3 seeds × 120 positions per arch — `f32` holds 100%
 (the math is exact); `f16` is 99.7–100%; `int8` is 90.8–100%. The int8 dips are near-tie argmax flips on *tiny random*
 weights (largest on the deliberately-sharp YaRN config) — real checkpoints quantize better (e.g. real GPT-2 int8 ==
@@ -140,6 +146,37 @@ the resident set is the shared layers + a working set of hot experts, not the wh
 `generate`/`generate_stream` (+ optional int8 KV), and `explain` (live circuits + features) are wired for **every**
 arch — the incremental KV-cache decode is byte-identical to the naive full recompute (the f32 generation gate in
 `scripts/validate_all.sh`).
+
+**Routed blind-max probes.** `--blind-max <layer>,<expert>,<neuron>` uses zero-based coordinates;
+`--blind-max 7,3,42` selects expert 3's neuron 42 in layer 7. Dense probes use `--blind-max <layer>,<neuron>`.
+For example, append `--blind-max 7,3,42 --blind-cands 24 --blind-steps 8 --blind-corpus corpus.json` to a bundle
+invocation. Corpus IDs must use that bundle's tokenizer.
+
+Every routed probe scores `w_router * act[neuron]` before the expert's down projection, using the actual forward
+path's activation and mixture weight. A position that does not select the expert is skipped (internally NaN).
+Shared experts affect subsequent hidden states and routing, but the named unit always belongs to a routed expert;
+its score excludes the shared expert's activation. The output row used for proposals is the named expert's own
+down-projection row. `--blind-pole neg` reverses the objective. The blind/oracle ratio describes the configured
+search and corpus, and a ratio below one does not refute the unit's explanation.
+
+| Kernel / family | Named unit's activation and routing weight | Forward context used by the scorer |
+|---|---|---|
+| `qwen3moe`: Qwen3-MoE / Mixtral / Qwen2-MoE | SwiGLU; softmax weights with the forward's top-k renormalization policy | Actual QK-norm, projection biases, window and shared-expert settings; routed layers only |
+| `qwen35moe` | SwiGLU; renormalized softmax top-k | Carried DeltaNet state and full-attention KV; shared expert remains in the forward |
+| `minimax` | SwiGLU; unbiased sigmoid weights renormalized over experts chosen with correction bias | Full-width q/k norm and KV history; no shared expert |
+| `gemma4` MoE | GEGLU; renormalized softmax top-k times per-expert scale | Router normalization/scales, expert input norm, per-layer attention widths and KV sharing |
+| `mla` | SwiGLU; unbiased sigmoid weights with configured renormalization and routed scale | Group-limited biased selection, MLA/YaRN history and shared expert; initial dense layers decline routed coordinates |
+| `dsv4` (sliding subset) | Clamped SwiGLU; unbiased sqrtsoftplus weights renormalized and scaled | Sliding attention, mHC and shared expert; full causal recompute |
+| `gptoss` | Biased, interleaved clamped SwiGLU with `(up+1)`; softmax over selected biased logits | Learned sinks and the configured alternating sliding/full attention; full causal recompute |
+
+GPT-OSS and DeepSeek-V4 use a full forward for each candidate, so `K` candidates over `S` successful steps require
+`K*S` forwards on growing prefixes. Corpus scoring recomputes prefixes of 32, 64, 96, ... tokens, retaining the full
+causal history each time. This overhead grows with prefix length, corpus length, candidate count and step count;
+GPT-OSS additionally materializes quadratic attention-score matrices even on its masked sliding layers. It becomes
+particularly relevant for long contexts and disk-paged experts. Start with a short corpus and small candidate/step
+counts; no wall-clock overhead benchmark is claimed here. The uncached walks provide a reference for future cached
+scorers, which must preserve candidate isolation and agree with the forward. GPT-OSS generation already uses KV
+caching; this recompute limitation applies to its blind-max scorer.
 
 **`--recursion-explain`** (the recursion spectrum — COMPUTED / DEFERRED / BINDING long-range binds + nested-fold
 detection — and the value-stack logit-lens) additionally needs the per-position substrate `recursion_trace`, currently

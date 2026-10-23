@@ -520,6 +520,8 @@ impl Model for Dsv4 {
     /// No KV cache exists on this arch, so each candidate re-runs the whole forward over `prefix ++ [t]`
     /// and the value is read off the LAST row. That is exact by construction and costs O(prefix) per
     /// candidate — the honest trade until this arch grows a `generate`.
+    // Keep this uncached walk as the forward reference for a future scorer cache. K candidates over S
+    // successful steps rerun K*S full prefixes; a cache must match these values and isolate candidates.
     fn blind_moe_climb(&self, layer: usize, expert: usize, neuron: usize, prefix: &[i64], cands: &[i64],
                        steps: usize, polarity: f32) -> Option<crate::model::BlindArm> {
         if cands.is_empty() || layer >= self.nl || self.n_exp == 0 || expert >= self.n_exp {
@@ -560,6 +562,7 @@ impl Model for Dsv4 {
             return None;
         }
         let (mut best_obj, mut best_idx, mut routed) = (f32::NEG_INFINITY, 0usize, 0usize);
+        // Uncached: prefixes grow by CORPUS_CHUNK (32), so earlier history is recomputed each chunk.
         // carried context: each chunk attends over everything before it, as the dense arm does
         let mut carried: Vec<i64> = Vec::new();
         for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {

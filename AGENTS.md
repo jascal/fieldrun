@@ -92,7 +92,7 @@ diverges without explaining why.
   int8 KV, prefix reuse, explain, and routed blind-max are wired. The blind-max candidate and corpus paths recompute
   full causal history (no scorer cache). Conversion accepts floating-point expert tensors; packed MXFP4 is unsupported.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
-  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax` — `qwen3moe` also takes Mixtral/Qwen2-MoE), `--dtype int8|f16|f32` (f32 = bit-exact, for the
+  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax|gptoss` — `qwen3moe` also takes Mixtral/Qwen2-MoE), `--dtype int8|f16|f32` (f32 = bit-exact, for the
   faithfulness gate). `-o` defaults to `bundles/<name>/<name>` (grouped, not loose in cwd); copies `tokenizer.json` next
   to the bundle + records `eos` in the manifest (for chat / the text API). MoE experts written one int8 array each
   (independently pageable). lm_head (non-tied unembed) stored raw (vocab, d) low-precision — read row-wise by
@@ -152,6 +152,12 @@ diverges without explaining why.
   scorer to silently disagree with the forward; the assertion that keeps this honest is candidate
   independence, which becomes a real snapshot/restore property the moment `generate` lands. No MoE arch
   declines blind-max any more.
+  GPT-OSS also supports routed probes through an uncached walk (despite having KV-cached generation). For both
+  GPT-OSS and DeepSeek-V4, K candidates × S successful steps means K*S full forwards over growing prefixes;
+  corpus chunks recompute prefixes of 32, 64, ... tokens. Long prefixes/corpora and paged experts amplify this cost;
+  GPT-OSS materializes quadratic attention-score matrices. No wall-clock benchmark is claimed. See README's routed
+  probe table for activation/weight semantics and shared-expert exclusions. The int8-KV generation sweep diverged
+  from naive f32 on Gemma-4 MoE and the sharp MLA YaRN fixture; f32 KV and quantized prefix-reuse checks passed.
 - `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
   and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
   Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and
