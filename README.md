@@ -74,9 +74,16 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 56/60 |
   | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
   | `qwen3moe` (sliding window) | Qwen3MoeForCausalLM `use_sliding_window` | 60/60 | 60/60 | 60/60 |
+  | `qwen3moe` (Mixtral sliding) | MixtralForCausalLM | 60/60 | 60/60 | 56/60 |
+  | `qwen3moe` (Mixtral full) | MixtralForCausalLM | 60/60 | 60/60 | 59/60 |
+  | `qwen3moe` (Qwen2-MoE, nonzero biases) | Qwen2MoeForCausalLM | 60/60 | 60/60 | 53/60 |
+  | `gptoss` (nonzero biases) | GptOssForCausalLM | 60/60 | 60/60 | 60/60 |
   | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
   | `mla` (YaRN) | DeepseekV3ForCausalLM yarn `rope_parameters` | 60/60 | 59/60 | 54/60 |
   | `minimax`  | MiniMaxM2ForCausalLM     | 60/60 | 60/60 | 60/60 |
+
+  The Qwen2-MoE fixture uses nonzero q/k/v biases: dropping those biases reduces agreement to 3/60.
+  GPT-OSS also uses nonzero attention, router, and expert biases; its int4 bundle matches 60/60 on this fixture.
 
   The YaRN row is built deliberately *sharp* (mean-1 norm weights, large init) so it actually gates the rotary
   details — a wrong rope de-interleave agrees only ~11/60, a missing YaRN ramp ~32/60; its int8 dip is that same
@@ -120,9 +127,12 @@ Pick `--arch` by family:
 | `gemma`  | Gemma-2 | √d embed, 4-norm sandwich, logit soft-cap, sliding window |
 | `gemma3` | Gemma-3 (1B/4B/12B/27B) | + QK-norm, dual-base RoPE, 5:1 local/global, no soft-cap |
 | `gemma4` | Gemma-4 (E2B/E4B dense, **26B-A4B MoE**) | + value-norm, per-layer-type `head_dim`, partial-rotary global RoPE, PLE, MoE |
-| `qwen3moe` | Qwen3-MoE (e.g. 30B-A3B) | RoPE + QK-norm + sparse MoE + optional sliding window; no new attention kernel |
+| `qwen3moe` | Qwen3-MoE, Mixtral, Qwen2-MoE | RoPE + sparse MoE; checkpoint-specific QK-norm, q/k/v biases, shared expert, and sliding window |
 | `mla`    | DeepSeek-V3/R1, **Kimi-K2** | multi-head latent attention (incl. interleaved rotary + YaRN long-context) + group-limited sigmoid MoE + shared expert |
 | `minimax`| MiniMax-M2 | softmax attn + full-width q/k-norm + sigmoid-router MoE (no MLA, no shared expert) |
+| `gptoss` | GPT-OSS (floating-point safetensors) | Alternating sliding/full attention, learned sinks, YaRN, biased projections and interleaved clamped SwiGLU experts |
+
+GPT-OSS conversion accepts floating-point expert tensors (`F32`, `F16`, or `BF16`); packed MXFP4 checkpoints require dequantization before conversion. Its blind-max probe preserves full causal history by recomputing each candidate; corpus scoring batches positions but also recomputes prior history.
 
 All validated to top-1 agreement vs the torch reference (see the gate above). Big MoE models (Gemma-4 26B, Qwen3-MoE,
 DeepSeek/Kimi) use **expert offload** — the experts stay mmap'd on disk and only the active top-k page in per token, so

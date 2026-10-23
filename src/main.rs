@@ -46,6 +46,7 @@ mod gemma;
 mod headgate;
 mod gemma3;
 mod gemma4;
+mod gptoss;
 #[cfg(feature = "api")]
 mod mdfmt;
 #[cfg(feature = "hub")]
@@ -82,6 +83,7 @@ use blas_src as _;
 use bundle::Bundle;
 use composition::Gpt2;
 use dsv4::Dsv4;
+use gptoss::GptOss;
 use gemma::Gemma;
 use gemma3::Gemma3;
 use gemma4::Gemma4;
@@ -173,14 +175,14 @@ fn main() {
                     "[fieldrun] convert: --model is required.\n  \
                      fieldrun convert --model <local-dir | hf-repo-id> --arch <arch> [--dtype int8|f16|f32] [-o <stem>]\n  \
                      e.g.  fieldrun convert --model Qwen/Qwen2.5-1.5B-Instruct --arch rope --dtype f16\n  \
-                     archs: gpt2 | rope | qwen35 | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax   (see `fieldrun --help`)"
+                     archs: gpt2 | rope | qwen35 | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax | dsv4 | gptoss   (see `fieldrun --help`)"
                 );
                 std::process::exit(2);
             }
         };
         let requested_arch = flag(&args, "--arch");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "bert"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "gptoss", "bert"];
         if let Some(arch) = requested_arch {
             if !ARCHS.contains(&arch) {
                 eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
@@ -773,8 +775,9 @@ fn main() {
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
+            "gptoss" => Box::new(GptOss::new(bundle, route, kv_int8)),
             "bert" => Box::new(bert::Bert::new(bundle)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, bert)"),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, gptoss, bert)"),
         };
 
         // ── encode-dump: encoder-only per-token hidden states ───────────────────────────────────────────────
@@ -2576,7 +2579,9 @@ fn main() {
                 }
             };
             let (expert, neuron) = match it.next().and_then(|s| s.trim().parse().ok()) {
-                Some(e) => (Some(e), second),
+                // 3-component form is `<layer>,<expert>,<neuron>` — the order the help text and AGENTS.md both
+                // document, and the order the readout prints as L/E/N. `second` is the EXPERT here.
+                Some(n) => (Some(second), n),
                 // 2-component form, or an explicit --neuron with the expert taken from --expert
                 None => (flag(&args, "--expert").and_then(|s| s.parse().ok()), second),
             };
@@ -2587,7 +2592,7 @@ fn main() {
             let routed = expert.is_some();
             match (lm.blind_support(), routed) {
                 (model::BlindSupport::NoScorer, _) => {
-                    eprintln!("[fieldrun] --blind-max: arch {arch} has no cached scorer yet (rope family + Qwen3.5)");
+                    eprintln!("[fieldrun] --blind-max: arch {arch} has no blind-max scorer for this bundle");
                     return;
                 }
                 // A routed unit was named but these layers are dense: the 3-component form needs a MoE bundle.
@@ -2676,6 +2681,15 @@ fn main() {
                 }
             } else {
                 println!("  oracle arm: none (corpus shorter than 2 tokens, unit out of range for this layer, or the arch has no cached scorer)");
+                if routed {
+                    // A MoE unit's reachable set is ROUTING-DEPENDENT: `blind_moe_corpus_best` returns None
+                    // when the expert is never selected anywhere in the corpus. That is a property of the
+                    // routing, not a failure, so say it rather than leaving the reader to guess which of
+                    // the three reasons above applied.
+                    println!("           (this is a ROUTED unit: an oracle can be absent when the router never");
+                    println!("            selected that expert anywhere in this corpus — a property of the");
+                    println!("            routing over this corpus, not of the search or the unit)");
+                }
             }
             return;
         }
@@ -4283,7 +4297,7 @@ USAGE\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
-  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | qwen35 (Qwen3.5 dense text) | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla (DeepSeek/Kimi) | minimax\n\
+  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | qwen35 (Qwen3.5 dense text) | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe (Qwen3/Mixtral/Qwen2-MoE) | mla (DeepSeek/Kimi) | minimax | dsv4 (sliding only) | gptoss\n\
   --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\
