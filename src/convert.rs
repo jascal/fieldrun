@@ -171,6 +171,15 @@ impl BundleWriter {
     }
 
     /// A weight linear from an (out, in) source: int8 (transposed, per-column), or f32/f16 transposed to (in, out).
+    /// Row-major `(rows, cols)` -> `(cols, rows)`. Needed for packed expert tensors that ship as
+    /// `nn.Parameter(num_experts, in, out)` — i.e. ALREADY `(in, out)` — where `put_lin` would otherwise
+    /// transpose them a second time and silently scramble every weight.
+    fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut t = vec![0f32; rows * cols];
+        for r in 0..rows { for c in 0..cols { t[c * rows + r] = data[r * cols + c]; } }
+        t
+    }
+
     fn put_lin(&mut self, name: &str, data: &[f32], out: usize, inp: usize, dtype: &str) -> std::io::Result<()> {
         let dtype = dmap_dtype(name, dtype);       // per-tensor override from --dtype-map, else the global dtype
         let dtype: &str = &dtype;
@@ -381,15 +390,53 @@ fn eos_ids(c: &serde_json::Value) -> Vec<i64> {
     }
 }
 
-/// Select the supported text backbone from a checkpoint's model type.
-/// MiMo's separate MTP tensors are omitted from ordinary `rope` bundles.
+/// HF `model_type` -> fieldrun arch family, as (arch, model_type tokens that route to it). Matched by LONGEST token
+/// that prefixes the model_type, so e.g. "gemma3_text" resolves to `gemma3` (not `gemma`) and "deepseek_v4" to `dsv4`
+/// (not `mla`). This table is the single source of truth: `infer_arch` (used when `--arch` is omitted) and the
+/// wrong-arch guard in `convert` both read it, so a family can never be auto-detected into one arch and refused as
+/// another.
+fn arch_table() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("gpt2", &["gpt2"]),
+        ("neox", &["gpt_neox"]),
+        ("rope", &["llama", "qwen2", "mistral", "phi", "mimo"]),
+        ("gemma", &["gemma", "gemma2"]),
+        ("gemma3", &["gemma3"]),
+        ("gemma4", &["gemma4"]),
+        // qwen3moe carries three sparse-MoE families on one kernel: Qwen3-MoE itself, Mixtral (`block_sparse_moe` +
+        // w1/w3/w2 expert naming, no QK-norm, forced top-k renorm) and Qwen2-MoE (shared expert + sigmoid gate).
+        // "qwen2_moe" (9 chars) must out-prefix the rope family's "qwen2" (5) to land here.
+        ("qwen3moe", &["qwen3_moe", "qwen3moe", "qwen2_moe", "mixtral"]),
+        ("qwen35", &["qwen3_5", "qwen3_5_text"]),
+        ("qwen35moe", &["qwen3_5_moe", "qwen3_5_moe_text"]),
+        ("mla", &["deepseek", "deepseek_v3", "kimi"]),
+        ("minimax", &["minimax"]),
+        ("bert", &["bert"]),
+        // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with a new attention class (shared-KV MQA + sink +
+        // undo-RoPE + grouped o_proj, mHC residual, sqrtsoftplus MoE, and CSA/HCA compressors). Longest-prefix-wins
+        // routes "deepseek_v4" here (11 chars) over `mla`'s "deepseek" (8). convert_dsv4 handles the sliding subset
+        // and refuses checkpoints that actually use the CSA/HCA compressors (a later stage).
+        ("dsv4", &["deepseek_v4"]),
+        ("gptoss", &["gpt_oss"]),
+    ]
+}
+
+/// The arch this checkpoint's model_type maps to, or None when the type is novel/unknown (which must PASS THROUGH to
+/// the user's explicit `--arch` rather than being guessed at).
 pub fn infer_arch(c: &serde_json::Value) -> Option<&'static str> {
-    match c.get("model_type")?.as_str()? {
-        "mimo" => Some("rope"),
-        "qwen3_5" | "qwen3_5_text" => Some("qwen35"),
-        "qwen3_5_moe" | "qwen3_5_moe_text" => Some("qwen35moe"),
-        _ => None,
-    }
+    let model_type = c.get("model_type")?.as_str()?;
+    match_longest_prefix(model_type)
+}
+
+/// Longest-token-prefix-wins lookup over `arch_table`.
+fn match_longest_prefix(model_type: &str) -> Option<&'static str> {
+    arch_table()
+        .iter()
+        .filter_map(|(a, toks)| {
+            toks.iter().filter(|t| model_type.starts_with(**t)).map(|t| t.len()).max().map(|l| (*a, l))
+        })
+        .max_by_key(|&(_, l)| l)
+        .map(|(a, _)| a)
 }
 
 fn check_mimo_config(c: &serde_json::Value) -> std::io::Result<()> {
@@ -429,34 +476,9 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
     // CONFIDENT mismatch (model_type recognized AND it maps to a different arch) — novel/unknown models pass through.
     let model_type = cfg["model_type"].as_str().unwrap_or("");
     if !model_type.is_empty() {
-        // HF model_type → fieldrun arch. Match by longest token that prefixes the model_type, so e.g. "gemma3_text"
-        // resolves to `gemma3` (not `gemma`) and "deepseek_v3" to `mla`. Longest-prefix-wins disambiguates the families.
-        let table: &[(&str, &[&str])] = &[
-            ("gpt2", &["gpt2"]),
-            ("neox", &["gpt_neox"]),
-            ("rope", &["llama", "qwen2", "mistral", "phi", "mimo"]),
-            ("gemma", &["gemma", "gemma2"]),
-            ("gemma3", &["gemma3"]),
-            ("gemma4", &["gemma4"]),
-            ("qwen3moe", &["qwen3_moe", "qwen3moe"]),
-            ("qwen35", &["qwen3_5", "qwen3_5_text"]),
-            ("qwen35moe", &["qwen3_5_moe", "qwen3_5_moe_text"]),
-            ("mla", &["deepseek", "deepseek_v3", "kimi"]),
-            ("minimax", &["minimax"]),
-            ("bert", &["bert"]),
-            // DeepSeek-V4 is NOT "V3 plus deltas": it replaces MLA with a new attention class (shared-KV MQA + sink +
-            // undo-RoPE + grouped o_proj, mHC residual, sqrtsoftplus MoE, and CSA/HCA compressors). Longest-prefix-wins
-            // routes "deepseek_v4" here (11 chars) over `mla`'s "deepseek" (8). convert_dsv4 handles the sliding subset
-            // and refuses checkpoints that actually use the CSA/HCA compressors (a later stage).
-            ("dsv4", &["deepseek_v4"]),
-        ];
-        let best = table
-            .iter()
-            .filter_map(|(a, toks)| {
-                toks.iter().filter(|t| model_type.starts_with(**t)).map(|t| t.len()).max().map(|l| (*a, l))
-            })
-            .max_by_key(|&(_, l)| l)
-            .map(|(a, _)| a);
+        // Same `arch_table` the auto-detect path uses — one source of truth, so a family can never be detected into one
+        // arch and then refused as another.
+        let best = match_longest_prefix(model_type);
         if let Some(right) = best {
             if right != arch {
                 panic!("convert: this checkpoint is model_type={model_type:?}, which fieldrun maps to --arch {right}, \
@@ -485,6 +507,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "mla" => convert_mla(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "minimax" => convert_minimax(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "gptoss" => convert_gptoss(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "bert" => convert_bert(&cfg, &m, dtype, embed_dtype, out_stem)?,
         other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, bert)"),
     };
@@ -928,9 +951,28 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
 /// Experts are written one int8 array each (offload), so this reaches Qwen3-MoE on a ≤24 GB box. No attention bias
 /// (Qwen3 dropped it), no embed scale, no soft-capping. Sliding window (`use_sliding_window`) applies ONE window to
 /// every layer (no per-layer pattern; the window is appended to `config` after the MoE flags, 0 = full attention).
+///
+/// Three sparse-MoE families share this kernel, differing in three places only — all three probed from the CHECKPOINT,
+/// not the `model_type` string, so a re-upload under a different type still converts correctly:
+///   - **Qwen3-MoE** — `q_norm`/`k_norm` present; `mlp.experts.{e}.gate_proj/up_proj/down_proj`; per-layer MoE-or-dense
+///     by `decoder_sparse_step`/`mlp_only_layers`; `norm_topk_prob` from config.
+///   - **Mixtral** — no QK-norm; `block_sparse_moe.gate` + `experts.{e}.w1/w3/w2` (gate/up/down); EVERY layer MoE; and
+///     the top-k is ALWAYS renormalised (HF's `/= routing_weights.sum(dim=-1)` is unconditional and the config has no
+///     `norm_topk_prob` key at all), so `norm_topk` is forced on. Sliding is gated on `sliding_window` being SET (8x7B:
+///     4096; 8x22B: null ⇒ full attention) — Mixtral has no `use_sliding_window` flag.
+///   - **Qwen2-MoE** — no QK-norm; `mlp.experts.{e}.*` like Qwen3, PLUS an always-on shared expert whose SwiGLU output
+///     is scaled per token by `sigmoid(mlp.shared_expert_gate)` and added to the routed mixture.
 fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    let model_type = c.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let mixtral = model_type.starts_with("mixtral");
     let swa = c.get("use_sliding_window").and_then(|v| v.as_bool()).unwrap_or(false);
-    let window = if swa { geti(c, "sliding_window").unwrap_or(4096) } else { 0 };
+    let window = if mixtral {
+        c.get("sliding_window").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+    } else if swa {
+        geti(c, "sliding_window").unwrap_or(4096)
+    } else {
+        0
+    };
     let nh = geti(c, "num_attention_heads").unwrap();
     let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
     let d = geti(c, "hidden_size").unwrap();
@@ -938,19 +980,41 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
     let (nl, ffn, vocab) = (geti(c, "num_hidden_layers").unwrap(), geti(c, "intermediate_size").unwrap(), geti(c, "vocab_size").unwrap());
     let (theta, eps) = rope_theta_eps(c);
     let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
-    let n_exp = geti(c, "num_experts").or_else(|| geti(c, "num_local_experts")).unwrap_or(0); // Qwen serializes num_local_experts
+    let n_exp = geti(c, "num_experts").or_else(|| geti(c, "num_local_experts")).unwrap_or(0); // Qwen3/Mixtral: num_local_experts
     let topk = geti(c, "num_experts_per_tok").unwrap_or(0);
     let moe_inter = geti(c, "moe_intermediate_size").unwrap_or(0);
-    let norm_topk = c.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(false);
+    let norm_topk = if mixtral {
+        true // HF Mixtral renormalises the selected top-k unconditionally — see the fn doc.
+    } else {
+        c.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(false)
+    };
     let sparse_step = geti(c, "decoder_sparse_step").unwrap_or(1);
     let mlp_only: Vec<usize> = c.get("mlp_only_layers").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect()).unwrap_or_default();
-    let is_moe = |l: usize| !mlp_only.contains(&l) && n_exp > 0 && (l + 1) % sparse_step == 0;
+    let is_moe = |l: usize| {
+        mixtral || (!mlp_only.contains(&l) && n_exp > 0 && (l + 1) % sparse_step == 0)
+    };
+    // QK-norm's weights exist iff the family has QK-norm, and the shared expert is optional and ships with its own gate.
+    // Probe the FIRST MoE layer, not layer 0: with `decoder_sparse_step`/`mlp_only_layers` layer 0 can be a DENSE mlp,
+    // which has neither tensor. Probing it would advertise a shared-expert width that convert never wrote — the kernel
+    // would then read a missing array. `shared_inter` is written as 0 unless the probe found one, so the kernel's
+    // enable bit and the arrays on disk can never disagree.
+    let first_moe = (0..nl).find(|&l| is_moe(l)).unwrap_or(0);
+    let qk_norm = m.has(&format!("model.layers.{first_moe}.self_attn.q_norm.weight"));
+    let shared_inter = geti(c, "shared_expert_intermediate_size").unwrap_or(0);
+    let has_shared = shared_inter > 0
+        && m.has(&format!("model.layers.{first_moe}.mlp.shared_expert.gate_proj.weight"));
     let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, ffn, vocab, tie as usize, n_exp, topk, moe_inter, norm_topk as usize];
     for l in 0..nl { config.push(if is_moe(l) { 1 } else { 0 }); } // MoE flags start at config[12]
     config.push(window); // sliding window, all layers (0 = full attention)
-    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen3moe",
+    config.push(qk_norm as usize);
+    config.push(has_shared as usize);
+    config.push(if has_shared { shared_inter } else { 0 });
+    let mut manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "qwen3moe",
         "config": config, "config_f": [theta, eps] });
+    if mixtral || model_type.starts_with("qwen2_moe") {
+        manifest["source_model_type"] = serde_json::json!(model_type);
+    }
 
     let mut w = BundleWriter::new(stem)?;
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
@@ -972,18 +1036,41 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
         let p = format!("model.layers.{l}.");
         norm(&mut w, &format!("l{l}.in_ln"), &format!("{p}input_layernorm.weight"))?;
         norm(&mut w, &format!("l{l}.post_ln"), &format!("{p}post_attention_layernorm.weight"))?;
-        norm(&mut w, &format!("l{l}.q_norm"), &format!("{p}self_attn.q_norm.weight"))?;
-        norm(&mut w, &format!("l{l}.k_norm"), &format!("{p}self_attn.k_norm.weight"))?;
+        if qk_norm { // Mixtral/Qwen2-MoE ship no q_norm/k_norm — writing them would fabricate a normalisation that
+            norm(&mut w, &format!("l{l}.q_norm"), &format!("{p}self_attn.q_norm.weight"))?; // torch never applies.
+            norm(&mut w, &format!("l{l}.k_norm"), &format!("{p}self_attn.k_norm.weight"))?;
+        }
         for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
             lin(&mut w, &format!("l{l}.{proj}"), &format!("{p}{proj}.weight"))?;
+            let bias = format!("{p}{proj}.bias");
+            if m.has(&bias) {
+                norm(&mut w, &format!("l{l}.{proj}.bias"), &bias)?;
+            }
         }
         if is_moe(l) {
-            lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?; // router (n_exp, d) -> (d, n_exp)
-            // Qwen3-MoE checkpoints store each expert as separate gate_proj/up_proj/down_proj Linears (not packed).
-            for e in 0..n_exp {
-                for (fr, hf) in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")] {
-                    lin(&mut w, &format!("l{l}.experts.{e}.{fr}"), &format!("{p}mlp.experts.{e}.{hf}.weight"))?;
+            if mixtral {
+                // Mixtral's block is `block_sparse_moe` and its experts are w1 (gate) / w3 (up) / w2 (down).
+                lin(&mut w, &format!("l{l}.gate"), &format!("{p}block_sparse_moe.gate.weight"))?;
+                for e in 0..n_exp {
+                    for (fr, hf) in [("gate", "w1"), ("up", "w3"), ("down", "w2")] {
+                        lin(&mut w, &format!("l{l}.experts.{e}.{fr}"),
+                            &format!("{p}block_sparse_moe.experts.{e}.{hf}.weight"))?;
+                    }
                 }
+            } else {
+                lin(&mut w, &format!("l{l}.gate"), &format!("{p}mlp.gate.weight"))?; // router (n_exp, d) -> (d, n_exp)
+                // Qwen3-MoE / Qwen2-MoE checkpoints store each expert as separate gate_proj/up_proj/down_proj Linears.
+                for e in 0..n_exp {
+                    for (fr, hf) in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")] {
+                        lin(&mut w, &format!("l{l}.experts.{e}.{fr}"), &format!("{p}mlp.experts.{e}.{hf}.weight"))?;
+                    }
+                }
+            }
+            if has_shared {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    lin(&mut w, &format!("l{l}.shared.{proj}"), &format!("{p}mlp.shared_expert.{proj}.weight"))?;
+                }
+                lin(&mut w, &format!("l{l}.shared_gate"), &format!("{p}mlp.shared_expert_gate.weight"))?;
             }
         } else {
             for proj in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
@@ -1551,6 +1638,17 @@ mod tests {
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_text"})), Some("qwen35"));
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe"})), Some("qwen35moe"));
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe_text"})), Some("qwen35moe"));
+        // Mixtral + Qwen2-MoE ride the qwen3moe kernel. "qwen2_moe" must beat the rope family's "qwen2" prefix, and
+        // "mixtral" has no other claimant — these pin both, since a wrong answer here silently converts the checkpoint
+        // as a dense Llama.
+        assert_eq!(infer_arch(&json!({"model_type": "mixtral"})), Some("qwen3moe"));
+        assert_eq!(infer_arch(&json!({"model_type": "mixtral_moe"})), Some("qwen3moe"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen2_moe"})), Some("qwen3moe"));
+        assert_eq!(infer_arch(&json!({"model_type": "qwen2"})), Some("rope"));
+        // unknown families still pass through to the caller's explicit --arch rather than being guessed at
+        assert_eq!(infer_arch(&json!({"model_type": "brand_new_family"})), None);
+        assert_eq!(infer_arch(&json!({"model_type": "gemma3_text"})), Some("gemma3"));
+        assert_eq!(infer_arch(&json!({"model_type": "deepseek_v4"})), Some("dsv4"));
         assert!(check_mimo_config(&json!({"use_sliding_window": false, "use_mrope": false})).is_ok());
         assert!(check_mimo_config(&json!({"use_sliding_window": true})).is_err());
         assert!(check_mimo_config(&json!({"use_mrope": true})).is_err());
@@ -1630,4 +1728,136 @@ mod tests {
         let dots = b.rowdot_f32("embed", &[1.0, 1.0, 1.0, 1.0]); // dot with ones = sum of the dequantised row
         assert!((dots[1] - rows.row(0).sum()).abs() < 1e-4, "rowdot {} vs {}", dots[1], rows.row(0).sum());
     }
+}
+
+/// GPT-OSS (`model_type: gpt_oss`): the RoPE backbone with **attention biases**, a per-head **attention
+/// sink**, **alternating** sliding/full layers, **YaRN** rope over the full head_dim, and the gpt-oss
+/// clamped SwiGLU over per-expert packed weights.
+///
+/// The pieces that are easy to get wrong, all probed here and mirrored in `src/gptoss.rs`:
+/// * the router takes the top-k on the RAW (biased) logits and softmaxes only those top-k values;
+/// * the expert `gate_up_proj` is **INTERLEAVED** (`gate_up[..., ::2]`, `gate_up[..., 1::2]`), not split in
+///   half — so gate `j` is at column `2j`;
+/// * both `gate_up_proj_bias` and `down_proj_bias` are per-expert and load-bearing;
+/// * `alpha = 1.702` / `limit = 7.0`, and the activation is `(up+1)·glu`, not `silu(g)·u`;
+/// * `layer_types[i] = sliding if (i+1)%2 else full`, so layer 0 is SLIDING and layer 1 is full;
+/// * YaRN: factor 32, beta_fast 32, beta_slow 1, truncate False, original max 4096.
+///
+/// Experts are written one array each (the mmap-offload contract), streamed a row at a time so a 128-expert
+/// checkpoint does not have to be materialised as f32.
+fn convert_gptoss(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    if m.has("model.layers.0.mlp.experts.gate_up_proj_blocks") {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+            "GPT-OSS packed MXFP4 experts are not supported; use floating-point safetensors (F32/F16/BF16)"));
+    }
+    let nl = geti(c, "num_hidden_layers").unwrap();
+    let nh = geti(c, "num_attention_heads").unwrap();
+    let d = geti(c, "hidden_size").unwrap();
+    let hd = geti(c, "head_dim").unwrap_or(d / nh);
+    let nkv = geti(c, "num_key_value_heads").unwrap_or(nh);
+    let vocab = geti(c, "vocab_size").unwrap();
+    let inter = geti(c, "intermediate_size").unwrap();
+    let n_exp = geti(c, "num_local_experts").or_else(|| geti(c, "num_experts")).unwrap_or(0);
+    let topk = geti(c, "num_experts_per_tok").unwrap_or(0);
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let eps = getf(c, "rms_norm_eps").unwrap_or(1e-5);
+    let alpha = 1.702f64;
+    let limit = 7.0f64;
+    // layer_types: "sliding_attention" if (i+1)%2 else "full_attention". Fall back to that exact pattern
+    // when the key is absent, so a minimal config still converts to the real architecture.
+    let lt: Vec<String> = c.get("layer_types").and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|x| x.as_str().unwrap_or("full_attention").to_string()).collect())
+        .unwrap_or_else(|| (0..nl).map(|i| if (i + 1) % 2 != 0 { "sliding_attention" } else { "full_attention" }.to_string()).collect());
+    let window = geti(c, "sliding_window").unwrap_or(0);
+    let rope = c.get("rope_parameters").cloned().unwrap_or(serde_json::json!({}));
+    let g = |k: &str, d: f64| rope.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    let yarn_factor = g("factor", 32.0);
+    let beta_fast = g("beta_fast", 32.0);
+    let beta_slow = g("beta_slow", 1.0);
+    let orig_max = g("original_max_position_embeddings", 4096.0);
+    // GPT-OSS keeps rope_theta INSIDE rope_parameters, not at the top level
+    let theta = rope.get("rope_theta").and_then(|v| v.as_f64())
+        .or_else(|| c.get("rope_theta").and_then(|v| v.as_f64())).unwrap_or(150000.0);
+    // YaRN's `attention_factor`. transformers has three cases, and taking the "ratio" by default is the
+    // trap: when `mscale`/`mscale_all_dim` are ABSENT it uses `get_mscale(factor)` = 1 + 0.1·ln(factor)
+    // DIRECTLY (≈1.3466 at factor 32), NOT 1.0. Getting this wrong costs top-1 positions with no shape error.
+    //
+    // WHERE it lands: it scales **cos/sin only** (`cos = emb.cos() * self.attention_scaling`). GPT-OSS's
+    // attention `scaling` is a bare `head_dim**-0.5` — unlike DeepSeek-V3, this arch does NOT fold mscale
+    // into the softmax scale. It is stored here purely so the kernel can scale the rotated vectors.
+    let get_mscale = |scale: f64, m: f64| if scale <= 1.0 { 1.0 } else { 0.1 * m * scale.ln() + 1.0 };
+    let att_factor = if let Some(af) = rope.get("attention_factor").and_then(|v| v.as_f64()) {
+        af
+    } else {
+        match (rope.get("mscale").and_then(|v| v.as_f64()), rope.get("mscale_all_dim").and_then(|v| v.as_f64())) {
+            (Some(ms), Some(mad)) => get_mscale(yarn_factor, ms) / get_mscale(yarn_factor, mad),
+            _ => get_mscale(yarn_factor, 1.0),
+        }
+    };
+
+    let mut config: Vec<usize> = vec![nl, nh, nkv, hd, d, vocab, tie as usize, n_exp, topk, inter];
+    for l in 0..nl { config.push((lt[l] == "sliding_attention") as usize); }
+    config.push(window);
+    let manifest = serde_json::json!({ "format": "fieldrun-bundle", "version": 1, "arch": "gptoss",
+        "config": config,
+        "config_f": [theta, eps, alpha, limit, att_factor, yarn_factor, beta_fast, beta_slow, orig_max] });
+
+    let mut w = BundleWriter::new(stem)?;
+    let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_lin(name, &dt, s[0], s[1], dtype)
+    };
+    let bias = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
+        let (s, dt) = m.read(hf);
+        w.put_small(name, &dt, &s, dtype)
+    };
+    let (es, ed) = m.read("model.embed_tokens.weight");
+    w.put_embed("embed", &ed, &es, edt, dtype)?;
+    norm(&mut w, "norm", "model.norm.weight")?;
+    if !tie {
+        let (s, dt) = m.read("lm_head.weight");
+        w.put_embed("lm_head", &dt, &s, edt, dtype)?;
+    }
+    for l in 0..nl {
+        let p = format!("model.layers.{l}.");
+        let q = format!("l{l}.");
+        norm(&mut w, &format!("{q}input_layernorm"), &format!("{p}input_layernorm.weight"))?;
+        norm(&mut w, &format!("{q}post_attention_layernorm"), &format!("{p}post_attention_layernorm.weight"))?;
+        // attention projections carry BIASES in this family
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            lin(&mut w, &format!("{q}self_attn.{proj}"), &format!("{p}self_attn.{proj}.weight"))?;
+            bias(&mut w, &format!("{q}self_attn.{proj}.bias"), &format!("{p}self_attn.{proj}.bias"))?;
+        }
+        bias(&mut w, &format!("{q}self_attn.sinks"), &format!("{p}self_attn.sinks"))?;
+        // router (with bias) + one array per expert
+        lin(&mut w, &format!("{q}router"), &format!("{p}mlp.router.weight"))?;
+        bias(&mut w, &format!("{q}router.bias"), &format!("{p}mlp.router.bias"))?;
+        let gu_shape = m.shape(&format!("{p}mlp.experts.gate_up_proj"));   // (E, hidden, 2*inter)
+        let dn_shape = m.shape(&format!("{p}mlp.experts.down_proj"));      // (E, inter, hidden)
+        for e in 0..n_exp {
+            // put_lin takes (out, in) row-major data and STORES (in, out). GPT-OSS ships these experts as
+            // nn.Parameter(E, in, out) — already (in, out) — so the slice is transposed here first; handing
+            // put_lin the raw (in, out) data would transpose it twice and silently scramble every weight.
+            let gu = m.read_rows(&format!("{p}mlp.experts.gate_up_proj"), e, 1); // flat (hidden, 2*inter)
+            let gu_t = BundleWriter::transpose(&gu, gu_shape[1], gu_shape[2]);  // -> (2*inter, hidden)
+            w.put_lin(&format!("{q}experts.{e}.gate_up"), &gu_t, gu_shape[2], gu_shape[1], dtype)?;
+            // the per-expert biases ship PACKED as (E, 2*inter) / (E, hidden) — slice row e
+            let gb = m.read_rows(&format!("{p}mlp.experts.gate_up_proj_bias"), e, 1);
+            // NB the name must NOT contain ".experts." — that substring routes an array into the PAGED map
+            // (loader.rs:330), and these biases are tiny + read on every forward, so they belong resident.
+            w.put_small(&format!("{q}expertbias.{e}.gate_up"), &gb, &[2 * inter], dtype)?;
+            let dn = m.read_rows(&format!("{p}mlp.experts.down_proj"), e, 1);   // flat (inter, hidden)
+            let dn_t = BundleWriter::transpose(&dn, dn_shape[1], dn_shape[2]); // -> (hidden, inter)
+            w.put_lin(&format!("{q}experts.{e}.down"), &dn_t, dn_shape[2], dn_shape[1], dtype)?;
+            let db = m.read_rows(&format!("{p}mlp.experts.down_proj_bias"), e, 1);
+            w.put_small(&format!("{q}expertbias.{e}.down"), &db, &[d], dtype)?;
+        }
+    }
+    let n = w.arrays.len();
+    w.finish(stem, manifest)?;
+    Ok(n)
 }

@@ -119,6 +119,76 @@ def make_config():
             **({"max_position_embeddings": 256} if not yarn else {}),
             **extra,
         )
+    if ARCH.startswith("gptoss"):
+        from transformers import GptOssConfig
+        # GPT-OSS: attention biases, a per-head attention SINK, ALTERNATING layer types (0=sliding,
+        # 1=full), the gated router (top-k on raw logits, softmax over just those k) and the clamped
+        # interleaved gate/up with alpha/limit + per-expert biases. 4 layers exercises the alternation twice.
+        return GptOssConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=16,           # expert width
+            num_hidden_layers=4,            # GptOssConfig derives 0 sliding, 1 full, 2 sliding, 3 full
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            sliding_window=4,               # small so seq>window actually masks on the sliding layers
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False,
+            max_position_embeddings=256,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
+    if ARCH.startswith("qwen2moe"):
+        from transformers import Qwen2MoeConfig
+        # Qwen2-MoE: the RoPE backbone with NO QK-norm plus a shared expert that is ADDED to the routed mixture and
+        # scaled per token by sigmoid(mlp.shared_expert_gate).
+        return Qwen2MoeConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,          # dense layers
+            moe_intermediate_size=16,      # routed experts
+            shared_expert_intermediate_size=16,  # the always-on shared expert (same width here, separable by the gate)
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,        # every layer MoE, so the shared expert lands in ALL layers and the
+                                         # column is discriminating (at step=2 — 1 MoE layer — dropping it moved
+                                         # only 2/60 positions); the dense path stays covered by qwen3moe rows.
+            norm_topk_prob=True,          # exercise the top-k renorm (real Qwen2-57B-A14B sets this)
+            max_position_embeddings=256,
+            tie_word_embeddings=False,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
+    if ARCH.startswith("mixtral"):
+        from transformers import MixtralConfig
+        # Mixtral, in the two regimes that ship: `mixtral` = 8x7B (sliding_window SET), `mixtralfull` = 8x22B
+        # (sliding_window null => full attention). No QK-norm; every layer is a block_sparse_moe; HF renormalises the
+        # top-k unconditionally, which is what the kernel's forced norm_topk encodes.
+        return MixtralConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,          # unused by the MoE forward, but part of the config
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            sliding_window=4 if ARCH == "mixtral" else None,  # small so seq>window actually masks
+            max_position_embeddings=256,
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
     if ARCH.startswith("qwen3moe"):
         from transformers import Qwen3MoeConfig
         swa = ARCH == "qwen3moeswa"
@@ -206,7 +276,10 @@ def build():
     torch.manual_seed(SEED)
     cfg = make_config()
     tf = __import__("transformers")
-    Cls = (tf.Qwen3ForCausalLM if ARCH == "qwen3"
+    Cls = (tf.GptOssForCausalLM if ARCH.startswith("gptoss")
+           else tf.MixtralForCausalLM if ARCH.startswith("mixtral")
+           else tf.Qwen2MoeForCausalLM if ARCH.startswith("qwen2moe")
+           else tf.Qwen3ForCausalLM if ARCH == "qwen3"
            else tf.DeepseekV4ForCausalLM if ARCH == "dsv4"
            else tf.MiniMaxM2ForCausalLM if ARCH == "minimax"
            else tf.DeepseekV3ForCausalLM if ARCH.startswith("mla")
@@ -221,14 +294,31 @@ def build():
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
-                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv", "gemma4kvshare", "dsv4") else 0.0))
+                p.copy_(torch.randn_like(p) * 0.1 + (1.0 if ARCH in ("mlayarn", "qwen3", "gemma4keqv", "gemma4kvshare", "dsv4",
+                              "mixtral", "mixtralfull", "qwen2moe", "gptoss") else 0.0))
             # Identity-init router scales (Gemma-4 MoE): mean-1 so the `*scale`/`*per_expert_scale` terms become
             # discriminating — at the ones() default a bug in either is invisible.
+            elif ARCH.startswith(("qwen2moe", "gptoss")) and (name.endswith(".bias") or name.endswith("_bias")):
+                # Nonzero biases make omission observable in the faithfulness gate.
+                p.copy_(torch.randn_like(p) * 0.2)
             elif name.endswith(("router.scale", "router.per_expert_scale")):
                 p.copy_(torch.randn_like(p) * 0.1 + 1.0)
+            # Mixtral/Qwen2-MoE: HF initialises every MoE linear at initializer_range=0.02, so at this scale the
+            # sparse block contributes almost nothing to the logits — the column then passes 60/60 even with the
+            # shared expert deleted (measured: only 2/60 positions move). Rescale the routed experts, the router
+            # and the shared expert to std 0.2 for these two families so the sparse block is load-bearing and the
+            # gate can actually fail. Scoped to them on purpose: the pre-existing rows keep their published numbers.
+            elif ARCH.startswith(("mixtral", "qwen2moe")) and (
+                    ".experts." in name or "shared_expert" in name
+                    or name.endswith("mlp.gate.weight") or name.endswith("block_sparse_moe.gate.weight")):
+                p.copy_(torch.randn_like(p) * 0.2)
             # DeepSeek-V4 identity-init PARAMETERS the kernel must read (else the gate is blind to those code paths):
             #   self_attn.sinks (per-head attention sink, init 0 — a zero sink is NOT a no-op in the softmax);
             #   attn_hc/ffn_hc/hc_head base (HC additive gates, init 0) + scale (HC multiplicative, init 1).
+            # GPT-OSS attention sink inits to 0, and a ZERO sink is NOT a no-op (it is concatenated to the
+            # logits and softmaxed with them) — mean-0 would leave that path blind to any bug in it.
+            elif ARCH.startswith("gptoss") and name.endswith("self_attn.sinks"):
+                p.copy_(torch.randn_like(p) * 0.5)
             elif ARCH == "dsv4" and name.endswith("self_attn.sinks"):
                 p.copy_(torch.randn_like(p) * 0.5)
             elif ARCH == "dsv4" and name.endswith(("attn_hc.base", "ffn_hc.base", "hc_base")):
@@ -269,7 +359,10 @@ def compare(dump_path):
     rust = [int(x) for x in open(dump_path).read().split()]
     n = min(len(ref), len(rust))
     agree = sum(1 for a, b in zip(ref[:n], rust[:n]) if a == b)
-    cls = ("Qwen3ForCausalLM" if ARCH == "qwen3"
+    cls = ("GptOssForCausalLM" if ARCH.startswith("gptoss")
+           else "MixtralForCausalLM" if ARCH.startswith("mixtral")
+           else "Qwen2MoeForCausalLM" if ARCH.startswith("qwen2moe")
+           else "Qwen3ForCausalLM" if ARCH == "qwen3"
            else "DeepseekV4ForCausalLM" if ARCH == "dsv4"
            else "MiniMaxM2ForCausalLM" if ARCH == "minimax"
            else "DeepseekV3ForCausalLM" if ARCH.startswith("mla")

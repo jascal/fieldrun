@@ -52,7 +52,18 @@ diverges without explaining why.
   (plain-gate router: softmax → top-k → optional renorm; SwiGLU experts read from the mmap) + optional **sliding
   window** (`use_sliding_window`: ONE window on every layer — no per-layer pattern, unlike Gemma 3). No new attention
   kernel — reuses the MoE-FFN + expert-offload. KV-cache `generate` (+ int8-KV) and `explain` wired; on a MoE layer the
-  explain feature is the dominant expert's promoted neuron.
+  explain feature is the dominant expert's promoted neuron. **The same kernel also carries Mixtral and Qwen2-MoE** — the
+  three families differ in exactly three places, all probed from the CHECKPOINT at convert (never inferred at runtime,
+  so a re-upload under a different `model_type` still converts right): **QK-norm** is on only where `q_norm` exists
+  (Mixtral/Qwen2-MoE have none, and `head_norm` reads a *required* array, so the guard is one call at each of the six
+  forward sites rather than a per-site `if`); **Mixtral** names its block `block_sparse_moe` with `w1/w3/w2` experts,
+  makes EVERY layer MoE, renormalises the top-k unconditionally (HF's `/= routing_weights.sum(-1)` has no config key, so
+  `norm_topk` is forced), and gates sliding on `sliding_window` merely being SET (8x7B 4096 / 8x22B null); **Qwen2-MoE**
+  adds an always-on shared expert whose SwiGLU output is scaled per token by `sigmoid(shared_expert_gate)` and *added*
+  to the routed mixture. Qwen2-MoE q/k/v biases are stored and applied in every forward/scoring path; the tiny
+  reference randomizes these biases so omission is observable. Validated f32 60/60 each vs `MixtralForCausalLM` / `Qwen2MoeForCausalLM`, plus the SWA and
+  full-attention Mixtral regimes. Two of these bits are **load-bearing, and the sweep proves it by ablation**: dropping
+  the shared expert or the forced renorm moves 2–8 of 60 positions, dropping the window moves 39.
 - `src/qwen35moe.rs` + `src/deltanet.rs` — Qwen3.5 / Qwen3.6 (`model_type: qwen3_5` dense, `qwen3_5_moe` MoE; this single
   arch also covers the 27B Qwen3.6/3.8 dense releases, which are shape-identical): a **hybrid** stack — 3 of every 4 layers
   are Gated DeltaNet *linear* attention (`deltanet.rs`, pinned ~1e-7 vs `torch_recurrent_gated_delta_rule`), the 4th is gated
@@ -76,8 +87,12 @@ diverges without explaining why.
   per-head) + all-MoE with a sigmoid router (+bias for the choice, sigmoid renormed for the weight; no group, no shared
   expert). Mixtral-style expert weights on disk (`block_sparse_moe.experts.{e}.w1/w2/w3`). Experts paged. KV-cache
   `generate` (+ int8-KV) and `explain` (dominant-expert feature) wired.
+- `src/gptoss.rs` — GPT-OSS: biased attention projections, learned per-head sinks, alternating sliding/full
+  attention, YaRN, and biased interleaved clamped SwiGLU experts. Experts remain mmap-paged. Validated f32/f16/int8/int4 60/60 against a tiny `GptOssForCausalLM` with nonzero biases. KV-cache generation,
+  int8 KV, prefix reuse, explain, and routed blind-max are wired. The blind-max candidate and corpus paths recompute
+  full causal history (no scorer cache). Conversion accepts floating-point expert tensors; packed MXFP4 is unsupported.
 - `src/convert.rs` — `convert` subcommand: HF safetensors (single/sharded, mmap-streamed) → bundle, pure Rust, all
-  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax`), `--dtype int8|f16|f32` (f32 = bit-exact, for the
+  archs (`--arch gpt2|rope|gemma|gemma3|gemma4|qwen3moe|mla|minimax|gptoss` — `qwen3moe` also takes Mixtral/Qwen2-MoE), `--dtype int8|f16|f32` (f32 = bit-exact, for the
   faithfulness gate). `-o` defaults to `bundles/<name>/<name>` (grouped, not loose in cwd); copies `tokenizer.json` next
   to the bundle + records `eos` in the manifest (for chat / the text API). MoE experts written one int8 array each
   (independently pageable). lm_head (non-tied unembed) stored raw (vocab, d) low-precision — read row-wise by
@@ -108,7 +123,41 @@ diverges without explaining why.
   PAGED and `weight_row` cannot see them. The two forms are the same flag: `--blind-max 7,42` names a dense
   unit (layer 7, neuron 42), `--blind-max 7,3,42` names expert 3's neuron 42 on layer 7 — so a MoE bundle
   accepts only the three-component form and a dense bundle only the two, and each says so rather than
-  guessing.
+  guessing. (The 3-component order is `<layer>,<expert>,<neuron>`, the order this doc, the CLI help and the
+  readout `L/E/N` all use; the parser used to take the expert from the THIRD field, so a 3-field spec named
+  the wrong unit rather than failing — on a many-expert model both indices are in range, which is why it
+  went unnoticed.) Routed support now covers `qwen35moe`, the **`qwen3moe` family** (Qwen3-MoE, Mixtral,
+  Qwen2-MoE), **`minimax`**, **`gemma4`** and **`mla`**: the cached scorer there is a KV-cache twin of the
+  forward — `Qwen3Scorer` / `MiniMaxScorer` / `Gemma4Scorer` / `MlaScorer` clone K/V into a snapshot so
+  candidates can't see each other's writes, where Qwen3.5 has to advance a hybrid DeltaNet state
+  instead. `qwen3moe`'s test module pins the invariants: the scorer step is **bit-identical** to a
+  naive per-position forward, candidates are independent, the routed objective equals
+  `w_router · silu(gate_n)·up_n` and is `NaN` (never 0) where the router skipped the expert, a MoE
+  bundle reports `RoutedLayers` rather than `NoScorer`, and the QK-norm bit is load-bearing.
+  `minimax` adds the case where the two must NOT be conflated: its top-k is chosen on `sigmoid + bias`
+  but the weight is the **raw sigmoid** renormalised over the kept set, so a test that reused the
+  softmax formula would pass the bias and fail the weight (or vice versa). `gemma4` adds a router
+  with FIVE terms (weightless RMSNorm, per-channel `router.scale`, 1/√d, softmax→top-k→renorm, and a
+  per-EXPERT `router.per_expert_scale` that is part of the weight) and a **GEGLU** activation, not
+  SwiGLU — dropping any term still "works", just wrongly. Its scorer caches per-LAYER-WIDTH
+  (`nkv_of(l)·hd_of(l)`; sliding and global layers differ, and KV-shared layers point at an earlier
+  layer's cache). A **dense** Gemma-4 bundle reports `NoScorer`, not `Supported`: only the routed arm
+  exists there, so claiming support would promise a dense probe that does not exist. `mla` adds group-
+  limited routing (the group score is the top-2 of the **biased** choice within each group; the weight
+  is the **unbiased** sigmoid renormed and scaled) and a guard with teeth: its first `first_k` layers
+  are dense, so a routed unit named there returns None rather than a fabricated value. `dsv4` closes the
+  set with a **fourth** weight form (`sqrtsoftplus`, biased choice / unbiased weight) and — because it has
+  no KV cache yet — a deliberately *uncached* probe: each candidate re-runs the whole forward, which is
+  exact by construction and costs O(prefix). A cache twin would be faster and would add a way for the
+  scorer to silently disagree with the forward; the assertion that keeps this honest is candidate
+  independence, which becomes a real snapshot/restore property the moment `generate` lands. No MoE arch
+  declines blind-max any more.
+  GPT-OSS also supports routed probes through an uncached walk (despite having KV-cached generation). For both
+  GPT-OSS and DeepSeek-V4, K candidates × S successful steps means K*S full forwards over growing prefixes;
+  corpus chunks recompute prefixes of 32, 64, ... tokens. Long prefixes/corpora and paged experts amplify this cost;
+  GPT-OSS materializes quadratic attention-score matrices. No wall-clock benchmark is claimed. See README's routed
+  probe table for activation/weight semantics and shared-expert exclusions. The int8-KV generation sweep diverged
+  from naive f32 on Gemma-4 MoE and the sharp MLA YaRN fixture; f32 KV and quantized prefix-reuse checks passed.
 - `scripts/make_corpora.py` — corpus generator, **parameterised by tokenizer**. A corpus is a list of token IDs
   and is only meaningful for the tokenizer that produced it: Qwen3.5 has a 248070-entry vocabulary against
   Qwen2.5's 151665, so a Qwen2.5 corpus fed to a Qwen3.5 bundle indexes the wrong embeddings. Qwen3 and
@@ -139,7 +188,7 @@ diverges without explaining why.
   Default build excludes all of this (no GPU dependency).
 - `src/main.rs` — CLI: scoring, `--generate`, `--route-frac`, `--explain`, `--serve`, `--dump`.
 
-Done across the board: Tier A/B (**10 archs**: GPT-2, GPT-NeoX/Pythia (neox), RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE** incl. sliding window, **MLA** (DeepSeek-V3/R1/Kimi-K2, incl. YaRN + interleaved rotary; V4 is a different attention class, see below), **MiniMax-M2**), KV-cache +
+Done across the board: Tier A/B (**10 archs**: GPT-2, GPT-NeoX/Pythia (neox), RoPE/Qwen2.5, Gemma-2/3/4 incl. **Gemma-4 MoE**, **Qwen3-MoE** incl. sliding window **and incl. Mixtral + Qwen2-MoE on that same kernel**, **MLA** (DeepSeek-V3/R1/Kimi-K2, incl. YaRN + interleaved rotary; V4 is a different attention class, see below), **MiniMax-M2**), KV-cache +
 **int8 KV cache** (`--kv-int8`, GPT-2/RoPE/Gemma-2/Gemma-3, ~4x smaller, lossy: near-lossless short-run, occasional
 greedy flips long-run), fp16/int8 bundles (int8 for all archs — embeddings stay fp16, linear weights int8 W8A8 +
 outlier-aware quant; signed int8 dot — stable NEON `vmull`/`vpadal` on aarch64, scalar elsewhere), **MoE expert-offload**

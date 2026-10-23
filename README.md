@@ -74,13 +74,26 @@ Every tier is validated by **top-1 agreement against the Python/torch reference*
   | `gemma4` (MoE) | Gemma4ForCausalLM `enable_moe_block` | 60/60 | 59/60 | 56/60 |
   | `qwen3moe` | Qwen3MoeForCausalLM      | 60/60 | 60/60 | 60/60 |
   | `qwen3moe` (sliding window) | Qwen3MoeForCausalLM `use_sliding_window` | 60/60 | 60/60 | 60/60 |
+  | `qwen3moe` (Mixtral sliding) | MixtralForCausalLM | 60/60 | 60/60 | 56/60 |
+  | `qwen3moe` (Mixtral full) | MixtralForCausalLM | 60/60 | 60/60 | 59/60 |
+  | `qwen3moe` (Qwen2-MoE, nonzero biases) | Qwen2MoeForCausalLM | 60/60 | 60/60 | 53/60 |
+  | `gptoss` (nonzero biases) | GptOssForCausalLM | 60/60 | 60/60 | 60/60 |
   | `mla`      | DeepseekV3ForCausalLM    | 60/60 | 60/60 | 60/60 |
   | `mla` (YaRN) | DeepseekV3ForCausalLM yarn `rope_parameters` | 60/60 | 59/60 | 54/60 |
   | `minimax`  | MiniMaxM2ForCausalLM     | 60/60 | 60/60 | 60/60 |
 
+  The Qwen2-MoE fixture uses nonzero q/k/v biases: dropping those biases reduces agreement to 3/60.
+  GPT-OSS also uses nonzero attention, router, and expert biases; its int4 bundle matches 60/60 on this fixture.
+
   The YaRN row is built deliberately *sharp* (mean-1 norm weights, large init) so it actually gates the rotary
   details — a wrong rope de-interleave agrees only ~11/60, a missing YaRN ramp ~32/60; its int8 dip is that same
   sharpness amplifying near-tie flips, not a kernel gap.
+
+**KV precision.** `--kv-int8` quantizes cached keys and values separately from bundle weights. In the 16-token
+generation sweep, Gemma-4 MoE and the sharp MLA YaRN fixture produced sequences different from naive f32;
+their f32 KV sequences matched exactly. Quantized prefix reuse matched a fresh quantized prefill on every tested
+architecture. These are different checks: cache reuse can be correct while quantization changes a greedy token.
+Use f32 KV when token identity matters; the tiny fixtures do not establish a safe context-length threshold for int8 KV.
 
 **Quality (precision sweep, `scripts/bench.sh`).** Aggregating 3 seeds × 120 positions per arch — `f32` holds 100%
 (the math is exact); `f16` is 99.7–100%; `int8` is 90.8–100%. The int8 dips are near-tie argmax flips on *tiny random*
@@ -120,9 +133,12 @@ Pick `--arch` by family:
 | `gemma`  | Gemma-2 | √d embed, 4-norm sandwich, logit soft-cap, sliding window |
 | `gemma3` | Gemma-3 (1B/4B/12B/27B) | + QK-norm, dual-base RoPE, 5:1 local/global, no soft-cap |
 | `gemma4` | Gemma-4 (E2B/E4B dense, **26B-A4B MoE**) | + value-norm, per-layer-type `head_dim`, partial-rotary global RoPE, PLE, MoE |
-| `qwen3moe` | Qwen3-MoE (e.g. 30B-A3B) | RoPE + QK-norm + sparse MoE + optional sliding window; no new attention kernel |
+| `qwen3moe` | Qwen3-MoE, Mixtral, Qwen2-MoE | RoPE + sparse MoE; checkpoint-specific QK-norm, q/k/v biases, shared expert, and sliding window |
 | `mla`    | DeepSeek-V3/R1, **Kimi-K2** | multi-head latent attention (incl. interleaved rotary + YaRN long-context) + group-limited sigmoid MoE + shared expert |
 | `minimax`| MiniMax-M2 | softmax attn + full-width q/k-norm + sigmoid-router MoE (no MLA, no shared expert) |
+| `gptoss` | GPT-OSS (floating-point safetensors) | Alternating sliding/full attention, learned sinks, YaRN, biased projections and interleaved clamped SwiGLU experts |
+
+GPT-OSS conversion accepts floating-point expert tensors (`F32`, `F16`, or `BF16`); packed MXFP4 checkpoints require dequantization before conversion. Its blind-max probe preserves full causal history by recomputing each candidate; corpus scoring batches positions but also recomputes prior history.
 
 All validated to top-1 agreement vs the torch reference (see the gate above). Big MoE models (Gemma-4 26B, Qwen3-MoE,
 DeepSeek/Kimi) use **expert offload** — the experts stay mmap'd on disk and only the active top-k page in per token, so
@@ -130,6 +146,37 @@ the resident set is the shared layers + a working set of hot experts, not the wh
 `generate`/`generate_stream` (+ optional int8 KV), and `explain` (live circuits + features) are wired for **every**
 arch — the incremental KV-cache decode is byte-identical to the naive full recompute (the f32 generation gate in
 `scripts/validate_all.sh`).
+
+**Routed blind-max probes.** `--blind-max <layer>,<expert>,<neuron>` uses zero-based coordinates;
+`--blind-max 7,3,42` selects expert 3's neuron 42 in layer 7. Dense probes use `--blind-max <layer>,<neuron>`.
+For example, append `--blind-max 7,3,42 --blind-cands 24 --blind-steps 8 --blind-corpus corpus.json` to a bundle
+invocation. Corpus IDs must use that bundle's tokenizer.
+
+Every routed probe scores `w_router * act[neuron]` before the expert's down projection, using the actual forward
+path's activation and mixture weight. A position that does not select the expert is skipped (internally NaN).
+Shared experts affect subsequent hidden states and routing, but the named unit always belongs to a routed expert;
+its score excludes the shared expert's activation. The output row used for proposals is the named expert's own
+down-projection row. `--blind-pole neg` reverses the objective. The blind/oracle ratio describes the configured
+search and corpus, and a ratio below one does not refute the unit's explanation.
+
+| Kernel / family | Named unit's activation and routing weight | Forward context used by the scorer |
+|---|---|---|
+| `qwen3moe`: Qwen3-MoE / Mixtral / Qwen2-MoE | SwiGLU; softmax weights with the forward's top-k renormalization policy | Actual QK-norm, projection biases, window and shared-expert settings; routed layers only |
+| `qwen35moe` | SwiGLU; renormalized softmax top-k | Carried DeltaNet state and full-attention KV; shared expert remains in the forward |
+| `minimax` | SwiGLU; unbiased sigmoid weights renormalized over experts chosen with correction bias | Full-width q/k norm and KV history; no shared expert |
+| `gemma4` MoE | GEGLU; renormalized softmax top-k times per-expert scale | Router normalization/scales, expert input norm, per-layer attention widths and KV sharing |
+| `mla` | SwiGLU; unbiased sigmoid weights with configured renormalization and routed scale | Group-limited biased selection, MLA/YaRN history and shared expert; initial dense layers decline routed coordinates |
+| `dsv4` (sliding subset) | Clamped SwiGLU; unbiased sqrtsoftplus weights renormalized and scaled | Sliding attention, mHC and shared expert; full causal recompute |
+| `gptoss` | Biased, interleaved clamped SwiGLU with `(up+1)`; softmax over selected biased logits | Learned sinks and the configured alternating sliding/full attention; full causal recompute |
+
+GPT-OSS and DeepSeek-V4 use a full forward for each candidate, so `K` candidates over `S` successful steps require
+`K*S` forwards on growing prefixes. Corpus scoring recomputes prefixes of 32, 64, 96, ... tokens, retaining the full
+causal history each time. This overhead grows with prefix length, corpus length, candidate count and step count;
+GPT-OSS additionally materializes quadratic attention-score matrices even on its masked sliding layers. It becomes
+particularly relevant for long contexts and disk-paged experts. Start with a short corpus and small candidate/step
+counts; no wall-clock overhead benchmark is claimed here. The uncached walks provide a reference for future cached
+scorers, which must preserve candidate isolation and agree with the forward. GPT-OSS generation already uses KV
+caching; this recompute limitation applies to its blind-max scorer.
 
 **`--recursion-explain`** (the recursion spectrum — COMPUTED / DEFERRED / BINDING long-range binds + nested-fold
 detection — and the value-stack logit-lens) additionally needs the per-position substrate `recursion_trace`, currently

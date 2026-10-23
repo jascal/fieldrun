@@ -453,7 +453,27 @@ impl Bundle {
         (shape, v)
     }
 
-    /// `x (tokens, in) @ expert_W (in, out)` for an on-demand expert weight — dequantised from the mmap per call.
+    /// `mm` plus a per-output-channel bias — GPT-OSS's attention projections all carry one (and Llama-3
+    /// dropped it, which is why this is not the default everywhere).
+    pub fn mm_bias(&self, a: &Array2<f32>, name: &str, bias: &str) -> Array2<f32> {
+        let mut out = self.mm(a, name);
+        let bv = self.arr1o(bias);
+        for mut row in out.rows_mut() { row += &bv; }
+        out
+    }
+
+    /// `expert_mm` plus a per-output-channel bias. GPT-OSS experts are the one family here with BOTH
+    /// `gate_up_proj_bias` and `down_proj_bias`; without them the MoE is quietly wrong, not merely imprecise.
+    pub fn expert_mm_bias(&self, x: &Array2<f32>, name: &str, bias: &str) -> Array2<f32> {
+        let (shape, w) = self.expert_f32(name);
+        let wv = ArrayView2::from_shape((shape[0], shape[1]), &w).unwrap();
+        let mut out = x.dot(&wv);
+        let bv = self.arr1o(bias);
+        for mut row in out.rows_mut() { row += &bv; }
+        out
+    }
+
+    /// `x (tokens, in) @ expert_W (in, out)`, dequantised from the mmap per call.
     pub fn expert_mm(&self, x: &Array2<f32>, name: &str) -> Array2<f32> {
         let (shape, w) = self.expert_f32(name);
         let wv = ArrayView2::from_shape((shape[0], shape[1]), &w).unwrap();

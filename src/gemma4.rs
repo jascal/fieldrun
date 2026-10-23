@@ -128,7 +128,15 @@ impl Gemma4 {
     /// The MoE-FFN expert branch for one layer: route each token to its top-k experts, then for each *active* expert
     /// dequantise its weights once (paged in from the mmap) and run its assigned tokens. `x_pre` is the pre-FFN hidden
     /// (= the residual the router and experts both read). Returns the (already pre/post-normed) expert contribution.
-    fn moe_branch(&self, l: usize, x_pre: &Array2<f32>) -> Array2<f32> {
+    /// `scan = Some((expert, neuron))` additionally returns the per-row value of that ONE routed unit —
+    /// `w_router · gelu_tanh(gate_n) · up_n` — recorded in the same pass so the expert's weights are read
+    /// once. Rows whose top-k does not contain `expert` stay `NaN`: the unit is not computed there at all,
+    /// so it has no value rather than a value of zero (see `Model::blind_moe_*`).
+    ///
+    /// NB the Gemma-4 router has three terms a plain softmax-router does not: a weightless RMSNorm, a
+    /// per-channel `router.scale`, and a per-EXPERT `router.per_expert_scale` that is part of the weight.
+    /// The activation is GEGLU (`gelu_tanh(gate) · up`), not SwiGLU. Both are load-bearing here.
+    fn moe_branch(&self, l: usize, x_pre: &Array2<f32>, scan: Option<(usize, usize)>) -> (Array2<f32>, Vec<f32>) {
         let p = format!("l{l}.");
         let seq = x_pre.nrows();
         // --- router (norm has no weight; then * scale * 1/√d; proj; softmax; top-k; renorm; per-expert scale) ---
@@ -161,6 +169,7 @@ impl Gemma4 {
         // --- experts (pre-norm’d input; each active expert dequantised once from the mmap) ---
         let h2_in = self.norm(x_pre, &format!("{p}pre_feedforward_layernorm_2"));
         let mut h2 = Array2::<f32>::zeros((seq, self.d));
+        let mut scan_out: Vec<f32> = scan.map(|_| vec![f32::NAN; seq]).unwrap_or_default();
         let mi = self.moe_inter;
         // Prefetch every active expert's weights up front (MADV_WILLNEED) so the OS pages experts 2..k from the mmap
         // while expert 1 is computed — overlapping the per-token page-in stalls that bound MoE decode under offload.
@@ -180,10 +189,15 @@ impl Gemma4 {
             }
             let outp = self.b.expert_mm(&hh, &format!("{p}experts.{e}.down")); // (ntok, d)
             for (i, &(t, w)) in toks.iter().enumerate() {
+                if let Some((se, sn)) = scan {
+                    if *e == se && sn < hh.ncols() {
+                        scan_out[t] = w * hh[[i, sn]];
+                    }
+                }
                 for c in 0..self.d { h2[[t, c]] += w * outp[[i, c]]; }
             }
         }
-        self.norm(&h2, &format!("{p}post_feedforward_layernorm_2"))
+        (self.norm(&h2, &format!("{p}post_feedforward_layernorm_2")), scan_out)
     }
 
     fn unembed(&self) -> &str {
@@ -389,7 +403,7 @@ impl Gemma4 {
             let combined = if self.moe {
                 // dense path normed by post_ffn_norm_1, expert path normed by post_ffn_norm_2 (inside moe_branch), summed
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -472,7 +486,7 @@ impl Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -552,7 +566,7 @@ impl Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -641,7 +655,7 @@ impl Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -688,6 +702,79 @@ impl Gemma4 {
     /// which differs between local and global layers) and attending over the whole cache (causal + per-layer sliding
     /// window). The PLE gated-residual block is per-token, so it is recomputed for the new rows only. cur = absolute
     /// position of the first new row.
+    /// `forward_block` that also returns the per-row value of ONE routed unit at the target layer — the
+    /// blind-max scoring kernel. Identical walk and arithmetic (same PLE inputs, same KV-sharing source,
+    /// same sliding pattern, same dense+MoE sum and norms), so its value is bit-identical to a naive
+    /// per-position forward; it only ADVANCES the cache, which is why the scorer snapshots before probing.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_scan(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>],
+                          vc: &mut [Array2<f32>], scan: Option<(usize, usize, usize)>) -> Vec<f32> {
+        let h = self.h;
+        let m = emb.nrows();
+        let klen = cur + m;
+        let mut x = emb.clone();
+        let pli = self.per_layer_inputs(ids, &x);
+        let mut scan_out: Vec<f32> = Vec::new();
+        for l in 0..self.n_layer {
+            let p = format!("l{l}.");
+            let hd = self.hd_of(l);
+            let nkv = self.nkv_of(l);
+            let rep = h / nkv;
+            let a = self.norm(&x, &format!("{p}input_layernorm"));
+            let q = self.derive_q(l, &a, cur);
+            if !self.is_shared(l) {
+                let (k, v) = self.derive_kv(l, &a, cur);
+                kc[l].slice_mut(s![cur..klen, ..]).assign(&k);
+                vc[l].slice_mut(s![cur..klen, ..]).assign(&v);
+            }
+            let src = self.kv_src[l];
+            let sliding = self.sliding[l];
+            let mut attn_out = Array2::<f32>::zeros((m, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = kc[src].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let vh = vc[src].slice(s![0..klen, kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..m {
+                    let abs = cur + i;
+                    for j in 0..klen {
+                        if j > abs || (sliding && j + self.window <= abs) { scores[[i, j]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = self.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            x = &x + &self.norm(&o, &format!("{p}post_attention_layernorm"));
+            let a2 = self.norm(&x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = self.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = self.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if self.moe {
+                let sc = scan.filter(|(sl, ..)| *sl == l).map(|(_, e, n)| (e, n));
+                let (mb, vals) = self.moe_branch(l, &x, sc);
+                if !vals.is_empty() { scan_out = vals; }
+                let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &mb
+            } else {
+                mlp
+            };
+            x = &x + &self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            if self.ple > 0 {
+                let mut g = self.b.mm(&x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[l];
+                let proj = self.b.mm(&g, &format!("{p}per_layer_projection"));
+                x = &x + &self.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+            }
+            x *= self.layer_scalar[l];
+        }
+        scan_out
+    }
+
     fn forward_block(&self, ids: &[i64], emb: &Array2<f32>, cur: usize, kc: &mut [Array2<f32>], vc: &mut [Array2<f32>]) -> Array2<f32> {
         let h = self.h;
         let m = emb.nrows();
@@ -734,7 +821,7 @@ impl Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -821,7 +908,7 @@ impl Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -862,7 +949,177 @@ impl Gemma4 {
     }
 }
 
+/// The blind-max scorer for this arch: a KV-cache twin of [`Gemma4::forward_block_scan`] held at position
+/// `pos`, with a snapshot so candidate tokens never see each other's writes. The cache is per-LAYER-WIDTH here
+/// (`nkv_of(l) · hd_of(l)` — sliding and global layers differ, and KV-shared layers point at an earlier
+/// layer's cache), so allocation goes through the same per-layer expression `generate` uses.
+struct Gemma4Scorer {
+    kc: Vec<Array2<f32>>,
+    vc: Vec<Array2<f32>>,
+    snap_kc: Vec<Array2<f32>>,
+    snap_vc: Vec<Array2<f32>>,
+    pos: usize,
+}
+
+impl Gemma4Scorer {
+    fn alloc(m: &Gemma4, total: usize) -> (Vec<Array2<f32>>, Vec<Array2<f32>>) {
+        let kc: Vec<Array2<f32>> = (0..m.n_layer)
+            .map(|l| Array2::zeros((total, m.nkv_of(l) * m.hd_of(l)))).collect();
+        let vc = kc.clone();
+        (kc, vc)
+    }
+
+    /// Prefill `prefix`, then score candidates at the next position.
+    fn new(m: &Gemma4, prefix: &[i64], total: usize) -> Option<Gemma4Scorer> {
+        if prefix.is_empty() || prefix.len() >= total {
+            return None;
+        }
+        let (mut kc, mut vc) = Gemma4Scorer::alloc(m, total);
+        let emb = m.b.rows_f32("embed", prefix);
+        m.forward_block(prefix, &emb, 0, &mut kc, &mut vc);
+        let snap_kc = kc.clone();
+        let snap_vc = vc.clone();
+        Some(Gemma4Scorer { kc, vc, snap_kc, snap_vc, pos: prefix.len() })
+    }
+
+    /// An empty scorer at position 0 — no seed context, for the corpus scan, which places every token.
+    fn empty(m: &Gemma4, total: usize) -> Gemma4Scorer {
+        let (kc, vc) = Gemma4Scorer::alloc(m, total);
+        let snap_kc = kc.clone();
+        let snap_vc = vc.clone();
+        Gemma4Scorer { kc, vc, snap_kc, snap_vc, pos: 0 }
+    }
+
+    /// Score `token` at `pos` by the ROUTED unit's `w_router · act`, WITHOUT committing. `None` for a bad
+    /// unit; `Some(NaN)` when the router did not select that expert here — no value, not a value of zero.
+    fn try_token_moe(&mut self, m: &Gemma4, token: i64, layer: usize, expert: usize, neuron: usize) -> Option<f32> {
+        if layer >= m.n_layer || expert >= m.n_exp { return None; }
+        self.kc.clone_from(&self.snap_kc); // candidates must not see each other's writes
+        self.vc.clone_from(&self.snap_vc);
+        let emb = m.b.rows_f32("embed", &[token]);
+        let vals = m.forward_block_scan(&[token], &emb, self.pos, &mut self.kc, &mut self.vc,
+                                        Some((layer, expert, neuron)));
+        vals.first().copied()
+    }
+
+    /// Advance the cache by `token` (the winner's value was already read by the probe).
+    fn commit(&mut self, m: &Gemma4, token: i64) {
+        let emb = m.b.rows_f32("embed", &[token]);
+        m.forward_block(&[token], &emb, self.pos, &mut self.kc, &mut self.vc);
+        self.pos += 1;
+        self.snap_kc.clone_from(&self.kc);
+        self.snap_vc.clone_from(&self.vc);
+    }
+}
+
 impl Model for Gemma4 {
+    /// On a Gemma-4 MoE bundle the scorer IS implemented, so the honest answer is `RoutedLayers` (the dense
+    /// per-layer unit is declined; `--blind-max L,E,N` names a routed one). A DENSE Gemma-4 bundle reports
+    /// `NoScorer` honestly: only the routed arm exists for this arch, so claiming `Supported` would be the
+    /// very incoherence this enum exists to prevent.
+    fn blind_support(&self) -> crate::model::BlindSupport {
+        if self.moe && self.n_exp != 0 {
+            crate::model::BlindSupport::RoutedLayers
+        } else {
+            crate::model::BlindSupport::NoScorer
+        }
+    }
+
+    /// One ROUTED unit's self-description: expert `e` neuron `n`'s own output row. Gemma-4 experts are
+    /// PACKED, so `down` is the second half of nothing — it is its own (d, moe_inter)-shaped projection read
+    /// as (in, out): row `n` is one contiguous d-wide run. Paged, so it goes through `expert_f32`.
+    fn blind_moe_proposals(&self, layer: usize, expert: usize, neuron: usize, k: usize, polarity: f32) -> Option<Vec<i64>> {
+        if layer >= self.n_layer || !self.moe || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        let (shape, vals) = self.b.expert_f32(&format!("l{layer}.experts.{expert}.down"));
+        let d = shape[1];
+        if neuron >= shape[0] {
+            return None;
+        }
+        let gain = self.b.arr1("norm").to_vec();
+        let mut w = vals[neuron * d..(neuron + 1) * d].to_vec();
+        w.iter_mut().zip(gain.iter()).for_each(|(v, g)| *v *= g);
+        let proj = self.b.rowdot_f32(self.unembed(), &w);
+        let mut idx: Vec<usize> = (0..proj.len()).collect();
+        idx.sort_by(|&a, &b| {
+            (polarity * proj[b]).partial_cmp(&(polarity * proj[a])).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(idx.into_iter().take(k).map(|i| i as i64).collect())
+    }
+
+    /// Greedy hill-climb for one routed unit, scored by `w_router · act`. Candidates the router does not
+    /// select score `NaN` and are skipped rather than treated as zero, so the climb never "wins" by
+    /// steering the router away from the expert it is trying to maximise.
+    fn blind_moe_climb(&self, layer: usize, expert: usize, neuron: usize, prefix: &[i64], cands: &[i64],
+                       steps: usize, polarity: f32) -> Option<crate::model::BlindArm> {
+        if cands.is_empty() || layer >= self.n_layer || !self.moe || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        let mut sc = Gemma4Scorer::new(self, prefix, prefix.len() + steps + 1)?;
+        let mut ids = prefix.to_vec();
+        let mut best = f32::NEG_INFINITY;
+        for _ in 0..steps {
+            let mut pick = None;
+            let mut pick_obj = f32::NEG_INFINITY;
+            for &t in cands {
+                match sc.try_token_moe(self, t, layer, expert, neuron) {
+                    Some(v) if !v.is_nan() && polarity * v > pick_obj => {
+                        pick_obj = polarity * v;
+                        pick = Some(t);
+                    }
+                    _ => {}
+                }
+            }
+            let Some(t) = pick else { break }; // no candidate reaches this expert on this position
+            sc.commit(self, t);
+            ids.push(t);
+            best = best.max(pick_obj);
+        }
+        if best == f32::NEG_INFINITY {
+            return None;
+        }
+        Some(crate::model::BlindArm { ids, obj: best, pos: None })
+    }
+
+    /// Oracle for one routed unit over a corpus: best `w_router · act` among positions that route to
+    /// `expert`. Chunked exactly like the dense arm, advancing the same per-layer-width cache.
+    fn blind_moe_corpus_best(&self, layer: usize, expert: usize, neuron: usize, ids: &[i64],
+                             polarity: f32) -> Option<crate::model::BlindArm> {
+        if ids.len() < 2 || layer >= self.n_layer || !self.moe || self.n_exp == 0 || expert >= self.n_exp {
+            return None;
+        }
+        let mut sc = Gemma4Scorer::empty(self, ids.len());
+        let (mut best_obj, mut best_idx, mut routed) = (f32::NEG_INFINITY, 0usize, 0usize);
+        for chunk in ids.chunks(crate::model::CORPUS_CHUNK) {
+            let start = sc.pos;
+            let emb = self.b.rows_f32("embed", chunk);
+            let vals = self.forward_block_scan(chunk, &emb, start, &mut sc.kc, &mut sc.vc,
+                                                Some((layer, expert, neuron)));
+            sc.pos += chunk.len();
+            if vals.len() != chunk.len() {
+                continue;
+            }
+            for (j, &v) in vals.iter().enumerate() {
+                if v.is_nan() {
+                    continue; // expert not in this row's top-k: unit not computed there
+                }
+                routed += 1;
+                let o = polarity * v;
+                if o > best_obj {
+                    best_obj = o;
+                    best_idx = start + j;
+                }
+            }
+        }
+        if routed == 0 {
+            return None; // this expert is never selected anywhere in the corpus
+        }
+        let lo = best_idx.saturating_sub(crate::model::CORPUS_CTX - 1);
+        Some(crate::model::BlindArm { ids: ids[lo..=best_idx].to_vec(), obj: best_obj, pos: Some(best_idx) })
+    }
+
+
     fn predict(&self, ids: &[i64]) -> i64 {
         let xf = self.hidden(ids);
         let last = xf.row(ids.len() - 1).to_vec();
@@ -968,7 +1225,7 @@ impl Model for Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let mut combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -1065,7 +1322,7 @@ impl Model for Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else {
                 mlp
             };
@@ -1220,7 +1477,7 @@ impl Model for Gemma4 {
             let mlp = self.b.mm(&hidden, &format!("{p}mlp.down_proj"));
             let combined = if self.moe {
                 let h1 = self.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
-                &h1 + &self.moe_branch(l, &x)
+                &h1 + &{ let (mb, _) = self.moe_branch(l, &x, None); mb }
             } else { mlp };
             let fw = self.norm(&combined, &format!("{p}post_feedforward_layernorm"));
             x = &x + &fw;
@@ -1387,5 +1644,272 @@ impl Model for Gemma4 {
             self.forward_block(ids, &emb, cur, kc, vc)
         };
         crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::Bundle;
+    use crate::model::BlindSupport;
+
+    fn v(seed: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (((seed * 41 + i * 23) % 43) as f32) / 20.0 - 1.0).collect()
+    }
+
+    /// A tiny Gemma-4 bundle, `moe = true` swapping the dense MLP for the routed branch. No PLE and a uniform
+    /// head_dim keep the fixture minimal; the router's `scale` / `per_expert_scale` are real (not identity)
+    /// because they are load-bearing. Each test gets its OWN path — `cargo test` runs these concurrently.
+    fn build_tiny(tag: &str, moe: bool) -> Gemma4 {
+        let (nl, nh, nkv, hd, d, vocab, ffn) = (4usize, 4, 2, 8, 32, 24, 16);
+        let (n_exp, topk, mi) = (4usize, 2usize, 32usize);
+        let window = 0usize; // full attention — the sliding pattern is not what this test module is about
+        let dir = std::env::temp_dir().join(format!("fr_bm_g4_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut bin: Vec<u8> = Vec::new();
+        let mut specs: Vec<serde_json::Value> = Vec::new();
+        let mut add = |name: String, shape: Vec<usize>, data: Vec<f32>| {
+            let offset = bin.len();
+            for x in &data { bin.extend_from_slice(&x.to_le_bytes()); }
+            specs.push(serde_json::json!({ "name": name, "dtype": "f32", "shape": shape,
+                "offset": offset, "bytes": bin.len() - offset }));
+        };
+        add("embed".into(), vec![vocab, d], v(1, vocab * d));
+        add("norm".into(), vec![d], v(2, d));
+        if moe {
+            // tied unembed: the fixture omits lm_head, so `unembed()` resolves to `embed`
+        } else {
+            add("lm_head".into(), vec![vocab, d], v(3, vocab * d));
+        }
+        for l in 0..nl {
+            let p = format!("l{l}.");
+            add(format!("{p}input_layernorm"), vec![d], v(10 + l, d));
+            add(format!("{p}post_attention_layernorm"), vec![d], v(20 + l, d));
+            add(format!("{p}post_feedforward_layernorm"), vec![d], v(25 + l, d));
+            add(format!("{p}self_attn.q_proj"), vec![d, nh * hd], v(300 + l, d * nh * hd));
+            add(format!("{p}self_attn.k_proj"), vec![d, nkv * hd], v(310 + l, d * nkv * hd));
+            add(format!("{p}self_attn.v_proj"), vec![d, nkv * hd], v(320 + l, d * nkv * hd));
+            add(format!("{p}self_attn.o_proj"), vec![nh * hd, d], v(330 + l, nh * hd * d));
+            add(format!("{p}self_attn.q_norm"), vec![hd], v(340 + l, hd));
+            add(format!("{p}self_attn.k_norm"), vec![hd], v(350 + l, hd));
+            add(format!("{p}layer_scalar"), vec![1], v(600 + l, 1));
+            add(format!("{p}pre_feedforward_layernorm"), vec![d], v(40 + l, d));
+            add(format!("{p}mlp.gate_proj"), vec![d, ffn], v(70 + l, d * ffn));
+            add(format!("{p}mlp.up_proj"), vec![d, ffn], v(80 + l, d * ffn));
+            add(format!("{p}mlp.down_proj"), vec![ffn, d], v(90 + l, ffn * d));
+            if moe {
+                add(format!("{p}post_feedforward_layernorm_1"), vec![d], v(50 + l, d));
+                add(format!("{p}post_feedforward_layernorm_2"), vec![d], v(51 + l, d));
+                add(format!("{p}pre_feedforward_layernorm_2"), vec![d], v(52 + l, d));
+                add(format!("{p}router.proj"), vec![d, n_exp], v(100 + l, d * n_exp));
+                add(format!("{p}router.scale"), vec![d], v(400 + l, d));
+                add(format!("{p}router.per_expert_scale"), vec![n_exp], v(410 + l, n_exp));
+                for e in 0..n_exp {
+                    // packed: `.experts.` puts these in the PAGED map `expert_f32` reads
+                    add(format!("{p}experts.{e}.gate_up"), vec![d, 2 * mi], v(110 + e, d * 2 * mi));
+                    add(format!("{p}experts.{e}.down"), vec![mi, d], v(130 + e, mi * d));
+                }
+            }
+        }
+        let mut cfg: Vec<i64> = vec![nl as i64, nh as i64, nkv as i64, nkv as i64, hd as i64, hd as i64,
+                                    d as i64, ffn as i64, vocab as i64, if moe { 1 } else { 0 },
+                                    window as i64, 0 /* ple */, moe as i64, n_exp as i64,
+                                    topk as i64, mi as i64];
+        for _ in 0..nl { cfg.push(0); } // no sliding layers
+        let manifest = serde_json::json!({ "format": crate::bundle::FORMAT, "version": crate::bundle::VERSION,
+            "arch": "gemma4", "config": cfg, "config_f": [10000.0, 1e-6, 1.0, 1.0], "arrays": specs });
+        std::fs::write(format!("{stem}.fieldrun.bin"), &bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        Gemma4::new(Bundle::load(&stem).unwrap(), 0.0, false)
+    }
+
+    /// Naive re-walk: the residual entering layer `l`'s MoE branch (`x_pre`), with NO cache. `moe_branch`
+    /// takes the residual BEFORE the layer's FFN norms, so this walks layers `0..l` whole and then stops
+    /// right after layer l's attention write + `post_attention_layernorm`. An independent copy of the walk,
+    /// so the cached scorer has something honest to be compared against.
+    fn naive_x_pre(m: &Gemma4, ids: &[i64], l: usize) -> Array2<f32> {
+        let seq = ids.len();
+        let h = m.h;
+        let pli = m.per_layer_inputs(ids, &m.b.rows_f32("embed", ids));
+        let mut x = m.b.rows_f32("embed", ids);
+        let attend = |j: usize, x: &mut Array2<f32>| {
+            let p = format!("l{j}.");
+            let hd = m.hd_of(j);
+            let nkv = m.nkv_of(j);
+            let rep = h / nkv;
+            let a = m.norm(x, &format!("{p}input_layernorm"));
+            let q = m.derive_q(j, &a, 0);
+            let (k, v) = m.derive_kv(j, &a, 0);
+            let mut attn_out = Array2::<f32>::zeros((seq, h * hd));
+            for head in 0..h {
+                let kv = head / rep;
+                let qh = q.slice(s![.., head * hd..(head + 1) * hd]);
+                let kh = k.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let vh = v.slice(s![.., kv * hd..(kv + 1) * hd]);
+                let mut scores = qh.dot(&kh.t());
+                for i in 0..seq {
+                    for j2 in 0..seq {
+                        if j2 > i { scores[[i, j2]] = -1e30; }
+                    }
+                }
+                softmax_rows(&mut scores);
+                attn_out.slice_mut(s![.., head * hd..(head + 1) * hd]).assign(&scores.dot(&vh));
+            }
+            let o = m.b.mm(&attn_out, &format!("{p}self_attn.o_proj"));
+            let n = m.norm(&o, &format!("{p}post_attention_layernorm"));
+            *x = &*x + &n;
+        };
+        let ffn = |j: usize, x: &mut Array2<f32>| {
+            let p = format!("l{j}.");
+            let a2 = m.norm(x, &format!("{p}pre_feedforward_layernorm"));
+            let gate = m.b.mm(&a2, &format!("{p}mlp.gate_proj"));
+            let up = m.b.mm(&a2, &format!("{p}mlp.up_proj"));
+            let mut hidden = gate;
+            for (hv, uv) in hidden.iter_mut().zip(up.iter()) { *hv = gelu_tanh(*hv) * uv; }
+            let mlp = m.b.mm(&hidden, &format!("{p}mlp.down_proj"));
+            let combined = if m.moe {
+                let (mb, _) = m.moe_branch(j, x, None);
+                let h1 = m.norm(&mlp, &format!("{p}post_feedforward_layernorm_1"));
+                &h1 + &mb
+            } else {
+                mlp
+            };
+            let n = m.norm(&combined, &format!("{p}post_feedforward_layernorm"));
+            *x = &*x + &n;
+            if m.ple > 0 {
+                let mut g = m.b.mm(x, &format!("{p}per_layer_input_gate"));
+                g.mapv_inplace(gelu_tanh);
+                g = &g * &pli[j];
+                let proj = m.b.mm(&g, &format!("{p}per_layer_projection"));
+                let pn = m.norm(&proj, &format!("{p}post_per_layer_input_norm"));
+                *x = &*x + &pn;
+            }
+            *x *= m.layer_scalar[j];
+        };
+        for j in 0..l {
+            attend(j, &mut x);
+            ffn(j, &mut x);
+        }
+        attend(l, &mut x); // layer l's FFN must NOT run — x_pre is its input
+        x
+    }
+
+    /// The routed probe rests on this: one cached scorer step over the KV state must equal a naive
+    /// from-scratch forward over the same ids, bit for bit.
+    #[test]
+    fn gemma4_scorer_step_matches_naive_bitwise() {
+        let m = build_tiny("step", true);
+        let ids: Vec<i64> = vec![1, 9, 4, 7, 2, 5];
+        let total = ids.len() + 6;
+        for layer in [0usize, 2, 3] {
+            let mut sc = Gemma4Scorer::new(&m, &ids, total).unwrap();
+            assert_eq!(sc.pos, ids.len());
+            for (i, &tok) in [7i64, 3, 11].iter().enumerate() {
+                let (e, n) = ((i + layer) % m.n_exp, (i * 5) % 32);
+                let got = sc.try_token_moe(&m, tok, layer, e, n).unwrap();
+                let mut want_ids = ids.clone();
+                want_ids.push(tok);
+                let xp = naive_x_pre(&m, &want_ids, layer);
+                let (_, want) = m.moe_branch(layer, &xp, Some((e, n)));
+                let want = want[want.len() - 1];
+                if want.is_nan() {
+                    assert!(got.is_nan(), "layer {layer}: expert not selected, so both must be NaN");
+                } else {
+                    assert_eq!(got.to_bits(), want.to_bits(),
+                        "layer {layer} tok {tok}: scorer {:e} != naive {:e}", got, want);
+                }
+            }
+        }
+    }
+
+    /// Candidates must be INDEPENDENT: probing B after A must equal probing B on a fresh scorer.
+    #[test]
+    fn gemma4_candidates_are_independent() {
+        let m = build_tiny("indep", true);
+        let ids: Vec<i64> = vec![2, 4, 6];
+        let (l, e, n) = (1usize, 2usize, 3usize);
+        let mut sc = Gemma4Scorer::new(&m, &ids, 32).unwrap();
+        let _ = sc.try_token_moe(&m, 11, l, e, n);
+        let after_a = sc.try_token_moe(&m, 7, l, e, n).unwrap();
+        let mut fresh = Gemma4Scorer::new(&m, &ids, 32).unwrap();
+        let on_fresh = fresh.try_token_moe(&m, 7, l, e, n).unwrap();
+        assert_eq!(after_a.to_bits(), on_fresh.to_bits(),
+            "probing A then B differs from probing B alone: candidates leak into each other");
+    }
+
+    /// The routed objective must equal `w_router · gelu_tanh(gate_n) · up_n` written out by hand, with the
+    /// FULL Gemma-4 router: weightless RMSNorm, per-channel `router.scale`, 1/√d, softmax, top-k, renorm,
+    /// and the per-EXPERT `per_expert_scale` — which is part of the weight, not a separate term. GEGLU, not
+    /// SwiGLU. Dropping any of those still "works", just wrongly, which is the point of this test.
+    #[test]
+    fn gemma4_routed_objective_matches_reference() {
+        let m = build_tiny("ref", true);
+        let (l, n) = (1usize, 7usize);
+        // Long enough that a top-k of 2 out of 4 routes each expert somewhere; the guard below fails the test
+        // rather than letting a never-routed expert make it vacuous.
+        let stream: Vec<i64> = (0..16).map(|i: i64| i % 7).collect();
+        let xp = naive_x_pre(&m, &stream, l);
+        let p = format!("l{l}.");
+        let d = m.d;
+        let dscale = (d as f32).powf(-0.5);
+        // the pre-norm'd input every expert consumes, exactly as the branch computes it
+        let h2 = m.norm(&xp, &format!("{p}pre_feedforward_layernorm_2"));
+        let mut n_checked = 0;
+        for e in 0..m.n_exp {
+            let (_out, got) = m.moe_branch(l, &xp, Some((e, n)));
+            // rebuild this expert's scores from scratch
+            let hn = m.rmsnorm(&xp, None);
+            let rscale = m.b.arr1o(&format!("{p}router.scale"));
+            let mut hs = hn;
+            for mut row in hs.rows_mut() {
+                for (i, val) in row.iter_mut().enumerate() { *val = *val * rscale[i] * dscale; }
+            }
+            let scores = m.b.mm(&hs, &format!("{p}router.proj"));
+            let pes = m.b.arr1o(&format!("{p}router.per_expert_scale"));
+            let mi = m.moe_inter;
+            assert_eq!(got.len(), stream.len(), "one value per position");
+            let mut n_routed = 0;
+            for t in 0..stream.len() {
+                let row = scores.row(t);
+                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = row.iter().map(|v| (v - mx).exp()).collect();
+                let denom: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / denom).collect();
+                let mut idx: Vec<usize> = (0..m.n_exp).collect();
+                idx.sort_by(|&x, &y| probs[y].partial_cmp(&probs[x]).unwrap());
+                idx.truncate(m.topk);
+                if !idx.contains(&e) {
+                    assert!(got[t].is_nan(), "e={e} t={t}: expert not selected, so the unit has NO value there");
+                    continue;
+                }
+                n_routed += 1;
+                let tksum: f32 = idx.iter().map(|&x| probs[x]).sum();
+                let w = probs[e] / tksum * pes[e];
+                // The activation is read through the SAME `expert_mm` the kernel uses. This test is
+                // about the ROUTER — the weightless norm, the per-channel `router.scale`, the 1/√d,
+                // softmax, top-k, renorm and the per-EXPERT `per_expert_scale` — which is the part that
+                // differs between archs and the part that is silently wrong if you drop a term. The
+                // packed (d, 2*mi) GEMM layout is not re-derived here: it is covered by the 60/60 torch
+                // gate, and re-deriving it by hand just duplicates a convention.
+                let rows = h2.slice(s![t..t + 1, ..]).to_owned();
+                let gate_up = m.b.expert_mm(&rows, &format!("{p}experts.{e}.gate_up")); // (1, 2*mi)
+                let act = gelu_tanh(gate_up[[0, n]]) * gate_up[[0, n + mi]]; // GEGLU, not SwiGLU
+                let want = w * act;
+                assert_eq!(got[t].to_bits(), want.to_bits(),
+                    "e={e} t={t}: branch {:e} != reference {:e}", got[t], want);
+            }
+            if n_routed > 0 { n_checked += 1; }
+        }
+        assert!(n_checked > 0, "no expert was ever selected — the reference proves nothing");
+    }
+
+    /// Coherence: a MoE bundle must report `RoutedLayers` (the scorer IS implemented, so `NoScorer` would be
+    /// a lie), and a DENSE bundle must report `NoScorer` — only the routed arm exists for this arch, so
+    /// claiming `Supported` would promise a dense probe that does not exist.
+    #[test]
+    fn gemma4_blind_support_is_coherent() {
+        assert_eq!(build_tiny("decl", true).blind_support(), BlindSupport::RoutedLayers);
+        assert_eq!(build_tiny("decl2", false).blind_support(), BlindSupport::NoScorer);
     }
 }

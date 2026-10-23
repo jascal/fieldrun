@@ -15,7 +15,7 @@ cargo build --release ${FEATURES:+--features "$FEATURES"} >/dev/null 2>&1 || { e
 printf "\n%-12s %-14s %-8s %-8s %-8s %-8s\n" arch ref f32 f16 int8 int4
 printf '%.0s-' {1..54}; echo
 # arch | bundle --arch flag | torch reference class
-for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "gemma4keqv:gemma4:Gemma4-k=v" "gemma4kvshare:gemma4:Gemma4-kvshare" "qwen3:rope:Qwen3-dense" "qwen3moe:qwen3moe:Qwen3-MoE" "qwen3moeswa:qwen3moe:Qwen3-MoE-SWA" "mla:mla:DeepSeek-V3" "mlayarn:mla:DeepSeek-YaRN" "minimax:minimax:MiniMax-M2" "dsv4:dsv4:DeepSeek-V4-sliding"; do
+for spec in "gemma3:gemma3:Gemma3" "gemma4:gemma4:Gemma4-dense" "gemma4moe:gemma4:Gemma4-MoE" "gemma4keqv:gemma4:Gemma4-k=v" "gemma4kvshare:gemma4:Gemma4-kvshare" "qwen3:rope:Qwen3-dense" "qwen3moe:qwen3moe:Qwen3-MoE" "qwen3moeswa:qwen3moe:Qwen3-MoE-SWA" "mixtral:qwen3moe:Mixtral-SWA" "mixtralfull:qwen3moe:Mixtral-full" "qwen2moe:qwen3moe:Qwen2-MoE" "mla:mla:DeepSeek-V3" "mlayarn:mla:DeepSeek-YaRN" "gptoss:gptoss:GPT-OSS" "minimax:minimax:MiniMax-M2" "dsv4:dsv4:DeepSeek-V4-sliding"; do
   tag="${spec%%:*}"; rest="${spec#*:}"; arch="${rest%%:*}"; ref="${rest##*:}"
   $PY $REF build "$tag" >/dev/null 2>&1 || { printf "%-12s BUILD FAILED\n" "$tag"; continue; }
   row=""
@@ -128,7 +128,7 @@ echo
 # every arch. Reuses the f32 bundles + holdouts built above.
 printf "%-12s %-22s %-9s %-9s %-9s %s\n" arch "generate f32(KV==naive)" "int8-KV" "prefix" "prefix-q" explain
 printf '%.0s-' {1..70}; echo
-for spec in qwen3:rope gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 gemma4keqv:gemma4 gemma4kvshare:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mla:mla mlayarn:mla minimax:minimax; do
+for spec in qwen3:rope gemma3:gemma3 gemma4:gemma4 gemma4moe:gemma4 gemma4keqv:gemma4 gemma4kvshare:gemma4 qwen3moe:qwen3moe qwen3moeswa:qwen3moe mixtral:qwen3moe mixtralfull:qwen3moe qwen2moe:qwen3moe mla:mla mlayarn:mla gptoss:gptoss minimax:minimax; do
   tag="${spec%%:*}"; b=/tmp/${tag}_f32; ids=/tmp/${tag}_holdout.json
   [ -f "$b.fieldrun.json" ] || { printf "%-12s (no f32 bundle — built above?)\n" "$tag"; continue; }
   idn=$($BIN --bundle "$b" --ids "$ids" --ctx 16 --generate 16 2>/dev/null | grep -oE 'identical: (true|false)' | grep -oE '(true|false)')
