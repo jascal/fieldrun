@@ -1,0 +1,14 @@
+{
+  "runs": [
+    {
+      "arm": "baseline",
+      "native_process_wall_seconds": 3.475883930001146,
+      "end_to_end_wall_seconds": 4.5456586239997705
+    },
+    {
+      "arm": "service",
+      "native_process_wall_seconds": 3.2565131840001413,
+      "end_to_end_wall_seconds": 4.308427728999959
+    }
+  ]
+}

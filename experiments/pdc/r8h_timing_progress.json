@@ -1,0 +1,53 @@
+[
+  {
+    "arm": "baseline",
+    "end_to_end_wall_seconds": 13.354881196999486,
+    "capture": "experiments/pdc/r8h_timed_baseline_capture.json",
+    "bundle": "experiments/pdc/r8h_baseline_bundle.json",
+    "command": [
+      "/usr/bin/python3",
+      "scripts/pdc_service.py",
+      "--runtime",
+      "target/release/fieldrun",
+      "--selection",
+      "experiments/pdc/r8h_baseline_selection.json",
+      "--retain-capture",
+      "experiments/pdc/r8h_timed_baseline_capture.json",
+      "--domain",
+      "experiments/pdc/r5_domain.json",
+      "--probe",
+      "experiments/pdc/r8h_probe.json",
+      "--bundle",
+      "bundles/gpt2",
+      "--out",
+      "experiments/pdc/r8h_baseline_bundle.json",
+      "--grade-addition",
+      "--allow-full-baseline"
+    ]
+  },
+  {
+    "arm": "service",
+    "end_to_end_wall_seconds": 12.870530618000885,
+    "capture": "experiments/pdc/r8h_timed_service_capture.json",
+    "bundle": "experiments/pdc/r8h_service_bundle.json",
+    "command": [
+      "/usr/bin/python3",
+      "scripts/pdc_service.py",
+      "--runtime",
+      "target/release/fieldrun",
+      "--selection",
+      "experiments/pdc/r8h_service_selection.json",
+      "--retain-capture",
+      "experiments/pdc/r8h_timed_service_capture.json",
+      "--domain",
+      "experiments/pdc/r5_domain.json",
+      "--probe",
+      "experiments/pdc/r8h_probe.json",
+      "--bundle",
+      "bundles/gpt2",
+      "--out",
+      "experiments/pdc/r8h_service_bundle.json",
+      "--grade-addition"
+    ]
+  }
+]

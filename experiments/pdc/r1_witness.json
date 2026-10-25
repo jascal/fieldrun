@@ -1,0 +1,66 @@
+{
+  "schema": "pdc.finite-derive.v1",
+  "semantics": "PDC_Derive.thy; float implementation, not a kernel certificate",
+  "rivals": [
+    "A",
+    "B"
+  ],
+  "bodies": {
+    "A": [
+      {
+        "id": "a1",
+        "score": 0
+      },
+      {
+        "id": "a2",
+        "score": 0
+      }
+    ],
+    "B": [
+      {
+        "id": "b1",
+        "score": 0.5
+      }
+    ]
+  },
+  "queries": [
+    {
+      "readout": "viterbi",
+      "temperature": 1,
+      "scores": {
+        "A": 0,
+        "B": 0.5
+      },
+      "winners": [
+        "B"
+      ],
+      "winning_bodies": {
+        "B": [
+          "b1"
+        ]
+      },
+      "margin": 0.5,
+      "status": "selected"
+    },
+    {
+      "readout": "marginal",
+      "temperature": 1,
+      "scores": {
+        "A": 0.6931471805599453,
+        "B": 0.5
+      },
+      "winners": [
+        "A"
+      ],
+      "winning_bodies": {
+        "A": [
+          "a1",
+          "a2"
+        ]
+      },
+      "margin": 0.1931471805599453,
+      "status": "selected"
+    }
+  ],
+  "fragile": true
+}

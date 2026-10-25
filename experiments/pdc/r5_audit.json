@@ -1,0 +1,17 @@
+{
+  "schema": "pdc.bundle-audit.v1",
+  "contexts_checked": 75,
+  "heldout_contexts_captured": 0,
+  "body_annotations_checked": 2025,
+  "commitments_checked": {
+    "viterbi": 8,
+    "marginal": 10
+  },
+  "maximum_annotation_error": 0.0,
+  "scope": "finite numeric source/body/candidate guard audit, not a theory-soundness proof",
+  "sha256": {
+    "experiments/pdc/r5_bundle.json": "eaa8571f5a5e9fed0e490cddff0c85c2142fa278ff6743f796d3582aac8d18b0",
+    "experiments/pdc/r5_domain.json": "3dc65f9f9483b52dc803de69dd6bbae77810319f513edf927ff2539d843c39a3",
+    "experiments/pdc/r5_reads.json": "ee16c8aa33013dff0ca3dc9afdeaad584e9b32f3250961eb83a145f8444711fe"
+  }
+}

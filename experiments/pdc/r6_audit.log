@@ -1,0 +1,109 @@
+{
+  "schema": "pdc.two-hop-result.v1",
+  "contexts": 27,
+  "arm_forwards": 108,
+  "reference_agreement": 1.0,
+  "refused_replay_identity_cases": 27,
+  "unique_admission_counts": {
+    "refused": 9
+  },
+  "strata": {
+    "admitted": {
+      "n": 0,
+      "accuracies": {
+        "rederive": {
+          "correct": 0,
+          "rate": null
+        },
+        "crystallize": {
+          "correct": 0,
+          "rate": null
+        },
+        "generated": {
+          "correct": 0,
+          "rate": null
+        },
+        "tool": {
+          "correct": 0,
+          "rate": null
+        }
+      },
+      "paired": {
+        "crystallize": {},
+        "generated": {},
+        "tool": {}
+      },
+      "generated_minus_rederive": null,
+      "refused_improvement_claim": "untested"
+    },
+    "refused": {
+      "n": 27,
+      "accuracies": {
+        "rederive": {
+          "correct": 3,
+          "rate": 0.1111111111111111
+        },
+        "crystallize": {
+          "correct": 3,
+          "rate": 0.1111111111111111
+        },
+        "generated": {
+          "correct": 9,
+          "rate": 0.3333333333333333
+        },
+        "tool": {
+          "correct": 9,
+          "rate": 0.3333333333333333
+        }
+      },
+      "paired": {
+        "crystallize": {
+          "base_1_arm_1": 3,
+          "base_0_arm_0": 24
+        },
+        "generated": {
+          "base_1_arm_1": 3,
+          "base_0_arm_0": 18,
+          "base_0_arm_1": 6
+        },
+        "tool": {
+          "base_1_arm_1": 3,
+          "base_0_arm_0": 18,
+          "base_0_arm_1": 6
+        }
+      },
+      "generated_minus_rederive": 0.2222222222222222,
+      "refused_improvement_claim": "confirmed_on_slice"
+    },
+    "unknown": {
+      "n": 0,
+      "accuracies": {
+        "rederive": {
+          "correct": 0,
+          "rate": null
+        },
+        "crystallize": {
+          "correct": 0,
+          "rate": null
+        },
+        "generated": {
+          "correct": 0,
+          "rate": null
+        },
+        "tool": {
+          "correct": 0,
+          "rate": null
+        }
+      },
+      "paired": {
+        "crystallize": {},
+        "generated": {},
+        "tool": {}
+      },
+      "generated_minus_rederive": null,
+      "refused_improvement_claim": "untested"
+    }
+  },
+  "admitted_redundancy_claim": "untested",
+  "generated_intermediate_correct_unique": 4
+}

@@ -1,0 +1,11 @@
+[fieldrun] device: CPU · model 248 MB / 16004 MB RAM
+[fieldrun] loading bundle | 0s …[fieldrun] loaded bundle (248 MB)                    
+{
+  "responses": 75,
+  "work": {
+    "native_output_row_calls": 127725,
+    "body_probe_dot_calls": 383175,
+    "distinct_output_rows_per_context": 1703
+  },
+  "export_elapsed_seconds": 10.957783085000301
+}
