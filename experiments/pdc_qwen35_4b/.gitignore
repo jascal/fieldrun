@@ -1,0 +1,14 @@
+# Large evidence files are in the supplemental release.
+batch_00_capture.json
+batch_01_capture.json
+batch_02_capture.json
+batch_03_capture.json
+batch_04_capture.json
+batch_05_capture.json
+batch_06_capture.json
+batch_07_capture.json
+batch_08_capture.json
+batch_09_capture.json
+bundle.json
+engineering_capture.json
+scientific_reference.json

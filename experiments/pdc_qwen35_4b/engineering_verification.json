@@ -1,0 +1,44 @@
+{
+  "schema": "pdc.qwen35-engineering-check.v1",
+  "cases": 5,
+  "reference_agreement": 1.0,
+  "observer_effect": 0,
+  "rows": [
+    {
+      "prediction": 15,
+      "source_sum_error": 1.0561197996139526e-06,
+      "rms_fold_error": 6.734145788556134e-06,
+      "full_body_score_error": 3.614540341523309e-05,
+      "reference_score_error": 0.014288902282714844
+    },
+    {
+      "prediction": 17,
+      "source_sum_error": 3.07522714138031e-06,
+      "rms_fold_error": 1.7802792324772554e-06,
+      "full_body_score_error": 2.850288767319853e-05,
+      "reference_score_error": 0.016246140003204346
+    },
+    {
+      "prediction": 19,
+      "source_sum_error": 1.0617077350616455e-06,
+      "rms_fold_error": 1.270614552950633e-05,
+      "full_body_score_error": 3.75956397853372e-05,
+      "reference_score_error": 0.017428159713745117
+    },
+    {
+      "prediction": 21,
+      "source_sum_error": 1.1045485734939575e-06,
+      "rms_fold_error": 1.2583744414484954e-05,
+      "full_body_score_error": 3.417778776615421e-05,
+      "reference_score_error": 0.014317870140075684
+    },
+    {
+      "prediction": 23,
+      "source_sum_error": 2.089887857437134e-06,
+      "rms_fold_error": 4.733683834245994e-06,
+      "full_body_score_error": 3.071504963614302e-05,
+      "reference_score_error": 0.01592707633972168
+    }
+  ],
+  "scope": "engineering gate; not scientific coverage result"
+}

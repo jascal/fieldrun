@@ -1,0 +1,80 @@
+{
+  "schema": "pdc.qwen35-comparison-result.v1",
+  "summary": {
+    "development": {
+      "contexts": 50,
+      "host_correct": 50,
+      "host_accuracy": 1.0,
+      "viterbi": {
+        "committed": 50,
+        "affirmed": 50,
+        "full_host_agreements": 50,
+        "misses": 0,
+        "fragile_truth": 0,
+        "hallucination": 0,
+        "useful_coverage": 1.0,
+        "commitment_theory_accuracy": 1.0,
+        "full_host_agreement": 1.0,
+        "covered_candidate_agreement": 1.0,
+        "hallucination_rate": 0.0,
+        "classification": "positive_local_comparison"
+      },
+      "marginal": {
+        "committed": 50,
+        "affirmed": 50,
+        "full_host_agreements": 50,
+        "misses": 0,
+        "fragile_truth": 0,
+        "hallucination": 0,
+        "useful_coverage": 1.0,
+        "commitment_theory_accuracy": 1.0,
+        "full_host_agreement": 1.0,
+        "covered_candidate_agreement": 1.0,
+        "hallucination_rate": 0.0,
+        "classification": "positive_local_comparison"
+      }
+    },
+    "heldout": {
+      "contexts": 50,
+      "host_correct": 50,
+      "host_accuracy": 1.0,
+      "viterbi": {
+        "committed": 50,
+        "affirmed": 50,
+        "full_host_agreements": 50,
+        "misses": 0,
+        "fragile_truth": 0,
+        "hallucination": 0,
+        "useful_coverage": 1.0,
+        "commitment_theory_accuracy": 1.0,
+        "full_host_agreement": 1.0,
+        "covered_candidate_agreement": 1.0,
+        "hallucination_rate": 0.0,
+        "classification": "positive_local_comparison"
+      },
+      "marginal": {
+        "committed": 50,
+        "affirmed": 50,
+        "full_host_agreements": 50,
+        "misses": 0,
+        "fragile_truth": 0,
+        "hallucination": 0,
+        "useful_coverage": 1.0,
+        "commitment_theory_accuracy": 1.0,
+        "full_host_agreement": 1.0,
+        "covered_candidate_agreement": 1.0,
+        "hallucination_rate": 0.0,
+        "classification": "positive_local_comparison"
+      }
+    }
+  },
+  "model_forwards": 100,
+  "native_output_row_calls": 24832000,
+  "body_probe_annotations": 678300,
+  "error_maxima": {
+    "source_sum": 3.6209821701049805e-06,
+    "rms_fold": 2.442791850398862e-05,
+    "full_body_score": 6.229315881256525e-05
+  },
+  "scope": "new fixed model/template comparison; original GPT-2 results unchanged"
+}

@@ -750,6 +750,19 @@ fn main() {
             if let Err(e) = result { eprintln!("[fieldrun] PDC read capture: {e}"); std::process::exit(1); }
             return;
         }
+        if let Some(out) = flag(&args, "--pdc-qwen-source-dump") {
+            let result = (|| -> Result<(), String> {
+                if arch != "qwen35" { return Err("PDC Qwen source capture supports dense qwen35 only".into()); }
+                if route != 0.0 { return Err("PDC Qwen capture requires unpruned weights".into()); }
+                let spec = flag(&args, "--pdc-read-selection").ok_or("--pdc-read-selection <json> required")?;
+                let selection: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(spec).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+                let dump = qwen35moe::Qwen35Moe::new(bundle, route, kv_int8).pdc_source_dump(&selection)?;
+                std::fs::write(out, serde_json::to_vec(&dump).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+            })();
+            if let Err(e) = result { eprintln!("[fieldrun] PDC Qwen source capture: {e}"); std::process::exit(1); }
+            return;
+        }
         // GPU residual dumps: only when arch=rope + explicit --device gpu + --source-dump (narrow blast radius).
         // Other consumers under --device gpu keep the CPU Model (they call methods GpuRopeModel does not implement).
         let mut lm: Box<dyn Model> = match arch.as_str() {
