@@ -1,0 +1,38 @@
+[
+  {
+    "batch": 0,
+    "cases": 9,
+    "wall_seconds": 59.99876674500047,
+    "sha256": "2a5faaefdbd47287964cdd74cd1fa936c285deafdbbce1ba83afbe7dafd876b2"
+  },
+  {
+    "batch": 1,
+    "cases": 9,
+    "wall_seconds": 58.16060842200022,
+    "sha256": "8c9f92205d5419a19bb3a6ec13759574115a2995ba89449ba3d44d2b62459564"
+  },
+  {
+    "batch": 2,
+    "cases": 9,
+    "wall_seconds": 58.99875721400167,
+    "sha256": "69805f3561bb245c4a433861938fa6d4ba9ac947767701d6c41c0aeb11173fba"
+  },
+  {
+    "batch": 3,
+    "cases": 9,
+    "wall_seconds": 58.41651391799678,
+    "sha256": "2f78f008eef70ad32da35ecea8c650fdfc77ee03a43db021f50cc16544f522aa"
+  },
+  {
+    "batch": 4,
+    "cases": 9,
+    "wall_seconds": 58.233112887999596,
+    "sha256": "0e42b5e9e42f15491df2cae60df60572eadf9d48bdb3d23033a743f16f2ddbf3"
+  },
+  {
+    "batch": 5,
+    "cases": 9,
+    "wall_seconds": 56.4330860279988,
+    "sha256": "2f666fc7c719e57d3c6ea933bb2d87c1ee47a6833da9456365b75a8c39209dc9"
+  }
+]

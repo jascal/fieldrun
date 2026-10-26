@@ -41,3 +41,9 @@ sim/data/probes.json
 sim/data/hf/
 sim/data/threx.fieldrun.*
 experiments/ilp_decompile/
+
+# Frozen Qwen memory raw evidence is distributed in the supplemental release.
+/experiments/pdc_qwen35_memory/batch_*.log
+/experiments/pdc_qwen35_memory/batch_*_capture.json
+/experiments/pdc_qwen35_memory/bundle.json
+/experiments/pdc_qwen35_memory/reference.json

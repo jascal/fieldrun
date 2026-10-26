@@ -1,0 +1,12 @@
+{
+  "schema": "pdc.qwen35-learning-data-audit.v1",
+  "gate": "passed",
+  "protected_contexts": 208,
+  "initial_full_host_matches": 208,
+  "source_error": 3.552713678800501e-15,
+  "outside_max_error": 3.552713678800501e-15,
+  "outside_lse_error": 4.618527782440651e-14,
+  "outside_gram_error": 9.094947017729282e-13,
+  "data_sha256": "771a77f88c9b5074165570ec75ea7787660ab59b58fbcb96e46f24fda80d8e99",
+  "new_model_calls": 0
+}
