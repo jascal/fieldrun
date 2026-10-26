@@ -1,0 +1,7 @@
+{
+  "gate": "passed",
+  "unique_inputs": 54,
+  "paired_triples": 27,
+  "exact_prefix_suffix_checks": 54,
+  "new_model_forwards": 0
+}
