@@ -1,0 +1,22 @@
+{
+  "gate": "passed",
+  "contexts_checked": 54,
+  "paired_triples": 27,
+  "native_reference_matches": 54,
+  "native_output_rows": 13409280,
+  "counts": {
+    "neutral": {
+      "cases": 27,
+      "correct": 9,
+      "follows_wrong": 0
+    },
+    "wrong": {
+      "cases": 27,
+      "correct": 0,
+      "follows_wrong": 27
+    }
+  },
+  "original_path_hashes_verified": 23,
+  "new_model_forwards": 0,
+  "scope": "Independent assembly, full-host label/reference and count audit; no source-score or causal-replay claim."
+}

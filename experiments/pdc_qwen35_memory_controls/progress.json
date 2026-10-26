@@ -1,0 +1,38 @@
+[
+  {
+    "batch": 0,
+    "cases": 9,
+    "wall_seconds": 48.992252060998,
+    "sha256": "2e108a487a0c639c9641615d32288513d5fde38fa5d67562482592d7dc12bf09"
+  },
+  {
+    "batch": 1,
+    "cases": 9,
+    "wall_seconds": 59.507317205003346,
+    "sha256": "a79da5d8c7503bc6a43732728c24d7f4a830524af3d51412d25c69fafa3354f2"
+  },
+  {
+    "batch": 2,
+    "cases": 9,
+    "wall_seconds": 39.32852788300079,
+    "sha256": "0040f0a2d0a1d71b5654c37632653cb609fae28e6f49d4bfef80b5b60bafeeab"
+  },
+  {
+    "batch": 3,
+    "cases": 9,
+    "wall_seconds": 61.118248494996806,
+    "sha256": "7b33ec160e81f96873ae91e95b9c8ab1e4bdfeb611a162461663b73563aaaf5d"
+  },
+  {
+    "batch": 4,
+    "cases": 9,
+    "wall_seconds": 60.12885692300915,
+    "sha256": "798d815f855be1d3b13c0189b599821bc8a75d3f057d7276c1f6dfe8aa8d582e"
+  },
+  {
+    "batch": 5,
+    "cases": 9,
+    "wall_seconds": 59.53467363098753,
+    "sha256": "288657cbd4cdc7815ca19f3b840cb35e08fc360767de8a288df2ca7861a63510"
+  }
+]
