@@ -1,0 +1,284 @@
+warning: function `trits_for` is never used
+  --> src/ternary.rs:15:8
+   |
+15 | pub fn trits_for(q: i64) -> usize {
+   |        ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `distribute` is never used
+  --> src/ternary.rs:49:8
+   |
+49 | pub fn distribute(w: &[i64], x: &[i64], k: usize) -> (i64, i64) {
+   |        ^^^^^^^^^^
+
+warning: struct `TritStats` is never constructed
+  --> src/ternary.rs:63:12
+   |
+63 | pub struct TritStats {
+   |            ^^^^^^^^^
+
+warning: function `trit_stats` is never used
+  --> src/ternary.rs:71:8
+   |
+71 | pub fn trit_stats(w: &[i64], k: usize) -> TritStats {
+   |        ^^^^^^^^^^
+
+warning: field `k` is never read
+  --> src/ternary.rs:65:9
+   |
+63 | pub struct TritStats {
+   |            --------- field in this struct
+64 |     pub n_weights: usize,
+65 |     pub k: usize,
+   |         ^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `fieldrun` (lib) generated 4 warnings
+warning: `fieldrun` (lib test) generated 1 warning
+   Compiling fieldrun v0.1.0 (/tmp/pdc-fieldrun-review)
+warning: unused variable: `ml`
+   --> src/qwen35moe.rs:680:33
+    |
+680 |             } else if let Some((ml, me, mn)) = moe_scan.filter(|(ml, ..)| *ml == l) {
+    |                                 ^^ help: if this is intentional, prefix it with an underscore: `_ml`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1338:21
+     |
+1338 |                 let mut emit = |flips: &mut String, nf: &mut usize, l: usize, kind: &str, idx: i64, new: i64| {
+     |                     ----^^^^
+     |                     |
+     |                     help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `HybridState` is more private than the item `qwen35moe::Qwen35Moe::blind_score_state`
+   --> src/qwen35moe.rs:634:5
+    |
+634 |     pub(crate) fn blind_score_state(&self, prefix: &[i64], total: usize) -> Option<HybridState> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `qwen35moe::Qwen35Moe::blind_score_state` is reachable at visibility `pub(crate)`
+    |
+note: but type `HybridState` is only usable at visibility `pub(self)`
+   --> src/qwen35moe.rs:117:1
+    |
+117 | struct HybridState {
+    | ^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: `fieldrun` (bin "fieldrun" test) generated 3 warnings (run `cargo fix --bin "fieldrun" -p fieldrun --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 36.84s
+     Running unittests src/lib.rs (/tmp/pdc-qwen-replay-target/release/deps/fieldrun-e9097522799b2ef1)
+
+running 14 tests
+test bundle::tests::f16_saxpy_matches_scalar ... ok
+test bundle::tests::i4_q4a_dot_matches_manual ... ok
+test bundle::tests::i4_q4a_dot_simd_vs_reference ... ok
+test bundle::tests::i8dot_matches_manual ... ok
+test bundle::tests::i8dot_simd_vs_scalar ... ok
+test ternary::tests::distribute_is_exact ... ok
+test ternary::tests::sparsity_small_weights_use_fewer_trits ... ok
+test ternary::tests::roundtrip_exhaustive_over_int8_expansion_range ... ok
+test ternary::tests::trits_for_known_bounds ... ok
+test bundle::tests::f16_to_f32_simd_vs_scalar ... ok
+test bundle::tests::mm_f16_close_to_f32 ... ok
+test bundle::tests::mm_f32_exact ... ok
+test bundle::tests::rows_and_rowdot ... ok
+test bundle::tests::rowdot_subset_matches_full ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/tmp/pdc-qwen-replay-target/release/deps/fieldrun-efabd0ec6f4e420a)
+
+running 180 tests
+test api::tests::anthropic_tool_frames_stream_calls ... ok
+test api::tests::candidate_set_frame_shows_set_and_position ... ok
+test api::tests::openai_tool_frames_plain_answer ... ok
+test api::tests::render_chat_anthropic_tool_roundtrip ... ok
+test api::tests::openai_tool_frames_stream_calls ... ok
+test api::tests::sse_anthropic_format ... ok
+test api::tests::sse_openai_format ... ok
+test api::tests::wants_stream_parses ... ok
+test api::tests::render_chat_openai_tool_roundtrip ... ok
+test bucketing::tests::balanced_bisects_two_clusters ... ok
+test bucketing::tests::balanced_terminates_on_a_clique ... ok
+test bucketing::tests::buckets_cluster_and_route ... ok
+test bucketing::tests::empty_render_is_safe ... ok
+test bucketing::tests::emit_datalog_holds_out_unseen_signatures ... ok
+test bucketing::tests::emit_datalog_has_relations_rules_and_stats ... ok
+test bucketing::tests::partition_emits_expert_circuit_sets ... ok
+test bucketing::tests::residency_splits_hot_and_tail ... ok
+test bucketing::tests::recursive_splits_the_residual ... ok
+test bucketing::tests::routes_match_expert_map ... ok
+test bundle::tests::f16_saxpy_matches_scalar ... ok
+test bundle::tests::i4_q4a_dot_matches_manual ... ok
+test bundle::tests::i4_q4a_dot_simd_vs_reference ... ok
+test bundle::tests::i8dot_matches_manual ... ok
+test bundle::tests::i8dot_simd_vs_scalar ... ok
+test convert::tests::gemma3_thetas_flat_nested_default ... ok
+test convert::tests::eos_ids_int_array_none ... ok
+test convert::tests::geti_getf_basic ... ok
+test deltanet::tests::beta_zero_is_inert ... ok
+test bundle::tests::f16_to_f32_simd_vs_scalar ... ok
+test deltanet::tests::conv_matches_torch_golden ... ok
+test deltanet::tests::conv_hist_split_is_bit_identical ... ok
+test convert::tests::mimo_uses_rope_backbone ... ok
+test deltanet::tests::delta_gate_matches_golden ... ok
+test deltanet::tests::full_decay_is_memoryless ... ok
+test deltanet::tests::low_norm_qk_matches_transformers_regularized_squared_norm ... ok
+test deltanet::tests::matches_transformers_golden ... ok
+test deltanet::tests::mha_matches_oracle_golden ... ok
+test deltanet::tests::mha_state_split_is_bit_identical ... ok
+test deltanet::tests::q_scaled_by_inv_sqrt_dk ... ok
+test deltanet::tests::rmsnorm_gated_matches_torch_golden ... ok
+test deltanet::tests::single_token_decode_closed_form ... ok
+test deltanet::tests::state_split_is_bit_identical ... ok
+test explain::tests::apply_final_norm_centers_then_gains ... ok
+test explain::tests::assemble_builds_decomp_substrate ... ok
+test explain::tests::assemble_ranks_neurons_by_dla_not_activation ... ok
+test explain::tests::descent_collapses_to_minimal_when_redundant ... ok
+test explain::tests::descent_drops_a_removable_source ... ok
+test explain::tests::classify_head_names_idioms ... ok
+test bundle::tests::mm_f32_exact ... ok
+test bundle::tests::rowdot_subset_matches_full ... ok
+test convert::tests::rowi8_embed_roundtrip ... ok
+test explain::tests::final_norm_scale_recovers_frozen_scale ... ok
+test explain::tests::rank_of_is_one_based_and_handles_ties_and_oob ... ok
+test explain::tests::descent_invariants_atom_subset_and_still_decides ... ok
+test explain::tests::top_promoted_picks_largest_signed ... ok
+test dsv4::tests::dsv4_reports_routed_layers ... ok
+test bundle::tests::mm_f16_close_to_f32 ... ok
+test dsv4::tests::dsv4_candidates_are_independent ... ok
+test bundle::tests::rows_and_rowdot ... ok
+test explain::tests::descent_keeps_an_irreducible_coalition ... ok
+test convert::tests::int8_quant_roundtrip ... ok
+test explain::tests::descent_handles_empty_sources ... ok
+test convert::tests::q4a_beats_int4_on_offset_data ... ok
+test dsv4::tests::dsv4_routed_objective_matches_reference ... ok
+test dsv4::tests::dsv4_swiglu_clamps_are_applied ... ok
+test gptoss::tests::gptoss_zero_token_generation_is_empty ... ok
+test headgate::tests::gate_falls_back_when_no_margin_can_be_formed ... ok
+test headgate::tests::normalized_margin_is_facet_distance ... ok
+test headgate::tests::top2_picks_best_and_runner_up_skipping_non_finite ... ok
+test jlens::tests::crc32_matches_standard_vector ... ok
+test jlens::tests::dist_from_identity_zero_for_eye ... ok
+test dsv4::tests::dsv4_routed_unit_bounds ... ok
+test gptoss::tests::gptoss_alternating_window_is_load_bearing ... ok
+test explain::tests::explain_mode_parses_levels ... ok
+test gptoss::tests::gptoss_bundle_reports_routed_layers ... ok
+test gptoss::tests::gptoss_routed_objective_matches_reference ... ok
+test jlens::tests::logit_weighted_keeps_relevant_over_big_irrelevant ... ok
+test jlens::tests::gauss_is_roughly_standard_normal ... ok
+test headgate::tests::gate_accepts_wide_margin_and_falls_back_thin ... ok
+test jlens::tests::npz_has_zip_signatures_and_members ... ok
+test gptoss::tests::gptoss_scan_twin_matches_an_independent_walk ... ok
+test jlens::tests::sample_src_spreads_and_caps ... ok
+test jlens::tests::rank_reduce_preserves_identity_and_reduces_l ... ok
+test jlens::tests::nn_pursuit_recovers_a_sparse_nonneg_code ... ok
+test jlens::tests::npy_header_is_64b_aligned_and_wellformed ... ok
+test jlens::tests::shrink_interpolates_between_identity_and_j ... ok
+test jlens::tests::sym_eig_jacobi_recovers_known_spectrum ... ok
+test jlens::tests::save_load_round_trips ... ok
+test jlens::tests::truncate_full_rank_is_a_noop ... ok
+test gemma4::tests::gemma4_blind_support_is_coherent ... ok
+test logic_whole::tests::ff_is_souffle_safe ... ok
+test mdfmt::tests::inline_markdown ... ok
+test mdfmt::tests::blocks ... ok
+test jlens::tests::truncate_recovers_a_low_rank_matrix ... ok
+test mdfmt::tests::latex_inline_and_display ... ok
+test mdfmt::tests::inline_only_latexes_math ... ok
+test mdfmt::tests::latex_scripts_and_frac ... ok
+test mla::tests::mla_blind_support_and_dense_layer_guard ... ok
+test minimax::tests::minimax_reports_routed_layers ... ok
+test gptoss::tests::gptoss_sink_is_not_a_no_op ... ok
+test qwen35moe::tests::pdc_memory_is_explicit_last_query_intervention ... ok
+test qwen35moe::tests::pdc_observer_preserves_hybrid_walk_and_complete_source_sum ... ok
+test jlens::tests::estimate_recovers_known_linear_map ... ok
+test minimax::tests::minimax_routed_objective_matches_reference ... ok
+test qwen35moe::tests::qwen35_candidates_are_independent ... ok
+test mla::tests::mla_routed_objective_matches_reference ... ok
+test qwen35moe::tests::qwen35_chunked_scan_matches_single_token_walk ... ok
+test qwen35moe::tests::qwen35_commit_advances_state ... ok
+test gemma4::tests::gemma4_routed_objective_matches_reference ... ok
+test gemma4::tests::gemma4_candidates_are_independent ... ok
+test qwen35moe::tests::qwen35_corpus_best_matches_naive_per_position_max ... ok
+test qwen35moe::tests::qwen35_climb_objective_matches_naive ... ok
+test qwen35moe::tests::qwen35_scorer_step_matches_naive_bitwise ... ok
+test qwen35moe::tests::qwen35_dense_reports_supported ... ok
+test qwen35moe::tests::qwen35_moe_layers_decline ... ok
+test recursion_probe::pil_dump_tests::argmax_can_land_off_candidate_zero ... ok
+test recursion_probe::pil_dump_tests::argmax_is_the_largest_blocksum ... ok
+test mla::tests::mla_candidates_are_independent ... ok
+test recursion_probe::pil_dump_tests::empty_candidate_set_is_none ... ok
+test qwen3moe::tests::qwen3_moe_bundle_reports_routed_layers ... ok
+test qwen35moe::tests::qwen35_routed_objective_matches_reference ... ok
+test recursion_probe::pil_dump_tests::inf_blocksum_is_rejected ... ok
+test recursion_probe::pil_dump_tests::nan_blocksum_is_rejected ... ok
+test retrieval::tests::candidates_union_dedups_and_includes_ngrams ... ok
+test qwen3moe::tests::qwen3_routed_objective_matches_reference ... ok
+test retrieval::tests::context_candidates_recent_and_induction ... ok
+test retrieval::tests::predict_conf_reports_bucket_fanout ... ok
+test retrieval::tests::induction_copies_token_after_recurrence ... ok
+test retrieval::tests::ngram_bigram_fallback_when_no_induction ... ok
+test retrieval::tests::rule_for_names_the_explaining_rule ... ok
+test retrieval::tests::unigram_is_the_floor ... ok
+test qwen3moe::tests::qwen3_candidates_are_independent ... ok
+test rope::tests::blind_climb_objective_matches_naive_recompute ... ok
+test rope::tests::blind_climb_polarity_selects_opposite_extremes ... ok
+test rope::tests::mlp_act_last_cached_matches_naive_bitwise ... ok
+test rope::tests::blind_corpus_best_scores_position_zero ... ok
+test rope::tests::mlp_act_last_single_token ... ok
+test rope::tests::mlp_act_last_early_exit_is_exact ... ok
+test rope::tests::mlp_act_last_rejects_bad_inputs ... ok
+test minimax::tests::minimax_candidates_are_independent ... ok
+test rope::tests::native_probe_rejects_invalid_coordinates_and_ambiguous_patches ... ok
+test rope::tests::native_probe_matches_forward_and_identity_patch ... ok
+test rope::tests::native_probe_patch_is_position_specific_and_propagates ... ok
+test ternary::tests::distribute_is_exact ... ok
+test rope::tests::score_cache_rejects_bad_prefix ... ok
+test ternary::tests::roundtrip_exhaustive_over_int8_expansion_range ... ok
+test ternary::tests::sparsity_small_weights_use_fewer_trits ... ok
+test rope::tests::rope_reports_supported ... ok
+test ternary::tests::trits_for_known_bounds ... ok
+test rope::tests::score_commit_advances_and_persists_winner ... ok
+test rope::tests::score_step_is_bit_identical_to_naive ... ok
+test tests::flag_parsing ... ok
+test tests::search_desc_names_the_config_that_produced_the_ratio ... ok
+test tools::tests::arguments_as_json_string ... ok
+test tools::tests::hermes_single_and_multi ... ok
+test tools::tests::mistral_and_llama_and_generic ... ok
+test tools::tests::parse_tools_openai_and_anthropic ... ok
+test tests::resolve_bundle_explicit_cache_and_repo_id ... ok
+test tools::tests::plain_answer_has_no_calls_and_leading_text ... ok
+test tropical::tests::interior_iff_atom_gt_one ... ok
+test tropical::tests::local_rank_counts_within_eps ... ok
+test tropical::tests::nearest_facet_basic ... ok
+test rope::tests::blind_corpus_best_matches_naive_per_position_max ... ok
+test tropical::tests::nearest_facet_skips_degenerate ... ok
+test mla::tests::mla_scorer_step_matches_naive_bitwise ... ok
+test turboquant::tests::rho_and_dprod_scaling ... ok
+test turboquant::tests::rotation_is_orthogonal_and_invertible ... ok
+test turboquant::tests::fwht_twice_is_n_identity ... ok
+test turboquant::tests::rotation_isotropizes_a_spike ... ok
+test turboquant::tests::codec_roundtrip_error_falls_with_bits ... ok
+test turboquant::tests::lloyd_levels_symmetric_and_monotone ... ok
+test turboquant::tests::roundtrip_nonpow2_large_d ... ok
+test gptoss::tests::gptoss_candidates_are_independent ... ok
+test qwen3moe::tests::qwen3_qk_norm_bit_is_load_bearing ... ok
+test minimax::tests::minimax_scorer_step_matches_naive_bitwise ... ok
+test gptoss::tests::gptoss_kv_decode_is_bit_identical_to_naive ... ok
+test gemma4::tests::gemma4_scorer_step_matches_naive_bitwise ... ok
+test qwen35moe::tests::qwen35_routed_chunked_equals_single_token_walk ... ok
+test qwen3moe::tests::qwen3_scorer_step_matches_naive_bitwise ... ok
+test gptoss::tests::gptoss_corpus_oracle_matches_causal_positions ... ok
+
+test result: ok. 180 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests fieldrun
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

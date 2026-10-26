@@ -1,0 +1,46 @@
+{
+  "gate": "passed",
+  "engineering_only": true,
+  "admitted_replay_tested": false,
+  "native_reference_matches": 5,
+  "rows": [
+    {
+      "prediction": 15,
+      "source_sum_error": 2.08243727684021e-06,
+      "hidden_max_error": 0.020223140716552734,
+      "candidate_score_max_error": 0.014326095581054688
+    },
+    {
+      "prediction": 15,
+      "source_sum_error": 2.08243727684021e-06,
+      "hidden_max_error": 0.020223140716552734,
+      "candidate_score_max_error": 0.014326095581054688
+    },
+    {
+      "prediction": 15,
+      "source_sum_error": 3.6046840250492096e-06,
+      "hidden_max_error": 0.02116537094116211,
+      "candidate_score_max_error": 0.018190383911132812
+    },
+    {
+      "prediction": 17,
+      "source_sum_error": 1.819804310798645e-06,
+      "hidden_max_error": 0.01988840103149414,
+      "candidate_score_max_error": 0.015982676297426224
+    },
+    {
+      "prediction": 19,
+      "source_sum_error": 3.334134817123413e-06,
+      "hidden_max_error": 0.03406679630279541,
+      "candidate_score_max_error": 0.017277419567108154
+    }
+  ],
+  "zero_replay_bit_identity": true,
+  "effects": [
+    {
+      "native_nonzero_effect": 0.5496826171875,
+      "reference_nonzero_effect": 0.5546875
+    }
+  ],
+  "earlier_position_scope": "Native unit test; not independently measured on these real-model captures."
+}

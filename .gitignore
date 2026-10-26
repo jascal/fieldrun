@@ -50,3 +50,5 @@ experiments/ilp_decompile/
 /experiments/pdc_qwen35_memory_controls/batch_*.log
 /experiments/pdc_qwen35_memory_controls/batch_*_capture.json
 /experiments/pdc_qwen35_memory_controls/reference.json
+/experiments/pdc_qwen35_replay_engineering/real_corrected_capture.json
+/experiments/pdc_qwen35_replay_engineering/real_reference.json

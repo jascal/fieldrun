@@ -1,0 +1,17 @@
+{
+  "status": "failed_absolute_tiny_hidden_gate",
+  "reference_matches": 9,
+  "default_reference_matches": 60,
+  "threshold": 0.0001,
+  "observed_baseline_hidden_max_error": 0.0017129182815551758,
+  "observation": "Unmodified baseline already fails; zero replay identical. No scientific transfer inputs run.",
+  "manifest_timing": "Recorded after first engineering failure; unchanged execution sources, not a preregistration timestamp.",
+  "sha256": {
+    "src/qwen35moe.rs": "03556ada3d797bff14dad7c82a6b2cfa307b42de286da34fe2e580ac8090e713",
+    "src/deltanet.rs": "6b5586e427c80a7f4709c6700343abeae345545d39e9edb3e89407009e5e827f",
+    "scripts/pdc_qwen35_replay_reference.py": "feb577fe04b0c232802d07eb817412afa6724097132114c650799041e5723eb0",
+    "experiments/pdc_qwen35_replay_engineering/PROTOCOL.md": "f0f592a14d059e9c0ac1870c6266df9a8905344f689145362d823cc45486be87",
+    "experiments/pdc_qwen35_replay_engineering/tiny_selection.json": "ac05804f9534e9cba2d751f7dbf93f9bd79dc1fe28f625762452644e337659fc",
+    "/tmp/pdc-qwen-replay-legacy-normalization": "11404426e9c53fa1479a11231ed7f242a8151f44024f9f2c0a00005ac743cfee"
+  }
+}
