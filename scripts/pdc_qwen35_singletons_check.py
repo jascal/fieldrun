@@ -21,15 +21,33 @@ def main():
     torch.set_num_threads(4)
     manifest = json.loads((out / "manifest.json").read_text())
     original = json.loads((root / "run_manifest.json").read_text())
+    repo = Path(__file__).resolve().parents[1]
     for name, wanted in manifest["sha256"].items():
+        archived = Path(name)
+        if name.startswith("experiments/pdc_qwen35_4b/"):
+            local = root / archived.name
+        elif name.startswith("experiments/pdc_qwen35_singletons/"):
+            local = out / archived.name
+        elif name.startswith("scripts/") or archived.parent.name == "scripts":
+            local = repo / "scripts" / archived.name
+        elif name.endswith(".fieldrun.json"):
+            local = Path(str(a.bundle) + ".fieldrun.json")
+        elif name.endswith(".fieldrun.bin"):
+            local = Path(str(a.bundle) + ".fieldrun.bin")
+        else:
+            raise ValueError(f"unexpected frozen input identity: {name}")
         h = hashlib.sha256()
-        with Path(name).open("rb") as f:
+        with local.open("rb") as f:
             for b in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(b)
         assert h.hexdigest() == wanted, name
     for suffix in [".fieldrun.json", ".fieldrun.bin"]:
-        key = str(a.bundle) + suffix
-        assert manifest["sha256"][key] == original["sha256"][key]
+        diagnostic_ids = [
+            v for k, v in manifest["sha256"].items() if k.endswith(suffix)
+        ]
+        original_ids = [v for k, v in original["sha256"].items() if k.endswith(suffix)]
+        assert len(diagnostic_ids) == len(original_ids) == 1
+        assert diagnostic_ids == original_ids
     domain = json.loads((root / "domain.json").read_text())
     tokens = json.loads((root / "probe.json").read_text())["tokens"]
     m, U, gain = read_frame(a.bundle, tokens)
