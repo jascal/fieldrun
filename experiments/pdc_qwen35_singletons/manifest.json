@@ -1,0 +1,26 @@
+{
+  "schema": "pdc.qwen35-singleton-diagnostic.v1",
+  "scope": "saved-data diagnosis; no fresh heldout confirmation",
+  "sha256": {
+    "experiments/pdc_qwen35_4b/domain.json": "986f141855dced94f140f308a033b309fda3c220c8b97039db141f60ae149d35",
+    "experiments/pdc_qwen35_4b/probe.json": "d0bbbf53eac0cb4f84e6c2bb27a2f2ee02c8d9a42f4dfca8923d634762832289",
+    "experiments/pdc_qwen35_4b/run_manifest.json": "db90dae20bd1f1c25179e33628bf88e173a6466df681e4892a15d053cc8d2de4",
+    "experiments/pdc_qwen35_4b/verification.json": "935bd475123b3b2919738b4acd889347ae5f287b7272c01ac5f7b248d5205442",
+    "experiments/pdc_qwen35_4b/batch_00_capture.json": "e6e60fe2ce11d7c23551fcb0a6a1f5d54e53dd553cdec791bebafac68fa17e3b",
+    "experiments/pdc_qwen35_4b/batch_01_capture.json": "994e5f751e575304bc544a07d2df6ba8a62848f9aba229e6fd2c80298d29f436",
+    "experiments/pdc_qwen35_4b/batch_02_capture.json": "156c435b0b11f814b8898abe70224b207c9c81dcbc82f992c197acb8ccc22f3f",
+    "experiments/pdc_qwen35_4b/batch_03_capture.json": "5b621bc1e00b7b52d8c1797676db5830b528c9f526d1390f60d45b1c935a059a",
+    "experiments/pdc_qwen35_4b/batch_04_capture.json": "66114b0bf8c126ce000656d8367f5b23c9a8ecd9226818ec79a4958abc662e72",
+    "experiments/pdc_qwen35_4b/batch_05_capture.json": "229403143572f8b488a03770aacbcb283578b1a4cad4be414b65b56f11b0b464",
+    "experiments/pdc_qwen35_4b/batch_06_capture.json": "24df6eeb8d54daaa9ac41a874222ddee28ee4109a0fa69c26c7b7c0bfa9622c8",
+    "experiments/pdc_qwen35_4b/batch_07_capture.json": "a39503f377b9c8e50ca2d1739d9fc6b18d1157088b987f745348fc7aeda0ed83",
+    "experiments/pdc_qwen35_4b/batch_08_capture.json": "d14689ec732c1b23c1668175a4c2f7aec7b003edb41d7a872263a0b475ac7db9",
+    "experiments/pdc_qwen35_4b/batch_09_capture.json": "90a4f8371f9188f7dc941892fed3fa86329130f8427a80d0f520cc468a05fd50",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/fieldrun/qwen35-4b.fieldrun.json": "c6e946976dbb0f305296040aaaf1a6952a96adbda36d7dfad07e7de046079ab5",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/fieldrun/qwen35-4b.fieldrun.bin": "f8f5c41fc31877f4606bdb89caab4b6e5d9fa5a9c9fdff2aa11a471d6a7522ac",
+    "experiments/pdc_qwen35_singletons/PREREG.md": "4c87741c158145fbec12030200b28c61346ed2b1ca7e2caad9f56d071b8ab0cb",
+    "/tmp/pdc-fieldrun-review/scripts/pdc_qwen35_singletons.py": "29c293df1811e4ff942215df7889f84992c709f4919f4991c238bcc36fdc689c"
+  },
+  "gamma_floor": 0.5,
+  "new_model_forwards": 0
+}
