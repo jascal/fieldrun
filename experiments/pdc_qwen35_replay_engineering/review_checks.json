@@ -1,0 +1,17 @@
+{
+  "source_revision_before_final_documentation": "d9672badba964b9f042f824747bfe009893c0e48",
+  "rust_library_tests_passed": 14,
+  "rust_binary_tests_passed": 182,
+  "python_unit_tests_passed": 21,
+  "normalized_transformers_kernel_max_abs_error": 8.6e-08,
+  "saved_tiny_cases": 9,
+  "saved_real_cases": 5,
+  "new_scientific_model_forwards": 0,
+  "source_sha256": {
+    "src/composition.rs": "7b71f680874844df672c137e10852a22445509e279195d7f022e395d47cd3adc",
+    "src/deltanet.rs": "604542c85646c87e0825d6385bc29bd9db4d6c2d73073013f60ce5689627cf47",
+    "scripts/pdc_qwen35_replay_engineering_check.py": "dc3e2440d87b261ded53e18192b589072348195731280ea2ddf8ac5ac54ca57a",
+    "experiments/qwen3next/deltanet_ref.py": "af51108253f654860cac2fcaa64e2405810402a2c53d8810234401f8ffc56dcd",
+    "experiments/qwen3next/crosscheck_deltanet.py": "d6dcb650058a96f4da93784d268c08b17c77ae7e316b48eb64cdca34db6d13b6"
+  }
+}

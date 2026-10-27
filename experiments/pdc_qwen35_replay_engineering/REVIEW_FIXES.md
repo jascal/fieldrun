@@ -25,3 +25,7 @@ The low-norm Rust test remains the separate executable normalization gate.
 
 No capture, filler, threshold, model or scientific contrast was changed. No
 additional full-model forward was requested for this review repair.
+
+Final stack validation: 21 Python unit tests, 14 Rust library tests and 182 Rust
+binary tests pass, including the low-norm golden, hybrid prefill/decode identity,
+explicit replay and GPT-2 observer accounting tests.
