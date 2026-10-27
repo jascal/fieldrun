@@ -1,0 +1,6 @@
+{
+  "scripts/pdc_qwen35_analyze.py": "7ae83728222a18763567f79561c277a346eac4a41abddbfed0676635ffb6c25b",
+  "scripts/pdc_qwen35_bundle_check.py": "6e20245340135fb06ebd018aa708be5f2ead105ed29358fcc567830a67c53726",
+  "scripts/pdc_qwen35_engineering_check.py": "e80da37de4a92e163f9b41bd8a3dc649dff68db4362ef2be2ffd912b77d449ba",
+  "scripts/pdc_qwen35_singletons.py": "be0605ded0923ab04f721e501e0e995b66c33facfc390f8ecdd66d59027f1ff8"
+}

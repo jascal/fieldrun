@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pdc_qwen35_engineering_check import read_frame
+from pdc_qwen35_engineering_check import read_frame, check_reconstruction
 
 
 def main():
@@ -19,6 +19,7 @@ def main():
         type=Path,
         help="original HF checkpoint directory (defaults to bundle parent/parent)",
     )
+    p.add_argument("--frozen-source-root",type=Path,help="original frozen source/binary snapshot for historical hash checks; current checker still audits captures")
     a = p.parse_args()
     root = a.artifacts
     repo = Path(__file__).resolve().parents[1]
@@ -38,7 +39,7 @@ def main():
             or name.startswith("src/")
             or name.startswith("target/")
         ):
-            local = repo / original
+            local = (a.frozen_source_root or repo) / original
         elif original.name.endswith(".fieldrun.bin"):
             local = Path(str(a.bundle) + ".fieldrun.bin")
         elif original.name.endswith(".fieldrun.json"):
@@ -72,6 +73,7 @@ def main():
         matches += native_case["prediction"] == ref["prediction"]
         raw = np.array([s["write"] for s in native_case["sources"]])
         r = np.array(native_case["final_residual"])
+        check_reconstruction(raw,r,native_case["final_hidden"],gain,m["config_f"][1],native_case["candidate_scores"],U)
         # Apply the host's fixed RMS gain after summing a coalition, instead
         # of folding each write as the exporter does.
         scale = gain / np.sqrt(np.mean(r * r) + m["config_f"][1])
@@ -125,7 +127,11 @@ def main():
         commitments_checked=commitments,
         input_hashes_verified=True,
         gate="passed" if matches == 100 else "failed_native_reference_agreement",
-        reference_forward_calls=100,
+        reference_forward_calls=0,
+        retained_reference_cases=100,
+        frozen_source_snapshot=str(a.frozen_source_root) if a.frozen_source_root else None,
+        checker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        reconstruction_gate="passed_all_100_cases",
         scope="finite engineering and certificate audit; no truth theorem",
     )
     (root / "verification.json").write_text(json.dumps(result, indent=2) + "\n")
