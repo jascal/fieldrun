@@ -10,7 +10,7 @@ import numpy as np
 
 from pdc_certificate import certify
 from pdc_derive import Body, evaluate
-from pdc_qwen35_engineering_check import read_frame
+from pdc_qwen35_engineering_check import read_frame, check_reconstruction
 from pdc_theory_check import judge_commitment
 
 
@@ -55,7 +55,7 @@ def analyze(directory, stem):
         residual = np.array(observed["final_residual"])
         hidden = np.array(observed["final_hidden"])
         assert np.isfinite(raw).all() and np.isfinite(residual).all()
-        folded = raw * gain / np.sqrt(np.mean(residual * residual) + m["config_f"][1])
+        folded, reconstruction_errors = check_reconstruction(raw,residual,hidden,gain,m["config_f"][1],observed["candidate_scores"],U)
         guard = {
             name: (folded[coalition].sum(0) @ U.T).tolist()
             for name, coalition in programs.items()
@@ -103,6 +103,7 @@ def analyze(directory, stem):
                     domain["token_map"][graded["atom"]] == observed["prediction"]
                 )
                 t = guard_rivals.index(graded["atom"])
+                counts["covered_candidate_agreements"] += t == int(np.argmax(observed["candidate_scores"]))
                 assert t == int(np.argmax(observed["candidate_scores"]))
             else:
                 counts["abstained"] += 1
@@ -113,17 +114,7 @@ def analyze(directory, stem):
         n[split] += 1
         correct = observed["prediction"] == domain["token_map"][case["truth"]]
         host[split] += correct
-        errors.append(
-            dict(
-                source_sum=float(np.max(np.abs(raw.sum(0) - residual))),
-                rms_fold=float(np.max(np.abs(folded.sum(0) - hidden))),
-                full_body_score=float(
-                    np.max(
-                        np.abs(np.array(guard["full"]) - observed["candidate_scores"])
-                    )
-                ),
-            )
-        )
+        errors.append(reconstruction_errors)
         responses.append(
             dict(
                 id=case["id"],
@@ -169,7 +160,7 @@ def analyze(directory, stem):
                 "useful_coverage": coverage,
                 "commitment_theory_accuracy": accuracy,
                 "full_host_agreement": agreement,
-                "covered_candidate_agreement": 1.0 if c else None,
+                "covered_candidate_agreement": counts["covered_candidate_agreements"]/c if c else None,
                 "hallucination_rate": hallucinations / c if c else None,
                 "classification": "positive_local_comparison"
                 if positive
@@ -195,6 +186,7 @@ def analyze(directory, stem):
         model_forwards=100,
         native_output_row_calls=100 * m["config"][5],
         body_probe_annotations=100 * 3 * len(tokens),
+        reconstruction_gate="passed_all_100_cases",
         error_maxima={key: max(e[key] for e in errors) for key in errors[0]},
         scope="new fixed model/template comparison; original GPT-2 results unchanged",
     )

@@ -26,6 +26,27 @@ def read_frame(stem, tokens):
     return m, weights[name], 1 + weights["norm"]
 
 
+def check_reconstruction(raw, residual, hidden, gain, epsilon, scores, frame):
+    raw, residual, hidden, gain, scores, frame = [np.asarray(x,dtype=float)
+        for x in (raw,residual,hidden,gain,scores,frame)]
+    width = residual.size
+    if residual.shape != (width,) or width == 0 or hidden.shape != (width,) \
+            or gain.shape != (width,) or raw.ndim != 2 or raw.shape[0] == 0 \
+            or raw.shape[1] != width or scores.ndim != 1 or scores.size == 0 \
+            or frame.shape != (scores.size,width) or not np.isfinite(epsilon) or epsilon <= 0 \
+            or not all(np.isfinite(x).all() for x in (raw,residual,hidden,gain,scores,frame)):
+        raise ValueError("incomplete or nonfinite reconstruction inputs")
+    folded = raw*gain/np.sqrt(np.mean(residual*residual)+epsilon)
+    errors = dict(source_sum=float(np.max(np.abs(raw.sum(0)-residual))),
+        rms_fold=float(np.max(np.abs(folded.sum(0)-hidden))),
+        full_body_score=float(np.max(np.abs(frame@folded.sum(0)-scores))))
+    for name, tolerance, reference in (("source_sum",1e-4,residual),
+            ("rms_fold",1e-4,hidden),("full_body_score",1e-3,scores)):
+        if not errors[name] < tolerance*(1+np.max(np.abs(reference))):
+            raise ValueError(f"{name} reconstruction exceeds engineering bound")
+    return folded, errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["capture", "reference", "bundle", "out"]:
@@ -54,15 +75,8 @@ def main():
         r = np.array(native["final_residual"])
         h = np.array(native["final_hidden"])
         assert np.isfinite(D).all() and np.isfinite(r).all() and np.isfinite(h).all()
-        folded = D * gain / np.sqrt(np.mean(r * r) + m["config_f"][1])
-        raw_error = float(np.max(np.abs(D.sum(0) - r)))
-        fold_error = float(np.max(np.abs(folded.sum(0) - h)))
-        score_error = float(
-            np.max(np.abs(U @ folded.sum(0) - native["candidate_scores"]))
-        )
-        assert raw_error < 1e-4 * (1 + np.max(np.abs(r)))
-        assert fold_error < 1e-4 * (1 + np.max(np.abs(h)))
-        assert score_error < 1e-3 * (1 + np.max(np.abs(native["candidate_scores"])))
+        folded, errors = check_reconstruction(D,r,h,gain,m["config_f"][1],native["candidate_scores"],U)
+        raw_error, fold_error, score_error = (errors[k] for k in ("source_sum","rms_fold","full_body_score"))
         rows.append(
             dict(
                 prediction=native["prediction"],

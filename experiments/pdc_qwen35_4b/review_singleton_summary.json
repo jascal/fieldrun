@@ -1,0 +1,67 @@
+{
+  "summary": {
+    "development": {
+      "contexts": 50,
+      "raw_singleton_host_matches": 50,
+      "exact": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      },
+      "centered": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      }
+    },
+    "heldout": {
+      "contexts": 50,
+      "raw_singleton_host_matches": 50,
+      "exact": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      },
+      "centered": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      }
+    },
+    "all": {
+      "contexts": 100,
+      "raw_singleton_host_matches": 100,
+      "exact": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      },
+      "centered": {
+        "admitted": 0,
+        "rate": 0.0,
+        "covered_host_agreements": 0,
+        "covered_host_agreement": null,
+        "theory_affirmed": 0,
+        "witnesses": {}
+      }
+    }
+  },
+  "classification": "negative_fixed_singletons",
+  "source_verdicts": 6500,
+  "new_model_forwards": 0
+}

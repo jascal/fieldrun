@@ -1,0 +1,16 @@
+{
+  "schema": "pdc.qwen35-bundle-audit.v1",
+  "contexts": 100,
+  "reference_matches": 100,
+  "maximum_independent_body_error": 1.0658141036401503e-14,
+  "body_probe_annotations_checked": 678300,
+  "commitments_checked": 200,
+  "input_hashes_verified": true,
+  "gate": "passed",
+  "reference_forward_calls": 0,
+  "retained_reference_cases": 100,
+  "frozen_source_snapshot": "/tmp/pdc-frozen-source-148",
+  "checker_sha256": "6e20245340135fb06ebd018aa708be5f2ead105ed29358fcc567830a67c53726",
+  "reconstruction_gate": "passed_all_100_cases",
+  "scope": "finite engineering and certificate audit; no truth theorem"
+}

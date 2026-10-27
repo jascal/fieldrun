@@ -19,6 +19,11 @@ def sha(path):
     return h.hexdigest()
 
 
+def witness_agreement(rows, name):
+    matches = sum(r[name+"_witness_token"] == r["host_token"] for r in rows)
+    return matches, matches/len(rows) if rows else None
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ["artifacts", "bundle", "out"]:
@@ -120,6 +125,7 @@ def main():
                     id=case["id"],
                     split=case["split"],
                     status="scored",
+                    host_token=native["prediction"],
                     target_token=target_token,
                     target_atom=next(
                         (
@@ -133,6 +139,8 @@ def main():
                     memory="none",
                     any_raw_host_match=bool(strict.any()),
                     sources=body_rows,
+                    exact_witness_token=tokens[int(partial[exact_indices[0]].argmax())] if exact_indices else None,
+                    centered_witness_token=tokens[int(partial[centered_indices[0]].argmax())] if centered_indices else None,
                     exact_witness=source_names[exact_indices[0]]
                     if exact_indices
                     else None,
@@ -155,10 +163,12 @@ def main():
         )
         for name in ["exact", "centered"]:
             admitted = [r for r in rows if r.get(name + "_witness") is not None]
+            matches, agreement = witness_agreement(admitted,name)
             summary[name] = dict(
                 admitted=len(admitted),
                 rate=len(admitted) / len(rows),
-                covered_host_agreement=1.0 if admitted else None,
+                covered_host_agreements=matches,
+                covered_host_agreement=agreement,
                 theory_affirmed=sum(r["host_correct"] for r in admitted),
                 witnesses=dict(Counter(r[name + "_witness"] for r in admitted)),
             )

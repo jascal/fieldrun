@@ -10,6 +10,14 @@ use crate::model::Model;
 
 fn default_observer_check() -> bool { true }
 
+fn observer_identity(observed: &Array2<f32>, plain: &Array2<f32>) -> Result<f32, String> {
+    if observed.shape() != plain.shape() || observed.iter().zip(plain.iter()).any(|(a,b)|
+        !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()) {
+        return Err("observer changed hidden state".into());
+    }
+    Ok(0.0)
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct ResidualMemory {
     pub site: String,
@@ -242,7 +250,6 @@ impl Gpt2 {
             let mut sources = Vec::new();
             let started = std::time::Instant::now();
             let observed = self.hidden_observed(ids, Some(&selected), &mut reads, &mut sources);
-            let plain = selection.check_observer.then(|| self.hidden(ids));
             let prediction_positions: Vec<usize> = if selection.last_prediction_only {
                 vec![ids.len() - 1]
             } else { (0..ids.len()).collect() };
@@ -267,10 +274,12 @@ impl Gpt2 {
                 (predicted, candidate_scores)
             };
             let (observed_predictions, candidate_scores) = predictions(&observed);
-            let plain_predictions = plain.as_ref().map(|x| predictions(x).0);
             let elapsed_us = started.elapsed().as_micros();
-            let observer_error = plain.as_ref().map(|plain| observed.iter().zip(plain.iter())
-                .map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max));
+            // Validation is outside the measured forward/decode and never unembeds twice.
+            let plain = selection.check_observer.then(|| self.hidden(ids));
+            let observer_error = plain.as_ref().map(|plain| observer_identity(&observed, plain)).transpose()?;
+            // Equal hidden bits imply the same deterministic scorer output.
+            let plain_predictions = plain.as_ref().map(|_| observed_predictions.clone());
             cases.push(serde_json::json!({
                 "ids": ids, "reads": reads,
                 "sources": sources, "prediction_positions": prediction_positions,
@@ -279,6 +288,7 @@ impl Gpt2 {
                 "scoring_scope": if selection.score_candidates_only { "candidate_subset" } else { "full_vocabulary" },
                 "native_output_row_calls": native_output_row_calls,
                 "elapsed_forward_decode_us": elapsed_us,
+                "measurement_scope": "observed_forward_and_decode_only",
                 "observer_check_performed": selection.check_observer,
                 "memory_replay": selected.memory_writes.first().cloned().flatten(),
                 "final_hidden": observed.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
@@ -647,5 +657,64 @@ impl Model for Gpt2 {
             self.forward_block(&emb, cur, kc, vc)
         };
         crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb))
+    }
+}
+
+#[cfg(test)]
+mod pdc_tests {
+    use super::*;
+    #[test]
+    fn observer_identity_fails_closed() {
+        let observed = ndarray::arr2(&[[1.0, 2.0]]);
+        assert!(observer_identity(&observed, &ndarray::arr2(&[[1.0, 2.1]])).is_err());
+        assert!(observer_identity(&observed, &ndarray::arr2(&[[1.0, f32::NAN]])).is_err());
+    }
+    #[test]
+    fn observer_counts_only_the_observed_scorer() {
+        let dir = std::env::temp_dir().join(format!("fr_gpt2_pdc_review_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut bin = Vec::new();
+        let mut arrays = Vec::new();
+        let mut add = |name: &str, shape: Vec<usize>, values: Vec<f32>| {
+            let offset = bin.len();
+            for x in values { bin.extend_from_slice(&x.to_le_bytes()); }
+            arrays.push(serde_json::json!({"name":name,"shape":shape,"dtype":"f32","offset":offset,"bytes":bin.len()-offset}));
+        };
+        add("wte", vec![3,2], vec![1.,0.,0.,1.,2.,-1.]);
+        add("wpe", vec![3,2], vec![0.;6]);
+        for prefix in ["ln_f", "h0.ln_1", "h0.ln_2"] {
+            add(&format!("{prefix}.weight"), vec![2], vec![1.;2]);
+            add(&format!("{prefix}.bias"), vec![2], vec![0.;2]);
+        }
+        for (name, shape, bias) in [("h0.attn.c_attn",vec![2,6],6),
+            ("h0.attn.c_proj",vec![2,2],2),("h0.mlp.c_fc",vec![2,8],8),
+            ("h0.mlp.c_proj",vec![8,2],2)] {
+            add(&format!("{name}.weight"), shape.clone(), vec![0.;shape.iter().product()]);
+            add(&format!("{name}.bias"), vec![bias], vec![0.;bias]);
+        }
+        std::fs::write(format!("{stem}.fieldrun.bin"), bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_vec(&serde_json::json!({
+            "format":crate::bundle::FORMAT,"version":crate::bundle::VERSION,"arch":"gpt2",
+            "config":[1,1,2,3,3],"arrays":arrays})).unwrap()).unwrap();
+        let model = Gpt2::new(Bundle::load(&stem).unwrap(),0.,false);
+        for subset in [false,true] {
+            let mut last = None;
+            for observer in [false,true] {
+                let selection: ReadSelection = serde_json::from_value(serde_json::json!({
+                    "layers":[0],"heads":[0],"positions":[1],"contexts":[[0,1]],
+                    "capture_sources":true,"candidate_tokens":[0,1],
+                    "score_candidates_only":subset,"check_observer":observer})).unwrap();
+                let result = model.read_dump(&selection).unwrap();
+                let case = &result["cases"][0];
+                assert_eq!(case["native_output_row_calls"], if subset {4} else {6});
+                if observer {
+                    assert_eq!(case["observer_hidden_max_error"],0.);
+                    assert_eq!(case["unobserved_predictions"],case["predictions"]);
+                    assert_eq!(last.as_ref().unwrap(), &case["predictions"]);
+                } else { last = Some(case["predictions"].clone()); }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
