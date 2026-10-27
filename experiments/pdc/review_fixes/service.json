@@ -1,0 +1,112 @@
+{
+  "schema": "pdc.service-audit.v1",
+  "contexts": 75,
+  "untouched_heldout": 25,
+  "probe_size": 1703,
+  "body_probe_annotations_checked": 383175,
+  "maximum_body_score_discrepancy": 7.389644451905042e-13,
+  "probe_score_max_discrepancy": 0,
+  "source_write_max_discrepancy": 0,
+  "frozen_R5_full_host_agreements": 75,
+  "misses": 47,
+  "fragile_truth": 3,
+  "theory_soundness_claim": false,
+  "viterbi": {
+    "abstained": 75,
+    "committed": 0,
+    "affirmed": 0,
+    "hallucination": 0,
+    "full_host_agreement": null,
+    "hallucination_rate": null,
+    "host_gate": "untested",
+    "abstention_reasons": {
+      "pairwise_fidelity_guard": 22,
+      "body_margin_guard": 20,
+      "readout_margin_guard": 33
+    }
+  },
+  "marginal": {
+    "abstained": 75,
+    "committed": 0,
+    "affirmed": 0,
+    "hallucination": 0,
+    "full_host_agreement": null,
+    "hallucination_rate": null,
+    "host_gate": "untested",
+    "abstention_reasons": {
+      "pairwise_fidelity_guard": 15,
+      "body_margin_guard": 23,
+      "readout_margin_guard": 37
+    }
+  },
+  "compute": {
+    "baseline_native_output_row_calls": 3769275,
+    "service_native_output_row_calls": 127725,
+    "body_probe_dot_calls_each_arm": 383175,
+    "native_output_rows_skipped": 3641550,
+    "native_row_reduction": 0.9661141731500089,
+    "output_and_body_dot_reduction": 0.8769642018567352,
+    "positions_skipped": 0,
+    "layers_skipped": 0
+  },
+  "timings": {
+    "paired_runs": [
+      {
+        "arm": "baseline",
+        "end_to_end_wall_seconds": 13.354881196999486,
+        "capture": "experiments/pdc/r8h_timed_baseline_capture.json",
+        "bundle": "experiments/pdc/r8h_baseline_bundle.json",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/pdc_service.py",
+          "--runtime",
+          "target/release/fieldrun",
+          "--selection",
+          "experiments/pdc/r8h_baseline_selection.json",
+          "--retain-capture",
+          "experiments/pdc/r8h_timed_baseline_capture.json",
+          "--domain",
+          "experiments/pdc/r5_domain.json",
+          "--probe",
+          "experiments/pdc/r8h_probe.json",
+          "--bundle",
+          "bundles/gpt2",
+          "--out",
+          "experiments/pdc/r8h_baseline_bundle.json",
+          "--grade-addition",
+          "--allow-full-baseline"
+        ]
+      },
+      {
+        "arm": "service",
+        "end_to_end_wall_seconds": 12.870530618000885,
+        "capture": "experiments/pdc/r8h_timed_service_capture.json",
+        "bundle": "experiments/pdc/r8h_service_bundle.json",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/pdc_service.py",
+          "--runtime",
+          "target/release/fieldrun",
+          "--selection",
+          "experiments/pdc/r8h_service_selection.json",
+          "--retain-capture",
+          "experiments/pdc/r8h_timed_service_capture.json",
+          "--domain",
+          "experiments/pdc/r5_domain.json",
+          "--probe",
+          "experiments/pdc/r8h_probe.json",
+          "--bundle",
+          "bundles/gpt2",
+          "--out",
+          "experiments/pdc/r8h_service_bundle.json",
+          "--grade-addition"
+        ]
+      }
+    ],
+    "native_baseline_forward_decode_seconds": 9.411635,
+    "native_service_forward_decode_seconds": 8.784932,
+    "inference": "one fixed ordered pair; descriptive timings only"
+  },
+  "review_recheck": true,
+  "checker_sha256": "9a5a1372fafbc93ae6e5c6535f468c81912bd74ff7ac68f80ca72aacd4118fba"
+}

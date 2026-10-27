@@ -7,6 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
+from pdc_service import decision_sources
+
+
+def require_published_baseline(path, expected_sha):
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise ValueError("held-out baseline differs from the published frozen capture")
+    return json.loads(data)
+
 
 def analyze(directory, model_stem):
     source_directory = directory
@@ -15,14 +24,17 @@ def analyze(directory, model_stem):
         return json.loads((directory/name).read_text())
     domain = json.loads((source_directory/"r5_domain.json").read_text())
     probe = json.loads((source_directory/"r8h_probe.json").read_text())
-    full, partial = read("baseline_capture.json"), read("service_capture.json")
+    partial = read("service_capture.json")
     baseline, service = read("baseline_bundle.json"), read("service_bundle.json")
-    initial = read("baseline_capture.json")
+    # Anchor the host labels/source writes to the independently published archive.
+    # No earlier R5 capture exists for these reserved held-out contexts.
+    frozen_sha = "89262975694d0d2e1d81ed11b8f8644cf5803dc2f80411ee8338cb686d9a688d"
+    full = require_published_baseline(directory/"baseline_capture.json", frozen_sha)
     
     timing = read("timing.json")
     expected = [c for c in domain["cases"] if c["split"] == "heldout"]
     assert len(expected) == len(full["cases"]) == len(partial["cases"]) == len(service["responses"]) == 25
-    assert len(baseline["responses"]) == len(initial["cases"]) == 25
+    assert len(baseline["responses"]) == 25
     assert baseline["request_mode"] == "live_native_full_baseline"
     assert service["request_mode"] == "live_native_subset"
     assert service["claims"]["theory_soundness"] is False
@@ -47,9 +59,10 @@ def analyze(directory, model_stem):
     counter = {name: Counter() for name in ["viterbi", "marginal"]}
     reasons = {name: Counter() for name in counter}
     max_body_error, misses, fragile_truth = 0., 0, 0
-    for pos, (f, p, b, response, case, original) in enumerate(zip(full["cases"], partial["cases"],
-        baseline["responses"], service["responses"], expected, initial["cases"], strict=True)):
-        assert f["ids"] == p["ids"] == response["context_ids"] == case["ids"] == original["ids"]
+    max_probe_error, max_source_error = 0., 0.
+    for pos, (f, p, b, response, case) in enumerate(zip(full["cases"], partial["cases"],
+        baseline["responses"], service["responses"], expected, strict=True)):
+        assert f["ids"] == p["ids"] == response["context_ids"] == case["ids"]
         assert f["candidate_tokens"] == p["candidate_tokens"] == tokens
         assert f["scoring_scope"] == "full_vocabulary" and p["scoring_scope"] == "candidate_subset"
         assert f["observer_check_performed"] is p["observer_check_performed"] is False
@@ -57,12 +70,15 @@ def analyze(directory, model_stem):
         assert p["native_output_row_calls"] == len(tokens)
         assert f["prediction_positions"] == p["prediction_positions"] == [len(case["ids"])-1]
         assert np.array_equal(f["candidate_scores"], p["candidate_scores"])
-        assert f["predictions"] == original["predictions"]
-        assert f["sources"] == p["sources"] == original["sources"]
+        max_probe_error = max(max_probe_error, float(np.max(np.abs(
+            np.asarray(f["candidate_scores"])-np.asarray(p["candidate_scores"])))))
+        max_source_error = max(max_source_error, float(np.max(np.abs(
+            np.asarray([s["write"] for s in f["sources"]])-np.asarray([s["write"] for s in p["sources"]])))))
+        assert f["sources"] == p["sources"]
         assert np.array_equal(f["final_hidden"], p["final_hidden"])
         assert response["full_host_token"] is None and b["full_host_token"] == f["predictions"][0]
-        raw = np.array([s["write"] for s in p["sources"]])
-        residual = np.array(p["reads"][0]["final_residual"])
+        raw, residual = decision_sources(p, len(arrays["ln_f.weight"]))
+        decision_sources(f, len(arrays["ln_f.weight"]))
         sigma = np.sqrt(np.mean((residual-residual.mean())**2)+1e-5)
         sources = (raw-raw.mean(axis=1,keepdims=True))*arrays["ln_f.weight"]/sigma
         assert np.max(np.abs(sources-response["sources"])) < 1e-8
@@ -123,8 +139,9 @@ def analyze(directory, model_stem):
         assert response["chart"]["fragile"] == (winners["viterbi"] != winners["marginal"])
     report = {"schema": "pdc.final-heldout-audit.v1", "contexts": 25, "untouched_heldout": 0,
         "probe_size": len(tokens), "body_probe_annotations_checked": 25*3*len(tokens),
-        "maximum_body_score_discrepancy": max_body_error, "probe_score_max_discrepancy": 0,
-        "source_write_max_discrepancy": 0, "paired_full_host_labels_checked": 25,
+        "maximum_body_score_discrepancy": max_body_error, "probe_score_max_discrepancy": max_probe_error,
+        "source_write_max_discrepancy": max_source_error,
+        "published_baseline_sha256": frozen_sha, "earlier_independent_host_labels_checked": 0, "paired_full_host_labels_checked": 25,
         "misses": int(misses), "fragile_truth": int(fragile_truth), "theory_soundness_claim": False}
     for readout, counts in counter.items():
         n = counts["committed"]
