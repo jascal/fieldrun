@@ -25,3 +25,17 @@ that failure. Real verification uses the analogous real_* files without
 --tiny. Source builds include the independent low-norm fixture under the
 recorded experiments path. These are engineering checks, not admitted memory
 transfer or a scientific arithmetic study. Previous releases unchanged.
+
+## Post-review checker scope
+
+`pdc_qwen35_replay_engineering_check.py` audits saved JSON. It validates that
+the zero arm really contains finite zeros and the nonzero arm contains a finite
+nonzero vector. Its report does not attest the running kernel normalization,
+and does not execute Transformers. Run the separate discriminating kernel gate:
+
+```sh
+cargo test --bin fieldrun low_norm_qk_matches_transformers_regularized_squared_norm
+```
+
+See REVIEW_FIXES.md and the separate review-tiny/review-real reports for the
+post-review artifact checks. The original captures and reports remain unchanged.

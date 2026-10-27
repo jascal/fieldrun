@@ -7,7 +7,8 @@
 //! its grouped key-head), preceded by a short causal depthwise conv (kernel 4) on q/k/v.
 //!
 //! The recurrence and its conventions are PINNED against the reference HF implementation
-//! (`torch_recurrent_gated_delta_rule`, matched to ~1e-7 — see `experiments/qwen3next/`):
+//! (`torch_recurrent_gated_delta_rule`; L2norm is x/sqrt(sum(x*x)+1e-6)).
+//! The discriminating low-norm pin is `experiments/pdc_qwen35_replay_engineering/normalization_golden.json`:
 //!   • `α_t = exp(g_log_t)`           (the gate input is log-decay)
 //!   • `q ← (1/√d_k) · L2norm(q)`     (read scaling + L2-norm on the query)
 //!   • `k ← L2norm(k)`               (L2-norm on the key)
@@ -279,7 +280,8 @@ mod tests {
 
     #[test]
     fn matches_transformers_golden() {
-        // golden from experiments/qwen3next: gated_deltanet_qwen36 == transformers torch_recurrent_gated_delta_rule
+        // Historical O(1) reference: this loose tolerance alone cannot distinguish epsilon placement.
+        // low_norm_qk_matches_transformers_regularized_squared_norm below is the binding normalization pin.
         let (t, dk, dv) = (6, 4, 3);
         let (q, k, v, g, beta) = inputs(t, dk, dv);
         let out = gated_deltanet(&q, &k, &v, &g, &beta, t, dk, dv);

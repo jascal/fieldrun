@@ -1,9 +1,31 @@
-"""Check explicit replay provenance, zero identity and independent parity."""
+"""Audit saved replay artifacts; does not execute Transformers or the kernel golden."""
 
 import argparse
 import json
 from pathlib import Path
 import numpy as np
+
+
+def validate_replay_controls(selection, cases, tiny):
+    triples = [(0,1,2),(3,4,5),(6,7,8)] if tiny else [(0,1,2)]
+    if len(selection["memory_writes"]) != len(cases):
+        raise ValueError("memory writes must cover every case")
+    for i, memory in enumerate(selection["memory_writes"]):
+        if memory is None:continue
+        vector = np.asarray(memory["write"], dtype=float)
+        if memory["site"] != "embed" or vector.shape != (len(cases[i]["final_hidden"]),) \
+                or vector.size == 0 or not np.isfinite(vector).all():
+            raise ValueError("replay requires one finite embedding-width vector")
+    for base, zero, nonzero in triples:
+        if selection["memory_writes"][base] is not None:
+            raise ValueError("baseline arm must not replay memory")
+        z, w = (selection["memory_writes"][i] for i in (zero,nonzero))
+        if z is None or w is None or not np.all(np.asarray(z["write"]) == 0) \
+                or not np.any(np.asarray(w["write"]) != 0):
+            raise ValueError("zero/nonzero controls must contain actual zero/nonzero writes")
+        if not selection["contexts"][base] == selection["contexts"][zero] == selection["contexts"][nonzero]:
+            raise ValueError("replay controls must share the same context")
+    return triples
 
 
 def main():
@@ -24,6 +46,7 @@ def main():
         == len(selection["contexts"])
         == (9 if a.tiny else 5)
     )
+    triples = validate_replay_controls(selection,cases,a.tiny)
     for n, r, ids, memory in zip(
         cases,
         references,
@@ -74,7 +97,6 @@ def main():
                 ),
             )
         )
-    triples = [(0, 1, 2), (3, 4, 5), (6, 7, 8)] if a.tiny else [(0, 1, 2)]
     effects = []
     for base, zero, nonzero in triples:
         b = np.array(cases[base]["final_hidden"], dtype=np.float32)
@@ -96,6 +118,10 @@ def main():
     report = dict(
         gate="passed",
         engineering_only=True,
+        validation_mode="saved_artifact_comparison",
+        executes_transformers=False,
+        executes_normalization_golden=False,
+        kernel_normalization_validated=False,
         admitted_replay_tested=False,
         native_reference_matches=len(cases),
         rows=rows,
