@@ -35,6 +35,28 @@ def load_readout(stem, tokens):
     return manifest, arrays
 
 
+def decision_sources(native, width):
+    """Require a complete finite source decomposition at the decision position."""
+    last = len(native["ids"])-1
+    if last < 0 or native["prediction_positions"] != [last]:
+        raise ValueError("one final-position decision is required")
+    reads, sources = native["reads"], native["sources"]
+    if not reads or not sources or any(r["query_position"] != last for r in reads) \
+            or any(s["position"] != last for s in sources):
+        raise ValueError("source writes and reads must be at the decision position")
+    raw = np.asarray([s["write"] for s in sources], dtype=np.float64)
+    residual = np.asarray(reads[0]["final_residual"], dtype=np.float64)
+    if raw.shape != (len(sources), width) or residual.shape != (width,) \
+            or not np.isfinite(raw).all() or not np.isfinite(residual).all():
+        raise ValueError("finite residual-width source vectors are required")
+    if any(not np.array_equal(r["final_residual"], residual) for r in reads):
+        raise ValueError("reads disagree on the decision residual")
+    error = np.max(np.abs(raw.sum(0)-residual))
+    if error >= 1e-4*(1+np.max(np.abs(residual))):
+        raise ValueError("source writes do not reconstruct the decision residual")
+    return raw, residual
+
+
 def serve(capture, domain, probe, stem, *, audit_split="r5"):
     if audit_split not in {"r5", "heldout"}:
         raise ValueError("unknown audit split")
@@ -73,8 +95,7 @@ def serve(capture, domain, probe, stem, *, audit_split="r5"):
             raise ValueError("timed arm must use one forward, without the validation duplicate")
         if [s["id"] for s in native["sources"]] != source_ids:
             raise ValueError("the complete measured source program is required")
-        raw = np.asarray([s["write"] for s in native["sources"]], dtype=np.float64)
-        residual = np.asarray(native["reads"][0]["final_residual"], dtype=np.float64)
+        raw, residual = decision_sources(native, len(norm_weight))
         sigma = np.sqrt(np.mean((residual-residual.mean())**2)+1e-5)
         sources = (raw-raw.mean(axis=1, keepdims=True))*norm_weight/sigma
         guard_scores = {name: (sources[coalition].sum(axis=0) @ frame.T+bias).tolist()

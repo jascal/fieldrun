@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from pdc_service import decision_sources
+
 
 def analyze(directory, model_stem):
     def read(name):
@@ -58,8 +60,8 @@ def analyze(directory, model_stem):
         assert f["sources"] == p["sources"] == original["sources"]
         assert np.array_equal(f["final_hidden"], p["final_hidden"])
         assert response["full_host_token"] is None and b["full_host_token"] == f["predictions"][0]
-        raw = np.array([s["write"] for s in p["sources"]])
-        residual = np.array(p["reads"][0]["final_residual"])
+        raw, residual = decision_sources(p, len(arrays["ln_f.weight"]))
+        decision_sources(f, len(arrays["ln_f.weight"]))
         sigma = np.sqrt(np.mean((residual-residual.mean())**2)+1e-5)
         sources = (raw-raw.mean(axis=1,keepdims=True))*arrays["ln_f.weight"]/sigma
         assert np.max(np.abs(sources-response["sources"])) < 1e-8
