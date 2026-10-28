@@ -1,0 +1,35 @@
+{
+  "schema": "pdc.qwen35-singleton-verification.v1",
+  "source_verdicts_checked": 6500,
+  "maximum_independent_discrepancy": 5.684341886080802e-14,
+  "counts": {
+    "development": {
+      "contexts": 50,
+      "exact": 0,
+      "centered": 0,
+      "raw_match": 50,
+      "any_floor_pass": 48,
+      "any_pairwise_slack_pass": 0
+    },
+    "heldout": {
+      "contexts": 50,
+      "exact": 0,
+      "centered": 0,
+      "raw_match": 50,
+      "any_floor_pass": 49,
+      "any_pairwise_slack_pass": 0
+    },
+    "all": {
+      "contexts": 100,
+      "exact": 0,
+      "centered": 0,
+      "raw_match": 100,
+      "any_floor_pass": 97,
+      "any_pairwise_slack_pass": 0
+    }
+  },
+  "original_frame_hashes_match": true,
+  "input_hashes_verified": true,
+  "new_model_forwards": 0,
+  "scope": "fixed-source score diagnosis, not causal or impossibility evidence"
+}

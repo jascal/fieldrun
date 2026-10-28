@@ -1,0 +1,16 @@
+{
+  "schema": "pdc.qwen35-memory-assembly-check.v1",
+  "triples": 27,
+  "paths": 108,
+  "unique_contexts": 54,
+  "original_prefixes_preserved": 108,
+  "memory_tags": {
+    "none": 54,
+    "generated": 27,
+    "tool": 27
+  },
+  "refused_replay_identity_by_input": 27,
+  "generated_tool_identity_by_input": 27,
+  "admitted_replay_tested": 0,
+  "new_model_calls": 0
+}

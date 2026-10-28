@@ -1,0 +1,24 @@
+{
+  "sha256": {
+    "experiments/pdc_qwen35_memory/learning_data.npz": "771a77f88c9b5074165570ec75ea7787660ab59b58fbcb96e46f24fda80d8e99",
+    "experiments/pdc_qwen35_memory/learning_data_verification.json": "d178d67bfe5bedcbf0950cb74680cee550270c142fca8370c65a053dbab8aa45",
+    "experiments/pdc_qwen35_coalitions/PREREG.md": "a2e97bbdfdcdd9aa53ebf38186ffad2c1699ceec742fd300f1d3cbb111af45a6",
+    "experiments/pdc_qwen35_coalitions/bodies.json": "e50542e53bef1fd02b02f175175b3b96c3fc0795c6015817493ad9d449a69d48",
+    "/tmp/pdc-fieldrun-review/scripts/pdc_qwen35_coalitions.py": "83da0164320234d77d6d0b238c698544b3035386f6221f034b2ba63b96fb942a",
+    "experiments/pdc_qwen35_4b/domain.json": "986f141855dced94f140f308a033b309fda3c220c8b97039db141f60ae149d35",
+    "experiments/pdc_qwen35_4b/verification.json": "935bd475123b3b2919738b4acd889347ae5f287b7272c01ac5f7b248d5205442",
+    "experiments/pdc_qwen35_4b/batch_00_capture.json": "e6e60fe2ce11d7c23551fcb0a6a1f5d54e53dd553cdec791bebafac68fa17e3b",
+    "experiments/pdc_qwen35_4b/batch_01_capture.json": "994e5f751e575304bc544a07d2df6ba8a62848f9aba229e6fd2c80298d29f436",
+    "experiments/pdc_qwen35_4b/batch_02_capture.json": "156c435b0b11f814b8898abe70224b207c9c81dcbc82f992c197acb8ccc22f3f",
+    "experiments/pdc_qwen35_4b/batch_03_capture.json": "5b621bc1e00b7b52d8c1797676db5830b528c9f526d1390f60d45b1c935a059a",
+    "experiments/pdc_qwen35_4b/batch_04_capture.json": "66114b0bf8c126ce000656d8367f5b23c9a8ecd9226818ec79a4958abc662e72",
+    "experiments/pdc_qwen35_4b/batch_05_capture.json": "229403143572f8b488a03770aacbcb283578b1a4cad4be414b65b56f11b0b464",
+    "experiments/pdc_qwen35_4b/batch_06_capture.json": "24df6eeb8d54daaa9ac41a874222ddee28ee4109a0fa69c26c7b7c0bfa9622c8",
+    "experiments/pdc_qwen35_4b/batch_07_capture.json": "a39503f377b9c8e50ca2d1739d9fc6b18d1157088b987f745348fc7aeda0ed83",
+    "experiments/pdc_qwen35_4b/batch_08_capture.json": "d14689ec732c1b23c1668175a4c2f7aec7b003edb41d7a872263a0b475ac7db9",
+    "experiments/pdc_qwen35_4b/batch_09_capture.json": "90a4f8371f9188f7dc941892fed3fa86329130f8427a80d0f520cc468a05fd50"
+  },
+  "new_model_forwards": 0,
+  "frame_updates": 0,
+  "floor": 0.5
+}

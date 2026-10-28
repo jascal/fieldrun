@@ -744,16 +744,67 @@ impl Qwen35Moe {
     }
 
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
+        self.hidden_pdc(ids, false).0
+    }
+
+    // Observe the actual residual additions, without changing the default arithmetic.
+    fn hidden_pdc(&self, ids: &[i64], capture: bool) -> (Array2<f32>, Vec<f32>, Vec<serde_json::Value>) {
         let mut x = self.b.rows_f32("embed", ids);
+        let last = ids.len() - 1;
+        let mut sources = Vec::new();
+        if capture { sources.push(serde_json::json!({"id":"embed", "write":x.row(last).to_vec()})); }
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}in_ln"));
             let attn = if self.linear[l] { self.linear_attn(l, &a) } else { self.full_attn(l, &a) };
+            if capture { sources.push(serde_json::json!({"id":format!("L{l}.attn"),
+                "mechanism":if self.linear[l] {"gated_deltanet"} else {"gated_full_attention"},
+                "write":attn.row(last).to_vec()})); }
             x = &x + &attn;
             let a2 = self.norm(&x, &format!("{p}post_ln"));
-            x = &x + &self.ffn(l, &a2);
+            let mlp = self.ffn(l, &a2);
+            if capture { sources.push(serde_json::json!({"id":format!("L{l}.mlp"),"write":mlp.row(last).to_vec()})); }
+            x = &x + &mlp;
         }
-        self.norm(&x, "norm")
+        let residual = if capture { x.row(last).to_vec() } else { Vec::new() };
+        (self.norm(&x, "norm"), residual, sources)
+    }
+
+    pub fn pdc_source_dump(&self, selection: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if self.n_exp != 0 || self.kv_int8 { return Err("PDC Qwen capture requires unpruned weights and f32 state".into()); }
+        let contexts: Vec<Vec<i64>> = serde_json::from_value(selection["contexts"].clone()).map_err(|e|e.to_string())?;
+        let candidates: Vec<i64> = serde_json::from_value(selection["candidate_tokens"].clone()).map_err(|e|e.to_string())?;
+        let vocab = self.b.config[5];
+        if contexts.is_empty() || contexts.iter().any(|c| c.is_empty() || c.iter().any(|&t|t<0 || t>=vocab)) {
+            return Err("nonempty in-vocabulary contexts required".into());
+        }
+        if candidates.is_empty() || candidates.iter().any(|&t|t<0 || t>=vocab)
+            || candidates.iter().collect::<std::collections::HashSet<_>>().len()!=candidates.len() {
+            return Err("nonempty unique in-vocabulary candidates required".into());
+        }
+        let check = selection.get("check_observer").and_then(|v|v.as_bool()).unwrap_or(true);
+        let mut cases = Vec::new();
+        for ids in contexts {
+            let started = std::time::Instant::now();
+            let (hidden, residual, sources) = self.hidden_pdc(&ids, true);
+            let last_hidden = hidden.row(ids.len()-1).to_vec();
+            let scores = self.b.rowdot_f32(self.unembed(), &last_hidden);
+            let winner = scores.iter().enumerate().max_by(|a,b|a.1.total_cmp(b.1)).unwrap().0;
+            let elapsed = started.elapsed().as_micros();
+            let observer_error = if check {
+                let plain = self.hidden(&ids);
+                Some(hidden.iter().zip(plain.iter()).map(|(a,b)|(a-b).abs()).fold(0.0f32, f32::max))
+            } else { None };
+            if observer_error.is_some_and(|e|e!=0.0) { return Err("observer changed native hidden states".into()); }
+            cases.push(serde_json::json!({"ids":ids,"sources":sources,"final_residual":residual,
+                "final_hidden":last_hidden,"prediction":winner,"candidate_tokens":candidates,
+                "candidate_scores":candidates.iter().map(|&t|scores[t as usize]).collect::<Vec<_>>(),
+                "scoring_scope":"full_vocabulary","native_output_row_calls":vocab,
+                "observer_hidden_max_error":observer_error,"observer_check_performed":check,
+                "elapsed_forward_decode_us":elapsed}));
+        }
+        Ok(serde_json::json!({"schema":"pdc.qwen35-source-capture.v1","arch":self.b.arch,
+            "config":self.b.config,"config_f":self.b.config_f,"cases":cases}))
     }
 
     /// Debug: residual-stream snapshots in transformers `output_hidden_states` convention — [input-to-L0
@@ -1489,4 +1540,27 @@ mod tests {
         assert_ne!(m.blind_support(), load_tiny_moe("support_moe").blind_support(),
                    "dense and MoE releases of one arch must not report the same support");
     }
+    #[test]
+    fn pdc_observer_preserves_hybrid_walk_and_complete_source_sum() {
+        let m = load_tiny("pdc_observer");
+        let ids = vec![1, 2, 3, 4];
+        let (hidden, residual, sources) = m.hidden_pdc(&ids, true);
+        let snapshots = m.hiddens(&ids);
+        assert_eq!(hidden.iter().cloned().collect::<Vec<_>>(), *snapshots.last().unwrap());
+        assert_eq!(sources.len(), 1 + 2 * m.n_layer);
+        let mut sum = vec![0.0f32; m.d];
+        for (index, source) in sources.iter().enumerate() {
+            if index == 0 { assert_eq!(source["id"], "embed"); }
+            for (j, value) in source["write"].as_array().unwrap().iter().enumerate() {
+                sum[j] += value.as_f64().unwrap() as f32;
+            }
+        }
+        assert!(sum.iter().zip(residual.iter()).all(|(a,b)|(a-b).abs()<1e-5));
+        let dump = m.pdc_source_dump(&serde_json::json!({"contexts":[ids],"candidate_tokens":[0,1,2]})).unwrap();
+        assert_eq!(dump["cases"][0]["observer_hidden_max_error"], 0.0);
+        assert_eq!(dump["cases"][0]["native_output_row_calls"], m.b.config[5]);
+        assert!(m.pdc_source_dump(&serde_json::json!({"contexts":[[]],"candidate_tokens":[0]})).is_err());
+        assert!(m.pdc_source_dump(&serde_json::json!({"contexts":[[1]],"candidate_tokens":[0,0]})).is_err());
+    }
+
 }

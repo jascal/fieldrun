@@ -1,0 +1,18 @@
+{
+  "development": {
+    "viterbi": {
+      "full": 50
+    },
+    "marginal": {
+      "full": 50
+    }
+  },
+  "heldout": {
+    "viterbi": {
+      "full": 50
+    },
+    "marginal": {
+      "full": 50
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "gate": "passed",
+  "contexts": 100,
+  "body_verdicts": 209100,
+  "maximum_errors": {
+    "margin": 1.7763568394002505e-13,
+    "minimum_pairwise_slack": 3.481659405224491e-13,
+    "two_delta": 1.1457501614131615e-13
+  },
+  "compact_exact_contexts": 5,
+  "compact_centered_contexts": 0,
+  "original_path_hashes_verified": 17,
+  "new_model_forwards": 0,
+  "scope": "Independent raw-vector sum then frame folding/Torch scoring; covered-score guards only, no causal replay."
+}

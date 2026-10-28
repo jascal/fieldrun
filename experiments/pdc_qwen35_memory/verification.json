@@ -1,0 +1,18 @@
+{
+  "schema": "pdc.qwen35-two-hop-audit.v1",
+  "unique_contexts": 54,
+  "paths": 108,
+  "reference_matches": 54,
+  "maximum_independent_body_error": 2.1316282072803006e-14,
+  "body_probe_annotations_checked": 366282,
+  "unique_readout_commitments_checked": 104,
+  "memory_tags": {
+    "none": 54,
+    "generated": 27,
+    "tool": 27
+  },
+  "first_hop_admitted": 0,
+  "actual_admitted_replay_tested": 0,
+  "input_hashes_verified": true,
+  "gate": "passed"
+}

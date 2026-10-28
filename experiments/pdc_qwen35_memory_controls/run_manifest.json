@@ -1,0 +1,30 @@
+{
+  "schema": "pdc.qwen35-memory-controls-run.v1",
+  "sha256": {
+    "experiments/pdc_qwen35_memory_controls/PREREG.md": "47c01b8a33be4e7734f8ea51e1df78b9df0c97a27270b0cb4c1eeb80508fe6a5",
+    "experiments/pdc_qwen35_memory_controls/requests.json": "bf500c0dfa2ee6fc64927be2c0d6c53d81519718deb32da2f311617c99a6f564",
+    "experiments/pdc_qwen35_memory_controls/selection.json": "078c355758e7ccc85f702eb57bfd7431409b9c358b28dd7b507c083fc256c64b",
+    "experiments/pdc_qwen35_memory/requests.json": "7889cacede4ddcf273d43631b79dda5897b62dcf19f48c6fef4b1382de10d909",
+    "experiments/pdc_qwen35_memory/results.json": "44970aa582818a81aba91c35e685694e15831ad0f0b853b8d8b421b8f116ebec",
+    "experiments/pdc_qwen35_memory/verification.json": "bd95dfcc91cb2edfe2bdcccf6a8d5e577bbd7a885e56b9a71b356b07867f864f",
+    "experiments/pdc_qwen35_memory/run_manifest.json": "a01c5ebbd5df317d13248b20b1e2a1cbcd87e699e9b3342e547dc297fef5befa",
+    "experiments/pdc_qwen35_memory/batch_00_capture.json": "2a5faaefdbd47287964cdd74cd1fa936c285deafdbbce1ba83afbe7dafd876b2",
+    "experiments/pdc_qwen35_memory/batch_01_capture.json": "8c9f92205d5419a19bb3a6ec13759574115a2995ba89449ba3d44d2b62459564",
+    "experiments/pdc_qwen35_memory/batch_02_capture.json": "69805f3561bb245c4a433861938fa6d4ba9ac947767701d6c41c0aeb11173fba",
+    "experiments/pdc_qwen35_memory/batch_03_capture.json": "2f78f008eef70ad32da35ecea8c650fdfc77ee03a43db021f50cc16544f522aa",
+    "experiments/pdc_qwen35_memory/batch_04_capture.json": "0e42b5e9e42f15491df2cae60df60572eadf9d48bdb3d23033a743f16f2ddbf3",
+    "experiments/pdc_qwen35_memory/batch_05_capture.json": "2f666fc7c719e57d3c6ea933bb2d87c1ee47a6833da9456365b75a8c39209dc9",
+    "/tmp/pdc-fieldrun-review/scripts/pdc_qwen35_memory_controls.py": "b55aa6f43fd4b172957bfdf744dac5ae13628030613b3e1d29d21b19670b224c",
+    "scripts/pdc_qwen35_reference.py": "a1cbbd470ba60bc74eb863ec366fdb9b52ee4e0f9b4ec2dcf0e655e6b19c0799",
+    "/tmp/pdc-fieldrun-review/target/release/fieldrun": "90cd5c8dda5b1f5c16888387baa92b78205c82a99b0eb04a98679ca324c1928d",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/model.safetensors-00001-of-00002.safetensors": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/model.safetensors-00002-of-00002.safetensors": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/fieldrun/qwen35-4b.fieldrun.json": "c6e946976dbb0f305296040aaaf1a6952a96adbda36d7dfad07e7de046079ab5",
+    "/home/allans/code/.pdc-models/Qwen3.5-4B/fieldrun/qwen35-4b.fieldrun.bin": "f8f5c41fc31877f4606bdb89caab4b6e5d9fa5a9c9fdff2aa11a471d6a7522ac"
+  },
+  "native_forward_budget": 54,
+  "reference_forward_budget": 54
+}

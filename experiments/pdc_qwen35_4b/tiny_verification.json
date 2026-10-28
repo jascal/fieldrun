@@ -1,0 +1,30 @@
+{
+  "schema": "pdc.qwen35-engineering-check.v1",
+  "cases": 3,
+  "reference_agreement": 1.0,
+  "observer_effect": 0,
+  "rows": [
+    {
+      "prediction": 23,
+      "source_sum_error": 5.491529009304941e-09,
+      "rms_fold_error": 3.255771512389316e-07,
+      "full_body_score_error": 9.547629586936779e-08,
+      "reference_score_error": 0.0002528876066207886
+    },
+    {
+      "prediction": 59,
+      "source_sum_error": 3.14321368932724e-09,
+      "rms_fold_error": 3.5820700716726606e-07,
+      "full_body_score_error": 1.2084974765347312e-07,
+      "reference_score_error": 0.00035771727561950684
+    },
+    {
+      "prediction": 10,
+      "source_sum_error": 6.504706107079983e-09,
+      "rms_fold_error": 3.411081412885153e-07,
+      "full_body_score_error": 6.72925374589628e-08,
+      "reference_score_error": 0.00037413835525512695
+    }
+  ],
+  "scope": "engineering gate; not scientific coverage result"
+}
