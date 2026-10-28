@@ -1,0 +1,78 @@
+{
+  "gate": "passed",
+  "engineering_only": true,
+  "admitted_replay_tested": false,
+  "native_reference_matches": 9,
+  "rows": [
+    {
+      "prediction": 10,
+      "source_sum_error": 4.831235855817795e-09,
+      "hidden_max_error": 4.76837158203125e-07,
+      "candidate_score_max_error": 8.940696716308594e-08
+    },
+    {
+      "prediction": 10,
+      "source_sum_error": 4.831235855817795e-09,
+      "hidden_max_error": 4.76837158203125e-07,
+      "candidate_score_max_error": 8.940696716308594e-08
+    },
+    {
+      "prediction": 10,
+      "source_sum_error": 8.207280188798904e-09,
+      "hidden_max_error": 5.960464477539062e-07,
+      "candidate_score_max_error": 8.940696716308594e-08
+    },
+    {
+      "prediction": 63,
+      "source_sum_error": 5.205947672948241e-09,
+      "hidden_max_error": 2.682209014892578e-07,
+      "candidate_score_max_error": 1.1920928955078125e-07
+    },
+    {
+      "prediction": 63,
+      "source_sum_error": 5.205947672948241e-09,
+      "hidden_max_error": 2.682209014892578e-07,
+      "candidate_score_max_error": 1.1920928955078125e-07
+    },
+    {
+      "prediction": 25,
+      "source_sum_error": 7.307789928745478e-09,
+      "hidden_max_error": 7.152557373046875e-07,
+      "candidate_score_max_error": 1.4901161193847656e-07
+    },
+    {
+      "prediction": 3,
+      "source_sum_error": 3.725290298461914e-09,
+      "hidden_max_error": 3.7997961044311523e-07,
+      "candidate_score_max_error": 1.1920928955078125e-07
+    },
+    {
+      "prediction": 3,
+      "source_sum_error": 3.725290298461914e-09,
+      "hidden_max_error": 3.7997961044311523e-07,
+      "candidate_score_max_error": 1.1920928955078125e-07
+    },
+    {
+      "prediction": 3,
+      "source_sum_error": 7.30506144464016e-09,
+      "hidden_max_error": 3.5762786865234375e-07,
+      "candidate_score_max_error": 9.685754776000977e-08
+    }
+  ],
+  "zero_replay_bit_identity": true,
+  "effects": [
+    {
+      "native_nonzero_effect": 0.8653405904769897,
+      "reference_nonzero_effect": 0.8653404712677002
+    },
+    {
+      "native_nonzero_effect": 0.7484942674636841,
+      "reference_nonzero_effect": 0.7484945058822632
+    },
+    {
+      "native_nonzero_effect": 0.9415555000305176,
+      "reference_nonzero_effect": 0.9415555894374847
+    }
+  ],
+  "earlier_position_scope": "Native unit test; not independently measured on these real-model captures."
+}

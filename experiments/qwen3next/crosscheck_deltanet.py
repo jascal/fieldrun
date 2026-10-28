@@ -11,7 +11,8 @@ Conventions read from transformers (torch_recurrent_gated_delta_rule):
   • optional L2-norm on BOTH q and k  (use_qk_l2norm_in_kernel)  (deltanet_ref normalizes only k: pre-norm)
 The recurrence itself (decay→delta-correct-vs-decayed-state→write→read-after-write) is identical.
 
-Needs transformers>=5.12. Usage: python crosscheck_deltanet.py
+Reference version and low-norm source pin: pdc_qwen35_replay_engineering/normalization_golden.json.
+Usage: python crosscheck_deltanet.py
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_recurrent
 
 
 def _l2(x, eps=1e-6):
-    return x / (np.linalg.norm(x, axis=1, keepdims=True) + eps)
+    return x / (np.sqrt(np.sum(x*x, axis=1, keepdims=True) + eps))
 
 
 def crosscheck(T=96, dk=24, dv=24, l2=True, seed=0):
@@ -66,6 +67,8 @@ def main():
     print("VERDICT:", "deltanet_ref IS the Qwen3.6 DeltaNet recurrence — variant PINNED: α=exp(g), q·(1/√dₖ),"
           " L2-norm(q)&L2-norm(k), decay→delta-correct-vs-decayed-state→write→read-after-write."
           if ok else "DIVERGES in the real (l2=True) config — inspect before porting.")
+    if not ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

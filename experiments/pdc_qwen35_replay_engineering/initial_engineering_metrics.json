@@ -1,0 +1,53 @@
+{
+  "gate": "failed",
+  "failed_condition": "tiny hidden max error <1e-4",
+  "cases": [
+    {
+      "case": 0,
+      "native_reference_match": true,
+      "hidden_error": 0.0017129182815551758
+    },
+    {
+      "case": 1,
+      "native_reference_match": true,
+      "hidden_error": 0.0017129182815551758
+    },
+    {
+      "case": 2,
+      "native_reference_match": true,
+      "hidden_error": 0.001454174518585205
+    },
+    {
+      "case": 3,
+      "native_reference_match": true,
+      "hidden_error": 0.0016838312149047852
+    },
+    {
+      "case": 4,
+      "native_reference_match": true,
+      "hidden_error": 0.0016838312149047852
+    },
+    {
+      "case": 5,
+      "native_reference_match": true,
+      "hidden_error": 0.001440383493900299
+    },
+    {
+      "case": 6,
+      "native_reference_match": true,
+      "hidden_error": 0.0016696453094482422
+    },
+    {
+      "case": 7,
+      "native_reference_match": true,
+      "hidden_error": 0.0016696453094482422
+    },
+    {
+      "case": 8,
+      "native_reference_match": true,
+      "hidden_error": 0.00110588688403368
+    }
+  ],
+  "zero_identity_all_three": true,
+  "reference_matches": 9
+}

@@ -1,0 +1,96 @@
+warning: function `trits_for` is never used
+  --> src/ternary.rs:15:8
+   |
+15 | pub fn trits_for(q: i64) -> usize {
+   |        ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `distribute` is never used
+  --> src/ternary.rs:49:8
+   |
+49 | pub fn distribute(w: &[i64], x: &[i64], k: usize) -> (i64, i64) {
+   |        ^^^^^^^^^^
+
+warning: struct `TritStats` is never constructed
+  --> src/ternary.rs:63:12
+   |
+63 | pub struct TritStats {
+   |            ^^^^^^^^^
+
+warning: function `trit_stats` is never used
+  --> src/ternary.rs:71:8
+   |
+71 | pub fn trit_stats(w: &[i64], k: usize) -> TritStats {
+   |        ^^^^^^^^^^
+
+warning: field `k` is never read
+  --> src/ternary.rs:65:9
+   |
+63 | pub struct TritStats {
+   |            --------- field in this struct
+64 |     pub n_weights: usize,
+65 |     pub k: usize,
+   |         ^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `fieldrun` (lib) generated 4 warnings
+warning: `fieldrun` (lib test) generated 1 warning
+   Compiling fieldrun v0.1.0 (/tmp/pdc-fieldrun-review)
+warning: unused variable: `ml`
+   --> src/qwen35moe.rs:680:33
+    |
+680 |             } else if let Some((ml, me, mn)) = moe_scan.filter(|(ml, ..)| *ml == l) {
+    |                                 ^^ help: if this is intentional, prefix it with an underscore: `_ml`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1338:21
+     |
+1338 |                 let mut emit = |flips: &mut String, nf: &mut usize, l: usize, kind: &str, idx: i64, new: i64| {
+     |                     ----^^^^
+     |                     |
+     |                     help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `HybridState` is more private than the item `qwen35moe::Qwen35Moe::blind_score_state`
+   --> src/qwen35moe.rs:634:5
+    |
+634 |     pub(crate) fn blind_score_state(&self, prefix: &[i64], total: usize) -> Option<HybridState> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `qwen35moe::Qwen35Moe::blind_score_state` is reachable at visibility `pub(crate)`
+    |
+note: but type `HybridState` is only usable at visibility `pub(self)`
+   --> src/qwen35moe.rs:117:1
+    |
+117 | struct HybridState {
+    | ^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: `fieldrun` (bin "fieldrun" test) generated 3 warnings (run `cargo fix --bin "fieldrun" -p fieldrun --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 36.37s
+     Running unittests src/lib.rs (/tmp/pdc-qwen-replay-target/release/deps/fieldrun-e9097522799b2ef1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/tmp/pdc-qwen-replay-target/release/deps/fieldrun-efabd0ec6f4e420a)
+
+running 1 test
+
+thread 'deltanet::tests::low_norm_qk_matches_transformers_regularized_squared_norm' (48) panicked at src/deltanet.rs:319:9:
+official low-norm DeltaNet golden error=8.847154e-2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test deltanet::tests::low_norm_qk_matches_transformers_regularized_squared_norm ... FAILED
+
+failures:
+
+failures:
+    deltanet::tests::low_norm_qk_matches_transformers_regularized_squared_norm
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 179 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin fieldrun`

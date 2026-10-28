@@ -7,7 +7,8 @@
 //! its grouped key-head), preceded by a short causal depthwise conv (kernel 4) on q/k/v.
 //!
 //! The recurrence and its conventions are PINNED against the reference HF implementation
-//! (`torch_recurrent_gated_delta_rule`, matched to ~1e-7 — see `experiments/qwen3next/`):
+//! (`torch_recurrent_gated_delta_rule`; L2norm is x/sqrt(sum(x*x)+1e-6)).
+//! The discriminating low-norm pin is `experiments/pdc_qwen35_replay_engineering/normalization_golden.json`:
 //!   • `α_t = exp(g_log_t)`           (the gate input is log-decay)
 //!   • `q ← (1/√d_k) · L2norm(q)`     (read scaling + L2-norm on the query)
 //!   • `k ← L2norm(k)`               (L2-norm on the key)
@@ -15,8 +16,8 @@
 //! State `S ∈ ℝ^{d_k×d_v}`. Recurrent form (one token at a time) — exactly what fieldrun's decode needs;
 //! the chunked-parallel form is only a prefill speedup (add later, test against this).
 
-/// L2-norm denominator floor (matches the HF `l2norm(..., eps=1e-6)`). On an all-zero q/k row the
-/// normalized vector is ~0 (denominator = EPS), so that token contributes/reads nothing — benign.
+/// Squared-norm regularizer, matching HF `x * rsqrt(sum(x*x) + eps)`.
+/// Epsilon belongs inside the square root; zero q/k rows remain zero.
 const EPS: f32 = 1e-6;
 
 /// SiLU / swish: `z·σ(z)`. f32-graceful at ±inf.
@@ -77,8 +78,8 @@ pub fn gated_deltanet_state(
     for i in 0..t {
         let qrow = &q[i * dk..(i + 1) * dk];
         let krow = &k[i * dk..(i + 1) * dk];
-        let qden = qrow.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
-        let kden = krow.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+        let qden = (qrow.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
+        let kden = (krow.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
         for d in 0..dk {
             qn[d] = qrow[d] / qden * scale;
             kn[d] = krow[d] / kden;
@@ -279,7 +280,8 @@ mod tests {
 
     #[test]
     fn matches_transformers_golden() {
-        // golden from experiments/qwen3next: gated_deltanet_qwen36 == transformers torch_recurrent_gated_delta_rule
+        // Historical O(1) reference: this loose tolerance alone cannot distinguish epsilon placement.
+        // low_norm_qk_matches_transformers_regularized_squared_norm below is the binding normalization pin.
         let (t, dk, dv) = (6, 4, 3);
         let (q, k, v, g, beta) = inputs(t, dk, dv);
         let out = gated_deltanet(&q, &k, &v, &g, &beta, t, dk, dv);
@@ -301,6 +303,22 @@ mod tests {
             maxerr < 1e-5,
             "Gated DeltaNet diverges from the transformers-pinned oracle: maxerr {maxerr:e}"
         );
+    }
+
+    #[test]
+    fn low_norm_qk_matches_transformers_regularized_squared_norm() {
+        // External official-kernel fixture; tiny q/k exposes where epsilon belongs.
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../experiments/pdc_qwen35_replay_engineering/normalization_golden.json")).unwrap();
+        let matrix = |key: &str| -> Vec<f32> { f[key].as_array().unwrap().iter()
+            .flat_map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32)).collect() };
+        let vector = |key: &str| -> Vec<f32> { f[key].as_array().unwrap().iter()
+            .map(|v| v.as_f64().unwrap() as f32).collect() };
+        let got = gated_deltanet(&matrix("q"), &matrix("k"), &matrix("v"),
+            &vector("g"), &vector("beta"), 3, 4, 2);
+        let expected = vector("expected");
+        let error = got.iter().zip(expected.iter()).map(|(a,b)|(a-b).abs()).fold(0.0f32, f32::max);
+        assert!(error < 1e-7, "official low-norm DeltaNet golden error={error:e}");
     }
 
     #[test]
@@ -328,8 +346,8 @@ mod tests {
         let (q, k, v, _g, beta) = inputs(1, dk, dv);
         let out = gated_deltanet(&q, &k, &v, &[(-0.3f32)], &beta, 1, dk, dv);
         // recompute q̂ (l2norm·1/√dk) and k̂ (l2norm) to form the closed form
-        let qd = q.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
-        let kd = k.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+        let qd = (q.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
+        let kd = (k.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
         let scale = 1.0 / (dk as f32).sqrt();
         let kq: f32 = (0..dk).map(|d| (k[d] / kd) * (q[d] / qd * scale)).sum();
         for e in 0..dv {
@@ -348,8 +366,8 @@ mod tests {
         let scale = 1.0 / (dk as f32).sqrt();
         for i in 0..t {
             let (qr, kr, vr) = (&q[i * dk..(i + 1) * dk], &k[i * dk..(i + 1) * dk], &v[i * dv..(i + 1) * dv]);
-            let qd = qr.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
-            let kd = kr.iter().map(|x| x * x).sum::<f32>().sqrt() + EPS;
+            let qd = (qr.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
+            let kd = (kr.iter().map(|x| x * x).sum::<f32>() + EPS).sqrt();
             let kq: f32 = (0..dk).map(|d| (kr[d] / kd) * (qr[d] / qd * scale)).sum();
             for e in 0..dv {
                 assert!((out[i * dv + e] - kq * beta[i] * vr[e]).abs() < 1e-6);

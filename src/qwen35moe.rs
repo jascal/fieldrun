@@ -749,10 +749,22 @@ impl Qwen35Moe {
 
     // Observe the actual residual additions, without changing the default arithmetic.
     fn hidden_pdc(&self, ids: &[i64], capture: bool) -> (Array2<f32>, Vec<f32>, Vec<serde_json::Value>) {
+        self.hidden_pdc_memory(ids, capture, None)
+    }
+
+    // Explicit experimental intervention, not an inference from a score certificate.
+    // Add one raw residual-width vector at the final query's embedding site only.
+    fn hidden_pdc_memory(&self, ids: &[i64], capture: bool, memory: Option<&crate::composition::ResidualMemory>) -> (Array2<f32>, Vec<f32>, Vec<serde_json::Value>) {
         let mut x = self.b.rows_f32("embed", ids);
         let last = ids.len() - 1;
         let mut sources = Vec::new();
         if capture { sources.push(serde_json::json!({"id":"embed", "write":x.row(last).to_vec()})); }
+        if let Some(memory) = memory {
+            debug_assert_eq!(memory.site, "embed");
+            debug_assert_eq!(memory.write.len(), self.d);
+            for (j, &value) in memory.write.iter().enumerate() { x[[last, j]] += value; }
+            if capture { sources.push(serde_json::json!({"id":"memory@embed", "write":memory.write})); }
+        }
         for l in 0..self.n_layer {
             let p = format!("l{l}.");
             let a = self.norm(&x, &format!("{p}in_ln"));
@@ -783,10 +795,24 @@ impl Qwen35Moe {
             return Err("nonempty unique in-vocabulary candidates required".into());
         }
         let check = selection.get("check_observer").and_then(|v|v.as_bool()).unwrap_or(true);
+        let memories: Vec<Option<crate::composition::ResidualMemory>> = match selection.get("memory_writes") {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|e|e.to_string())?,
+            None => Vec::new(),
+        };
+        if !memories.is_empty() && memories.len() != contexts.len() {
+            return Err("memory writes must align one-to-one with contexts".into());
+        }
+        for memory in memories.iter().flatten() {
+            if memory.site != "embed" || memory.write.len() != self.d || memory.write.iter().any(|v|!v.is_finite()) {
+                return Err("Qwen memory requires site=embed and one finite residual-width vector".into());
+            }
+            if check { return Err("memory replay must explicitly disable the unmatched observer comparison".into()); }
+        }
         let mut cases = Vec::new();
-        for ids in contexts {
+        for (case_index, ids) in contexts.into_iter().enumerate() {
             let started = std::time::Instant::now();
-            let (hidden, residual, sources) = self.hidden_pdc(&ids, true);
+            let memory = memories.get(case_index).and_then(|m|m.as_ref());
+            let (hidden, residual, sources) = self.hidden_pdc_memory(&ids, true, memory);
             let last_hidden = hidden.row(ids.len()-1).to_vec();
             let scores = self.b.rowdot_f32(self.unembed(), &last_hidden);
             let winner = scores.iter().enumerate().max_by(|a,b|a.1.total_cmp(b.1)).unwrap().0;
@@ -800,6 +826,7 @@ impl Qwen35Moe {
                 "final_hidden":last_hidden,"prediction":winner,"candidate_tokens":candidates,
                 "candidate_scores":candidates.iter().map(|&t|scores[t as usize]).collect::<Vec<_>>(),
                 "scoring_scope":"full_vocabulary","native_output_row_calls":vocab,
+                "memory_replay":memory,
                 "observer_hidden_max_error":observer_error,"observer_check_performed":check,
                 "elapsed_forward_decode_us":elapsed}));
         }
@@ -1540,6 +1567,42 @@ mod tests {
         assert_ne!(m.blind_support(), load_tiny_moe("support_moe").blind_support(),
                    "dense and MoE releases of one arch must not report the same support");
     }
+    #[test]
+    fn pdc_memory_is_explicit_last_query_intervention() {
+        let m = load_tiny("pdc_memory");
+        let ids = vec![1, 2, 3, 4];
+        let (plain, _, _) = m.hidden_pdc(&ids, true);
+        let zero = crate::composition::ResidualMemory { site: "embed".into(), write: vec![0.0; m.d] };
+        let (zero_hidden, _, zero_sources) = m.hidden_pdc_memory(&ids, true, Some(&zero));
+        assert!(plain.iter().zip(zero_hidden.iter()).all(|(a,b)|a.to_bits()==b.to_bits()));
+        assert_eq!(zero_sources[1]["id"], "memory@embed");
+        let memory = crate::composition::ResidualMemory { site: "embed".into(),
+            write: (0..m.d).map(|j|0.1 + 0.01*j as f32).collect() };
+        let (changed, residual, sources) = m.hidden_pdc_memory(&ids, true, Some(&memory));
+        assert!(plain.rows().into_iter().take(ids.len()-1).zip(changed.rows()).all(|(a,b)|
+            a.iter().zip(b.iter()).all(|(x,y)|x.to_bits()==y.to_bits())));
+        assert!(plain.row(ids.len()-1).iter().zip(changed.row(ids.len()-1)).any(|(a,b)|(a-b).abs()>1e-6));
+        assert_eq!(sources.len(), 2 + 2*m.n_layer);
+        let mut sum = vec![0.0f32; m.d];
+        for source in &sources {
+            for (j,v) in source["write"].as_array().unwrap().iter().enumerate() { sum[j] += v.as_f64().unwrap() as f32; }
+        }
+        assert!(sum.iter().zip(residual.iter()).all(|(a,b)|(a-b).abs()<1e-4));
+        let request = serde_json::json!({"contexts":[ids],"candidate_tokens":[0,1,2],
+            "check_observer":false,"memory_writes":[memory]});
+        let dump = m.pdc_source_dump(&request).unwrap();
+        assert_eq!(dump["cases"][0]["memory_replay"], request["memory_writes"][0]);
+        let mut bad = request.clone();
+        bad["check_observer"] = true.into();
+        assert!(m.pdc_source_dump(&bad).is_err());
+        bad = request.clone(); bad["memory_writes"][0]["site"] = "L0.mlp".into();
+        assert!(m.pdc_source_dump(&bad).is_err());
+        bad = request.clone(); bad["memory_writes"][0]["write"] = serde_json::json!([0.0]);
+        assert!(m.pdc_source_dump(&bad).is_err());
+        bad = request; bad["memory_writes"] = serde_json::json!([null,null]);
+        assert!(m.pdc_source_dump(&bad).is_err());
+    }
+
     #[test]
     fn pdc_observer_preserves_hybrid_walk_and_complete_source_sum() {
         let m = load_tiny("pdc_observer");
