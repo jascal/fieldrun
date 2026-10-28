@@ -1,0 +1,7 @@
+{
+  "schema": "pdc.memory-assembly-check.v1",
+  "requests_checked": 108,
+  "tool_atoms_theory_checked": 27,
+  "heldout_contexts_used": 0,
+  "complete_triple_arm_grid": true
+}

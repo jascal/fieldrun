@@ -1,0 +1,32 @@
+{
+  "schema": "pdc.replay-engineering.v1",
+  "cases": [
+    {
+      "site": null,
+      "native_token": 352,
+      "reference_top1_agreement": true,
+      "hidden_max_error": 0.003173828125,
+      "query_hidden_max_error": 0.00022125244140625
+    },
+    {
+      "site": "L0.mlp",
+      "native_token": 352,
+      "reference_top1_agreement": true,
+      "hidden_max_error": 0.003173828125,
+      "query_hidden_max_error": 0.00022125244140625
+    },
+    {
+      "site": "L0.mlp",
+      "native_token": 352,
+      "reference_top1_agreement": true,
+      "hidden_max_error": 0.003173828125,
+      "query_hidden_max_error": 0.00022125244140625
+    }
+  ],
+  "zero_replay_hidden_error": 0.0,
+  "nonzero_replay_effect": 0.537841796875,
+  "replay_effect_max_error": 6.389617919921875e-05,
+  "all_earlier_positions_unchanged": true,
+  "initial_absolute_hidden_diagnostic": "1e-3 all-state threshold failed on the no-memory baseline (max 0.003173828125); retained, not claimed passed",
+  "experiment_status": "engineering validation only; no R4 admission or R6 memory result"
+}

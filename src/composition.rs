@@ -8,6 +8,55 @@ use ndarray::{s, Array1, Array2};
 use crate::bundle::Bundle;
 use crate::model::Model;
 
+fn default_observer_check() -> bool { true }
+
+fn observer_identity(observed: &Array2<f32>, plain: &Array2<f32>) -> Result<f32, String> {
+    if observed.shape() != plain.shape() || observed.iter().zip(plain.iter()).any(|(a,b)|
+        !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()) {
+        return Err("observer changed hidden state".into());
+    }
+    Ok(0.0)
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct ResidualMemory {
+    pub site: String,
+    pub write: Vec<f32>,
+}
+
+fn replay_memory(x: &mut Array2<f32>, memory: Option<&ResidualMemory>, site: &str) -> Option<Array2<f32>> {
+    let memory = memory.filter(|m| m.site == site)?;
+    let last = x.nrows()-1;
+    let mut added = Array2::<f32>::zeros(x.raw_dim());
+    for (i, &value) in memory.write.iter().enumerate() {
+        x[[last,i]] += value;
+        added[[last,i]] = value;
+    }
+    Some(added)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReadSelection {
+    pub layers: Vec<usize>,
+    pub heads: Vec<usize>,
+    pub positions: Vec<usize>,
+    pub contexts: Vec<Vec<i64>>,
+    #[serde(default)]
+    pub last_position: bool,
+    #[serde(default)]
+    pub capture_sources: bool,
+    #[serde(default)]
+    pub last_prediction_only: bool,
+    #[serde(default)]
+    pub candidate_tokens: Vec<i64>,
+    #[serde(default)]
+    pub score_candidates_only: bool,
+    #[serde(default = "default_observer_check")]
+    pub check_observer: bool,
+    #[serde(default)]
+    pub memory_writes: Vec<Option<ResidualMemory>>,
+}
+
 pub struct Gpt2 {
     b: Bundle,
     n_layer: usize,
@@ -67,9 +116,25 @@ impl Gpt2 {
     /// Final hidden states (seq, d) after the last LayerNorm — the forward pass minus the unembed. Mirrors
     /// `numpy_lm.NumpyGPT2.logits` up to `x @ wte.T`. The unembed is split out so `predict` projects only the last row.
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
+        self.hidden_observed(ids, None, &mut Vec::new(), &mut Vec::new())
+    }
+
+    fn hidden_observed(&self, ids: &[i64], selection: Option<&ReadSelection>, reads: &mut Vec<serde_json::Value>, sources: &mut Vec<serde_json::Value>) -> Array2<f32> {
         let seq = ids.len();
         let hd = self.d / self.n_head;
         let mut x = &self.b.rows_f32("wte", ids) + &self.b.rows_f32("wpe", &(0..seq as i64).collect::<Vec<_>>());
+        let mut capture_source = |id: String, write: &Array2<f32>| {
+            if let Some(sel) = selection.filter(|s| s.capture_sources) {
+                for &i in &sel.positions {
+                    sources.push(serde_json::json!({"id": id, "position": i, "write": write.row(i).to_vec()}));
+                }
+            }
+        };
+        capture_source("embed".into(), &x);
+        let memory = selection.and_then(|s| s.memory_writes.first()).and_then(|m| m.as_ref());
+        if let Some(added) = replay_memory(&mut x, memory, "embed") {
+            capture_source("memory@embed".into(), &added);
+        }
 
         for l in 0..self.n_layer {
             let p = format!("h{l}.");
@@ -86,20 +151,151 @@ impl Gpt2 {
                         scores[[i, j]] = -1e10; // causal mask
                     }
                 }
+                let observing = selection.is_some_and(|s| s.layers.contains(&l) && s.heads.contains(&h));
+                let raw_scores = observing.then(|| scores.clone());
                 softmax_rows(&mut scores);
                 attn_out.slice_mut(s![.., h * hd..(h + 1) * hd]).assign(&scores.dot(&v));
+                if let Some(sel) = selection.filter(|_| observing) {
+                    for &i in &sel.positions {
+                        reads.push(serde_json::json!({
+                            "layer": l, "head": h, "query_position": i,
+                            "scale": 1.0f32 / (hd as f32).sqrt(),
+                            "query": q.row(i).to_vec(),
+                            "keys": k.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                            "values": v.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                            "masked_logits": raw_scores.as_ref().unwrap().row(i).to_vec(),
+                            "probabilities": scores.row(i).to_vec(),
+                            "head_write": attn_out.slice(s![i, h * hd..(h + 1) * hd]).to_vec(),
+                        }));
+                    }
+                }
             }
-            x = &x + &(self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight"))
-                + &self.b.arr1(&format!("{p}attn.c_proj.bias")));
+            let attention_write = self.b.mm(&attn_out, &format!("{p}attn.c_proj.weight"))
+                + &self.b.arr1(&format!("{p}attn.c_proj.bias"));
+            capture_source(format!("L{l}.attn"), &attention_write);
+            x = &x + &attention_write;
+            if let Some(added) = replay_memory(&mut x, memory, &format!("L{l}.attn")) {
+                capture_source(format!("memory@L{l}.attn"), &added);
+            }
 
             let a2 = layernorm(&x, self.b.arr1(&format!("{p}ln_2.weight")), self.b.arr1(&format!("{p}ln_2.bias")));
             let mut h_mlp = self.b.mm(&a2, &format!("{p}mlp.c_fc.weight")) + &self.b.arr1(&format!("{p}mlp.c_fc.bias"));
             gelu(&mut h_mlp);
-            x = &x + &(self.down(&h_mlp, &format!("{p}mlp.c_proj.weight"))
-                + &self.b.arr1(&format!("{p}mlp.c_proj.bias")));
+            let mlp_write = self.down(&h_mlp, &format!("{p}mlp.c_proj.weight"))
+                + &self.b.arr1(&format!("{p}mlp.c_proj.bias"));
+            capture_source(format!("L{l}.mlp"), &mlp_write);
+            x = &x + &mlp_write;
+            if let Some(added) = replay_memory(&mut x, memory, &format!("L{l}.mlp")) {
+                capture_source(format!("memory@L{l}.mlp"), &added);
+            }
         }
 
+        if selection.is_some() {
+            for row in reads.iter_mut() {
+                let i = row["query_position"].as_u64().unwrap() as usize;
+                row["final_residual"] = serde_json::json!(x.row(i).to_vec());
+            }
+        }
         layernorm(&x, self.b.arr1("ln_f.weight"), self.b.arr1("ln_f.bias"))
+    }
+
+    /// Observe the actual native forward; no alternative attention implementation.
+    pub fn read_dump(&self, selection: &ReadSelection) -> Result<serde_json::Value, String> {
+        if self.route != 0.0 || self.kv_int8 {
+            return Err("read dump requires full gates and f32 KV mode".into());
+        }
+        if selection.layers.is_empty() || selection.heads.is_empty() || (!selection.last_position && selection.positions.is_empty())
+            || selection.contexts.is_empty()
+            || selection.layers.iter().any(|&l| l >= self.n_layer)
+            || selection.heads.iter().any(|&h| h >= self.n_head) {
+            return Err("nonempty, in-range head and position selection required".into());
+        }
+        if selection.candidate_tokens.iter().any(|&t| t < 0 || t >= self.b.config[4]) {
+            return Err("candidate token outside vocabulary".into());
+        }
+        if selection.score_candidates_only && selection.candidate_tokens.is_empty() {
+            return Err("candidate-only mode requires a nonempty candidate set".into());
+        }
+        if !selection.memory_writes.is_empty() && selection.memory_writes.len() != selection.contexts.len() {
+            return Err("memory writes must align one-to-one with contexts".into());
+        }
+        for memory in selection.memory_writes.iter().flatten() {
+            let valid_site = memory.site == "embed" || (0..self.n_layer).any(|l|
+                memory.site == format!("L{l}.attn") || memory.site == format!("L{l}.mlp"));
+            if !valid_site || memory.write.len() != self.d || memory.write.iter().any(|v| !v.is_finite()) {
+                return Err("memory requires a valid source site and one finite residual-width vector".into());
+            }
+            if selection.check_observer {
+                return Err("memory replay must explicitly disable the unmatched observer comparison".into());
+            }
+        }
+        let mut cases = Vec::new();
+        for (case_index, ids) in selection.contexts.iter().enumerate() {
+            if ids.is_empty() || ids.len() > self.b.config[3] as usize
+                || (!selection.last_position && selection.positions.iter().any(|&i| i >= ids.len()))
+                || ids.iter().any(|&i| i < 0 || i >= self.b.config[4]) {
+                return Err("invalid token context or query position".into());
+            }
+            let mut reads = Vec::new();
+            let selected = ReadSelection {
+                layers: selection.layers.clone(), heads: selection.heads.clone(),
+                positions: if selection.last_position { vec![ids.len() - 1] } else { selection.positions.clone() },
+                contexts: Vec::new(), last_position: false, capture_sources: selection.capture_sources,
+                last_prediction_only: selection.last_prediction_only,
+                candidate_tokens: selection.candidate_tokens.clone(),
+                score_candidates_only: selection.score_candidates_only,
+                check_observer: selection.check_observer,
+                memory_writes: vec![selection.memory_writes.get(case_index).cloned().flatten()],
+            };
+            let mut sources = Vec::new();
+            let started = std::time::Instant::now();
+            let observed = self.hidden_observed(ids, Some(&selected), &mut reads, &mut sources);
+            let prediction_positions: Vec<usize> = if selection.last_prediction_only {
+                vec![ids.len() - 1]
+            } else { (0..ids.len()).collect() };
+            let mut native_output_row_calls = 0usize;
+            let mut predictions = |x: &Array2<f32>| {
+                let mut predicted = Vec::new();
+                let mut candidate_scores = Vec::new();
+                for &i in &prediction_positions {
+                    if selection.score_candidates_only {
+                        let logits = self.b.rowdot_f32_subset("wte", &x.row(i).to_vec(), &selection.candidate_tokens);
+                        native_output_row_calls += selection.candidate_tokens.len();
+                        let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                        predicted.push(selection.candidate_tokens[best] as usize);
+                        candidate_scores.push(logits);
+                    } else {
+                        let logits = self.b.rowdot_f32("wte", &x.row(i).to_vec());
+                        native_output_row_calls += logits.len();
+                        predicted.push(logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0);
+                        candidate_scores.push(selection.candidate_tokens.iter().map(|&t| logits[t as usize]).collect::<Vec<_>>());
+                    }
+                }
+                (predicted, candidate_scores)
+            };
+            let (observed_predictions, candidate_scores) = predictions(&observed);
+            let elapsed_us = started.elapsed().as_micros();
+            // Validation is outside the measured forward/decode and never unembeds twice.
+            let plain = selection.check_observer.then(|| self.hidden(ids));
+            let observer_error = plain.as_ref().map(|plain| observer_identity(&observed, plain)).transpose()?;
+            // Equal hidden bits imply the same deterministic scorer output.
+            let plain_predictions = plain.as_ref().map(|_| observed_predictions.clone());
+            cases.push(serde_json::json!({
+                "ids": ids, "reads": reads,
+                "sources": sources, "prediction_positions": prediction_positions,
+                "predictions": observed_predictions, "unobserved_predictions": plain_predictions,
+                "candidate_tokens": selection.candidate_tokens, "candidate_scores": candidate_scores,
+                "scoring_scope": if selection.score_candidates_only { "candidate_subset" } else { "full_vocabulary" },
+                "native_output_row_calls": native_output_row_calls,
+                "elapsed_forward_decode_us": elapsed_us,
+                "measurement_scope": "observed_forward_and_decode_only",
+                "observer_check_performed": selection.check_observer,
+                "memory_replay": selected.memory_writes.first().cloned().flatten(),
+                "final_hidden": observed.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                "observer_hidden_max_error": observer_error,
+            }));
+        }
+        Ok(serde_json::json!({"schema": "pdc.read-incidence.v1", "arch": "gpt2", "cases": cases}))
     }
 
     fn mlp_act_last(&self, ids: &[i64], layer: usize) -> Option<Vec<f32>> {
@@ -461,5 +657,64 @@ impl Model for Gpt2 {
             self.forward_block(&emb, cur, kc, vc)
         };
         crate::model::prefix_generate(prompt, max_tokens, eos, emit, cache, n_layer, &alloc, &mut fwd, &|xb, _ctx| self.head_argmax(xb))
+    }
+}
+
+#[cfg(test)]
+mod pdc_tests {
+    use super::*;
+    #[test]
+    fn observer_identity_fails_closed() {
+        let observed = ndarray::arr2(&[[1.0, 2.0]]);
+        assert!(observer_identity(&observed, &ndarray::arr2(&[[1.0, 2.1]])).is_err());
+        assert!(observer_identity(&observed, &ndarray::arr2(&[[1.0, f32::NAN]])).is_err());
+    }
+    #[test]
+    fn observer_counts_only_the_observed_scorer() {
+        let dir = std::env::temp_dir().join(format!("fr_gpt2_pdc_review_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("b").to_string_lossy().into_owned();
+        let mut bin = Vec::new();
+        let mut arrays = Vec::new();
+        let mut add = |name: &str, shape: Vec<usize>, values: Vec<f32>| {
+            let offset = bin.len();
+            for x in values { bin.extend_from_slice(&x.to_le_bytes()); }
+            arrays.push(serde_json::json!({"name":name,"shape":shape,"dtype":"f32","offset":offset,"bytes":bin.len()-offset}));
+        };
+        add("wte", vec![3,2], vec![1.,0.,0.,1.,2.,-1.]);
+        add("wpe", vec![3,2], vec![0.;6]);
+        for prefix in ["ln_f", "h0.ln_1", "h0.ln_2"] {
+            add(&format!("{prefix}.weight"), vec![2], vec![1.;2]);
+            add(&format!("{prefix}.bias"), vec![2], vec![0.;2]);
+        }
+        for (name, shape, bias) in [("h0.attn.c_attn",vec![2,6],6),
+            ("h0.attn.c_proj",vec![2,2],2),("h0.mlp.c_fc",vec![2,8],8),
+            ("h0.mlp.c_proj",vec![8,2],2)] {
+            add(&format!("{name}.weight"), shape.clone(), vec![0.;shape.iter().product()]);
+            add(&format!("{name}.bias"), vec![bias], vec![0.;bias]);
+        }
+        std::fs::write(format!("{stem}.fieldrun.bin"), bin).unwrap();
+        std::fs::write(format!("{stem}.fieldrun.json"), serde_json::to_vec(&serde_json::json!({
+            "format":crate::bundle::FORMAT,"version":crate::bundle::VERSION,"arch":"gpt2",
+            "config":[1,1,2,3,3],"arrays":arrays})).unwrap()).unwrap();
+        let model = Gpt2::new(Bundle::load(&stem).unwrap(),0.,false);
+        for subset in [false,true] {
+            let mut last = None;
+            for observer in [false,true] {
+                let selection: ReadSelection = serde_json::from_value(serde_json::json!({
+                    "layers":[0],"heads":[0],"positions":[1],"contexts":[[0,1]],
+                    "capture_sources":true,"candidate_tokens":[0,1],
+                    "score_candidates_only":subset,"check_observer":observer})).unwrap();
+                let result = model.read_dump(&selection).unwrap();
+                let case = &result["cases"][0];
+                assert_eq!(case["native_output_row_calls"], if subset {4} else {6});
+                if observer {
+                    assert_eq!(case["observer_hidden_max_error"],0.);
+                    assert_eq!(case["unobserved_predictions"],case["predictions"]);
+                    assert_eq!(last.as_ref().unwrap(), &case["predictions"]);
+                } else { last = Some(case["predictions"].clone()); }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

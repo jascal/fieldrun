@@ -1,0 +1,43 @@
+{
+  "sha256": {
+    "experiments/pdc/r5_domain.json": "3dc65f9f9483b52dc803de69dd6bbae77810319f513edf927ff2539d843c39a3",
+    "experiments/pdc/r8h_probe.json": "2361b4e36efa7928c6ee5f7f1c9aaff1154f90d31b40a32b4c1b2635b045cc34",
+    "experiments/pdc/FINAL_AUDIT_PREREG.md": "1075ba815461d70b4ffb33cd460f2f0afdc877e68bc4a9078cde90ad198bc881",
+    "scripts/pdc_final_audit.py": "33949938c92b3dfcb9c44f1fd03f6a617e982f1e68e1af39b92201826e8b25a5",
+    "scripts/pdc_service.py": "92f8578c2acf90b28ee8d6b89d84077af7a8877221d14420b22295895a4539d5",
+    "scripts/pdc_final_audit_check.py": "2f1a21c72d85cfb4c6267dfa8ddc444f9acee2f995a1dc9bafa3e738cfa240b5",
+    "scripts/pdc_certificate.py": "d4d319597fc9a75d4fb674603f476f22fc32989ca0c7376155b70c81ea08411c",
+    "scripts/pdc_derive.py": "99c2c4b024ca2fcc7ef0947f4e421dfe812bc217b3876274795a57fb5dff73bc",
+    "bundles/gpt2.fieldrun.json": "322d79629f2e121c446560f57b71c5199e0d8a2a912c3a396137ca7eb207692c",
+    "bundles/gpt2.fieldrun.bin": "4edbcffed3bc19d571e679896ab3efebaa3802f8d7c9db3bdad31ff2416490f1"
+  },
+  "case_ids": [
+    "t3-a0-b0",
+    "t3-a0-b1",
+    "t3-a0-b2",
+    "t3-a0-b3",
+    "t3-a0-b4",
+    "t3-a1-b0",
+    "t3-a1-b1",
+    "t3-a1-b2",
+    "t3-a1-b3",
+    "t3-a1-b4",
+    "t3-a2-b0",
+    "t3-a2-b1",
+    "t3-a2-b2",
+    "t3-a2-b3",
+    "t3-a2-b4",
+    "t3-a3-b0",
+    "t3-a3-b1",
+    "t3-a3-b2",
+    "t3-a3-b3",
+    "t3-a3-b4",
+    "t3-a4-b0",
+    "t3-a4-b1",
+    "t3-a4-b2",
+    "t3-a4-b3",
+    "t3-a4-b4"
+  ],
+  "policy": "unchanged original R8-H",
+  "heldout_reservation": "consumed by this final audit"
+}

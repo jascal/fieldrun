@@ -1,0 +1,14 @@
+{
+  "schema": "pdc.two-hop-bundle-check.v1",
+  "nodes_checked": 117,
+  "paths_checked": 108,
+  "edges": {
+    "generated": 27,
+    "tool": 27,
+    "residual": 0,
+    "none": 54
+  },
+  "maximum_affine_score_error": 0.0,
+  "scope": "finite packet judgments and provenance; full native/reference checks remain r6_results.json",
+  "bundle_sha256": "e4a42383a54539cdb8b432a30d0b506ebf83536198e57f653a547e3eb1823eba"
+}

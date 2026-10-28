@@ -735,6 +735,21 @@ fn main() {
         let eos = bundle.eos.clone(); // for the text API / --chat stop condition
         let route: f32 = flag(&args, "--route-frac").and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let kv_int8 = has_flag(&args, "--kv-int8");
+        // PDC read observer uses an explicit, frozen JSON selection and exits after export.
+        if let Some(out) = flag(&args, "--pdc-read-dump") {
+            let result = (|| -> Result<(), String> {
+                if arch != "gpt2" { return Err("PDC read capture supports GPT-2 only".into()); }
+                let spec = flag(&args, "--pdc-read-selection").ok_or("--pdc-read-selection <json> required")?;
+                let selection: composition::ReadSelection = serde_json::from_str(
+                    &std::fs::read_to_string(spec).map_err(|e| e.to_string())?
+                ).map_err(|e| e.to_string())?;
+                let dump = Gpt2::new(bundle, route, kv_int8).read_dump(&selection)?;
+                std::fs::write(out, serde_json::to_vec(&dump).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            })();
+            if let Err(e) = result { eprintln!("[fieldrun] PDC read capture: {e}"); std::process::exit(1); }
+            return;
+        }
         // GPU residual dumps: only when arch=rope + explicit --device gpu + --source-dump (narrow blast radius).
         // Other consumers under --device gpu keep the CPU Model (they call methods GpuRopeModel does not implement).
         let mut lm: Box<dyn Model> = match arch.as_str() {

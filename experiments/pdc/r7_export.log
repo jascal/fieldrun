@@ -1,0 +1,23 @@
+{
+  "schema": "pdc.learning-data.v1",
+  "training_contexts": 75,
+  "protected_contexts": 183,
+  "pool_rows": 1703,
+  "outside_rows": 48554,
+  "heldout_contexts_used": 0,
+  "initial_full_host_agreement": 1.0,
+  "minimum_global_margin": 0.00016664870618399164,
+  "initial_gate": "passed",
+  "mismatches": [],
+  "numeric_closure_max_abs": 0.00017011119575727207,
+  "outside_semantics": "maximum for decisions; logsumexp for cross-entropy; all outside rows fixed",
+  "sha256": {
+    "experiments/pdc/r5_reads.json": "ee16c8aa33013dff0ca3dc9afdeaad584e9b32f3250961eb83a145f8444711fe",
+    "experiments/pdc/r6_capture.json": "1ffe6d05436e9bf559de0776e3912a325238b592f47b8904d5a54485fea15fac",
+    "experiments/pdc/r5_domain.json": "3dc65f9f9483b52dc803de69dd6bbae77810319f513edf927ff2539d843c39a3",
+    "experiments/pdc/r8h_probe.json": "2361b4e36efa7928c6ee5f7f1c9aaff1154f90d31b40a32b4c1b2635b045cc34",
+    "bundles/gpt2.fieldrun.json": "322d79629f2e121c446560f57b71c5199e0d8a2a912c3a396137ca7eb207692c",
+    "bundles/gpt2.fieldrun.bin": "4edbcffed3bc19d571e679896ab3efebaa3802f8d7c9db3bdad31ff2416490f1"
+  },
+  "npz_sha256": "ec7a855eaad8998c6eff6dac225e610b6dce641e283037399cfa93b0655ea195"
+}

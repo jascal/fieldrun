@@ -1,0 +1,79 @@
+{
+  "schema": "pdc.final-heldout-audit.v1",
+  "contexts": 25,
+  "untouched_heldout": 0,
+  "probe_size": 1703,
+  "body_probe_annotations_checked": 127725,
+  "maximum_body_score_discrepancy": 0.0,
+  "probe_score_max_discrepancy": 0,
+  "source_write_max_discrepancy": 0,
+  "paired_full_host_labels_checked": 25,
+  "misses": 18,
+  "fragile_truth": 1,
+  "theory_soundness_claim": false,
+  "viterbi": {
+    "abstained": 25,
+    "committed": 0,
+    "affirmed": 0,
+    "hallucination": 0,
+    "full_host_agreement": null,
+    "hallucination_rate": null,
+    "host_gate": "untested",
+    "abstention_reasons": {
+      "pairwise_fidelity_guard": 7,
+      "readout_margin_guard": 13,
+      "body_margin_guard": 5
+    }
+  },
+  "marginal": {
+    "abstained": 25,
+    "committed": 0,
+    "affirmed": 0,
+    "hallucination": 0,
+    "full_host_agreement": null,
+    "hallucination_rate": null,
+    "host_gate": "untested",
+    "abstention_reasons": {
+      "pairwise_fidelity_guard": 4,
+      "readout_margin_guard": 16,
+      "body_margin_guard": 5
+    }
+  },
+  "compute": {
+    "baseline_native_output_row_calls": 1256425,
+    "service_native_output_row_calls": 42575,
+    "body_probe_dot_calls_each_arm": 127725,
+    "native_output_rows_skipped": 1213850,
+    "native_row_reduction": 0.9661141731500089,
+    "output_and_body_dot_reduction": 0.8769642018567352,
+    "positions_skipped": 0,
+    "layers_skipped": 0
+  },
+  "timings": {
+    "paired_runs": [
+      {
+        "arm": "baseline",
+        "native_process_wall_seconds": 3.475883930001146,
+        "end_to_end_wall_seconds": 4.5456586239997705
+      },
+      {
+        "arm": "service",
+        "native_process_wall_seconds": 3.2565131840001413,
+        "end_to_end_wall_seconds": 4.308427728999959
+      }
+    ],
+    "native_baseline_forward_decode_seconds": 3.078305,
+    "native_service_forward_decode_seconds": 2.849535,
+    "inference": "one fixed ordered pair; descriptive timings only"
+  },
+  "sha256": {
+    "experiments/pdc/final_audit/baseline_bundle.json": "3c299b57dcd160307793b40b90655fcc9951eb179ea336c2da66e200a2735797",
+    "experiments/pdc/final_audit/service_capture.json": "46abfe17596ee6433f027a7c4eec8efd839e22949e5b8ec996d8bb8bbc09a5f9",
+    "experiments/pdc/final_audit/service_bundle.json": "859297708dfdfccfb3887ce174cedfd27d3bac79d69332ec6a9b6b9a80cb0260",
+    "experiments/pdc/final_audit/baseline_selection.json": "1fc1e4bee67aea8e4664abf690ab8866c9d6d8ea7dd7aec5dda709714fa94acf",
+    "experiments/pdc/final_audit/manifest.json": "be18dfb6e0bbfb85cdee6c22013bf30dd394a6cc5b7604c2bf3ea36d07787175",
+    "experiments/pdc/final_audit/service_selection.json": "1611ce3cde68553ec50ce2027029fe52dac9a64e513bb1323629d9c59574011c",
+    "experiments/pdc/final_audit/timing.json": "dae84d18d3770bb09d3a12a0894404aa5e88a0d790662bfab4eac255bde216e5",
+    "experiments/pdc/final_audit/baseline_capture.json": "89262975694d0d2e1d81ed11b8f8644cf5803dc2f80411ee8338cb686d9a688d"
+  }
+}

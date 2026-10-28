@@ -1,0 +1,63 @@
+{
+  "schema": "pdc.service-timing.v1",
+  "runs": [
+    {
+      "arm": "baseline",
+      "end_to_end_wall_seconds": 13.354881196999486,
+      "capture": "experiments/pdc/r8h_timed_baseline_capture.json",
+      "bundle": "experiments/pdc/r8h_baseline_bundle.json",
+      "command": [
+        "/usr/bin/python3",
+        "scripts/pdc_service.py",
+        "--runtime",
+        "target/release/fieldrun",
+        "--selection",
+        "experiments/pdc/r8h_baseline_selection.json",
+        "--retain-capture",
+        "experiments/pdc/r8h_timed_baseline_capture.json",
+        "--domain",
+        "experiments/pdc/r5_domain.json",
+        "--probe",
+        "experiments/pdc/r8h_probe.json",
+        "--bundle",
+        "bundles/gpt2",
+        "--out",
+        "experiments/pdc/r8h_baseline_bundle.json",
+        "--grade-addition",
+        "--allow-full-baseline"
+      ]
+    },
+    {
+      "arm": "service",
+      "end_to_end_wall_seconds": 12.870530618000885,
+      "capture": "experiments/pdc/r8h_timed_service_capture.json",
+      "bundle": "experiments/pdc/r8h_service_bundle.json",
+      "command": [
+        "/usr/bin/python3",
+        "scripts/pdc_service.py",
+        "--runtime",
+        "target/release/fieldrun",
+        "--selection",
+        "experiments/pdc/r8h_service_selection.json",
+        "--retain-capture",
+        "experiments/pdc/r8h_timed_service_capture.json",
+        "--domain",
+        "experiments/pdc/r5_domain.json",
+        "--probe",
+        "experiments/pdc/r8h_probe.json",
+        "--bundle",
+        "bundles/gpt2",
+        "--out",
+        "experiments/pdc/r8h_service_bundle.json",
+        "--grade-addition"
+      ]
+    }
+  ],
+  "sha256": {
+    "R8H_PREREG.md": "92ee9f0a9245192246d40e8c9255961adf5254d917fc9067083f09143cae8cfa",
+    "R8H_TIMING_ADDENDUM.md": "af4b82363469fb0ba2b0abf24f32a4bb7b9059efbf7659449f5a17892c9a56ec",
+    "r8h_probe.json": "2361b4e36efa7928c6ee5f7f1c9aaff1154f90d31b40a32b4c1b2635b045cc34",
+    "r8h_baseline_selection.json": "28800bcd5fddf14c123ad427f3c65d984a43f13e05c0c3122a13ca27e4a96ff5",
+    "r8h_service_selection.json": "07099dee8fb9d5c11cc03d7ad0e3ca32bbe10c82375fe8a0f4018574cebe2929"
+  }
+}

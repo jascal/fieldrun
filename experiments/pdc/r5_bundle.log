@@ -1,0 +1,9 @@
+{
+  "n": 75,
+  "reference_agreement": 1.0,
+  "observer_hidden_max_error": 0,
+  "source_sum_max_error": 1.681596040725708e-05,
+  "folded_hidden_max_error": 0.00017011119575727207,
+  "full_body_host_score_max_error": 0.00023980818494351297,
+  "fragile_contexts": 3
+}
