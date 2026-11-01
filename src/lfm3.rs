@@ -14,7 +14,8 @@ pub struct Lfm3 {
     ty: Vec<usize>,
     theta_full: f32,
     theta_slide: f32,
-    partial: usize,
+    partial_full: usize,
+    partial_slide: usize,
     window: usize,
     tied: bool,
 }
@@ -60,19 +61,20 @@ impl Lfm3 {
             eps: b.config_f[0] as f32,
             theta_full: b.config_f[1] as f32,
             theta_slide: b.config_f[2] as f32,
-            partial: c[8] as usize,
-            window: c[9] as usize,
+            partial_full: c[8] as usize,
+            partial_slide: c[9] as usize,
+            window: c[10] as usize,
             tied: c[7] != 0,
-            ty: c[10..].iter().map(|&x| x as usize).collect(),
+            ty: c[11..].iter().map(|&x| x as usize).collect(),
             b,
         }
     }
-    fn rope(&self, x: &mut Array2<f32>, heads: usize, pos0: usize, theta: f32) {
+    fn rope(&self, x: &mut Array2<f32>, heads: usize, pos0: usize, theta: f32, partial: usize) {
         let half = self.hd / 2;
         for (i, mut r) in x.rows_mut().into_iter().enumerate() {
             for h in 0..heads {
                 for j in 0..half {
-                    if j >= self.partial / 2 {
+                    if j >= partial / 2 {
                         continue;
                     }
                     let a = (pos0 + i) as f32 / theta.powf(2.0 * j as f32 / self.hd as f32);
@@ -135,10 +137,24 @@ impl Lfm3 {
         self.b.mm(&y, &format!("{p}conv.out_proj"))
     }
     fn hidden(&self, ids: &[i64]) -> Array2<f32> {
+        self.forward_capture(ids, false).0
+    }
+
+    /// Post-block residual snapshots used only for LFM3/reference parity diagnosis.
+    pub fn hiddens(&self, ids: &[i64]) -> Vec<Vec<f32>> {
+        self.forward_capture(ids, true)
+            .1
+            .into_iter()
+            .map(|x| x.into_raw_vec_and_offset().0)
+            .collect()
+    }
+
+    fn forward_capture(&self, ids: &[i64], capture: bool) -> (Array2<f32>, Vec<Array2<f32>>) {
         let n = ids.len();
         // Unlike Llama-family models, LFM3 applies `embedding_norm` to the decoder output,
         // not the token embeddings. The official checkpoints therefore have no separate final norm.
         let mut x = self.b.rows_f32("embed", ids);
+        let mut snaps = Vec::with_capacity(self.nl);
         let rep = self.nh / self.nkv;
         for l in 0..self.nl {
             let p = format!("l{l}.");
@@ -156,8 +172,13 @@ impl Lfm3 {
                 } else {
                     self.theta_slide
                 };
-                self.rope(&mut q, self.nh, 0, theta);
-                self.rope(&mut k, self.nkv, 0, theta);
+                // LFM3's RoPE parameters are layer-type-specific: the reference 1.7B
+                // rotates only half a head in full-attention blocks, but the whole head
+                // in sliding-attention blocks.  Sharing the former width caused the
+                // first meaningful residual divergence at the first sliding layer.
+                let partial = if self.ty[l] == 1 { self.partial_full } else { self.partial_slide };
+                self.rope(&mut q, self.nh, 0, theta, partial);
+                self.rope(&mut k, self.nkv, 0, theta, partial);
                 let mut out = Array2::zeros((n, self.nh * self.hd));
                 for h in 0..self.nh {
                     let kv = h / rep;
@@ -196,8 +217,11 @@ impl Lfm3 {
             }
             let ff = self.b.mm(&h, &format!("{p}feed_forward.w2"));
             x = &x1 + &rms(&ff, self.b.arr1(&format!("{p}post_ffn_norm")), self.eps);
+            if capture {
+                snaps.push(x.clone());
+            }
         }
-        rms(&x, self.b.arr1("embedding_norm"), self.eps)
+        (rms(&x, self.b.arr1("embedding_norm"), self.eps), snaps)
     }
 }
 impl Model for Lfm3 {

@@ -1089,6 +1089,17 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
 /// `sliding_attention` layers, with sandwich RMSNorm around both the operator and SwiGLU FFN.
 /// Multimodal LFM3 checkpoints wrap this exact text config in `text_config`; conversion deliberately
 /// handles the decoder only (the vision/audio encoders are outside fieldrun's token-id interface).
+fn lfm3_rope_params(rp: &serde_json::Value, kind: &str, hd: usize) -> Result<(f64, usize), std::io::Error> {
+    let x = &rp[kind];
+    if x["rope_type"].as_str().unwrap_or("default") != "default" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "lfm3: only default RoPE is supported"));
+    }
+    Ok((
+        x["rope_theta"].as_f64().unwrap_or(10000.0),
+        ((x["partial_rotary_factor"].as_f64().unwrap_or(1.0) * hd as f64) as usize),
+    ))
+}
+
 fn convert_lfm3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let tc = c.get("text_config").unwrap_or(c);
     let bad = |s: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("lfm3: {s}"));
@@ -1103,11 +1114,17 @@ fn convert_lfm3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
     let lt: Vec<&str> = tc.get("layer_types").and_then(|v|v.as_array()).ok_or_else(||bad("layer_types is required"))?.iter().map(|v|v.as_str().unwrap_or("")).collect();
     if lt.len()!=nl || lt.iter().any(|t| !matches!(*t,"conv"|"full_attention"|"sliding_attention")) { return Err(bad("layer_types must contain conv/full_attention/sliding_attention for every layer")); }
     let rp=tc.get("rope_parameters").ok_or_else(||bad("rope_parameters is required"))?;
-    let rope = |kind: &str| -> Result<(f64,usize),std::io::Error> { let x=&rp[kind]; if x["rope_type"].as_str().unwrap_or("default")!="default" {return Err(bad("only default RoPE is supported"));} Ok((x["rope_theta"].as_f64().unwrap_or(10000.0), ((x["partial_rotary_factor"].as_f64().unwrap_or(1.0)*hd as f64) as usize))) };
-    let (theta_full,partial)=rope("full_attention")?; let (theta_slide,_)=rope("sliding_attention")?;
-    if partial == 0 || partial > hd || partial % 2 != 0 { return Err(bad("invalid full_attention partial_rotary_factor")); }
+    let (theta_full,partial_full)=lfm3_rope_params(rp, "full_attention", hd)?;
+    let (theta_slide,partial_slide)=lfm3_rope_params(rp, "sliding_attention", hd)?;
+    for (kind, partial) in [("full_attention", partial_full), ("sliding_attention", partial_slide)] {
+        if partial == 0 || partial > hd || partial % 2 != 0 {
+            return Err(bad(&format!("invalid {kind} partial_rotary_factor")));
+        }
+    }
     let window=geti(tc,"sliding_window").unwrap_or(0); if lt.iter().any(|t|*t=="sliding_attention") && window==0 { return Err(bad("sliding_attention requires positive sliding_window")); }
-    let mut config=vec![nl,nh,nkv,hd,d,vocab,ffn,tied as usize,partial,window];
+    // Each attention flavor owns its RoPE width.  In LFM3-1.7B full attention is
+    // partial (0.5) while sliding attention defaults to a full head (1.0).
+    let mut config=vec![nl,nh,nkv,hd,d,vocab,ffn,tied as usize,partial_full,partial_slide,window];
     config.extend(lt.iter().map(|t| match *t {"conv"=>0,"full_attention"=>1,_=>2}));
     let manifest=serde_json::json!({"format":"fieldrun-bundle","version":1,"arch":"lfm3","config":config,"config_f":[eps,theta_full,theta_slide]});
     let mut w=BundleWriter::new(stem)?;
@@ -1704,6 +1721,18 @@ mod tests {
         let nested = json!({"rope_parameters": {"sliding_attention": {"rope_theta": 1234.0}, "full_attention": {"rope_theta": 9999.0}}});
         assert_eq!(gemma3_thetas(&nested), (1234.0, 9999.0));
         assert_eq!(gemma3_thetas(&json!({})), (10000.0, 1000000.0));
+    }
+
+    #[test]
+    fn lfm3_rope_width_is_per_attention_type() {
+        // LFM3-1.7B has half-head RoPE for full attention, but its sliding
+        // attention omits the factor and therefore rotates the full head.
+        let rp = json!({
+            "full_attention": {"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.5},
+            "sliding_attention": {"rope_theta": 10_000.0},
+        });
+        assert_eq!(lfm3_rope_params(&rp, "full_attention", 128).unwrap(), (1_000_000.0, 64));
+        assert_eq!(lfm3_rope_params(&rp, "sliding_attention", 128).unwrap(), (10_000.0, 128));
     }
 
     #[test]

@@ -764,6 +764,21 @@ fn main() {
             if let Err(e) = result { eprintln!("[fieldrun] PDC Qwen source capture: {e}"); std::process::exit(1); }
             return;
         }
+        // LFM3 parity diagnosis: avoid constructing the ordinary Model and then reloading a
+        // second 7 GB bundle merely to capture residuals.  The generic recursion diagnostic
+        // below predates LFM3 and can afford that on the much smaller development fixtures.
+        if arch == "lfm3" {
+            if let Some(out) = flag(&args, "--hidden-dump") {
+                let snaps = lfm3::Lfm3::new(bundle).hiddens(&ids);
+                let mut buf: Vec<u8> = Vec::new();
+                for s in &snaps {
+                    for v in s { buf.extend_from_slice(&v.to_le_bytes()); }
+                }
+                std::fs::write(out, &buf).unwrap();
+                eprintln!("[fieldrun] --hidden-dump: {} snapshots (each seq*d f32 LE) -> {out}", snaps.len());
+                return;
+            }
+        }
         // GPU residual dumps: only when arch=rope + explicit --device gpu + --source-dump (narrow blast radius).
         // Other consumers under --device gpu keep the CPU Model (they call methods GpuRopeModel does not implement).
         let mut lm: Box<dyn Model> = match arch.as_str() {
@@ -1209,6 +1224,7 @@ fn main() {
                 let b = bundle::Bundle::load(&stem).expect("reload bundle for --hidden-dump");
                 let snaps = match b.arch.as_str() {
                     "gemma4" => gemma4::Gemma4::new(b, route, kv_int8).hiddens(&ids),
+                    "lfm3" => lfm3::Lfm3::new(b).hiddens(&ids),
                     _ => qwen35moe::Qwen35Moe::new(b, route, kv_int8).hiddens(&ids),
                 };
                 let mut buf: Vec<u8> = Vec::new();
