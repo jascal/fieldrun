@@ -1204,18 +1204,6 @@ fn main() {
             // exprs of increasing nesting, get the model's answer, abduce its effective recursion depth + cut, and
             // report: model accuracy vs depth (the cliff), faithfulness (abduction reproduces the model), and the
             // recursive-vs-broken-cut-vs-semiring split. Tests "errs iff depth>D" and "error == retrieved cut". ──
-            // debug: dump per-position full-vocab logits (raw f32, [pos][vocab]) for the loaded --ids — used by
-            // experiments/qwen3next/compare.py to check whole-model parity vs the transformers reference.
-            if let Some(out) = flag(&args, "--logits-dump") {
-                let mut buf: Vec<u8> = Vec::new();
-                for p in 0..ids.len() {
-                    let lg = lm.logits(&ids[..=p]).expect("[fieldrun] --logits-dump: arch has no logits hook");
-                    for v in lg { buf.extend_from_slice(&v.to_le_bytes()); }
-                }
-                std::fs::write(out, &buf).unwrap();
-                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
-                return;
-            }
             // debug: per-layer residual-stream snapshots (qwen35moe only) for compare.py per-layer localization.
             if let Some(out) = flag(&args, "--hidden-dump") {
                 let b = bundle::Bundle::load(&stem).expect("reload bundle for --hidden-dump");
@@ -4011,6 +3999,30 @@ fn main() {
         } else {
             None
         };
+
+        // Raw full-vocabulary logits for architecture parity work. This deliberately sits outside
+        // recursion-explain: every decoder family with a `Model::logits` hook should be diagnosable.
+        if let Some(out) = flag(&args, "--logits-dump") {
+            if ids.is_empty() {
+                eprintln!("[fieldrun] --logits-dump needs --ids <token stream>");
+                return;
+            }
+            let mut buf = Vec::new();
+            for p in 0..ids.len() {
+                let Some(logits) = lm.logits(&ids[..=p]) else {
+                    eprintln!("[fieldrun] --logits-dump: arch {arch} has no logits hook");
+                    return;
+                };
+                buf.reserve(logits.len() * std::mem::size_of::<f32>());
+                for v in logits { buf.extend_from_slice(&v.to_le_bytes()); }
+            }
+            if let Err(e) = std::fs::write(out, buf) {
+                eprintln!("[fieldrun] --logits-dump: write {out}: {e}");
+            } else {
+                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
+            }
+            return;
+        }
 
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
         // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare

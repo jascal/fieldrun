@@ -212,4 +212,13 @@ impl Model for Lfm3 {
             .unwrap()
             .0 as i64
     }
+
+    fn logits(&self, ids: &[i64]) -> Option<Vec<f32>> {
+        if ids.is_empty() {
+            return None;
+        }
+        let x = self.hidden(ids);
+        let un = if self.tied { "embed" } else { "lm_head" };
+        Some(self.b.rowdot_f32(un, &x.row(x.nrows() - 1).to_vec()))
+    }
 }
