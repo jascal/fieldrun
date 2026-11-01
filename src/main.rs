@@ -46,6 +46,7 @@ mod gemma;
 mod headgate;
 mod gemma3;
 mod gemma4;
+mod lfm3;
 mod gptoss;
 #[cfg(feature = "api")]
 mod mdfmt;
@@ -175,14 +176,14 @@ fn main() {
                     "[fieldrun] convert: --model is required.\n  \
                      fieldrun convert --model <local-dir | hf-repo-id> --arch <arch> [--dtype int8|f16|f32] [-o <stem>]\n  \
                      e.g.  fieldrun convert --model Qwen/Qwen2.5-1.5B-Instruct --arch rope --dtype f16\n  \
-                     archs: gpt2 | rope | qwen35 | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax | dsv4 | gptoss   (see `fieldrun --help`)"
+                     archs: gpt2 | rope | lfm3 | qwen35 | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe | mla | minimax | dsv4 | gptoss   (see `fieldrun --help`)"
                 );
                 std::process::exit(2);
             }
         };
         let requested_arch = flag(&args, "--arch");
         let dtype = flag(&args, "--dtype").unwrap_or("int8");
-        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "gptoss", "bert"];
+        const ARCHS: &[&str] = &["gpt2", "neox", "rope", "lfm3", "gemma", "gemma3", "gemma4", "qwen3moe", "qwen35", "qwen35moe", "mla", "minimax", "dsv4", "gptoss", "bert"];
         if let Some(arch) = requested_arch {
             if !ARCHS.contains(&arch) {
                 eprintln!("[fieldrun] convert: unknown --arch {arch:?} (have: {})", ARCHS.join(", "));
@@ -763,6 +764,21 @@ fn main() {
             if let Err(e) = result { eprintln!("[fieldrun] PDC Qwen source capture: {e}"); std::process::exit(1); }
             return;
         }
+        // LFM3 parity diagnosis: avoid constructing the ordinary Model and then reloading a
+        // second 7 GB bundle merely to capture residuals.  The generic recursion diagnostic
+        // below predates LFM3 and can afford that on the much smaller development fixtures.
+        if arch == "lfm3" {
+            if let Some(out) = flag(&args, "--hidden-dump") {
+                let snaps = lfm3::Lfm3::new(bundle).hiddens(&ids);
+                let mut buf: Vec<u8> = Vec::new();
+                for s in &snaps {
+                    for v in s { buf.extend_from_slice(&v.to_le_bytes()); }
+                }
+                std::fs::write(out, &buf).unwrap();
+                eprintln!("[fieldrun] --hidden-dump: {} snapshots (each seq*d f32 LE) -> {out}", snaps.len());
+                return;
+            }
+        }
         // GPU residual dumps: only when arch=rope + explicit --device gpu + --source-dump (narrow blast radius).
         // Other consumers under --device gpu keep the CPU Model (they call methods GpuRopeModel does not implement).
         let mut lm: Box<dyn Model> = match arch.as_str() {
@@ -800,12 +816,13 @@ fn main() {
             "gemma4" => Box::new(Gemma4::new(bundle, route, kv_int8)),
             "qwen3moe" => Box::new(Qwen3Moe::new(bundle, route, kv_int8)),
             "qwen35" | "qwen35moe" => Box::new(qwen35moe::Qwen35Moe::new(bundle, route, kv_int8)),
+            "lfm3" => Box::new(lfm3::Lfm3::new(bundle)),
             "mla" => Box::new(Mla::new(bundle, route, kv_int8)),
             "minimax" => Box::new(MiniMax::new(bundle, route, kv_int8)),
             "dsv4" => Box::new(Dsv4::new(bundle, route, kv_int8)),
             "gptoss" => Box::new(GptOss::new(bundle, route, kv_int8)),
             "bert" => Box::new(bert::Bert::new(bundle)),
-            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, gptoss, bert)"),
+            other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, lfm3, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, gptoss, bert)"),
         };
 
         // ── encode-dump: encoder-only per-token hidden states ───────────────────────────────────────────────
@@ -1202,23 +1219,12 @@ fn main() {
             // exprs of increasing nesting, get the model's answer, abduce its effective recursion depth + cut, and
             // report: model accuracy vs depth (the cliff), faithfulness (abduction reproduces the model), and the
             // recursive-vs-broken-cut-vs-semiring split. Tests "errs iff depth>D" and "error == retrieved cut". ──
-            // debug: dump per-position full-vocab logits (raw f32, [pos][vocab]) for the loaded --ids — used by
-            // experiments/qwen3next/compare.py to check whole-model parity vs the transformers reference.
-            if let Some(out) = flag(&args, "--logits-dump") {
-                let mut buf: Vec<u8> = Vec::new();
-                for p in 0..ids.len() {
-                    let lg = lm.logits(&ids[..=p]).expect("[fieldrun] --logits-dump: arch has no logits hook");
-                    for v in lg { buf.extend_from_slice(&v.to_le_bytes()); }
-                }
-                std::fs::write(out, &buf).unwrap();
-                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
-                return;
-            }
             // debug: per-layer residual-stream snapshots (qwen35moe only) for compare.py per-layer localization.
             if let Some(out) = flag(&args, "--hidden-dump") {
                 let b = bundle::Bundle::load(&stem).expect("reload bundle for --hidden-dump");
                 let snaps = match b.arch.as_str() {
                     "gemma4" => gemma4::Gemma4::new(b, route, kv_int8).hiddens(&ids),
+                    "lfm3" => lfm3::Lfm3::new(b).hiddens(&ids),
                     _ => qwen35moe::Qwen35Moe::new(b, route, kv_int8).hiddens(&ids),
                 };
                 let mut buf: Vec<u8> = Vec::new();
@@ -4010,6 +4016,30 @@ fn main() {
             None
         };
 
+        // Raw full-vocabulary logits for architecture parity work. This deliberately sits outside
+        // recursion-explain: every decoder family with a `Model::logits` hook should be diagnosable.
+        if let Some(out) = flag(&args, "--logits-dump") {
+            if ids.is_empty() {
+                eprintln!("[fieldrun] --logits-dump needs --ids <token stream>");
+                return;
+            }
+            let mut buf = Vec::new();
+            for p in 0..ids.len() {
+                let Some(logits) = lm.logits(&ids[..=p]) else {
+                    eprintln!("[fieldrun] --logits-dump: arch {arch} has no logits hook");
+                    return;
+                };
+                buf.reserve(logits.len() * std::mem::size_of::<f32>());
+                for v in logits { buf.extend_from_slice(&v.to_le_bytes()); }
+            }
+            if let Err(e) = std::fs::write(out, buf) {
+                eprintln!("[fieldrun] --logits-dump: write {out}: {e}");
+            } else {
+                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
+            }
+            return;
+        }
+
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
         // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare
         // --explain with no ids falls through to chat with explanations enabled.)
@@ -4325,7 +4355,7 @@ USAGE\n\
 \n\
 CONVERT  (Hugging Face safetensors -> bundle, no torch)\n\
   --model <X>     local checkpoint dir, OR a HF repo id like Qwen/Qwen3-30B-A3B (org/name[@revision])   [hub: {hub}]\n\
-  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | qwen35 (Qwen3.5 dense text) | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe (Qwen3/Mixtral/Qwen2-MoE) | mla (DeepSeek/Kimi) | minimax | dsv4 (sliding only) | gptoss\n\
+  --arch <A>      gpt2 | neox (Pythia/GPT-NeoX) | rope (Llama/Qwen2.5/Mistral/Phi) | lfm3 (Liquid AI LFM3 text) | qwen35 (Qwen3.5 dense text) | qwen35moe | gemma | gemma3 | gemma4 | qwen3moe (Qwen3/Mixtral/Qwen2-MoE) | mla (DeepSeek/Kimi) | minimax | dsv4 (sliding only) | gptoss\n\
   --dtype <D>     int4 (group-wise Q4, smallest) | int8 (default, + expert-offload for MoE) | f16 | f32 (bit-exact)\n\
   -o, --out <S>   output bundle stem (default: ~/.cache/fieldrun/bundles/<name>/<name>, + a .tokenizer.json)\n\
   --hf-token <T>  token for gated models (else $HF_TOKEN, else `huggingface-cli login`)\n\

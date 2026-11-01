@@ -400,6 +400,7 @@ fn arch_table() -> &'static [(&'static str, &'static [&'static str])] {
         ("gpt2", &["gpt2"]),
         ("neox", &["gpt_neox"]),
         ("rope", &["llama", "qwen2", "mistral", "phi", "mimo"]),
+        ("lfm3", &["lfm3"]),
         ("gemma", &["gemma", "gemma2"]),
         ("gemma3", &["gemma3"]),
         ("gemma4", &["gemma4"]),
@@ -498,6 +499,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "gpt2" => convert_gpt2(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "neox" => convert_neox(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "rope" => convert_rope(&cfg, &m, dtype, embed_dtype, out_stem)?,
+        "lfm3" => convert_lfm3(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma" => convert_gemma(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma3" => convert_gemma3(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gemma4" => convert_gemma4(&cfg, &m, dtype, embed_dtype, out_stem)?,
@@ -509,7 +511,7 @@ pub fn convert(model_dir: &str, arch: &str, dtype: &str, embed_dtype: &str, out_
         "dsv4" => convert_dsv4(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "gptoss" => convert_gptoss(&cfg, &m, dtype, embed_dtype, out_stem)?,
         "bert" => convert_bert(&cfg, &m, dtype, embed_dtype, out_stem)?,
-        other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, gemma, gemma3, gemma4, qwen3moe, mla, minimax, bert)"),
+        other => panic!("convert: arch {other:?} not supported (gpt2, neox, rope, lfm3, gemma, gemma3, gemma4, qwen3moe, mla, minimax, bert)"),
     };
     // record the source's EOS token id(s) in the manifest (used to stop API/chat generation) — single point for all archs.
     let eos = eos_ids(&cfg);
@@ -1083,6 +1085,64 @@ fn convert_qwen3moe(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, st
     Ok(n)
 }
 
+/// Liquid AI LFM3 text backbone. It is a tri-hybrid stack: `conv`, `full_attention`, and
+/// `sliding_attention` layers, with sandwich RMSNorm around both the operator and SwiGLU FFN.
+/// Multimodal LFM3 checkpoints wrap this exact text config in `text_config`; conversion deliberately
+/// handles the decoder only (the vision/audio encoders are outside fieldrun's token-id interface).
+fn lfm3_rope_params(rp: &serde_json::Value, kind: &str, hd: usize) -> Result<(f64, usize), std::io::Error> {
+    let x = &rp[kind];
+    if x["rope_type"].as_str().unwrap_or("default") != "default" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "lfm3: only default RoPE is supported"));
+    }
+    Ok((
+        x["rope_theta"].as_f64().unwrap_or(10000.0),
+        ((x["partial_rotary_factor"].as_f64().unwrap_or(1.0) * hd as f64) as usize),
+    ))
+}
+
+fn convert_lfm3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
+    let tc = c.get("text_config").unwrap_or(c);
+    let bad = |s: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("lfm3: {s}"));
+    let (nl, nh, d, vocab) = (geti(tc,"num_hidden_layers").unwrap(), geti(tc,"num_attention_heads").unwrap(), geti(tc,"hidden_size").unwrap(), geti(tc,"vocab_size").unwrap());
+    let nkv = geti(tc,"num_key_value_heads").unwrap_or(nh);
+    let hd = geti(tc,"head_dim").unwrap_or(d / nh);
+    let ffn = geti(tc,"intermediate_size").unwrap();
+    let eps = getf(tc,"norm_eps").unwrap_or(1e-6);
+    let tied = tc.get("tie_word_embeddings").and_then(|v|v.as_bool()).unwrap_or(false);
+    if nh == 0 || nkv == 0 || nh % nkv != 0 || hd == 0 { return Err(bad("invalid attention dimensions")); }
+    if !tc.get("use_sandwich_norm").and_then(|v|v.as_bool()).unwrap_or(true) { return Err(bad("use_sandwich_norm=false is not supported")); }
+    let lt: Vec<&str> = tc.get("layer_types").and_then(|v|v.as_array()).ok_or_else(||bad("layer_types is required"))?.iter().map(|v|v.as_str().unwrap_or("")).collect();
+    if lt.len()!=nl || lt.iter().any(|t| !matches!(*t,"conv"|"full_attention"|"sliding_attention")) { return Err(bad("layer_types must contain conv/full_attention/sliding_attention for every layer")); }
+    let rp=tc.get("rope_parameters").ok_or_else(||bad("rope_parameters is required"))?;
+    let (theta_full,partial_full)=lfm3_rope_params(rp, "full_attention", hd)?;
+    let (theta_slide,partial_slide)=lfm3_rope_params(rp, "sliding_attention", hd)?;
+    for (kind, partial) in [("full_attention", partial_full), ("sliding_attention", partial_slide)] {
+        if partial == 0 || partial > hd || partial % 2 != 0 {
+            return Err(bad(&format!("invalid {kind} partial_rotary_factor")));
+        }
+    }
+    let window=geti(tc,"sliding_window").unwrap_or(0); if lt.iter().any(|t|*t=="sliding_attention") && window==0 { return Err(bad("sliding_attention requires positive sliding_window")); }
+    // Each attention flavor owns its RoPE width.  In LFM3-1.7B full attention is
+    // partial (0.5) while sliding attention defaults to a full head (1.0).
+    let mut config=vec![nl,nh,nkv,hd,d,vocab,ffn,tied as usize,partial_full,partial_slide,window];
+    config.extend(lt.iter().map(|t| match *t {"conv"=>0,"full_attention"=>1,_=>2}));
+    let manifest=serde_json::json!({"format":"fieldrun-bundle","version":1,"arch":"lfm3","config":config,"config_f":[eps,theta_full,theta_slide]});
+    let mut w=BundleWriter::new(stem)?;
+    let model_prefix=if m.has("model.language_model.embed_tokens.weight") {"model.language_model"} else {"model"};
+    let norm=|w:&mut BundleWriter,n:&str,h:&str| {let(s,x)=m.read(h);w.put_small(n,&x,&s,dtype)};
+    let lin=|w:&mut BundleWriter,n:&str,h:&str| {let(s,x)=m.read(h);w.put_lin(n,&x,s[0],s[1],dtype)};
+    w.put_embed_streamed(m,"embed",&format!("{model_prefix}.embed_tokens.weight"),edt,dtype)?;
+    norm(&mut w,"embedding_norm",&format!("{model_prefix}.embedding_norm.weight"))?;
+    if !tied { w.put_embed_streamed(m,"lm_head","lm_head.weight",edt,dtype)?; }
+    for l in 0..nl { let p=format!("{model_prefix}.layers.{l}.");
+        for n in ["operator_norm","post_operator_norm","ffn_norm","post_ffn_norm"] { norm(&mut w,&format!("l{l}.{n}"),&format!("{p}{n}.weight"))?; }
+        for (n,h) in [("w1","w1"),("w2","w2"),("w3","w3")] { lin(&mut w,&format!("l{l}.feed_forward.{n}"),&format!("{p}feed_forward.{h}.weight"))?; }
+        if lt[l]=="conv" { let (s,x)=m.read(&format!("{p}conv.conv.weight")); if s.len()!=3 || s[0]!=d || s[1]!=1 {return Err(bad("conv weight must have shape [hidden, 1, kernel]"));} w.put_small(&format!("l{l}.conv.conv"),&x,&[s[0],s[2]],dtype)?; for n in ["in_proj", "out_proj"] { lin(&mut w, &format!("l{l}.conv.{n}"), &format!("{p}conv.{n}.weight"))?; } }
+        else { for n in ["q_norm","k_norm"] {norm(&mut w,&format!("l{l}.self_attn.{n}"),&format!("{p}self_attn.{n}.weight"))?;} for n in ["q_proj","k_proj","v_proj","o_proj","gate_proj"] {lin(&mut w,&format!("l{l}.self_attn.{n}"),&format!("{p}self_attn.{n}.weight"))?;} }
+    }
+    let n=w.arrays.len();w.finish(stem,manifest)?;Ok(n)
+}
+
 /// Qwen3.5 dense text or Qwen3.5 MoE — hybrid: 3-of-4 layers are Gated DeltaNet *linear* attention,
 /// the rest full GQA. Dense uses SwiGLU per layer; MoE uses routed and shared experts.
 /// The text config may be nested under `text_config` (the family is VL/omni-capable). Experts ship as PACKED 3D
@@ -1634,6 +1694,7 @@ mod tests {
     #[test]
     fn mimo_uses_rope_backbone() {
         assert_eq!(infer_arch(&json!({"model_type": "mimo"})), Some("rope"));
+        assert_eq!(infer_arch(&json!({"model_type": "lfm3"})), Some("lfm3"));
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5"})), Some("qwen35"));
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_text"})), Some("qwen35"));
         assert_eq!(infer_arch(&json!({"model_type": "qwen3_5_moe"})), Some("qwen35moe"));
@@ -1660,6 +1721,18 @@ mod tests {
         let nested = json!({"rope_parameters": {"sliding_attention": {"rope_theta": 1234.0}, "full_attention": {"rope_theta": 9999.0}}});
         assert_eq!(gemma3_thetas(&nested), (1234.0, 9999.0));
         assert_eq!(gemma3_thetas(&json!({})), (10000.0, 1000000.0));
+    }
+
+    #[test]
+    fn lfm3_rope_width_is_per_attention_type() {
+        // LFM3-1.7B has half-head RoPE for full attention, but its sliding
+        // attention omits the factor and therefore rotates the full head.
+        let rp = json!({
+            "full_attention": {"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.5},
+            "sliding_attention": {"rope_theta": 10_000.0},
+        });
+        assert_eq!(lfm3_rope_params(&rp, "full_attention", 128).unwrap(), (1_000_000.0, 64));
+        assert_eq!(lfm3_rope_params(&rp, "sliding_attention", 128).unwrap(), (10_000.0, 128));
     }
 
     #[test]
