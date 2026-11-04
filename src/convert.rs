@@ -793,6 +793,41 @@ fn gemma3_thetas(c: &serde_json::Value) -> (f64, f64) {
 /// RoPE on global layers (handled in the kernel by zero-padding inv_freq), and the Per-Layer-Embedding gated-residual
 /// block. attention_k_eq_v (global layers drop v_proj) and KV-sharing (the last num_kv_shared_layers drop k/v/k_norm) are
 /// both supported.
+/// Gemma 4's global (full-attention) head_dim and KV-head count. transformers >= 5.22 no longer serializes
+/// `global_head_dim` / `num_global_key_value_heads`: `Gemma4TextConfig.__post_init__` folds them into
+/// `per_layer_config = {"<layer>": {"head_dim": .., "num_key_value_heads": ..}}` on the full-attention layers, and
+/// when `per_layer_config` is present it WINS over the flat keys. Mirror that precedence; fall back to the flat keys
+/// (older transformers, and the released Google configs) when it is absent. The kernel models per-layer-TYPE widths
+/// only, so a per_layer_config that overrides a sliding layer, overrides an unknown key, or disagrees across full
+/// layers is rejected instead of being silently flattened.
+fn gemma4_global_attn(tc: &serde_json::Value, nl: usize, is_full: &dyn Fn(usize) -> bool, hd: usize, nkv: usize)
+    -> std::io::Result<(usize, usize)> {
+    let bad = |s: String| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("gemma4: {s}"));
+    let Some(plc) = tc.get("per_layer_config").and_then(|v| v.as_object()) else {
+        return Ok((geti(tc, "global_head_dim").unwrap_or(hd), geti(tc, "num_global_key_value_heads").unwrap_or(nkv)));
+    };
+    let mut global: Option<(usize, usize)> = None;
+    for l in 0..nl {
+        let ov = plc.get(&l.to_string()).and_then(|v| v.as_object());
+        if !is_full(l) {
+            if ov.is_some_and(|o| !o.is_empty()) { return Err(bad(format!("per_layer_config overrides sliding layer {l}"))); }
+            continue;
+        }
+        let ov = ov.cloned().unwrap_or_default();
+        if let Some(k) = ov.keys().find(|k| !matches!(k.as_str(), "head_dim" | "num_key_value_heads")) {
+            return Err(bad(format!("per_layer_config key {k:?} (layer {l}) is not supported")));
+        }
+        let get = |k: &str, dflt: usize| ov.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dflt);
+        let this = (get("head_dim", hd), get("num_key_value_heads", nkv));
+        match global {
+            None => global = Some(this),
+            Some(g) if g != this => return Err(bad(format!("full-attention layers disagree in per_layer_config ({g:?} vs {this:?} at layer {l})"))),
+            _ => {}
+        }
+    }
+    Ok(global.unwrap_or((hd, nkv)))
+}
+
 fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     // The released checkpoints ship the multimodal composite `Gemma4Config` (model_type "gemma4") with all the text
     // params under `text_config`; a standalone `Gemma4ForCausalLM` saves the flat `Gemma4TextConfig` (no nesting). Read
@@ -814,10 +849,8 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
     let moe_inter = geti(tc, "moe_intermediate_size").unwrap_or(0);
     let nh = geti(tc, "num_attention_heads").unwrap();
     let nkv = geti(tc, "num_key_value_heads").unwrap_or(nh);
-    let nkv_g = geti(tc, "num_global_key_value_heads").unwrap_or(nkv);
     let d = geti(tc, "hidden_size").unwrap();
     let hd = geti(tc, "head_dim").unwrap_or(d / nh);
-    let hd_g = geti(tc, "global_head_dim").unwrap_or(hd);
     let (nl, ffn, vocab) = (geti(tc, "num_hidden_layers").unwrap(), geti(tc, "intermediate_size").unwrap(), geti(tc, "vocab_size").unwrap());
     let ple = geti(tc, "hidden_size_per_layer_input").unwrap_or(256);
     let eps = getf(tc, "rms_norm_eps").unwrap_or(1e-6);
@@ -832,6 +865,7 @@ fn convert_gemma4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem
         .map(|s| s == "full_attention").unwrap_or((l + 1) % pattern == 0);
     // Gemma 4 forces the last layer to full_attention.
     let is_full = |l: usize| full_of(l) || l + 1 == nl;
+    let (hd_g, nkv_g) = gemma4_global_attn(tc, nl, &is_full, hd, nkv)?;
     // Per-layer output scalar (`layer_scalar`, a persistent buffer applied as the LAST op of each decoder layer in
     // `Gemma4ForCausalLM`; default 1.0). Read it per layer so a checkpoint that ships a non-1.0 value runs faithfully
     // instead of silently diverging; appended to config_f after the 4 rope/eps scalars.
@@ -1548,6 +1582,41 @@ fn write_layers(w: &mut BundleWriter, c: &serde_json::Value, m: &Model, dtype: &
 /// grouped o_proj written as one block per group, per-head attention sinks, the two mHC HyperConnections + the final
 /// HyperHead (fn/base/scale params), the sqrtsoftplus router (+ e_score_correction_bias) over packed experts, and the
 /// always-on shared expert. config packs the dims; config_f the rope-theta/eps/clamp/scale scalars.
+/// HF-form DeepSeek-V4 tensor name -> the name actually present in the checkpoint. transformers >= 5.22 saves V4
+/// in the NATIVE layout (its `conversion_mapping` "deepseek_v4" renames, applied in reverse: `attn.wq_a`, `attn_norm`,
+/// `hc_attn_fn`, `ffn.shared_experts.w1`, …) while keeping the `model.` prefix, because the `^embed`/`^head`/
+/// `^hc_head_*` patterns are anchored and never match a prefixed key. Older transformers saved HF names. Try, in
+/// order: the HF name, the native name with `model.`, the fully native name (prefix stripped + anchored leaf renames —
+/// the layout of DeepSeek's own release; NOT yet validated against a real checkpoint). Falls back to the HF name so a
+/// missing tensor is still reported under the name the converter asked for.
+fn dsv4_key(m: &Model, hf: &str) -> String {
+    if m.has(hf) { return hf.to_string(); }
+    const MID: &[(&str, &str)] = &[
+        (".self_attn.q_b_proj.", ".self_attn.wq_b."), // before the generic .self_attn. rename
+        (".q_a_proj.", ".wq_a."), (".kv_proj.", ".wkv."), (".o_a_proj.", ".wo_a."), (".o_b_proj.", ".wo_b."),
+        (".q_a_norm.", ".q_norm."), (".kv_norm.", ".norm."), (".self_attn.sinks", ".self_attn.attn_sink"),
+        (".attn_hc.fn", ".hc_attn_fn"), (".attn_hc.base", ".hc_attn_base"), (".attn_hc.scale", ".hc_attn_scale"),
+        (".ffn_hc.fn", ".hc_ffn_fn"), (".ffn_hc.base", ".hc_ffn_base"), (".ffn_hc.scale", ".hc_ffn_scale"),
+        (".input_layernorm.", ".attn_norm."), (".post_attention_layernorm.", ".ffn_norm."),
+        (".gate.e_score_correction_bias", ".gate.bias"),
+        (".shared_experts.gate_proj.", ".shared_experts.w1."), (".shared_experts.down_proj.", ".shared_experts.w2."),
+        (".shared_experts.up_proj.", ".shared_experts.w3."),
+        (".self_attn.", ".attn."), (".mlp.", ".ffn."),
+    ];
+    let mut native = hf.to_string();
+    for (a, b) in MID { native = native.replace(a, b); }
+    if m.has(&native) { return native; }
+    const LEAF: &[(&str, &str)] = &[
+        ("model.embed_tokens.weight", "embed.weight"), ("lm_head.weight", "head.weight"),
+        ("model.hc_head.hc_fn", "hc_head_fn"), ("model.hc_head.hc_base", "hc_head_base"),
+        ("model.hc_head.hc_scale", "hc_head_scale"),
+    ];
+    let bare = LEAF.iter().find(|(a, _)| *a == native).map(|(_, b)| b.to_string())
+        .unwrap_or_else(|| native.strip_prefix("model.").unwrap_or(&native).to_string());
+    if m.has(&bare) { return bare; }
+    hf.to_string()
+}
+
 fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let nl = geti(c, "num_hidden_layers").unwrap();
     let nh = geti(c, "num_attention_heads").unwrap();
@@ -1568,7 +1637,7 @@ fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
     let window = geti(c, "sliding_window").unwrap();
     // V4 declares _tied_weights_keys(lm_head→embed): a checkpoint that omits lm_head.weight is tied (reload re-ties it),
     // so treat a missing lm_head as tied regardless of the config flag.
-    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false) || !m.has("lm_head.weight");
+    let tie = c.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false) || !m.has(&dsv4_key(m, "lm_head.weight"));
     let theta = getf(c, "rope_theta").unwrap_or(10000.0);
     let eps = getf(c, "rms_norm_eps").unwrap_or(1e-6);
     let limit = getf(c, "swiglu_limit").unwrap_or(10.0);
@@ -1596,28 +1665,30 @@ fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
         "config": config, "config_f": config_f });
 
     let mut w = BundleWriter::new(stem)?;
+    // Every tensor is named in HF form below and resolved through `dsv4_key` (HF name, else the native name).
+    let rd = |hf: &str| m.read(&dsv4_key(m, hf));
     let norm = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
-        let (s, dt) = m.read(hf);
+        let (s, dt) = rd(hf);
         w.put_small(name, &dt, &s, dtype)
     };
     let lin = |w: &mut BundleWriter, name: &str, hf: &str| -> std::io::Result<()> {
-        let (s, dt) = m.read(hf); // (out, in)
+        let (s, dt) = rd(hf); // (out, in)
         w.put_lin(name, &dt, s[0], s[1], dtype)
     };
     // embeddings stay low-precision; lm_head raw (vocab, d) for rowdot_f32 when untied.
-    let (es, ed) = m.read("model.embed_tokens.weight");
+    let (es, ed) = rd("model.embed_tokens.weight");
     w.put_embed("embed", &ed, &es, edt, dtype)?;
     if !tie {
-        let (s, dt) = m.read("lm_head.weight");
+        let (s, dt) = rd("lm_head.weight");
         w.put_embed("lm_head", &dt, &s, edt, dtype)?;
     }
     norm(&mut w, "norm", "model.norm.weight")?;
     // HyperHead (final stream collapse)
     lin(&mut w, "hc_head.hc_fn", "model.hc_head.hc_fn")?;
     {
-        let (s, dt) = m.read("model.hc_head.hc_base");
+        let (s, dt) = rd("model.hc_head.hc_base");
         w.put_small("hc_head.hc_base", &dt, &s, dtype)?;
-        let (s2, dt2) = m.read("model.hc_head.hc_scale");
+        let (s2, dt2) = rd("model.hc_head.hc_scale");
         w.put_small("hc_head.hc_scale", &dt2, &s2, dtype)?;
     }
     let gin = nh * hd / o_groups; // grouped o_proj input-per-group
@@ -1633,25 +1704,25 @@ fn convert_dsv4(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
         lin(&mut w, &format!("l{l}.self_attn.kv_proj"), &format!("{p}self_attn.kv_proj.weight"))?;
         lin(&mut w, &format!("l{l}.self_attn.o_b_proj"), &format!("{p}self_attn.o_b_proj.weight"))?;
         // grouped o_a_proj: HF weight (o_groups*o_lora, gin); write one block per group (o_lora, gin).
-        let (oas, oad) = m.read(&format!("{p}self_attn.o_a_proj.weight"));
+        let (oas, oad) = rd(&format!("{p}self_attn.o_a_proj.weight"));
         assert_eq!(oas, vec![o_groups * o_lora, gin], "dsv4 o_a_proj shape");
         for g in 0..o_groups {
             let blk = &oad[g * o_lora * gin..(g + 1) * o_lora * gin];
             w.put_lin(&format!("l{l}.self_attn.o_a_proj.{g}"), blk, o_lora, gin, dtype)?;
         }
-        let (sks, skd) = m.read(&format!("{p}self_attn.sinks"));
+        let (sks, skd) = rd(&format!("{p}self_attn.sinks"));
         w.put_small(&format!("l{l}.self_attn.sinks"), &skd, &sks, dtype)?;
         // mHC HyperConnections (attn + ffn sites)
         for hcn in ["attn_hc", "ffn_hc"] {
             lin(&mut w, &format!("l{l}.{hcn}.fn"), &format!("{p}{hcn}.fn"))?;
-            let (bs, bd) = m.read(&format!("{p}{hcn}.base"));
+            let (bs, bd) = rd(&format!("{p}{hcn}.base"));
             w.put_small(&format!("l{l}.{hcn}.base"), &bd, &bs, dtype)?;
-            let (ss, sd) = m.read(&format!("{p}{hcn}.scale"));
+            let (ss, sd) = rd(&format!("{p}{hcn}.scale"));
             w.put_small(&format!("l{l}.{hcn}.scale"), &sd, &ss, dtype)?;
         }
         // MoE router + bias
         lin(&mut w, &format!("l{l}.mlp.gate"), &format!("{p}mlp.gate.weight"))?;
-        let (bs, bd) = m.read(&format!("{p}mlp.gate.e_score_correction_bias"));
+        let (bs, bd) = rd(&format!("{p}mlp.gate.e_score_correction_bias"));
         w.put_small(&format!("l{l}.mlp.e_score_correction_bias"), &bd, &bs, dtype)?;
         // routed experts — saved UNPACKED per expert (Mixtral convention): w1=gate, w3=up, w2=down. One (in,out) array each.
         for e in 0..n_exp {
@@ -1721,6 +1792,23 @@ mod tests {
         let nested = json!({"rope_parameters": {"sliding_attention": {"rope_theta": 1234.0}, "full_attention": {"rope_theta": 9999.0}}});
         assert_eq!(gemma3_thetas(&nested), (1234.0, 9999.0));
         assert_eq!(gemma3_thetas(&json!({})), (10000.0, 1000000.0));
+    }
+
+    #[test]
+    fn gemma4_global_attn_reads_per_layer_config() {
+        let full = |l: usize| l >= 5;
+        // transformers >= 5.22: global head_dim folded into per_layer_config; it beats any flat key.
+        let tc = json!({"global_head_dim": 999, "per_layer_config": {"5": {"head_dim": 16}, "6": {"head_dim": 16}}});
+        assert_eq!(gemma4_global_attn(&tc, 7, &full, 8, 2).unwrap(), (16, 2));
+        let tc = json!({"per_layer_config": {"5": {"head_dim": 16, "num_key_value_heads": 1}, "6": {"head_dim": 16, "num_key_value_heads": 1}}});
+        assert_eq!(gemma4_global_attn(&tc, 7, &full, 8, 2).unwrap(), (16, 1));
+        // older transformers / released configs: flat keys.
+        let tc = json!({"global_head_dim": 16, "num_global_key_value_heads": 1});
+        assert_eq!(gemma4_global_attn(&tc, 7, &full, 8, 2).unwrap(), (16, 1));
+        // shapes the per-type kernel cannot represent are refused, not flattened.
+        assert!(gemma4_global_attn(&json!({"per_layer_config": {"5": {"head_dim": 16}, "6": {"head_dim": 32}}}), 7, &full, 8, 2).is_err());
+        assert!(gemma4_global_attn(&json!({"per_layer_config": {"0": {"head_dim": 16}}}), 7, &full, 8, 2).is_err());
+        assert!(gemma4_global_attn(&json!({"per_layer_config": {"5": {"sliding_window": 3}}}), 7, &full, 8, 2).is_err());
     }
 
     #[test]
