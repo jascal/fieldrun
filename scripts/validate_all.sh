@@ -49,6 +49,28 @@ else
 fi
 echo
 
+# LFM3 (Liquid AI) tri-hybrid: gated short conv + full + sliding GQA, per-head sigmoid output gate, sandwich norms,
+# per-layer-type RoPE width. Reference = the vendored remote code (scripts/lfm3_remote; transformers has no lfm3).
+# `build` itself fails unless ablating the window / RoPE width / output gate each moves predictions, so a 60/60 here
+# means those bits are matched, not merely unexercised. lfm3 = tied + flat names; lfm3vl = untied + VL composite
+# (no --arch: also gates auto-detection through text_config). f32 is gated; the other columns are informational.
+printf "%-12s %-14s %-8s %-8s %-8s %-8s\n" arch ref f32 f16 int8 int4
+for tag in lfm3 lfm3vl; do
+  $PY scripts/lfm3_ref.py build "$tag" >/dev/null 2>&1 || { printf "%-12s BUILD FAILED\n" "$tag"; FAILED="$FAILED $tag(build)"; continue; }
+  row=""
+  for dt in f32 f16 int8 int4; do
+    $BIN convert --model /tmp/${tag}tiny --dtype "$dt" -o /tmp/${tag}_$dt --force >/dev/null 2>&1
+    rm -f /tmp/${tag}_${dt}.txt
+    $BIN --bundle /tmp/${tag}_$dt --ids /tmp/${tag}_holdout.json --ctx 16 --n-eval 60 --dump /tmp/${tag}_${dt}.txt >/dev/null 2>&1
+    a=$($PY scripts/lfm3_ref.py compare /tmp/${tag}_${dt}.txt "$tag" 2>/dev/null | grep -oE '^[0-9]+/[0-9]+')
+    row="$row $(printf '%-8s' "${a:-ERR}")"
+    [ -n "$a" ] || FAILED="$FAILED $tag($dt:ERR)"
+    [ "$dt" != f32 ] || [ -z "$a" ] || [ "${a%%/*}" = "${a##*/}" ] || FAILED="$FAILED $tag(f32:$a)"
+  done
+  printf "%-12s %-14s%s\n" "$tag" "Lfm3ForCausalLM" "$row"
+done
+echo
+
 # Qwen3.5 MoE top-1 gate (experiments/qwen3next): 8 experts + a sigmoid-gated shared expert, the packed
 # experts.gate_up_proj/down_proj on-disk layout, and the same 3:1 DeltaNet/full hybrid — vs transformers
 # Qwen3_5MoeForCausalLM. This is the arch's first row in the automated sweep (it was previously only ever
