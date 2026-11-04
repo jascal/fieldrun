@@ -825,6 +825,33 @@ fn main() {
             other => panic!("unknown bundle arch {other:?} (have: gpt2, neox, rope, lfm3, gemma, gemma3, gemma4, qwen3moe, qwen35, qwen35moe, mla, minimax, dsv4, gptoss, bert)"),
         };
 
+        // Raw full-vocabulary logits for architecture parity work. Handled immediately after the model is built,
+        // ahead of every mode dispatch (notably --recursion-explain, whose arch-support early returns used to
+        // swallow it): every decoder family with a `Model::logits` hook must be diagnosable, and the
+        // validate_all.sh Qwen3.5-MoE gate passes `--recursion-explain --logits-dump`. Failures exit non-zero
+        // so a gate can never read a stale dump.
+        if let Some(out) = flag(&args, "--logits-dump") {
+            if ids.is_empty() {
+                eprintln!("[fieldrun] --logits-dump needs --ids <token stream>");
+                std::process::exit(2);
+            }
+            let mut buf = Vec::new();
+            for p in 0..ids.len() {
+                let Some(logits) = lm.logits(&ids[..=p]) else {
+                    eprintln!("[fieldrun] --logits-dump: arch {arch} has no logits hook");
+                    std::process::exit(2);
+                };
+                buf.reserve(logits.len() * std::mem::size_of::<f32>());
+                for v in logits { buf.extend_from_slice(&v.to_le_bytes()); }
+            }
+            if let Err(e) = std::fs::write(out, buf) {
+                eprintln!("[fieldrun] --logits-dump: write {out}: {e}");
+                std::process::exit(1);
+            }
+            eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
+            return;
+        }
+
         // ── encode-dump: encoder-only per-token hidden states ───────────────────────────────────────────────
         // Runs the full --ids sequence through an encoder arch and writes ALL hidden-state snapshots (HF
         // `output_hidden_states` convention: embeddings output + each layer's output, n_layer+1 total, each the
@@ -4015,30 +4042,6 @@ fn main() {
         } else {
             None
         };
-
-        // Raw full-vocabulary logits for architecture parity work. This deliberately sits outside
-        // recursion-explain: every decoder family with a `Model::logits` hook should be diagnosable.
-        if let Some(out) = flag(&args, "--logits-dump") {
-            if ids.is_empty() {
-                eprintln!("[fieldrun] --logits-dump needs --ids <token stream>");
-                return;
-            }
-            let mut buf = Vec::new();
-            for p in 0..ids.len() {
-                let Some(logits) = lm.logits(&ids[..=p]) else {
-                    eprintln!("[fieldrun] --logits-dump: arch {arch} has no logits hook");
-                    return;
-                };
-                buf.reserve(logits.len() * std::mem::size_of::<f32>());
-                for v in logits { buf.extend_from_slice(&v.to_le_bytes()); }
-            }
-            if let Err(e) = std::fs::write(out, buf) {
-                eprintln!("[fieldrun] --logits-dump: write {out}: {e}");
-            } else {
-                eprintln!("[fieldrun] --logits-dump: {} positions x vocab (f32 LE) -> {out}", ids.len());
-            }
-            return;
-        }
 
         // Chat (interactive REPL) is the DEFAULT when no other mode/input is given — the quickest "does it work?"
         // human interface — and also runs on explicit --chat. (--serve / --generate / --ids take precedence; bare
