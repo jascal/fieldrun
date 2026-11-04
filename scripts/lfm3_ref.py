@@ -186,6 +186,7 @@ def sweep(argv):
     ap.add_argument("--n-eval", type=int, default=60)
     ap.add_argument("--hidden-out", help="write post-decoder hidden states as f32 .npy")
     ap.add_argument("--logits-out", help="write final-position logits as f32 .npy")
+    ap.add_argument("--chunk", type=int, default=8, help="contexts per forward (bounds peak memory)")
     args = ap.parse_args(argv)
     ids = json.load(open(args.ids))
     ids = ids.get("holdout_ids", ids) if isinstance(ids, dict) else ids
@@ -193,30 +194,37 @@ def sweep(argv):
     if stop <= args.ctx:
         raise SystemExit("need more ids than --ctx")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=torch.float32
+        args.model, trust_remote_code=True, dtype=torch.float32
     ).eval()
     positions = list(range(args.ctx, stop))
     # Every row is an independent fixed-width causal context, exactly matching fieldrun's
-    # scoring loop while evaluating the reference in one batched forward.
+    # scoring loop (batched in chunks below).
     contexts = [ids[i - args.ctx:i] for i in positions]
-    captures = []
-    hooks = []
-    if args.hidden_out:
-        # `capture_outputs` has changed tuple conventions across transformers releases;
-        # direct block hooks unambiguously capture post-decoder residuals.
-        for layer in model.model.layers:
-            hooks.append(layer.register_forward_hook(lambda _m, _a, out: captures.append(out.detach())))
-    with torch.inference_mode():
-        output = model(input_ids=torch.tensor(contexts))
-        preds = output.logits[:, -1].argmax(dim=-1).tolist()
-        if args.logits_out:
-            import numpy as np
-            np.save(args.logits_out, output.logits[:, -1].float().cpu().numpy())
+    # Chunked, and `logits_to_keep=1`: the full [rows, ctx, vocab] logits of one batched forward are 16 GB at
+    # ctx 320 x 100 rows on the 128k-vocab 1.7B (OOM-killed); only the last position is scored.
+    preds, last_logits, hidden = [], [], []
+    for c0 in range(0, len(contexts), args.chunk):
+        captures, hooks = [], []
         if args.hidden_out:
-            import numpy as np
-            np.save(args.hidden_out, torch.stack(captures).float().cpu().numpy())
-    for hook in hooks:
-        hook.remove()
+            # `capture_outputs` has changed tuple conventions across transformers releases;
+            # direct block hooks unambiguously capture post-decoder residuals.
+            for layer in model.model.layers:
+                hooks.append(layer.register_forward_hook(lambda _m, _a, out: captures.append(out.detach())))
+        with torch.inference_mode():
+            output = model(input_ids=torch.tensor(contexts[c0:c0 + args.chunk]), logits_to_keep=1)
+        for hook in hooks:
+            hook.remove()
+        preds += output.logits[:, -1].argmax(dim=-1).tolist()
+        if args.logits_out:
+            last_logits.append(output.logits[:, -1].float().cpu())
+        if args.hidden_out:
+            hidden.append(torch.stack(captures).float().cpu())  # [layers, rows, ctx, d]
+    if args.logits_out:
+        import numpy as np
+        np.save(args.logits_out, torch.cat(last_logits).numpy())
+    if args.hidden_out:
+        import numpy as np
+        np.save(args.hidden_out, torch.cat(hidden, dim=1).numpy())
     json.dump({"ctx": args.ctx, "positions": positions, "preds": preds}, open(args.out, "w"))
 
 
