@@ -3,6 +3,7 @@
 
   lfm3_ref.py build <tag>            tiny random-weight fixture + its torch reference (offline; the gate)
   lfm3_ref.py compare <dump> <tag>   top-1 agreement of a fieldrun --dump against that reference
+  lfm3_ref.py build-bias             conv_bias checkpoints the converter must REFUSE (negative gate)
   lfm3_ref.py <model> <ids> <out> [--ctx N --n-eval M --hidden-out F --logits-out F]
                                      top-1 sweep of a real checkpoint (its own remote code, f32)
 
@@ -142,6 +143,26 @@ def build(tag):
     print(f"{tag}: reference {len(preds)} positions -> {out}")
 
 
+def build_bias():
+    """Two checkpoints fieldrun does not support and must refuse rather than run with the conv biases dropped:
+    /tmp/lfm3biastiny (conv_bias=true) and /tmp/lfm3biashiddentiny (the same bias tensors under a config that
+    says false — the converter must look at the tensors, not just trust the flag)."""
+    import shutil
+
+    cfg = tiny_config("lfm3", conv_bias=True)
+    model = make_model(cfg)
+    randomize(model, 3005)
+    on, hidden = Path("/tmp/lfm3biastiny"), Path("/tmp/lfm3biashiddentiny")
+    for d in (on, hidden):
+        shutil.rmtree(d, ignore_errors=True)
+    model.save_pretrained(on, safe_serialization=True)
+    shutil.copytree(on, hidden)
+    c = json.loads((hidden / "config.json").read_text())
+    c["conv_bias"] = False
+    (hidden / "config.json").write_text(json.dumps(c))
+    print(f"conv_bias checkpoints -> {on}, {hidden}")
+
+
 def compare(dump, tag):
     """Prints `N/60 top-1`; exit status is left to the caller (f32 is gated, lower precisions are informational)."""
     expected = json.loads(paths(tag)[2].read_text())
@@ -202,6 +223,8 @@ def sweep(argv):
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "build" and sys.argv[2] in TAGS:
         build(sys.argv[2])
+    elif sys.argv[1:] == ["build-bias"]:
+        build_bias()
     elif len(sys.argv) >= 4 and sys.argv[1] == "compare" and sys.argv[3] in TAGS:
         compare(sys.argv[2], sys.argv[3])
     else:
