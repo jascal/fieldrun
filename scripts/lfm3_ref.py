@@ -188,11 +188,16 @@ def sweep(argv):
     ap.add_argument("--logits-out", help="write final-position logits as f32 .npy")
     ap.add_argument("--chunk", type=int, default=8, help="contexts per forward (bounds peak memory)")
     args = ap.parse_args(argv)
+    if args.chunk < 1:
+        # a negative step makes the chunk loop empty: it would write `"preds": []` and exit 0 — a silent pass
+        raise SystemExit(f"--chunk must be >= 1 (got {args.chunk})")
     ids = json.load(open(args.ids))
     ids = ids.get("holdout_ids", ids) if isinstance(ids, dict) else ids
     stop = min(len(ids), args.ctx + args.n_eval)
     if stop <= args.ctx:
         raise SystemExit("need more ids than --ctx")
+    # CPU (from_pretrained's default), f32: the memory numbers in the PR/notes are CPU RSS, and f32 is what makes an
+    # exact top-1 comparison against an f32 fieldrun bundle meaningful — bf16 would lower memory but break that.
     model = AutoModelForCausalLM.from_pretrained(
         args.model, trust_remote_code=True, dtype=torch.float32
     ).eval()
