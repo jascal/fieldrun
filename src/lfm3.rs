@@ -166,6 +166,11 @@ impl Lfm3 {
     /// operator block (`L{l}.conv` or `L{l}.attn`, i.e. `post_operator_norm(op)` — the sandwich norm is part of the
     /// block, it is exactly what gets added) and the FFN block (`L{l}.mlp`, `post_ffn_norm(ffn)`). By construction
     /// `Σ_b writes[b] == pre_norm` at every position. `mlp`, not `ffn`, so rosetta/pil's `L(\d+).(attn|mlp)` parse it.
+    ///
+    /// Memory: `writes` holds `(1 + 2·nl)` full `[seq, d]` f32 matrices — 49 × 2048 × 4 B ≈ 0.4 MB per token on
+    /// LFM3-1.7B (≈130 MB at ctx 320, 1.6 GB at 4k, 13 GB at 32k). Only `decomp_all` needs every position;
+    /// `residual_normed_writes` / `residual_decomp` / `decision_decomp` read just the last row, so a last-position-only
+    /// capture mode is the natural fix once `explain` puts those paths on the chat/API surface.
     fn forward(&self, ids: &[i64], cap: Capture) -> Fwd {
         let n = ids.len();
         // Unlike Llama-family models, LFM3 applies `embedding_norm` to the decoder output,
