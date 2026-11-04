@@ -70,6 +70,22 @@ for tag in lfm3 lfm3vl; do
   printf "%-12s %-14s%s\n" "$tag" "Lfm3ForCausalLM" "$row"
 done
 echo
+# Negative gate: conv_bias is unsupported, so convert must FAIL — both on the config flag and on bias tensors hiding
+# under a config that says false. Passing here means a bias checkpoint can't silently run with its biases dropped.
+if $PY scripts/lfm3_ref.py build-bias >/dev/null 2>&1; then
+  for v in lfm3bias lfm3biashidden; do
+    if msg=$($BIN convert --model /tmp/${v}tiny --dtype f32 -o /tmp/${v}_f32 --force 2>&1); then
+      printf "%-15s converted — conv_bias NOT rejected\n" "$v"; FAILED="$FAILED $v(accepted)"
+    elif echo "$msg" | grep -q "conv_bias=true is not supported\|conv biases are not supported"; then
+      printf "%-15s rejected (ok)\n" "$v"
+    else
+      printf "%-15s failed for the wrong reason: %s\n" "$v" "$(echo "$msg" | tail -1)"; FAILED="$FAILED $v(wrong-error)"
+    fi
+  done
+else
+  printf "%-15s BUILD FAILED\n" lfm3bias; FAILED="$FAILED lfm3bias(build)"
+fi
+echo
 
 # Qwen3.5 MoE top-1 gate (experiments/qwen3next): 8 experts + a sigmoid-gated shared expert, the packed
 # experts.gate_up_proj/down_proj on-disk layout, and the same 3:1 DeltaNet/full hybrid — vs transformers

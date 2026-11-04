@@ -1134,6 +1134,25 @@ fn lfm3_rope_params(rp: &serde_json::Value, kind: &str, hd: usize) -> Result<(f6
     ))
 }
 
+/// LFM3's `conv_bias` adds a bias to the conv block's `in_proj`, depthwise `conv` and `out_proj`. Every released LFM3
+/// config ships `false` and the kernel has no bias terms, so a `true` config would otherwise convert "successfully"
+/// and run with the biases silently dropped. Refuse it — on the config flag, and on any conv bias tensor actually
+/// present (a checkpoint can carry them under a config that says false). Reports the first offending tensor.
+fn lfm3_reject_conv_bias(tc: &serde_json::Value, conv_layers: &[usize], prefix: &str, has: &dyn Fn(&str) -> bool)
+    -> std::io::Result<()> {
+    let bad = |s: String| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("lfm3: {s}"));
+    if tc.get("conv_bias").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(bad("conv_bias=true is not supported (the kernel has no conv bias terms)".into()));
+    }
+    for &l in conv_layers {
+        for n in ["conv.conv.bias", "conv.in_proj.bias", "conv.out_proj.bias"] {
+            let k = format!("{prefix}.layers.{l}.{n}");
+            if has(&k) { return Err(bad(format!("checkpoint has {k} but conv biases are not supported"))); }
+        }
+    }
+    Ok(())
+}
+
 fn convert_lfm3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: &str) -> std::io::Result<usize> {
     let tc = c.get("text_config").unwrap_or(c);
     let bad = |s: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("lfm3: {s}"));
@@ -1163,6 +1182,8 @@ fn convert_lfm3(c: &serde_json::Value, m: &Model, dtype: &str, edt: &str, stem: 
     let manifest=serde_json::json!({"format":"fieldrun-bundle","version":1,"arch":"lfm3","config":config,"config_f":[eps,theta_full,theta_slide]});
     let mut w=BundleWriter::new(stem)?;
     let model_prefix=if m.has("model.language_model.embed_tokens.weight") {"model.language_model"} else {"model"};
+    let conv_layers:Vec<usize>=(0..nl).filter(|&l| lt[l]=="conv").collect();
+    lfm3_reject_conv_bias(tc,&conv_layers,model_prefix,&|k| m.has(k))?;
     let norm=|w:&mut BundleWriter,n:&str,h:&str| {let(s,x)=m.read(h);w.put_small(n,&x,&s,dtype)};
     let lin=|w:&mut BundleWriter,n:&str,h:&str| {let(s,x)=m.read(h);w.put_lin(n,&x,s[0],s[1],dtype)};
     w.put_embed_streamed(m,"embed",&format!("{model_prefix}.embed_tokens.weight"),edt,dtype)?;
@@ -1809,6 +1830,21 @@ mod tests {
         assert!(gemma4_global_attn(&json!({"per_layer_config": {"5": {"head_dim": 16}, "6": {"head_dim": 32}}}), 7, &full, 8, 2).is_err());
         assert!(gemma4_global_attn(&json!({"per_layer_config": {"0": {"head_dim": 16}}}), 7, &full, 8, 2).is_err());
         assert!(gemma4_global_attn(&json!({"per_layer_config": {"5": {"sliding_window": 3}}}), 7, &full, 8, 2).is_err());
+    }
+
+    #[test]
+    fn lfm3_conv_bias_is_rejected() {
+        let none = |_: &str| false;
+        assert!(lfm3_reject_conv_bias(&json!({"conv_bias": false}), &[0, 2], "model", &none).is_ok());
+        assert!(lfm3_reject_conv_bias(&json!({}), &[0, 2], "model", &none).is_ok()); // reference default is false
+        let e = lfm3_reject_conv_bias(&json!({"conv_bias": true}), &[0, 2], "model", &none).unwrap_err();
+        assert!(e.to_string().contains("conv_bias=true"));
+        // config says false but the checkpoint carries a bias (VL prefix): still refused, naming the tensor.
+        let has = |k: &str| k == "model.language_model.layers.2.conv.out_proj.bias";
+        let e = lfm3_reject_conv_bias(&json!({"conv_bias": false}), &[0, 2], "model.language_model", &has).unwrap_err();
+        assert!(e.to_string().contains("layers.2.conv.out_proj.bias"));
+        // only conv layers are inspected: an attention layer index is never probed.
+        assert!(lfm3_reject_conv_bias(&json!({}), &[0], "model", &has).is_ok());
     }
 
     #[test]
