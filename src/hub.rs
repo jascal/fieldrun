@@ -98,14 +98,42 @@ fn download(url: &str, dest: &Path, token: &Option<String>, name: &str) -> Resul
 /// Fetch `repo_id`'s config + safetensors to a local cache dir and return that dir (what `convert` opens). Sharded
 /// models pull every shard listed in the index; single-file models pull `model.safetensors`. `revision` defaults to
 /// `main`. Files already present are reused (a simple cache).
+///
+/// On failure, the cache dirs this call left EMPTY are removed again (`<org>--<name>/<rev>`, then `<org>--<name>`), so a
+/// mistyped repo id or a bad path doesn't leave stray folders in the cache. `remove_dir` only succeeds on an empty dir,
+/// so already-cached files are never touched.
 pub fn fetch(repo_id: &str, token: Option<String>) -> Result<String, String> {
     let (repo, revision) = match repo_id.split_once('@') {
         Some((r, rev)) => (r, rev),
         None => (repo_id, "main"),
     };
-    let base = format!("https://huggingface.co/{repo}/resolve/{revision}");
     let dir = cache_root().join(repo.replace('/', "--")).join(revision);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("[hub] mkdir {}: {e}", dir.display()))?;
+    let result = fetch_into(&dir, repo, revision, token);
+    if result.is_err() {
+        remove_if_empty(&dir);
+    }
+    result
+}
+
+/// Remove `dir` and then its parent, each only if empty (best-effort; errors ignored).
+fn remove_if_empty(dir: &Path) {
+    if std::fs::remove_dir(dir).is_ok() {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+/// True if `--model` was written as a filesystem path (absolute, `./`, `../` or `~`), not as a hub repo id like
+/// `org/name`. Such a value that lacks a `config.json` is a missing local checkpoint, not something to download.
+pub fn looks_like_path(model: &str) -> bool {
+    model.starts_with('/') || model.starts_with("./") || model.starts_with("../") || model.starts_with('~')
+        || model == "." || model == ".."
+}
+
+fn fetch_into(dir: &Path, repo: &str, revision: &str, token: Option<String>) -> Result<String, String> {
+    let base = format!("https://huggingface.co/{repo}/resolve/{revision}");
+    std::fs::create_dir_all(dir).map_err(|e| format!("[hub] mkdir {}: {e}", dir.display()))?;
 
     let get = |file: &str| -> Result<(), String> {
         let dest = dir.join(file);
@@ -144,4 +172,41 @@ pub fn fetch(repo_id: &str, token: Option<String>) -> Result<String, String> {
         }
     }
     Ok(dir.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_like_models_are_not_repo_ids() {
+        for p in ["/tmp/nope", "./ckpt", "../ckpt", "~/models/x", ".", ".."] {
+            assert!(looks_like_path(p), "{p} should be treated as a path");
+        }
+        for r in ["Qwen/Qwen2.5-0.5B", "gpt2", "EleutherAI/pythia-160m@step1000"] {
+            assert!(!looks_like_path(r), "{r} should be treated as a repo id");
+        }
+    }
+
+    #[test]
+    fn remove_if_empty_keeps_nonempty_dirs() {
+        let root = std::env::temp_dir().join(format!("fieldrun-hub-test-{}", std::process::id()));
+        // empty rev dir under an empty repo dir: both go
+        let empty = root.join("org--empty").join("main");
+        std::fs::create_dir_all(&empty).unwrap();
+        remove_if_empty(&empty);
+        assert!(!root.join("org--empty").exists());
+        // rev dir holding a cached file: nothing is removed
+        let full = root.join("org--full").join("main");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("config.json"), "{}").unwrap();
+        remove_if_empty(&full);
+        assert!(full.join("config.json").exists());
+        // empty rev dir next to another cached revision: the rev dir goes, the repo dir stays
+        let other = root.join("org--full").join("step1");
+        std::fs::create_dir_all(&other).unwrap();
+        remove_if_empty(&other);
+        assert!(!other.exists() && full.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
