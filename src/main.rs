@@ -225,6 +225,12 @@ fn main() {
         } else {
             #[cfg(feature = "hub")]
             {
+                if hub::looks_like_path(model) {
+                    // written as a path, so it's a missing local checkpoint — don't send it to the hub as a repo id
+                    eprintln!("[fieldrun] convert: --model {model:?} looks like a local path, but there's no \
+                               config.json there (a hub model is given as a repo id like `org/name`).");
+                    std::process::exit(1);
+                }
                 match hub::fetch(model, hub::token(flag(&args, "--hf-token"))) {
                     Ok(dir) => dir,
                     Err(e) => {
